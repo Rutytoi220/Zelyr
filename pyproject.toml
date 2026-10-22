@@ -82,6 +82,7 @@ dev = [
     "pytest-qt>=4.5.0",
     "pytest-cov>=4.0",
     "mypy>=1.0",
+    "ruff>=0.6.0",
     "build>=1.0",
     "twine>=4.0",
     "pyinstaller>=6.0"

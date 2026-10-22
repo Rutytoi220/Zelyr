@@ -100,11 +100,21 @@ All code must pass clean with zero errors before considering any task complete.
 ## 4. Packaging, Distribution & Bootstrapping `[VERIFIED]`
 
 ### A. Wheel Package Build
-AXIOM is packaged as standard Python wheel distribution via `setuptools`:
+AXIOM is packaged as a standard Python wheel distribution via `setuptools`.
+
+Build through the isolated-source wrapper rather than invoking
+`uv build --wheel` or `python -m build --wheel` directly. Setuptools reuses
+`build/lib` in the project root, so a module deleted after an earlier build
+can be silently re-added to the wheel:
+
 ```bash
-uv build --wheel
+uv run python scripts/build_dist.py --wheel --no-isolation
 ```
 This produces `dist/axiom_core-1.0.0-py3-none-any.whl`.
+
+The script copies only the build inputs (`pyproject.toml`, metadata files and
+the `axiom` package) into a temporary directory, builds there, and verifies
+that every `.py` file in the wheel exists in the current source tree.
 
 ### B. Clean Installation Smoke Test
 To verify the distribution in an isolated environment without polluting the host:
