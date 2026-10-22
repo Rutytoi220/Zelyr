@@ -15,7 +15,7 @@ import uuid
 import requests
 import httpx
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.responses import StreamingResponse
@@ -118,10 +118,36 @@ class ChatResponse(BaseModel):
     usage: ChatResponseUsage = Field(default_factory=ChatResponseUsage)
 
 
+async def _supervise_optional_worker(
+    name: str, worker: Callable[[], Awaitable[None]]
+) -> None:
+    """Run an optional background worker and report missing dependencies.
+
+    The webhook/watcher subsystem is not part of the current source tree.  Its
+    worker coroutines raise ``ImportError`` on their first import, which would
+    otherwise surface only as an unretrieved task exception at shutdown.  Log
+    the failure explicitly and keep the API server available for its remaining
+    endpoints.
+    """
+    try:
+        await worker()
+    except asyncio.CancelledError:
+        raise
+    except ImportError as exc:
+        logger.error(
+            "Optional %s background worker disabled: required module is "
+            "unavailable (%s). The rest of the API server remains available.",
+            name,
+            exc,
+        )
+    except Exception:
+        logger.exception("Optional %s background worker stopped unexpectedly", name)
+
+
 @app.on_event("startup")
 async def startup_event():
-    asyncio.create_task(webhook_worker_loop())
-    asyncio.create_task(watcher_worker_loop())
+    asyncio.create_task(_supervise_optional_worker("webhook", webhook_worker_loop))
+    asyncio.create_task(_supervise_optional_worker("watcher", watcher_worker_loop))
 
 async def watcher_worker_loop():
     from axiom.core.watchers import get_pending_watcher_jobs, update_watcher_job_status, get_watcher_by_id, start_observer

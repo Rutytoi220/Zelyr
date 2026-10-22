@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import os
 import shutil
@@ -42,6 +43,32 @@ from prompt_toolkit.layout.margins import ScrollbarMargin
 from prompt_toolkit.lexers import Lexer
 from prompt_toolkit.completion import Completer, Completion
 from axiom.config import get_config
+
+logger = logging.getLogger(__name__)
+
+# The cron scheduler is an optional component: ``axiom.core.scheduler`` imports
+# ``apscheduler`` and the removed ``axiom.core.pipeline`` module at module
+# scope.  The TUI only uses it to render a job count in the footer, so a
+# missing backend must degrade that badge instead of breaking the whole app.
+_scheduler_warning_emitted = False
+
+
+def get_scheduler_job_count() -> tuple[int, bool]:
+    """Return ``(job_count, available)`` without raising from the TUI footer."""
+    global _scheduler_warning_emitted
+    try:
+        from axiom.core.scheduler import get_active_jobs
+
+        return len(get_active_jobs()), True
+    except Exception as exc:
+        if not _scheduler_warning_emitted:
+            _scheduler_warning_emitted = True
+            logger.warning(
+                "Cron scheduler unavailable; the TUI will show no scheduled jobs: %s",
+                exc,
+            )
+        return 0, False
+
 
 TAG_REGEX = re.compile(r'</?(?:function|highlight)(?:\s+[^>]*)?>', re.IGNORECASE)
 
@@ -846,13 +873,17 @@ def create_tui_app() -> Application[None]:
     # 4. Window (Footer/Status bar)
     def get_footer_text() -> HTML:
         from axiom.core.ipc import ACTIVE_DAEMONS
-        from axiom.core.scheduler import get_active_jobs
         cwd = str(Path.cwd())
         tool_status = f"  <ansiyellow>{current_tool_status}</ansiyellow>" if current_tool_status else ""
         num_daemons = len(ACTIVE_DAEMONS)
         daemon_str = f"<ansidarkgray>|</ansidarkgray>  <ansibrightcyan>Daemons:</ansibrightcyan> <ansibrightred>{num_daemons}</ansibrightred>  " if num_daemons > 0 else f"<ansidarkgray>|</ansidarkgray>  <ansibrightcyan>Daemons:</ansibrightcyan> <ansigray>0</ansigray>  "
-        num_cron = len(get_active_jobs())
-        cron_str = f"<ansidarkgray>|</ansidarkgray>  <ansibrightcyan>Cron:</ansibrightcyan> <ansimagenta>{num_cron}</ansimagenta>  " if num_cron > 0 else f"<ansidarkgray>|</ansidarkgray>  <ansibrightcyan>Cron:</ansibrightcyan> <ansigray>0</ansigray>  "
+        num_cron, cron_available = get_scheduler_job_count()
+        if not cron_available:
+            cron_str = f"<ansidarkgray>|</ansidarkgray>  <ansibrightcyan>Cron:</ansibrightcyan> <ansired>unavailable</ansired>  "
+        elif num_cron > 0:
+            cron_str = f"<ansidarkgray>|</ansidarkgray>  <ansibrightcyan>Cron:</ansibrightcyan> <ansimagenta>{num_cron}</ansimagenta>  "
+        else:
+            cron_str = f"<ansidarkgray>|</ansidarkgray>  <ansibrightcyan>Cron:</ansibrightcyan> <ansigray>0</ansigray>  "
         status_line = (
             f" <ansigray>{cwd}</ansigray>  "
             f"<ansidarkgray>|</ansidarkgray>  <ansibrightcyan>Session:</ansibrightcyan> <ansigreen>{CURRENT_SESSION_ID[:8]}</ansigreen>  "

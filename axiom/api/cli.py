@@ -85,18 +85,25 @@ Returns:
         import multiprocessing
         from axiom.memory.sleep_cycle import SleepCycleDaemon
         from axiom.memory.pruner import MemoryPrunerDaemon
-        from axiom.core.routine import RoutineEngine
         self.sleep_daemon: SleepCycleDaemon | None = None
         self.pruner_daemon: MemoryPrunerDaemon | None = None
-        self.routine_engine: RoutineEngine | None = None
+        self.routine_engine = None
         if multiprocessing.current_process().name == 'MainProcess':
             self.sleep_daemon = SleepCycleDaemon(self.engine.event_bus, self.memory, self.ollama)
             self.sleep_daemon.start()
             self.pruner_daemon = MemoryPrunerDaemon(self.memory, self.ollama)
             self.pruner_daemon.start()
-            from axiom.core.routine import RoutineEngine
-            self.routine_engine = RoutineEngine(self)
-            self.routine_engine.start()
+            try:
+                from axiom.core.routine import RoutineEngine
+            except ImportError as exc:
+                # ``croniter`` is an optional scheduling backend.  Its absence
+                # must not prevent the rest of the CLI from starting; routine
+                # commands already degrade via the ``routine_engine is None``
+                # checks in ``do_routine``.
+                logger.warning('Routine engine disabled: %s', exc)
+            else:
+                self.routine_engine = RoutineEngine(self)
+                self.routine_engine.start()
         else:
             pass
 
@@ -163,14 +170,13 @@ Returns:
     def _register_tools(self) -> None:
         """Register system tools."""
         from axiom.tools.os_assist import SafeFileSearchTool, FileOpenerTool, AppLauncherTool
-        from axiom.tools.vision_tools import ScreenCaptureTool
         from axiom.tools.document_reader import ReadDocumentContentTool
         from axiom.tools.clipboard_tools import ClipboardReadTool, ClipboardWriteTool
         from axiom.tools.desktop_control import DesktopAutomationTool
-        from axiom.tools.vision import VisionCaptureTool
-        from axiom.tools import EchoTool, ShellTool, FileReadTool, FileWriteTool, SystemInfoTool, FileTeleportTool, TaskSchedulerTool
+        from axiom.tools.vision import InteractWithUITool
+        from axiom.tools import EchoTool, ShellTool, FileReadTool, FileWriteTool, SystemInfoTool, ScreenCaptureTool, FileTeleportTool, TaskSchedulerTool
         from axiom.legacy_wrapper import create_legacy_tools
-        tools = [EchoTool(), ShellTool(), FileReadTool('.'), FileWriteTool('.'), SystemInfoTool(), SafeFileSearchTool(), FileOpenerTool(), AppLauncherTool(), ScreenCaptureTool(), ReadDocumentContentTool(), ClipboardReadTool(), ClipboardWriteTool(), DesktopAutomationTool(), VisionCaptureTool(), FileTeleportTool(), TaskSchedulerTool()]
+        tools = [EchoTool(), ShellTool(), FileReadTool('.'), FileWriteTool('.'), SystemInfoTool(), SafeFileSearchTool(), FileOpenerTool(), AppLauncherTool(), ScreenCaptureTool(), ReadDocumentContentTool(), ClipboardReadTool(), ClipboardWriteTool(), DesktopAutomationTool(), InteractWithUITool(), FileTeleportTool(), TaskSchedulerTool()]
         tools.extend(create_legacy_tools())
         for tool in tools:
             self.engine.registry.register_tool(tool.tool_id, tool)
@@ -788,6 +794,11 @@ Returns:
         print('Goodbye!')
         return True
 
+    def do_EOF(self, arg: str) -> bool:
+        """Exit cleanly when stdin is closed or Ctrl-D is pressed."""
+        print()
+        return self.do_quit(arg)
+
     def close(self) -> None:
         """Release engine, memory, and LLM client resources exactly once."""
         if self._closed:
@@ -823,6 +834,10 @@ Returns:
             return line
         if stripped.startswith('/'):
             return stripped[1:]
+        # ``cmd.Cmd`` dispatches bare ``exit``/``quit`` normally; without this
+        # guard they would be rewritten to ``ask exit`` and sent to the model.
+        if stripped in ('exit', 'quit'):
+            return stripped
         if stripped.startswith('ask '):
             return stripped
         if stripped.startswith('run '):
