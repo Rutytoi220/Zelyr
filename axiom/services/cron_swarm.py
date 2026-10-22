@@ -1,7 +1,7 @@
 import logging
 import asyncio
 from axiom.agents.swarm.supervisor import SwarmSupervisor
-from axiom.api.audit_ledger import AuditLedger
+from axiom.engine.audit_ledger import AuditLedger
 from axiom.core.events import EventBus
 
 logger = logging.getLogger(__name__)
@@ -39,7 +39,13 @@ class CronSwarmEngine:
             response = supervisor.synthesize_results(prompt, {})
             
             # Log successful completion
-            self.ledger.log_execution("CronSwarmEngine", "SUCCESS", f"Job '{job_name}' completed. Response snippet: {response[:100]}")
+            self.ledger.log_execution(
+                "CronSwarmEngine",
+                "execute_cron_job",
+                {"job_name": job_name, "response_preview": (response or "")[:100]},
+                "MEDIUM",
+                "SUCCESS",
+            )
             
             self.event_bus.publish_sync(
                 "telemetry.update",
@@ -48,7 +54,13 @@ class CronSwarmEngine:
             
         except Exception as e:
             logger.error(f"CronSwarmEngine: Job '{job_name}' failed: {e}")
-            self.ledger.log_execution("CronSwarmEngine", "FAILED", f"Job '{job_name}' failed: {e}")
+            self.ledger.log_execution(
+                "CronSwarmEngine",
+                "execute_cron_job",
+                {"job_name": job_name, "error": str(e)},
+                "MEDIUM",
+                "FAILED",
+            )
             self.event_bus.publish_sync(
                 "telemetry.update",
                 data={"message": f"[❌ Cron Swarm Failed: {job_name}]"}

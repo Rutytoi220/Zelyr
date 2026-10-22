@@ -3,7 +3,6 @@ import asyncio
 from mcp.server.fastmcp import FastMCP
 from axiom.engine.memory_tx import TransactionalMemoryManager
 from axiom.engine.consensus import SwarmConsensusEngine
-from axiom.memory.blackboard import Blackboard
 from axiom.core.engine import Engine
 
 logger = logging.getLogger(__name__)
@@ -53,7 +52,7 @@ def inspect_security_audit(limit: int = 10) -> str:
     """Retrieves recent tool execution logs from AuditLedger."""
     logger.info(f"MCP Tool 'inspect_security_audit' invoked with limit: {limit}")
     try:
-        from axiom.api.audit_ledger import AuditLedger
+        from axiom.engine.audit_ledger import AuditLedger
         ledger = AuditLedger()
         logs = ledger.get_recent_logs(limit)
         if not logs:

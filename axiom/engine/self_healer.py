@@ -96,7 +96,13 @@ class AutonomousSelfHealer:
         
         # Log to ledger
         status = "SUCCESS" if "SUCCESS" in result else "FAILED"
-        self.ledger.log_execution("AutonomousSelfHealer", status, f"Incident: {reason}. Result: {result}")
+        self.ledger.log_execution(
+            "AutonomousSelfHealer",
+            "heal_unit",
+            {"unit": unit, "reason": reason, "result": result},
+            "HIGH",
+            status,
+        )
         
         # Emit Desktop notification
         try:
