@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AXIOM Headless Swarm Node — Zero-Trust Tailscale Launcher.
+"""Zelyr Headless Swarm Node — Zero-Trust Tailscale Launcher.
 
 Automatically detects the host's Tailscale mesh IP and binds the FastAPI
 server exclusively to it, making the node invisible to the public internet.
@@ -17,12 +17,7 @@ import uvicorn
 BANNER = r"""
   ╔═══════════════════════════════════════════════════════════════╗
   ║                                                               ║
-  ║     █████╗ ██╗  ██╗██╗ ██████╗ ███╗   ███╗                   ║
-  ║    ██╔══██╗╚██╗██╔╝██║██╔═══██╗████╗ ████║                   ║
-  ║    ███████║ ╚███╔╝ ██║██║   ██║██╔████╔██║                   ║
-  ║    ██╔══██║ ██╔██╗ ██║██║   ██║██║╚██╔╝██║                   ║
-  ║    ██║  ██║██╔╝ ██╗██║╚██████╔╝██║ ╚═╝ ██║                   ║
-  ║    ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝ ╚═════╝ ╚═╝     ╚═╝                   ║
+  ║                     Z  E  L  Y  R                            ║
   ║                                                               ║
   ║           S W A R M   N O D E   v 1 1 . 0                    ║
   ║                                                               ║
@@ -71,7 +66,7 @@ def get_tailscale_ip() -> str | None:
 
 
 def get_tailscale_hostname() -> str | None:
-    """Return the Tailscale MagicDNS hostname (e.g. 'axiom-node')."""
+    """Return the Tailscale MagicDNS hostname (e.g. 'zelyr-node')."""
     try:
         result = subprocess.run(
             ["tailscale", "status", "--json"],
@@ -95,7 +90,7 @@ def get_tailscale_hostname() -> str | None:
 #  Main                                                                    #
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ #
 def main():
-    parser = argparse.ArgumentParser(description="AXIOM Headless Swarm Node")
+    parser = argparse.ArgumentParser(description="Zelyr Headless Swarm Node")
     parser.add_argument(
         "--port", type=int, default=8000,
         help="Port to listen on (default: 8000)",
@@ -143,7 +138,7 @@ def main():
         print(f"  {GREEN}[🔒]{RESET} Bound exclusively to Tailscale mesh — invisible to public internet.")
         print()
         print(f"  {CYAN}╭──────────────────────────────────────────────────╮{RESET}")
-        print(f"  {CYAN}│{RESET}  {BOLD}Enter this into your AXIOM Desktop App:{RESET}       {CYAN}│{RESET}")
+        print(f"  {CYAN}│{RESET}  {BOLD}Enter this into your Zelyr Desktop App:{RESET}       {CYAN}│{RESET}")
         print(f"  {CYAN}│{RESET}                                                  {CYAN}│{RESET}")
         print(f"  {CYAN}│{RESET}     {GREEN}{BOLD}{ts_ip}:{args.port}{RESET}{''.ljust(37 - len(f'{ts_ip}:{args.port}'))}{CYAN}│{RESET}")
         if ts_hostname:
@@ -159,7 +154,7 @@ def main():
         print(f"  {DIM}    https://tailscale.com/download{RESET}")
         print()
         print(f"  {CYAN}╭──────────────────────────────────────────────────╮{RESET}")
-        print(f"  {CYAN}│{RESET}  {BOLD}Connect from your AXIOM Desktop on this LAN:{RESET}   {CYAN}│{RESET}")
+        print(f"  {CYAN}│{RESET}  {BOLD}Connect from your Zelyr Desktop on this LAN:{RESET}   {CYAN}│{RESET}")
         print(f"  {CYAN}│{RESET}                                                  {CYAN}│{RESET}")
         print(f"  {CYAN}│{RESET}     {YELLOW}{BOLD}{bind_addr}:{args.port}{RESET}{''.ljust(37 - len(f'{bind_addr}:{args.port}'))}{CYAN}│{RESET}")
         print(f"  {CYAN}│{RESET}                                                  {CYAN}│{RESET}")
@@ -173,7 +168,7 @@ def main():
     print()
 
     uvicorn.run(
-        "axiom.server.node_api:app",
+        "zelyr.server.node_api:app",
         host=bind_addr,
         port=args.port,
         ws="auto",

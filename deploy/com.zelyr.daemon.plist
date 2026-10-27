@@ -3,14 +3,14 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.axiom.daemon</string>
+    <string>com.zelyr.daemon</string>
 
     <key>ProgramArguments</key>
     <array>
         <string>sh</string>
         <string>-c</string>
-        <!-- Use the user's PATH so the axiom command can be found -->
-        <string>export PATH="/usr/local/bin:/opt/homebrew/bin:$HOME/.local/bin:$PATH"; exec axiom daemon start</string>
+        <!-- Use the user's PATH so the zelyr command can be found -->
+        <string>export PATH="/usr/local/bin:/opt/homebrew/bin:$HOME/.local/bin:$PATH"; exec zelyr daemon start</string>
     </array>
 
     <!-- Run automatically when the user logs in -->
@@ -27,9 +27,9 @@
     </dict>
 
     <key>StandardOutPath</key>
-    <string>/tmp/axiom-daemon.log</string>
+    <string>/tmp/zelyr-daemon.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/axiom-daemon.err</string>
+    <string>/tmp/zelyr-daemon.err</string>
 
     <key>EnvironmentVariables</key>
     <dict>

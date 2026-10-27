@@ -1,8 +1,9 @@
 [Desktop Entry]
-Name=AXIOM
+Name=Zelyr
 Comment=Local-first AI Operating System
-Exec=bash -c "cd /var/home/rutytoi/Documents/ChienGPT && ./axiom.sh"
-Icon=utilities-terminal
+Exec=zelyr-gui
+Icon=zelyr
 Terminal=false
+StartupWMClass=Zelyr
 Type=Application
 Categories=Utility;ArtificialIntelligence;

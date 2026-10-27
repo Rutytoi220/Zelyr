@@ -1,12 +1,12 @@
 [Unit]
-Description=AXIOM AI Orchestration Daemon
+Description=Zelyr AI Orchestration Daemon
 Documentation=https://github.com/rutytoi/ChienGPT
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/axiom daemon start
+ExecStart=%h/.local/bin/zelyr daemon start
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=30
@@ -15,7 +15,7 @@ TimeoutStopSec=10
 # Logging
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=axiomd
+SyslogIdentifier=zelyrd
 
 # Environment
 Environment=PYTHONUNBUFFERED=1
@@ -24,7 +24,7 @@ Environment=PYTHONUNBUFFERED=1
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.axiom %h/.config/axiom %h/.local/share/axiom %h/.cache /tmp /var/tmp
+ReadWritePaths=%h/.zelyr %h/.config/zelyr %h/.local/share/zelyr %h/.axiom %h/.config/axiom %h/.local/share/axiom %h/.cache /tmp /var/tmp
 
 [Install]
 WantedBy=default.target

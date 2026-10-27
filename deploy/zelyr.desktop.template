@@ -1,7 +1,7 @@
 [Desktop Entry]
 Version=1.5
 Type=Application
-Name=AXIOM Desktop
+Name=Zelyr Desktop
 GenericName=AI Orchestration Platform
 Comment=Local-first AI orchestration framework with semantic memory and plugin extensibility
 Exec={{EXEC_PATH}}
@@ -10,5 +10,5 @@ Terminal=false
 Categories=Utility;TerminalEmulator;Development;
 Keywords=AI;LLM;Agent;Orchestration;Assistant;
 StartupNotify=true
-StartupWMClass=Axiom
+StartupWMClass=Zelyr
 SingleMainWindow=true

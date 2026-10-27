@@ -20,6 +20,7 @@ hiddenimports = [
     
     # GUI
     'PySide6',
+    'axiom',
     
     # Core utilities
     'logging',
@@ -39,10 +40,10 @@ hiddenimports = [
 
 # We need to bundle assets like images and fonts.
 datas = [
-    ('axiom/memory/schema.sql', 'axiom/memory'),
-    ('axiom/gui/styles/*.qss*', 'axiom/gui/styles'),
-    ('axiom/gui/styles/themes/*.json', 'axiom/gui/styles/themes'),
-    ('axiom/gui/assets/fonts/*.ttf', 'axiom/gui/assets/fonts'),
+    ('zelyr/memory/schema.sql', 'zelyr/memory'),
+    ('zelyr/gui/styles/*.qss*', 'zelyr/gui/styles'),
+    ('zelyr/gui/styles/themes/*.json', 'zelyr/gui/styles/themes'),
+    ('zelyr/gui/assets/fonts/*.ttf', 'zelyr/gui/assets/fonts'),
 ] + collect_data_files('litellm') + collect_data_files('tiktoken')
 
 # If there's an assets directory, let's include everything in it just in case
@@ -51,7 +52,7 @@ if os.path.exists('assets'):
 
 
 a = Analysis(
-    ['axiom/launcher.py'],
+    ['zelyr/launcher.py'],
     pathex=[],
     binaries=[],
     datas=datas,
@@ -72,7 +73,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='AXIOM',
+    name='Zelyr',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -92,5 +93,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='AXIOM',
+    name='Zelyr',
 )
