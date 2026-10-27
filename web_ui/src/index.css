@@ -2,17 +2,17 @@
 
 @theme {
   --font-sans: 'Inter', system-ui, sans-serif;
-  --color-axiom-bg: #000000;
-  --color-axiom-panel: #0a0a0a;
-  --color-axiom-border: #1f2937;
-  --color-axiom-accent: #00ffcc;
-  --color-axiom-text: #e5e7eb;
-  --color-axiom-muted: #9ca3af;
+  --color-zelyr-bg: #000000;
+  --color-zelyr-panel: #0a0a0a;
+  --color-zelyr-border: #1f2937;
+  --color-zelyr-accent: #00ffcc;
+  --color-zelyr-text: #e5e7eb;
+  --color-zelyr-muted: #9ca3af;
 }
 
 @layer base {
   body {
-    @apply bg-axiom-bg text-axiom-text font-sans antialiased;
+    @apply bg-zelyr-bg text-zelyr-text font-sans antialiased;
     margin: 0;
     overflow-x: hidden;
   }

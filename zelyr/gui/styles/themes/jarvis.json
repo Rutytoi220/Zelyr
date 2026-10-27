@@ -1,0 +1,26 @@
+{
+    "id": "jarvis",
+    "name": "Jarvis",
+    "author": "Zelyr Team",
+    "version": "1.0.0",
+    "tokens": {
+        "bg_base": "#000000",
+        "bg_surface": "#0A0A0A",
+        "primary": "#00FFFF",
+        "accent": "#00AAAA",
+        "text_main": "#00FFFF",
+        "text_muted": "#004444",
+        "borders": "#003333",
+        "danger": "#ff4444",
+        "success": "#00ff88",
+        "spacing_sm": "4px",
+        "spacing_md": "8px",
+        "radius_sm": "0px",
+        "radius_md": "0px",
+        "radius_lg": "0px",
+        "font_main": "'Fira Code', monospace",
+        "font_mono": "'Fira Code', monospace",
+        "accent_hover": "#008888",
+        "bg_deep": "#050505"
+    }
+}

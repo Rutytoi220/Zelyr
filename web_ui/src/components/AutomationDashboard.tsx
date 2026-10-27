@@ -48,8 +48,8 @@ const AutomationDashboard: React.FC<AutomationDashboardProps> = ({ wsUrl }) => {
       ws = new WebSocket(wsUrl);
 
       ws.onopen = () => {
-        ws.send(JSON.stringify({ 
-          method: "axiom.authenticate", 
+        ws.send(JSON.stringify({
+          method: "zelyr.authenticate",
           token: import.meta.env.VITE_DAEMON_TOKEN 
         }));
       };
@@ -57,7 +57,7 @@ const AutomationDashboard: React.FC<AutomationDashboardProps> = ({ wsUrl }) => {
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
-          if (data.method === 'axiom.event' && data.params && data.params.event_type) {
+          if (data.method === 'zelyr.event' && data.params && data.params.event_type) {
             const eventType = data.params.event_type;
             const payload = data.params.payload || {};
             
@@ -143,10 +143,10 @@ const AutomationDashboard: React.FC<AutomationDashboardProps> = ({ wsUrl }) => {
   };
 
   return (
-    <div className="w-full bg-black/40 backdrop-blur-md border border-axiom-border rounded-lg p-4 flex flex-col gap-4 shadow-xl mb-4">
+    <div className="w-full bg-black/40 backdrop-blur-md border border-zelyr-border rounded-lg p-4 flex flex-col gap-4 shadow-xl mb-4">
       <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2 text-axiom-text font-bold tracking-wider text-sm">
-          <Activity className="w-4 h-4 text-axiom-accent" />
+        <div className="flex items-center gap-2 text-zelyr-text font-bold tracking-wider text-sm">
+          <Activity className="w-4 h-4 text-zelyr-accent" />
           AUTOMATION CONTROL CENTER
         </div>
       </div>
@@ -154,7 +154,7 @@ const AutomationDashboard: React.FC<AutomationDashboardProps> = ({ wsUrl }) => {
       <div className="grid grid-cols-2 gap-4">
         {/* Macro Studio */}
         <div className="bg-zinc-900/50 border border-zinc-800 rounded-md p-3 flex flex-col">
-          <h3 className="text-xs font-mono text-axiom-accent uppercase mb-3 flex items-center gap-2">
+          <h3 className="text-xs font-mono text-zelyr-accent uppercase mb-3 flex items-center gap-2">
             <ListOrdered className="w-4 h-4" />
             Macro Studio
           </h3>
@@ -163,13 +163,13 @@ const AutomationDashboard: React.FC<AutomationDashboardProps> = ({ wsUrl }) => {
               <div className="text-zinc-500 text-xs italic font-mono">No macros saved yet.</div>
             ) : (
               macros.map(m => (
-                <div key={m.id} className="bg-zinc-950/80 border border-zinc-800/50 rounded p-2 flex items-center justify-between group hover:border-axiom-accent/30 transition-colors">
+                <div key={m.id} className="bg-zinc-950/80 border border-zinc-800/50 rounded p-2 flex items-center justify-between group hover:border-zelyr-accent/30 transition-colors">
                   <div>
                     <div className="text-sm font-semibold text-zinc-200">{m.name}</div>
                     <div className="text-[10px] text-zinc-500 font-mono mt-0.5">{m.steps?.length || 0} steps</div>
                   </div>
                   <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                    <button onClick={() => handleRunMacro(m.id)} className="p-1.5 bg-axiom-accent/10 text-axiom-accent hover:bg-axiom-accent/20 rounded">
+                    <button onClick={() => handleRunMacro(m.id)} className="p-1.5 bg-zelyr-accent/10 text-zelyr-accent hover:bg-zelyr-accent/20 rounded">
                       <Play className="w-3 h-3" />
                     </button>
                     <button onClick={() => handleDeleteMacro(m.id)} className="p-1.5 bg-red-500/10 text-red-400 hover:bg-red-500/20 rounded">
@@ -217,7 +217,7 @@ const AutomationDashboard: React.FC<AutomationDashboardProps> = ({ wsUrl }) => {
                     <span className="opacity-50">Waiting for actions...</span>
                   ) : (
                     liveSteps.map((step, idx) => (
-                      <div key={idx}><span className="text-axiom-accent">&gt;</span> {step.tool_name || step.tool}</div>
+                      <div key={idx}><span className="text-zelyr-accent">&gt;</span> {step.tool_name || step.tool}</div>
                     ))
                   )}
                 </div>
@@ -234,8 +234,8 @@ const AutomationDashboard: React.FC<AutomationDashboardProps> = ({ wsUrl }) => {
 
           {/* Replay Viewer */}
           {activeMacroId && (
-            <div className="bg-axiom-accent/5 border border-axiom-accent/20 rounded-md p-3 flex flex-col animate-in fade-in slide-in-from-bottom-2">
-              <h3 className="text-xs font-mono text-axiom-accent uppercase mb-2 flex items-center gap-2">
+            <div className="bg-zelyr-accent/5 border border-zelyr-accent/20 rounded-md p-3 flex flex-col animate-in fade-in slide-in-from-bottom-2">
+              <h3 className="text-xs font-mono text-zelyr-accent uppercase mb-2 flex items-center gap-2">
                 <CheckCircle2 className="w-4 h-4" />
                 Step-by-Step Replay Viewer
               </h3>
@@ -243,11 +243,11 @@ const AutomationDashboard: React.FC<AutomationDashboardProps> = ({ wsUrl }) => {
               <div className="flex items-center gap-3">
                 <div className="flex-1 h-2 bg-zinc-800 rounded-full overflow-hidden">
                   <div 
-                    className="h-full bg-axiom-accent transition-all duration-300"
+                    className="h-full bg-zelyr-accent transition-all duration-300"
                     style={{ width: `${(currentStep / totalSteps) * 100}%` }}
                   />
                 </div>
-                <div className="text-xs font-mono text-axiom-accent font-bold">
+                <div className="text-xs font-mono text-zelyr-accent font-bold">
                   {currentStep} / {totalSteps}
                 </div>
               </div>

@@ -1,4 +1,4 @@
-"""Simple tkinter GUI for ChienGPT / AXIOM."""
+"""Simple tkinter GUI for ChienGPT / Zelyr."""
 
 import tkinter as tk
 from tkinter import scrolledtext, ttk, messagebox
@@ -343,7 +343,7 @@ class ChienGPTGUI:
     def _show_help(self):
         """Show help information."""
         help_text = """
-📚 AXIOM Commands:
+📚 Zelyr Commands:
 
 TEXT COMMANDS:
 • Regular queries: "What is Python?"

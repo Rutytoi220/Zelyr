@@ -1,0 +1,33 @@
+{
+    "id": "custom",
+    "name": "Custom Sovereign",
+    "author": "Zelyr User",
+    "version": "1.0.0",
+    "tokens": {
+        "bg_base": "#0D1117",
+        "bg_surface": "#161B22",
+        "bg_deep": "#0D0D12",
+        "primary": "#ABCDEF",
+        "accent": "#A78BFA",
+        "accent_hover": "#8B5CF6",
+        "text_main": "#FAFAFA",
+        "text_muted": "#8B949E",
+        "borders": "#30363D",
+        "danger": "#EF4444",
+        "success": "#10B981",
+        "warning": "#F59E0B",
+        "info": "#3B82F6",
+        "card_bg": "#1F242C",
+        "input_bg": "#0B0E14",
+        "selection": "#4C1D95",
+        "spacing_sm": "8px",
+        "spacing_md": "16px",
+        "radius_sm": "4px",
+        "radius_md": "8px",
+        "radius_lg": "12px",
+        "radius_pill": "20px",
+        "radius_circle": "20px",
+        "font_main": "'Inter', sans-serif",
+        "font_mono": "'JetBrains Mono', monospace"
+    }
+}

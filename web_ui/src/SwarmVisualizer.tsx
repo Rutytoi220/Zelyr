@@ -18,7 +18,7 @@ const getStatusClasses = (status: NodeStatus) => {
     case 'idle':
       return 'bg-zinc-800 border-zinc-600 text-zinc-400';
     case 'active':
-      return 'bg-axiom-accent/20 border-axiom-accent text-axiom-accent animate-pulse shadow-[0_0_15px_rgba(0,255,204,0.4)]';
+      return 'bg-zelyr-accent/20 border-zelyr-accent text-zelyr-accent animate-pulse shadow-[0_0_15px_rgba(0,255,204,0.4)]';
     case 'pass':
       return 'bg-green-500/20 border-green-500 text-green-400 shadow-[0_0_15px_rgba(34,197,94,0.4)]';
     case 'reject':
@@ -44,8 +44,8 @@ const SwarmVisualizer: React.FC<SwarmVisualizerProps> = ({ wsUrl }) => {
       ws = new WebSocket(wsUrl);
 
       ws.onopen = () => {
-        ws.send(JSON.stringify({ 
-          method: "axiom.authenticate", 
+        ws.send(JSON.stringify({
+          method: "zelyr.authenticate",
           token: import.meta.env.VITE_DAEMON_TOKEN 
         }));
       };
@@ -53,8 +53,8 @@ const SwarmVisualizer: React.FC<SwarmVisualizerProps> = ({ wsUrl }) => {
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
-          // Look for JSON-RPC method "axiom.event" with params.event_type
-          if (data.method === 'axiom.event' && data.params && data.params.event_type) {
+          // Look for JSON-RPC method "zelyr.event" with params.event_type
+          if (data.method === 'zelyr.event' && data.params && data.params.event_type) {
             const eventType = data.params.event_type;
             
             if (eventType.startsWith('swarm.')) {
@@ -97,9 +97,9 @@ const SwarmVisualizer: React.FC<SwarmVisualizerProps> = ({ wsUrl }) => {
   }, [wsUrl]);
 
   return (
-    <div className="w-full bg-black/40 backdrop-blur-md border border-axiom-border rounded-lg p-4 flex flex-col gap-3 shadow-xl mb-4">
-      <div className="flex items-center gap-2 text-axiom-text font-bold tracking-wider text-sm">
-        <Network className="w-4 h-4 text-axiom-accent" />
+    <div className="w-full bg-black/40 backdrop-blur-md border border-zelyr-border rounded-lg p-4 flex flex-col gap-3 shadow-xl mb-4">
+      <div className="flex items-center gap-2 text-zelyr-text font-bold tracking-wider text-sm">
+        <Network className="w-4 h-4 text-zelyr-accent" />
         SWARM CONSENSUS ENGINE
       </div>
       
@@ -139,9 +139,9 @@ const SwarmVisualizer: React.FC<SwarmVisualizerProps> = ({ wsUrl }) => {
 
       {/* Consensus Log Drawer */}
       {drawerOpen && (
-        <div className="mt-4 p-3 bg-zinc-900/80 border border-axiom-accent/40 rounded-lg max-h-48 flex flex-col relative animate-in slide-in-from-top-2">
+        <div className="mt-4 p-3 bg-zinc-900/80 border border-zelyr-accent/40 rounded-lg max-h-48 flex flex-col relative animate-in slide-in-from-top-2">
           <div className="flex items-center justify-between mb-2">
-            <div className="flex items-center gap-2 text-axiom-accent text-xs font-mono font-bold uppercase">
+            <div className="flex items-center gap-2 text-zelyr-accent text-xs font-mono font-bold uppercase">
               <ScrollText className="w-4 h-4" />
               {activePersona} Chain of Thought
             </div>
@@ -155,7 +155,7 @@ const SwarmVisualizer: React.FC<SwarmVisualizerProps> = ({ wsUrl }) => {
             ) : (
               logs.filter(l => l.persona === activePersona).map((log, i) => (
                 <div key={i} className="pb-1 border-b border-zinc-800/50">
-                  <span className="text-axiom-accent/70 mr-2">&gt;</span>{log.thought}
+                  <span className="text-zelyr-accent/70 mr-2">&gt;</span>{log.thought}
                 </div>
               ))
             )}

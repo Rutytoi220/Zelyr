@@ -76,49 +76,49 @@ const TelemetrySidebar: React.FC = () => {
   }, []);
 
   return (
-    <div className="w-80 h-full bg-axiom-panel border-l border-axiom-border p-6 flex flex-col gap-6 shadow-xl">
-      <div className="flex items-center gap-3 border-b border-axiom-border pb-4">
-        <Zap className="text-axiom-accent w-6 h-6" />
-        <h2 className="text-xl font-bold tracking-wider text-axiom-text">AXIOM V2</h2>
+    <div className="w-80 h-full bg-zelyr-panel border-l border-zelyr-border p-6 flex flex-col gap-6 shadow-xl">
+      <div className="flex items-center gap-3 border-b border-zelyr-border pb-4">
+        <Zap className="text-zelyr-accent w-6 h-6" />
+        <h2 className="text-xl font-bold tracking-wider text-zelyr-text">Zelyr V2</h2>
       </div>
 
       <div className="flex flex-col gap-4">
-        <div className="bg-black/50 p-4 rounded-lg border border-axiom-border/50 flex flex-col gap-1">
-          <div className="text-xs text-axiom-muted uppercase tracking-widest font-semibold flex items-center gap-2">
+        <div className="bg-black/50 p-4 rounded-lg border border-zelyr-border/50 flex flex-col gap-1">
+          <div className="text-xs text-zelyr-muted uppercase tracking-widest font-semibold flex items-center gap-2">
             <Server className="w-4 h-4" /> System Status
           </div>
           <div className="flex items-center gap-2 mt-1">
             <div className={`w-2 h-2 rounded-full ${telemetry.status === 'Online' ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.6)]' : 'bg-yellow-500'}`} />
             <span className="text-sm font-medium">{telemetry.status}</span>
           </div>
-          <div className="text-xs text-axiom-muted mt-2 font-mono">Uptime: {telemetry.uptime}</div>
+          <div className="text-xs text-zelyr-muted mt-2 font-mono">Uptime: {telemetry.uptime}</div>
         </div>
 
-        <div className="bg-black/50 p-4 rounded-lg border border-axiom-border/50 flex flex-col gap-2">
-          <div className="text-xs text-axiom-muted uppercase tracking-widest font-semibold flex items-center gap-2 mb-1">
+        <div className="bg-black/50 p-4 rounded-lg border border-zelyr-border/50 flex flex-col gap-2">
+          <div className="text-xs text-zelyr-muted uppercase tracking-widest font-semibold flex items-center gap-2 mb-1">
             <Cpu className="w-4 h-4" /> Inference Engine
           </div>
-          <div className="text-sm font-mono text-axiom-accent">{telemetry.model}</div>
+          <div className="text-sm font-mono text-zelyr-accent">{telemetry.model}</div>
         </div>
 
-        <div className="bg-black/50 p-4 rounded-lg border border-axiom-border/50 flex flex-col gap-4">
-          <div className="text-xs text-axiom-muted uppercase tracking-widest font-semibold flex items-center gap-2">
+        <div className="bg-black/50 p-4 rounded-lg border border-zelyr-border/50 flex flex-col gap-4">
+          <div className="text-xs text-zelyr-muted uppercase tracking-widest font-semibold flex items-center gap-2">
             <Activity className="w-4 h-4" /> Hardware Telemetry
           </div>
           
           <div className="flex flex-col gap-1">
             <div className="flex justify-between text-xs">
-              <span className="text-axiom-muted">CPU Usage</span>
+              <span className="text-zelyr-muted">CPU Usage</span>
               <span className="font-mono">{telemetry.cpu}</span>
             </div>
             <div className="w-full bg-zinc-900 rounded-full h-1.5">
-              <div className="bg-axiom-accent h-1.5 rounded-full transition-all duration-500" style={{ width: `${rawCpu}%` }}></div>
+              <div className="bg-zelyr-accent h-1.5 rounded-full transition-all duration-500" style={{ width: `${rawCpu}%` }}></div>
             </div>
           </div>
 
           <div className="flex flex-col gap-1">
             <div className="flex justify-between text-xs">
-              <span className="text-axiom-muted flex items-center gap-1"><Database className="w-3 h-3"/> Memory</span>
+              <span className="text-zelyr-muted flex items-center gap-1"><Database className="w-3 h-3"/> Memory</span>
               <span className="font-mono">{telemetry.ram}</span>
             </div>
             <div className="w-full bg-zinc-900 rounded-full h-1.5">

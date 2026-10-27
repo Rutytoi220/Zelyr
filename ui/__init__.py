@@ -1,1 +1,1 @@
-"""UI package for AXIOM (CLI/TUI frontend)."""
+"""UI package for Zelyr (CLI/TUI frontend)."""

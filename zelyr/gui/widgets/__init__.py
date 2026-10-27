@@ -1,0 +1,1 @@
+"""Zelyr GUI widgets package."""

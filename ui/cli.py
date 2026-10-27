@@ -1,4 +1,4 @@
-"""Simple CLI front-end for AXIOM using the Agent pipeline.
+"""Simple CLI front-end for Zelyr using the Agent pipeline.
 
 Adds `:ollama` commands to manage local Ollama installation and server:
 - `:ollama status` — show whether server is reachable and whether binary exists
@@ -41,7 +41,7 @@ def _handle_ollama_command(cmd_parts):
 def run_repl(model: str = None, verbose: bool = False, system_prompt: str = None):
     agent = Agent(model=model, system_prompt=system_prompt)
     print("\n" + "="*60)
-    print("  AXIOM - Local AI Assistant")
+    print("  Zelyr - Local AI Assistant")
     print("="*60)
     print("  Type 'help' for commands, 'exit' to quit\n")
     
@@ -65,7 +65,7 @@ def run_repl(model: str = None, verbose: bool = False, system_prompt: str = None
             print("  - Run commands: Any system command")
             print("  - Vision mode: ':vision <task>' - Control PC with vision+LLM")
             print("  - :ollama status/start/install - Manage Ollama")
-            print("  - exit/quit - Close AXIOM\n")
+            print("  - exit/quit - Close Zelyr\n")
             print("💡 Vision examples:")
             print("  :vision click the blue button in the top right")
             print("  :vision open a web browser and search for github")
@@ -124,7 +124,7 @@ def run_repl(model: str = None, verbose: bool = False, system_prompt: str = None
                 
         elif parsed.get('type') == 'message':
             msg = result.get('message', '')
-            print(f"\n🤖 AXIOM:\n{msg}\n")
+            print(f"\n🤖 Zelyr:\n{msg}\n")
             
         elif parsed.get('type') == 'no_action':
             print("ℹ️  No action needed.")

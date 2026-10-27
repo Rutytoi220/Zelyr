@@ -32,7 +32,7 @@ const TerminalMirror: React.FC<TerminalMirrorProps> = ({ wsUrl }) => {
     term.open(terminalRef.current);
     xtermRef.current = term;
 
-    term.writeln('\x1b[36m[System]\x1b[0m Initializing AXIOM Terminal Mirror...');
+    term.writeln('\x1b[36m[System]\x1b[0m Initializing Zelyr Terminal Mirror...');
 
     let reconnectInterval: ReturnType<typeof setInterval>;
 
@@ -43,8 +43,8 @@ const TerminalMirror: React.FC<TerminalMirrorProps> = ({ wsUrl }) => {
 
       ws.onopen = () => {
         term.writeln('\x1b[32m[System]\x1b[0m WebSocket connection established. Authenticating...');
-        ws.send(JSON.stringify({ 
-          method: "axiom.authenticate", 
+        ws.send(JSON.stringify({
+          method: "zelyr.authenticate",
           token: import.meta.env.VITE_DAEMON_TOKEN 
         }));
       };
@@ -96,7 +96,7 @@ const TerminalMirror: React.FC<TerminalMirrorProps> = ({ wsUrl }) => {
       // Send JSON-RPC payload
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
         const payload = {
-          method: 'axiom.prompt',
+          method: 'zelyr.prompt',
           params: { text: text }
         };
         wsRef.current.send(JSON.stringify(payload));
@@ -112,17 +112,17 @@ const TerminalMirror: React.FC<TerminalMirrorProps> = ({ wsUrl }) => {
   };
 
   return (
-    <div className="flex flex-col flex-1 w-full h-full bg-black/40 backdrop-blur-md border border-axiom-border rounded-lg overflow-hidden shadow-2xl">
+    <div className="flex flex-col flex-1 w-full h-full bg-black/40 backdrop-blur-md border border-zelyr-border rounded-lg overflow-hidden shadow-2xl">
       <div className="flex-1 w-full p-2" ref={terminalRef} />
-      <div className="flex items-center px-4 py-3 bg-black/60 border-t border-axiom-border">
-        <span className="text-axiom-accent mr-3 font-mono text-sm">{'>'}</span>
+      <div className="flex items-center px-4 py-3 bg-black/60 border-t border-zelyr-border">
+        <span className="text-zelyr-accent mr-3 font-mono text-sm">{'>'}</span>
         <input 
           type="text" 
           value={inputValue}
           onChange={(e) => setInputValue(e.target.value)}
           onKeyDown={handleKeyDown}
           placeholder="Enter command or prompt..." 
-          className="flex-1 bg-transparent border-none outline-none text-axiom-text font-mono text-sm placeholder-axiom-muted"
+          className="flex-1 bg-transparent border-none outline-none text-zelyr-text font-mono text-sm placeholder-zelyr-muted"
           autoFocus
         />
       </div>
