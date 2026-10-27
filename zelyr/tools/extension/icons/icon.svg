@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1a1b26"/>
+      <stop offset="100%" stop-color="#16161e"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7aa2f7"/>
+      <stop offset="100%" stop-color="#7dcfff"/>
+    </linearGradient>
+  </defs>
+  <!-- Background rounded rect -->
+  <rect width="128" height="128" rx="28" fill="url(#bg)" stroke="#283457" stroke-width="3"/>
+  <!-- Stylized delta / Zelyr 'A' glyph -->
+  <path d="M64 26 L100 98 L84 98 L64 56 L44 98 L28 98 Z" fill="url(#accent)"/>
+  <!-- Center bridge bar -->
+  <polygon points="48,82 80,82 76,72 52,72" fill="#1a1b26"/>
+  <!-- Glowing orbit node -->
+  <circle cx="64" cy="40" r="5" fill="#bb9af7"/>
+</svg>
