@@ -1,7 +1,13 @@
-import torch
-import torch.nn as nn
-from PIL import Image
-from transformers import AutoProcessor
+try:
+    import torch
+    import torch.nn as nn
+    from PIL import Image
+    from transformers import AutoProcessor
+except ImportError as e:
+    raise ImportError(
+        "'torch' and 'transformers' are required for local VLM features. "
+        "Install them with: pip install 'zelyr-core[ml]'"
+    ) from e
 
 class SpotlessLatentAdapter(nn.Module):
     def __init__(self, d: int = 3584, bottleneck: int = 448):

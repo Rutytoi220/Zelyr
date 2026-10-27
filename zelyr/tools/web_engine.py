@@ -35,9 +35,15 @@ class PlaywrightWebTool(BaseTool):
                 self._browser = await self._playwright.chromium.launch(headless=True)
                 self._context = await self._browser.new_context()
                 self._page = await self._context.new_page()
-            except ImportError:
-                logger.error("Playwright not installed. Please 'pip install playwright' and 'playwright install'.")
-                raise RuntimeError("Playwright dependencies missing.")
+            except ImportError as e:
+                msg = "'playwright' is required for web browser automation. Install it with: pip install 'zelyr-core[browser]'"
+                logger.error(msg)
+                raise ImportError(msg) from e
+
+    async def execute(self, params: Optional[Dict[str, Any]] = None, **kwargs) -> Dict[str, Any]:
+        args = dict(params or {})
+        args.update(kwargs)
+        return await self(**args)
 
     async def __call__(self, action: str, url: str = None, selector: str = None, text: str = None) -> Dict[str, Any]:
         await self._ensure_browser()

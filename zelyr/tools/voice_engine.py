@@ -18,8 +18,14 @@ class VoiceDictationEngine:
 
     def _load_model(self):
         if not self.model:
-            from faster_whisper import WhisperModel
-            import torch
+            try:
+                from faster_whisper import WhisperModel
+                import torch
+            except ImportError as e:
+                raise ImportError(
+                    "'torch' and 'faster-whisper' are required for voice engine features. "
+                    "Install them with: pip install 'zelyr-core[ml,audio]'"
+                ) from e
             
             # Check for CUDA
             device = "cuda" if torch.cuda.is_available() else "cpu"

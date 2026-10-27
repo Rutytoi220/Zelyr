@@ -7,8 +7,14 @@ def get_grounding_engine():
     global _engine_instance
     with _engine_lock:
         if _engine_instance is None:
+            try:
+                from zelyr.core.vision_engine.zelyr_engine import ZelyrGroundingEngine
+            except ImportError as e:
+                raise ImportError(
+                    "'torch' and 'transformers' are required for local VLM features. "
+                    "Install them with: pip install 'zelyr-core[ml]'"
+                ) from e
             print(">>> [Zelyr] Bootstrapping resident ZelyrGroundingEngine into CUDA memory...")
-            from zelyr.core.vision_engine.zelyr_engine import ZelyrGroundingEngine
             _engine_instance = ZelyrGroundingEngine()
             ZelyrGroundingEngine._instance = _engine_instance
     return _engine_instance
@@ -30,8 +36,12 @@ def evict_grounding_engine():
                 ZelyrGroundingEngine._instance = None
             except Exception:
                 pass
-            import gc, torch
+            import gc
             gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except (ImportError, Exception):
+                pass
 

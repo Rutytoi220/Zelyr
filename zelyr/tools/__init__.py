@@ -1207,8 +1207,6 @@ Returns:
             return ToolResult(success=False, error=f'Graph query failed: {e}')
 from zelyr.tools.os_assist import SafeFileSearchTool, FileOpenerTool, AppLauncherTool
 from zelyr.tools.gui_actuator import GUIInspectTool, GUIActuateTool
-from zelyr.tools.web_engine import PlaywrightWebTool
-
 from zelyr.tools.workspace_manager import WorkspaceOrchestrateTool
 from zelyr.tools.web_engine import PlaywrightWebTool
 from zelyr.tools.live_vision import LiveVisionStreamTool

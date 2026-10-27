@@ -119,8 +119,22 @@ Empirical results from [`docs/benchmarks/live_baseline_report.md`](docs/benchmar
 git clone https://github.com/Rutytoi220/Zelyr.git
 cd Zelyr
 
-# 2. Sync virtual environment and dependencies
+# 2. Sync virtual environment and dependencies (Core runtime)
 uv sync
+
+# Optional extras:
+# Install with machine learning / local VLM support:
+uv sync --extra ml
+# Install with browser automation support:
+uv sync --extra browser
+# Install all optional features (audio, automation, experimental, ml, browser):
+uv sync --extra all
+
+# Or via standard pip:
+pip install zelyr-core               # Core runtime
+pip install 'zelyr-core[ml]'         # Core + Local VLM / PyTorch
+pip install 'zelyr-core[browser]'    # Core + Playwright Web Engine
+pip install 'zelyr-core[all]'        # Full feature battery
 
 # 3. Run the automated test suite
 uv run pytest -v

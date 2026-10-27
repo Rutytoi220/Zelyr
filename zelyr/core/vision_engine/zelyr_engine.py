@@ -2,12 +2,20 @@ from zelyr.compat import config_dir, get_env
 import os
 import time
 import json
-import torch
 from pathlib import Path
 from typing import Dict, Any, Optional
 from PIL import Image
-from transformers import AutoModel, AutoProcessor, BitsAndBytesConfig, PreTrainedModel
-from zelyr.core.vision_engine.models.spotless_vlm import SpotlessLatentAdapter, SpotlessMiniCPMV
+
+try:
+    import torch
+    from transformers import AutoModel, AutoProcessor, BitsAndBytesConfig, PreTrainedModel
+    import transformers.modeling_utils
+    from zelyr.core.vision_engine.models.spotless_vlm import SpotlessLatentAdapter, SpotlessMiniCPMV
+except ImportError as e:
+    raise ImportError(
+        "'torch' and 'transformers' are required for local VLM features. "
+        "Install them with: pip install 'zelyr-core[ml]'"
+    ) from e
 
 class _TiedKeysDescriptor:
     def __get__(self, obj, objtype=None):
