@@ -2,7 +2,15 @@
 
 from __future__ import annotations
 
-import tomllib
+import pytest
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+    except ModuleNotFoundError:
+        tomllib = None  # type: ignore[assignment]
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -294,6 +302,8 @@ def test_legacy_theme_id_is_normalized() -> None:
 
 
 def test_packaging_declares_new_and_legacy_entry_points() -> None:
+    if tomllib is None:
+        pytest.skip("Neither tomllib nor tomli is available in this environment")
     root = Path(__file__).resolve().parent.parent
     with open(root / "pyproject.toml", "rb") as fh:
         data = tomllib.load(fh)
