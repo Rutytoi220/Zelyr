@@ -1,7 +1,7 @@
 """Regression tests for the AuditLedger integrations repaired after the cleanup.
 
-The cleanup removed ``axiom.api.audit_ledger`` and left two callers importing
-it.  The live replacement is :class:`axiom.engine.audit_ledger.AuditLedger`,
+The cleanup removed ``zelyr.api.audit_ledger`` and left two callers importing
+it.  The live replacement is :class:`zelyr.engine.audit_ledger.AuditLedger`,
 whose ``log_execution`` signature takes five arguments.  These tests exercise
 the real SQLite persistence and the two repaired call sites.
 """
@@ -14,7 +14,7 @@ import types
 
 import pytest
 
-from axiom.engine.audit_ledger import AuditLedger
+from zelyr.engine.audit_ledger import AuditLedger
 
 
 def test_audit_ledger_persists_records(tmp_path):
@@ -34,8 +34,8 @@ def test_audit_ledger_persists_records(tmp_path):
 
 @pytest.mark.asyncio
 async def test_cron_swarm_logs_successful_job(monkeypatch, tmp_path):
-    from axiom.core.events import EventBus
-    from axiom.services import cron_swarm
+    from zelyr.core.events import EventBus
+    from zelyr.services import cron_swarm
 
     class FakeSupervisor:
         def __init__(self, *args, **kwargs):
@@ -50,7 +50,7 @@ async def test_cron_swarm_logs_successful_job(monkeypatch, tmp_path):
 
     monkeypatch.setattr(cron_swarm, "SwarmSupervisor", FakeSupervisor)
     monkeypatch.setattr(
-        "axiom.llm.universal_client.UniversalLLMClient", FakeLLM
+        "zelyr.llm.universal_client.UniversalLLMClient", FakeLLM
     )
 
     engine = cron_swarm.CronSwarmEngine(EventBus())
@@ -68,8 +68,8 @@ async def test_cron_swarm_logs_successful_job(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_cron_swarm_logs_failed_job(monkeypatch, tmp_path):
-    from axiom.core.events import EventBus
-    from axiom.services import cron_swarm
+    from zelyr.core.events import EventBus
+    from zelyr.services import cron_swarm
 
     class FailingSupervisor:
         def __init__(self, *args, **kwargs):
@@ -84,7 +84,7 @@ async def test_cron_swarm_logs_failed_job(monkeypatch, tmp_path):
 
     monkeypatch.setattr(cron_swarm, "SwarmSupervisor", FailingSupervisor)
     monkeypatch.setattr(
-        "axiom.llm.universal_client.UniversalLLMClient", FakeLLM
+        "zelyr.llm.universal_client.UniversalLLMClient", FakeLLM
     )
 
     engine = cron_swarm.CronSwarmEngine(EventBus())
@@ -129,9 +129,9 @@ def test_mcp_audit_tool_reads_engine_ledger(monkeypatch):
     monkeypatch.setitem(sys.modules, "mcp", fake_mcp)
     monkeypatch.setitem(sys.modules, "mcp.server", fake_server)
     monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fake_fastmcp)
-    monkeypatch.delitem(sys.modules, "axiom.server.mcp_server", raising=False)
+    monkeypatch.delitem(sys.modules, "zelyr.server.mcp_server", raising=False)
 
-    module = importlib.import_module("axiom.server.mcp_server")
+    module = importlib.import_module("zelyr.server.mcp_server")
 
     AuditLedger().log_execution("agent", "my_audited_tool", {}, "LOW", "SUCCESS")
 

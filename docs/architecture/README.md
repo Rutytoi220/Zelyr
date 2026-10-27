@@ -1,6 +1,6 @@
-# AXIOM Architecture Decision Records (ADRs)
+# Zelyr Architecture Decision Records (ADRs)
 
-Architecture Decision Records capture the key engineering tradeoffs made during AXIOM's development. They follow the [Michael Nygard ADR format](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions): each record documents the **Context** (the problem), the **Decision** (what we chose and why), and the **Consequences** (the good and bad tradeoffs).
+Architecture Decision Records capture the key engineering tradeoffs made during Zelyr's development. They follow the [Michael Nygard ADR format](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions): each record documents the **Context** (the problem), the **Decision** (what we chose and why), and the **Consequences** (the good and bad tradeoffs).
 
 ADRs are immutable once accepted. If a decision is later reversed, a new ADR is created referencing the superseded record.
 

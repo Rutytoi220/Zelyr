@@ -1,4 +1,4 @@
-"""Ollama LLM client for AXIOM (core).
+"""Ollama LLM client for Zelyr (core).
 
 Provides a `generate(prompt, model)` function. Uses `requests` and the
 `config/config.json` values. Returns raw text or an informative [MESSAGE] string

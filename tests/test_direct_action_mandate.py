@@ -15,9 +15,9 @@ import json
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from axiom.agents.native_orchestrator import NativeOrchestrator
-from axiom.core.instructions import InstructionManager
-from axiom.core.system_prompt import (
+from zelyr.agents.native_orchestrator import NativeOrchestrator
+from zelyr.core.instructions import InstructionManager
+from zelyr.core.system_prompt import (
     HARDENED_SYSTEM_DIRECTIVES,
     SOM_REACT_SYSTEM_PROMPT,
 )
@@ -136,7 +136,7 @@ class TestDirectActionMandate(unittest.IsolatedAsyncioTestCase):
             ],
         }
 
-        with patch("axiom.agents.native_orchestrator.execute_tool", side_effect=mock_execute), \
+        with patch("zelyr.agents.native_orchestrator.execute_tool", side_effect=mock_execute), \
              patch.object(orch, "get_active_window_context", return_value=None), \
              patch("httpx.AsyncClient") as mock_client:
 

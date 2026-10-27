@@ -1,4 +1,4 @@
-name: Build Cross-Platform AXIOM
+name: Build Cross-Platform Zelyr
 
 on:
   push:
@@ -45,36 +45,36 @@ jobs:
 
       - name: PyInstaller Build (Linux/macOS)
         if: runner.os != 'Windows'
-        run: pyinstaller --name axiom --onefile axiom/api/cli.py
+        run: pyinstaller --name zelyr --onefile zelyr/api/cli.py
         
       - name: PyInstaller Build (Windows)
         if: runner.os == 'Windows'
-        run: pyinstaller --name axiom --onefile axiom/api/cli.py --noupx
+        run: pyinstaller --name zelyr --onefile zelyr/api/cli.py --noupx
 
       - name: Package .deb and .rpm (Linux)
         if: runner.os == 'Linux'
         run: |
           mkdir -p build_pkg/usr/bin
-          cp dist/axiom build_pkg/usr/bin/
-          chmod +x build_pkg/usr/bin/axiom
+          cp dist/zelyr build_pkg/usr/bin/
+          chmod +x build_pkg/usr/bin/zelyr
           
           # Create Post-Install script
           cat << 'EOF' > post_install.sh
           #!/bin/bash
-          echo "AXIOM has been installed. Run 'axiom daemon install' to configure the background service."
+          echo "Zelyr has been installed. Run 'zelyr daemon install' to configure the background service."
           EOF
           chmod +x post_install.sh
           
-          fpm -s dir -t deb -n axiom -v ${GITHUB_REF_NAME#v} --architecture amd64 --after-install post_install.sh -C build_pkg .
-          fpm -s dir -t rpm -n axiom -v ${GITHUB_REF_NAME#v} --architecture x86_64 --after-install post_install.sh -C build_pkg .
+          fpm -s dir -t deb -n zelyr -v ${GITHUB_REF_NAME#v} --architecture amd64 --after-install post_install.sh -C build_pkg .
+          fpm -s dir -t rpm -n zelyr -v ${GITHUB_REF_NAME#v} --architecture x86_64 --after-install post_install.sh -C build_pkg .
 
       - name: Package .dmg (macOS)
         if: runner.os == 'macOS'
         run: |
-          mkdir -p build_app/AXIOM.app/Contents/MacOS
-          cp dist/axiom build_app/AXIOM.app/Contents/MacOS/
-          chmod +x build_app/AXIOM.app/Contents/MacOS/axiom
-          create-dmg --volname "AXIOM Installer" --window-pos 200 120 --window-size 800 400 --icon-size 100 --icon "AXIOM.app" 200 190 --hide-extension "AXIOM.app" --app-drop-link 600 185 "axiom_latest.dmg" build_app/
+          mkdir -p build_app/Zelyr.app/Contents/MacOS
+          cp dist/zelyr build_app/Zelyr.app/Contents/MacOS/
+          chmod +x build_app/Zelyr.app/Contents/MacOS/zelyr
+          create-dmg --volname "Zelyr Installer" --window-pos 200 120 --window-size 800 400 --icon-size 100 --icon "Zelyr.app" 200 190 --hide-extension "Zelyr.app" --app-drop-link 600 185 "zelyr_latest.dmg" build_app/
 
       - name: Upload Artifacts (Linux)
         if: runner.os == 'Linux'
@@ -90,7 +90,7 @@ jobs:
         if: runner.os == 'macOS'
         uses: softprops/action-gh-release@v2
         with:
-          files: axiom_latest.dmg
+          files: zelyr_latest.dmg
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -98,6 +98,6 @@ jobs:
         if: runner.os == 'Windows'
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/axiom.exe
+          files: dist/zelyr.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

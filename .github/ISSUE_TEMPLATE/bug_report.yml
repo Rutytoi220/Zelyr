@@ -1,5 +1,5 @@
 name: Bug Report
-description: Create a report to help us improve AXIOM v5.3.0
+description: Create a report to help us improve Zelyr v5.3.0
 title: "[BUG] "
 labels: ["bug", "triage"]
 body:
@@ -10,18 +10,18 @@ body:
   - type: input
     id: version
     attributes:
-      label: AXIOM Version
-      description: What version of AXIOM are you running? (e.g., v5.3.0 or commit hash)
+      label: Zelyr Version
+      description: What version of Zelyr are you running? (e.g., v5.3.0 or commit hash)
     validations:
       required: true
   - type: dropdown
     id: subsystem
     attributes:
       label: Subsystem
-      description: Which part of AXIOM is affected?
+      description: Which part of Zelyr is affected?
       options:
         - Kernel / Self-Patcher
-        - AxiomFS (FUSE)
+        - ZelyrFS (FUSE)
         - Multimodal HUD (GUI)
         - Security / Sandbox (bwrap/QEMU)
         - Swarm / Networking

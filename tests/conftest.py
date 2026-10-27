@@ -1,4 +1,4 @@
-"""Pytest configuration and shared fixtures for AXIOM."""
+"""Pytest configuration and shared fixtures for Zelyr."""
 
 import os
 import tempfile
@@ -7,8 +7,8 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
-_GLOBAL_TEST_TEMP_DIR = tempfile.TemporaryDirectory(prefix="axiom_test_global_")
-os.environ.setdefault("AXIOM_MEMORY_DB", os.path.join(_GLOBAL_TEST_TEMP_DIR.name, "default_test_memory.db"))
+_GLOBAL_TEST_TEMP_DIR = tempfile.TemporaryDirectory(prefix="zelyr_test_global_")
+os.environ.setdefault("ZELYR_MEMORY_DB", os.path.join(_GLOBAL_TEST_TEMP_DIR.name, "default_test_memory.db"))
 
 def pytest_configure(config):
     """Pytest configuration hook."""
@@ -23,7 +23,7 @@ def mock_home_directory(monkeypatch):
         monkeypatch.setenv("USERPROFILE", temp_home) # Windows
         monkeypatch.setenv("XDG_CONFIG_HOME", os.path.join(temp_home, ".config"))
         monkeypatch.setenv("XDG_DATA_HOME", os.path.join(temp_home, ".local", "share"))
-        monkeypatch.setenv("AXIOM_MEMORY_DB", os.path.join(temp_home, "test_isolated_memory.db"))
+        monkeypatch.setenv("ZELYR_MEMORY_DB", os.path.join(temp_home, "test_isolated_memory.db"))
         
         with patch("pathlib.Path.home", return_value=Path(temp_home)):
             yield temp_home
@@ -73,9 +73,9 @@ def block_external_io(request, monkeypatch):
 
     # 4. Block Model Config Initialization to prevent CLI stall
     try:
-        import axiom.core.config_service
-        if hasattr(axiom.core.config_service, "initialize_model_config"):
-            monkeypatch.setattr(axiom.core.config_service, "initialize_model_config", lambda *args, **kwargs: None)
+        import zelyr.core.config_service
+        if hasattr(zelyr.core.config_service, "initialize_model_config"):
+            monkeypatch.setattr(zelyr.core.config_service, "initialize_model_config", lambda *args, **kwargs: None)
     except ImportError:
         pass
 

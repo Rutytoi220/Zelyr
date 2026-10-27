@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Automated Linux Desktop Launcher Installer for AXIOM."""
+"""Automated Linux Desktop Launcher Installer for Zelyr."""
 
 import os
 import shutil
@@ -8,7 +8,7 @@ from pathlib import Path
 
 def main():
     project_root = Path(__file__).resolve().parent.parent
-    assets_dir = project_root / "axiom" / "gui" / "assets"
+    assets_dir = project_root / "zelyr" / "gui" / "assets"
     
     # 1. Create system icon directory
     icon_dir = Path.home() / ".local" / "share" / "icons"
@@ -19,11 +19,11 @@ def main():
     logo_png = assets_dir / "logo.png"
     
     if logo_svg.exists():
-        icon_path = icon_dir / "axiom.svg"
+        icon_path = icon_dir / "zelyr.svg"
         shutil.copy2(logo_svg, icon_path)
         print(f"Installed icon to {icon_path}")
     elif logo_png.exists():
-        icon_path = icon_dir / "axiom.png"
+        icon_path = icon_dir / "zelyr.png"
         shutil.copy2(logo_png, icon_path)
         print(f"Installed icon to {icon_path}")
     else:
@@ -34,18 +34,18 @@ def main():
     apps_dir.mkdir(parents=True, exist_ok=True)
     
     # 4. Generate desktop entry
-    desktop_file = apps_dir / "axiom.desktop"
+    desktop_file = apps_dir / "Zelyr.desktop"
     desktop_content = f"""[Desktop Entry]
-Name=AXIOM Desktop
+Name=Zelyr Desktop
 Comment=Local-First AI Orchestration Framework
-Exec=python3 -m axiom.gui.app
+Exec=python3 -m zelyr.gui.app
 Path={project_root.absolute()}
-Icon=axiom
+Icon=zelyr
 Terminal=false
 Type=Application
 Categories=Development;Utility;System;
 Keywords=AI;LLM;Orchestration;Ollama;Linux;PySide6;
-StartupWMClass=axiom
+StartupWMClass=Zelyr
 """
     desktop_file.write_text(desktop_content, encoding="utf-8")
     print(f"Installed desktop entry to {desktop_file}")

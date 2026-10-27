@@ -1,4 +1,4 @@
-"""Generic settings management actions for AXIOM.
+"""Generic settings management actions for Zelyr.
 
 Provides framework actions for querying and modifying configuration at runtime.
 These actions integrate with the action executor and are planner-friendly.

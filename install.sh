@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════
-#  AXIOM Desktop v8.2 — Native Linux Installer
+#  Zelyr Desktop v8.2 — Native Linux Installer
 # ═══════════════════════════════════════════════════════════════
 set -euo pipefail
 
@@ -21,19 +21,19 @@ error()   { echo -e "${RED}[FAIL]${NC}  $*"; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEPLOY_DIR="${SCRIPT_DIR}/deploy"
 
-CONFIG_DIR="${HOME}/.config/axiom"
-DATA_DIR="${HOME}/.local/share/axiom"
+CONFIG_DIR="${HOME}/.config/zelyr"
+DATA_DIR="${HOME}/.local/share/zelyr"
 VENV_DIR="${DATA_DIR}/venv"
 DESKTOP_DIR="${HOME}/.local/share/applications"
 ICON_DIR="${HOME}/.local/share/icons/hicolor/256x256/apps"
 
-ICON_SRC="${SCRIPT_DIR}/axiom/gui/assets/logo.png"
+ICON_SRC="${SCRIPT_DIR}/zelyr/gui/assets/logo.png"
 
 # ── Banner ──────────────────────────────────────────────────────
 echo ""
 echo -e "${BOLD}${CYAN}"
 echo "  ╔═══════════════════════════════════════════════════════╗"
-echo "  ║          AXIOM Desktop v8.2 — Linux Installer         ║"
+echo "  ║          Zelyr Desktop v8.2 — Linux Installer         ║"
 echo "  ║       Local-First AI Orchestration for Linux          ║"
 echo "  ╚═══════════════════════════════════════════════════════╝"
 echo -e "${NC}"
@@ -78,9 +78,9 @@ info "${BOLD}Step 2/3: Installing application icon...${NC}"
 
 mkdir -p "${ICON_DIR}"
 if [ -f "${ICON_SRC}" ]; then
-    cp "${ICON_SRC}" "${ICON_DIR}/axiom.png"
-    success "Installed icon → ${ICON_DIR}/axiom.png"
-    ICON_DEST="${ICON_DIR}/axiom.png"
+    cp "${ICON_SRC}" "${ICON_DIR}/zelyr.png"
+    success "Installed icon → ${ICON_DIR}/zelyr.png"
+    ICON_DEST="${ICON_DIR}/zelyr.png"
 else
     warn "Icon not found at ${ICON_SRC}. Will use generic icon."
     ICON_DEST="utilities-terminal"
@@ -91,8 +91,8 @@ echo ""
 info "${BOLD}Step 3/3: Installing desktop entry...${NC}"
 
 mkdir -p "${DESKTOP_DIR}"
-DESKTOP_SRC="${DEPLOY_DIR}/axiom.desktop.template"
-DESKTOP_DEST="${DESKTOP_DIR}/axiom.desktop"
+DESKTOP_SRC="${DEPLOY_DIR}/zelyr.desktop.template"
+DESKTOP_DEST="${DESKTOP_DIR}/Zelyr.desktop"
 
 if [ ! -f "${DESKTOP_SRC}" ]; then
     error "Desktop template not found at ${DESKTOP_SRC}"
@@ -106,7 +106,7 @@ sed -e "s|{{EXEC_PATH}}|${EXEC_CMD}|g" \
     "${DESKTOP_SRC}" > "${DESKTOP_DEST}"
 
 chmod +x "${DESKTOP_DEST}"
-success "Created Axiom.desktop → ${DESKTOP_DEST}"
+success "Created Zelyr.desktop → ${DESKTOP_DEST}"
 
 # ── Update Desktop Database ───────────────────────────────────
 if command -v update-desktop-database &>/dev/null; then
@@ -125,7 +125,7 @@ echo -e "${BOLD}${GREEN}"
 echo "  ╔═══════════════════════════════════════════════════════╗"
 echo "  ║            Installation Complete!                     ║"
 echo "  ╠═══════════════════════════════════════════════════════╣"
-echo "  ║  GUI:      Search 'AXIOM' in your app launcher       ║"
+echo "  ║  GUI:      Search 'Zelyr' in your app launcher       ║"
 echo "  ║  Binary:   ${SCRIPT_DIR}/scripts/launch.sh"
 echo "  ╚═══════════════════════════════════════════════════════╝"
 echo -e "${NC}"

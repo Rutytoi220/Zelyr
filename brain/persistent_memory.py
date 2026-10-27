@@ -1,4 +1,4 @@
-"""Persistent memory for AXIOM — SQLite-backed action storage.
+"""Persistent memory for Zelyr — SQLite-backed action storage.
 
 Stores all executed actions to disk so patterns can be detected
 across sessions. Loaded on startup, written after each action.
@@ -7,9 +7,11 @@ across sessions. Loaded on startup, written after each action.
 import os
 import sqlite3
 import time
+from pathlib import Path
 from typing import List, Dict, Optional
 from utils.logger import get_logger
 from utils.config import get_config
+from zelyr.compat import resolve_file
 
 logger = get_logger(__name__)
 
@@ -21,9 +23,12 @@ class PersistentMemory:
 
     def __init__(self, db_path: Optional[str] = None):
         cfg = get_config() or {}
-        raw = db_path or cfg.get('storage', {}).get('db_path', 'data/axiom.db')
-        # Resolve relative paths against project root
-        self.db_path = raw if os.path.isabs(raw) else os.path.join(_PROJECT_ROOT, raw)
+        raw = db_path or cfg.get('storage', {}).get('db_path', 'data/zelyr.db')
+        # Resolve relative paths against project root and reuse legacy AXIOM data.
+        resolved = Path(raw) if os.path.isabs(raw) else Path(_PROJECT_ROOT) / raw
+        if not os.path.isabs(raw):
+            resolved = resolve_file(resolved, Path(_PROJECT_ROOT) / 'data' / 'axiom.db')
+        self.db_path = str(resolved)
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
 
         self._conn: Optional[sqlite3.Connection] = None

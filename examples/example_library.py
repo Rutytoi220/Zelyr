@@ -1,10 +1,10 @@
-"""Example: Using AXIOM as a library."""
+"""Example: Using Zelyr as a library."""
 
-from axiom import Engine, OrchestratorAgent, MemoryManager, ShellCommandTool
+from zelyr import Engine, OrchestratorAgent, MemoryManager, ShellCommandTool
 
 
 def main():
-    """Demonstrate AXIOM library usage."""
+    """Demonstrate Zelyr library usage."""
     
     # Initialize components
     engine = Engine()
@@ -23,7 +23,7 @@ def main():
     # Register the agent
     engine.registry.register_agent(agent.agent_id, agent)
     
-    print("AXIOM Library Example")
+    print("Zelyr Library Example")
     print("=" * 60)
     
     # Example interactions

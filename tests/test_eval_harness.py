@@ -1,4 +1,4 @@
-"""Comprehensive unit and integration test suite for AXIOM Evaluation Harness."""
+"""Comprehensive unit and integration test suite for Zelyr Evaluation Harness."""
 
 from __future__ import annotations
 
@@ -8,13 +8,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from axiom.agents.native_orchestrator import NativeOrchestrator
-from axiom.eval.context import EvaluationContext
-from axiom.eval.harness import EvalHarness, EvaluationHarness
-from axiom.eval.metrics import EvalStatus, export_json_report, format_summary_table
-from axiom.eval.provider import DeterministicModelProvider, MockTurn
-from axiom.eval.report import BenchmarkReport
-from axiom.eval.suite_l1 import (
+from zelyr.agents.native_orchestrator import NativeOrchestrator
+from zelyr.eval.context import EvaluationContext
+from zelyr.eval.harness import EvalHarness, EvaluationHarness
+from zelyr.eval.metrics import EvalStatus, export_json_report, format_summary_table
+from zelyr.eval.provider import DeterministicModelProvider, MockTurn
+from zelyr.eval.report import BenchmarkReport
+from zelyr.eval.suite_l1 import (
     build_eval_l1_exception_cleanup,
     build_eval_l1_false_success,
     build_eval_l1_memory_round_trip,
@@ -23,8 +23,8 @@ from axiom.eval.suite_l1 import (
     build_eval_l1_tool_dispatch,
     get_level_1_suite,
 )
-from axiom.eval.task import EvalContext, EvaluationTask
-from axiom.eval.tasks.deterministic_p1 import (
+from zelyr.eval.task import EvalContext, EvaluationTask
+from zelyr.eval.tasks.deterministic_p1 import (
     build_task_false_success_rejection,
     build_task_memory_persistence_roundtrip,
     build_task_recovery_envelope,
@@ -33,11 +33,11 @@ from axiom.eval.tasks.deterministic_p1 import (
     build_task_tool_dispatch,
     get_deterministic_p1_tasks,
 )
-from axiom.eval.tasks.model_tasks_p3 import (
+from zelyr.eval.tasks.model_tasks_p3 import (
     build_task_live_web_research_synthesis,
     task_live_web_research_synthesis,
 )
-from axiom.eval.types import ResultStatus
+from zelyr.eval.types import ResultStatus
 
 
 class TestEvaluationHarness(unittest.IsolatedAsyncioTestCase):
@@ -187,7 +187,7 @@ class TestEvaluationHarness(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(orch.max_steps, 5)
         self.assertIsNone(orch.model_provider)
         self.assertIsNone(orch.tool_schemas)
-        from axiom.core.plugins import execute_tool
+        from zelyr.core.plugins import execute_tool
         self.assertEqual(orch.execute_tool, execute_tool)
 
     async def test_no_model_endpoint_invocation_when_using_deterministic_provider(self) -> None:
@@ -310,7 +310,7 @@ class TestEvalHarnessP1(unittest.IsolatedAsyncioTestCase):
 
         results = [res1, res2]
         table_str = format_summary_table(results)
-        self.assertIn("AXIOM DETERMINISTIC EVALUATION BENCHMARK REPORT", table_str)
+        self.assertIn("Zelyr DETERMINISTIC EVALUATION BENCHMARK REPORT", table_str)
         self.assertIn("task_tool_dispatch", table_str)
         self.assertIn("task_false_success_rejection", table_str)
 

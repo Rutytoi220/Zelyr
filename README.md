@@ -1,13 +1,13 @@
-# AXIOM
+# Zelyr
 
-[![Platform: Linux/Wayland](https://img.shields.io/badge/platform-Linux%20%2F%20Wayland-blue.svg)](https://github.com/Rutytoi220/Axiom)
+[![Platform: Linux/Wayland](https://img.shields.io/badge/platform-Linux%20%2F%20Wayland-blue.svg)](https://github.com/Rutytoi220/Zelyr)
 [![Python: 3.11](https://img.shields.io/badge/python-3.11-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Local Inference: Ollama](https://img.shields.io/badge/inference-Ollama%20127.0.0.1%3A11434-orange.svg)](https://ollama.com/)
 
-**AXIOM** is a local-first autonomous AI orchestration engine built for Linux (specifically Wayland compositors such as Hyprland). It connects local reasoning models to physical desktop workflows through structured system IPC, semantic web DOM automation, persistent memory, and hot-reloadable dynamic tool crafting.
+**Zelyr** is a local-first autonomous AI orchestration engine built for Linux (specifically Wayland compositors such as Hyprland). It connects local reasoning models to physical desktop workflows through structured system IPC, semantic web DOM automation, persistent memory, and hot-reloadable dynamic tool crafting.
 
-Designed to operate on consumer hardware (e.g., RTX 4060 8GB VRAM) with zero external cloud dependencies, AXIOM executes inference entirely against local endpoints (`http://127.0.0.1:11434`) with zero cloud telemetry.
+Designed to operate on consumer hardware (e.g., RTX 4060 8GB VRAM) with zero external cloud dependencies, Zelyr executes inference entirely against local endpoints (`http://127.0.0.1:11434`) with zero cloud telemetry.
 
 ---
 
@@ -30,7 +30,7 @@ flowchart TD
     
     subgraph Storage ["Persistent Subsystems"]
         Memory["Persistent Memory Store\n(SQLite WAL + FTS5 Index)"]
-        ToolManager["Tool Crafter & Manager\n(~/.config/axiom/tools.d/)"]
+        ToolManager["Tool Crafter & Manager\n(~/.config/zelyr/tools.d/)"]
     end
     
     Orchestrator --> Actuator
@@ -47,7 +47,7 @@ Physical workstation control is partitioned into three deterministic tiers with 
    - Returns structured JSON; zero visual hallucination risk.
 
 2. **Tier 2: Semantic Browser DOM & Web Search**
-   - Interacts with active web pages through an authenticated local WebSocket server (`ws://127.0.0.1:41144`) connected to the AXIOM WebExtension.
+   - Interacts with active web pages through an authenticated local WebSocket server (`ws://127.0.0.1:41144`) connected to the Zelyr WebExtension.
    - Native Web Tools: `web_search` (query DuckDuckGo / SearXNG with context budgeting) and `fetch_web_page` (HTML text extraction with SSRF security and prompt injection isolation boundaries).
    - Tools: `interact_with_browser`, `web_search`, `fetch_web_page`.
    - **Negative Gating & Tier Pruning:** When a browser window is focused and the DOM bridge is active, `NativeOrchestrator` strictly purges Tier 3 generic desktop vision tools (`interact_with_ui`, `capture_desktop_vision`) from the LLM tool manifest. This prevents models from guessing pixel coordinates on interactive web pages.
@@ -59,7 +59,7 @@ Physical workstation control is partitioned into three deterministic tiers with 
 ---
 
 ### B. Persistent Memory Store (SQLite WAL + FTS5)
-Persistent memory is implemented via [`axiom/db/memory.py`](axiom/db/memory.py):
+Persistent memory is implemented via [`zelyr/db/memory.py`](zelyr/db/memory.py):
 - **Concurrency & Resilience:** SQLite configured with Write-Ahead Logging (`PRAGMA journal_mode=WAL`), high busy timeouts (`PRAGMA busy_timeout=5000`), and foreign key enforcement.
 - **Full-Text Retrieval:** Virtual FTS5 tables (`memories_fts`) with triggers automatically index stored facts.
 - **Categorization & Versioning:** Enforces strict categories (`preference`, `environment`, `homelab`, `workflow`, `capability`). Superseded facts track historical lineage without data loss.
@@ -68,16 +68,16 @@ Persistent memory is implemented via [`axiom/db/memory.py`](axiom/db/memory.py):
 ---
 
 ### C. Autonomous Dynamic Tool Crafting & Lifecycle Management
-AXIOM synthesizes, validates, and installs new tools at runtime into `~/.config/axiom/tools.d/` via [`axiom/tools/tool_crafter.py`](axiom/tools/tool_crafter.py) and [`axiom/tools/tool_manager.py`](axiom/tools/tool_manager.py):
+Zelyr synthesizes, validates, and installs new tools at runtime into `~/.config/zelyr/tools.d/` via [`zelyr/tools/tool_crafter.py`](zelyr/tools/tool_crafter.py) and [`zelyr/tools/tool_manager.py`](zelyr/tools/tool_manager.py):
 - **AST Contract Inspection:** Statically parses candidate code with Python's `ast` module to confirm valid syntax, required `async def execute` definitions, and standard schema exports (`TOOL_SCHEMA`, `REQUIRED_RING`, `TIER`, `TUI_HINT`).
 - **Privilege Escalation Protection:** Generated dynamic tools cannot claim `REQUIRED_RING = 0` (Ring 0 is immutable and reserved for built-in actuators).
-- **Isolated Staging Dry-Run:** Stages the code into `/tmp/axiom_stage_<uuid>.py`, dynamically imports it via `importlib.util.spec_from_file_location`, tests execution under a 5.0s timeout, and cleans up `sys.modules` and scratch files.
+- **Isolated Staging Dry-Run:** Stages the code into `/tmp/zelyr_stage_<uuid>.py`, dynamically imports it via `importlib.util.spec_from_file_location`, tests execution under a 5.0s timeout, and cleans up `sys.modules` and scratch files.
 - **Atomic Rollback:** If plugin reloading fails, the file is unlinked, the runtime schema is unregistered, and persistent memory is restored to the previous working version.
 
 ---
 
-### D. Benchmark & Evaluation Harness (`axiom.eval`)
-AXIOM includes a deterministic and live benchmark evaluation suite via [`axiom/eval/`](axiom/eval/):
+### D. Benchmark & Evaluation Harness (`zelyr.eval`)
+Zelyr includes a deterministic and live benchmark evaluation suite via [`zelyr/eval/`](zelyr/eval/):
 - **Level 1 (Deterministic Offline):** 6 self-contained tasks evaluating tool dispatch, recovery envelopes, step limits, false success rejection, memory roundtrips, and timeouts in under 3 seconds with zero GPU or network dependencies.
 - **Level 2 (Live Model Evaluation):** Exercises real multi-turn ReAct loops against local models (`qwen3:8b`, `qwen3:1.7b`) with independent disk and state validators.
 - **Level 3 (Complex Workflows):** Tests multi-step triage, tool self-repair, and containment.
@@ -116,17 +116,17 @@ Empirical results from [`docs/benchmarks/live_baseline_report.md`](docs/benchmar
 
 ```bash
 # 1. Clone repository
-git clone https://github.com/Rutytoi220/Axiom.git
-cd Axiom
+git clone https://github.com/Rutytoi220/Zelyr.git
+cd Zelyr
 
 # 2. Sync virtual environment and dependencies
 uv sync
 
-# 3. Run automated test suite (61 verified tests)
+# 3. Run the automated test suite
 uv run pytest -v
 
-# 4. Launch AXIOM interactive streaming CLI
-uv run axiom
+# 4. Launch Zelyr interactive streaming CLI
+uv run zelyr
 ```
 
 ---
@@ -149,51 +149,51 @@ For developers, architects, and AI coding agents navigating the codebase, refer 
 
 ## 5. CLI Interface & Commands
 
-AXIOM provides multiple interfaces accessible via `axiom` (registered entrypoint) or `uv run axiom`:
+Zelyr provides multiple interfaces accessible via `zelyr` (registered entrypoint) or `uv run zelyr`:
 
 ```bash
 # Modern inline streaming CLI (Tokyo Night theme, default)
-axiom repl
+zelyr repl
 
 # Full-screen Opencode-tier TUI
-axiom chat
+zelyr chat
 
 # PySide6 Desktop GUI
-axiom ui
+zelyr ui
 
 # Start background FastAPI compute node & OpenAI-compatible proxy
-axiom server
+zelyr server
 
 # Run autonomous agent with natural-language prompt
-axiom run "Inspect open windows and list system memory"
+zelyr run "Inspect open windows and list system memory"
 
 # List all registered and dynamic tools
-axiom tool list
+zelyr tool list
 
 # Execute a tool directly by ID
-axiom tool run query_system_journal --args '{"lines": 10}'
+zelyr tool run query_system_journal --args '{"lines": 10}'
 
 # Show system and daemon telemetry
-axiom status
+zelyr status
 
 # Run automated headless test suite
-axiom test
+zelyr test
 
 # Run deterministic benchmark suite
-python -m axiom.eval --level 1
+python -m zelyr.eval --level 1
 
 # Run live benchmark evaluation against local Ollama model
-python -m axiom.eval --level 2 --live -m qwen3:8b --json benchmark_report.json
+python -m zelyr.eval --level 2 --live -m qwen3:8b --json benchmark_report.json
 ```
 
 ---
 
 ## 6. Security & Isolation Model
 
-AXIOM operates under a transparent, single-user workstation security model:
-- **SSRF Network Protection:** Outbound network requests pass through [`axiom.security.network.validate_safe_url`](axiom/security/network.py), blocking loopback, RFC 1918 private subnets, cloud metadata (169.254.169.254), Carrier-Grade NAT / Tailscale mesh (`100.64.0.0/10`), and re-validating redirect hops.
+Zelyr operates under a transparent, single-user workstation security model:
+- **SSRF Network Protection:** Outbound network requests pass through [`zelyr.security.network.validate_safe_url`](zelyr/security/network.py), blocking loopback, RFC 1918 private subnets, cloud metadata (169.254.169.254), Carrier-Grade NAT / Tailscale mesh (`100.64.0.0/10`), and re-validating redirect hops.
 - **Prompt Injection Isolation:** Web content and search results are enclosed in `<external_web_content>` XML boundaries with tag escaping.
-- **Fail-Closed Shell Confirmation:** Arbitrary shell commands require explicit interactive user approval via [`axiom/tools/__init__.py`](axiom/tools/__init__.py) (`_request_shell_authorization`) and fail closed in non-interactive sessions.
+- **Fail-Closed Shell Confirmation:** Arbitrary shell commands require explicit interactive user approval via [`zelyr/tools/__init__.py`](zelyr/tools/__init__.py) (`_request_shell_authorization`) and fail closed in non-interactive sessions.
 - **In-Process Execution Reality:** Dynamic tools execute in-process inside the Python interpreter under the host user's UID. AST validation and `/tmp` staging verify syntax and prevent accidental errors, but do **not** constitute an OS-level kernel sandbox.
 - **Zero External Telemetry:** All inference traffic remains strictly local on loopback (`http://127.0.0.1:11434`). Zero analytics, error reports, or prompts are sent to external servers.
 

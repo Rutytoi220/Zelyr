@@ -7,7 +7,7 @@ GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-echo -e "${BLUE}[INFO]${NC} Starting AXIOM Pro AppImage Build Process..."
+echo -e "${BLUE}[INFO]${NC} Starting Zelyr Pro AppImage Build Process..."
 
 # Ensure running from project root
 if [ ! -f "main.py" ] || [ ! -d "scripts" ]; then
@@ -24,39 +24,39 @@ echo -e "${BLUE}[INFO]${NC} Locking and syncing dependencies..."
 uv sync --python 3.11
 
 echo -e "${BLUE}[INFO]${NC} Compiling with PyInstaller..."
-uv run --python 3.11 pyinstaller axiom.spec --clean --noconfirm
+uv run --python 3.11 pyinstaller zelyr.spec --clean --noconfirm
 
 # 2. AppDir Construction
-echo -e "${BLUE}[INFO]${NC} Constructing AXIOM.AppDir..."
-APPDIR="AXIOM.AppDir"
+echo -e "${BLUE}[INFO]${NC} Constructing Zelyr.AppDir..."
+APPDIR="Zelyr.AppDir"
 rm -rf "$APPDIR"
 mkdir -p "$APPDIR/usr/bin"
 mkdir -p "$APPDIR/usr/share/applications"
 
 echo -e "${BLUE}[INFO]${NC} Copying binaries to AppDir..."
-# With the COLLECT step in axiom.spec, PyInstaller generates a directory at dist/AXIOM/
-cp -r dist/AXIOM/* "$APPDIR/usr/bin/"
+# With the COLLECT step in zelyr.spec, PyInstaller generates a directory at dist/Zelyr/
+cp -r dist/Zelyr/* "$APPDIR/usr/bin/"
 
-echo -e "${BLUE}[INFO]${NC} Generating axiom.desktop..."
-cat <<EOF > "$APPDIR/axiom.desktop"
+echo -e "${BLUE}[INFO]${NC} Generating Zelyr.desktop..."
+cat <<EOF > "$APPDIR/Zelyr.desktop"
 [Desktop Entry]
-Name=AXIOM Pro
+Name=Zelyr Pro
 Exec=AppRun
-Icon=axiom-logo
+Icon=zelyr-logo
 Type=Application
 Categories=Utility;Development;
 EOF
 
 # Make sure it's also in usr/share/applications/ per AppImage best practices
-cp "$APPDIR/axiom.desktop" "$APPDIR/usr/share/applications/"
+cp "$APPDIR/Zelyr.desktop" "$APPDIR/usr/share/applications/"
 
 echo -e "${BLUE}[INFO]${NC} Setting up icon..."
-if [ -f "assets/axiom-logo.png" ]; then
-    cp assets/axiom-logo.png "$APPDIR/"
+if [ -f "zelyr/gui/assets/logo.png" ]; then
+    cp "zelyr/gui/assets/logo.png" "$APPDIR/zelyr-logo.png"
 else
-    echo -e "${BLUE}[INFO]${NC} 'assets/axiom-logo.png' not found. Creating a default dummy icon..."
+    echo -e "${BLUE}[INFO]${NC} 'zelyr/gui/assets/logo.png' not found. Creating a default dummy icon..."
     # Generate a tiny 1x1 transparent PNG file as a fallback
-    echo "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=" | base64 -d > "$APPDIR/axiom-logo.png"
+    echo "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=" | base64 -d > "$APPDIR/zelyr-logo.png"
 fi
 
 echo -e "${BLUE}[INFO]${NC} Creating AppRun symlink..."
@@ -82,18 +82,18 @@ if ! check_lib "libGL.so.1"; then
 fi
 
 if [ -n "$MISSING_LIBS" ]; then
-    MSG="AXIOM cannot start because critical host libraries are missing:\n$MISSING_LIBS\n\nPlease install them using your package manager."
+    MSG="Zelyr cannot start because critical host libraries are missing:\n$MISSING_LIBS\n\nPlease install them using your package manager."
     echo -e "\033[0;31m[CRITICAL ERROR]\033[0m $MSG"
     
     if command -v zenity &> /dev/null; then
-        zenity --error --title="AXIOM: Missing Dependencies" --text="$MSG"
+        zenity --error --title="Zelyr: Missing Dependencies" --text="$MSG"
     elif command -v kdialog &> /dev/null; then
-        kdialog --error "$MSG" --title "AXIOM: Missing Dependencies"
+        kdialog --error "$MSG" --title "Zelyr: Missing Dependencies"
     fi
     exit 1
 fi
 
-exec "${HERE}/usr/bin/AXIOM" "$@"
+exec "${HERE}/usr/bin/Zelyr" "$@"
 EOF
 chmod +x "$APPDIR/AppRun"
 
@@ -107,7 +107,7 @@ fi
 
 echo -e "${BLUE}[INFO]${NC} Packaging AppImage..."
 # Run appimagetool silently to avoid noisy stdout, but set -e ensures we catch exit codes
-./appimagetool-x86_64.AppImage "$APPDIR" AXIOM-v11.2.0-x86_64.AppImage > /dev/null
+./appimagetool-x86_64.AppImage "$APPDIR" Zelyr-v11.2.0-x86_64.AppImage > /dev/null
 
 echo -e "${BLUE}[INFO]${NC} Cleaning up temporary AppDir..."
 rm -rf "$APPDIR"

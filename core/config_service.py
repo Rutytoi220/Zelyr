@@ -1,4 +1,4 @@
-"""Configuration Service for AXIOM.
+"""Configuration Service for Zelyr.
 
 Manages runtime configuration: loading, validation, persistence, and change notification.
 Provides a central interface for getting/setting values with full audit trail.

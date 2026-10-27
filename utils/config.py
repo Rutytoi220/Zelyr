@@ -1,4 +1,4 @@
-"""Configuration loader for AXIOM.
+"""Configuration loader for Zelyr.
 
 Reads `config/config.json` from the project root and returns a dict.
 """

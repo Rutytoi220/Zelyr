@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build AXIOM distributions from an isolated copy of the source tree.
+"""Build Zelyr distributions from an isolated copy of the source tree.
 
 Setuptools' ``bdist_wheel`` command reuses ``build/lib`` inside the project
 root.  If a module is deleted from the source and the wheel is rebuilt without
@@ -30,8 +30,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# Top-level inputs consumed by the setuptools build.  ``axiom`` is the only
-# package matched by ``[tool.setuptools.packages.find] include = ["axiom*"]``.
+# Top-level inputs consumed by the setuptools build.  ``zelyr`` is the
+# canonical package; ``axiom`` is the small legacy import shim.
 BUILD_INPUTS = (
     "pyproject.toml",
     "setup.py",
@@ -41,6 +41,7 @@ BUILD_INPUTS = (
     "LICENSE",
     "LICENSE.txt",
     "COPYING",
+    "zelyr",
     "axiom",
 )
 
@@ -71,7 +72,7 @@ def _verify_wheel(wheel: Path, source_root: Path) -> None:
             name
             for name in archive.namelist()
             if name.endswith(".py")
-            and not name.startswith(("axiom_core-", "axiom-"))
+            and not name.startswith(("zelyr_core-", "zelyr-"))
             and not (source_root / name).is_file()
         ]
     if missing:
@@ -107,7 +108,7 @@ def main() -> int:
         outdir = ROOT / outdir
     outdir.mkdir(parents=True, exist_ok=True)
 
-    temp_root = Path(tempfile.mkdtemp(prefix="axiom-build-src-"))
+    temp_root = Path(tempfile.mkdtemp(prefix="zelyr-build-src-"))
     source = temp_root / "src"
     started = time.time()
     try:

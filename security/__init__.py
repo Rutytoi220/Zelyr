@@ -1,1 +1,1 @@
-"""Security helpers for AXIOM."""
+"""Security helpers for Zelyr."""

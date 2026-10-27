@@ -4,7 +4,7 @@
 Verifies:
 1. Static validation of background.js handlers (navigate_url, capture_tab_screenshot, select & checkbox handling).
 2. InteractWithBrowserTool schema exposed parameters and actions.
-3. Mock WebSocket dispatch for navigate_url, capture_tab_screenshot (with /tmp/axiom_tab_capture.png save),
+3. Mock WebSocket dispatch for navigate_url, capture_tab_screenshot (with /tmp/zelyr_tab_capture.png save),
    and form control fill_element (<select> and checkbox/radio).
 """
 
@@ -14,13 +14,13 @@ import os
 from pathlib import Path
 import websockets
 
-from axiom.tools.browser_cdp import InteractWithBrowserTool
-from axiom.tools.browser_extension import BrowserExtensionBridge
+from zelyr.tools.browser_cdp import InteractWithBrowserTool
+from zelyr.tools.browser_extension import BrowserExtensionBridge
 
 
 def test_static_background_js():
     print("[CHECK 1] Validating deep browser capabilities in background.js...")
-    bg_js = Path("axiom/tools/extension/background.js")
+    bg_js = Path("zelyr/tools/extension/background.js")
     assert bg_js.is_file(), "background.js missing!"
     code = bg_js.read_text(encoding="utf-8")
 
@@ -143,7 +143,7 @@ async def test_live_bridge_deep_browser():
             print(f"  → navigate_url verified: {res_nav.output}")
 
             # 2. Test capture_tab_screenshot and local file persistence
-            capture_path = Path("/tmp/axiom_tab_capture.png")
+            capture_path = Path("/tmp/zelyr_tab_capture.png")
             if capture_path.exists():
                 capture_path.unlink()
 
@@ -151,12 +151,12 @@ async def test_live_bridge_deep_browser():
                 "action": "capture_tab_screenshot",
             })
             assert res_snap.success, f"capture_tab_screenshot failed: {res_snap.error}"
-            assert res_snap.output.get("screenshot_path") == "/tmp/axiom_tab_capture.png"
-            assert capture_path.is_file(), "/tmp/axiom_tab_capture.png was not created!"
+            assert res_snap.output.get("screenshot_path") == "/tmp/zelyr_tab_capture.png"
+            assert capture_path.is_file(), "/tmp/zelyr_tab_capture.png was not created!"
             # Verify PNG header
             png_bytes = capture_path.read_bytes()
             assert png_bytes.startswith(b"\x89PNG\r\n\x1a\n"), "Saved file is not a valid PNG header"
-            print(f"  → capture_tab_screenshot verified: saved {len(png_bytes)} bytes to /tmp/axiom_tab_capture.png")
+            print(f"  → capture_tab_screenshot verified: saved {len(png_bytes)} bytes to /tmp/zelyr_tab_capture.png")
 
             # 3. Test fill_element on dropdown <select>
             res_select = await tool.execute({
@@ -191,7 +191,7 @@ async def test_live_bridge_deep_browser():
 
 async def main():
     print("=" * 60)
-    print("AXIOM TIER 2 DEEP BROWSER AUTOMATION SUITE")
+    print("Zelyr TIER 2 DEEP BROWSER AUTOMATION SUITE")
     print("=" * 60)
     test_static_background_js()
     test_tool_schema()

@@ -1,4 +1,4 @@
-"""Instruction parser for AXIOM brain.
+"""Instruction parser for Zelyr brain.
 
 Accepts multiple LLM tag formats and returns structured instructions.
 Supports:

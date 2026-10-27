@@ -27,20 +27,20 @@ _patch_tiktoken_for_pyinstaller()
 
 def _ensure_directories():
     """Sanity check startup paths."""
-    from axiom.config import initialize_directories
+    from zelyr.config import initialize_directories
+    from zelyr.compat import data_dir
     initialize_directories()
-    data_dir = Path.home() / ".local" / "share" / "axiom"
-    data_dir.mkdir(parents=True, exist_ok=True)
+    data_dir().mkdir(parents=True, exist_ok=True)
 
 
 def daemon_entry_point():
-    """Console script entry point for the AXIOM background daemon."""
-    from axiom.server.daemon import main as daemon_main
+    """Console script entry point for the Zelyr background daemon."""
+    from zelyr.server.daemon import main as daemon_main
     daemon_main()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="AXIOM - Local AI Assistant")
+    parser = argparse.ArgumentParser(description="Zelyr - Local AI Assistant")
     parser.add_argument("--model", default=None, help="Ollama model name (optional)")
     parser.add_argument("--verbose", "-v", action="store_true", help="Show raw LLM output (debug)")
     parser.add_argument("--system-prompt", "-s", default=None, help="Persistent system prompt to prepend to each query")
@@ -49,7 +49,7 @@ def main():
     args = parser.parse_args()
     
     if args.health_check:
-        print("AXIOM Health Check OK")
+        print("Zelyr Health Check OK")
         sys.exit(0)
         
     _ensure_directories()
@@ -57,10 +57,10 @@ def main():
     if args.gui:
         try:
             # We use the new PySide6 GUI if available
-            from axiom.gui.app import run_gui
+            from zelyr.gui.app import run_gui
             run_gui()
         except ImportError as e:
-            print(f"Error: AXIOM PySide6 GUI dependencies not available. {e}", file=sys.stderr)
+            print(f"Error: Zelyr PySide6 GUI dependencies not available. {e}", file=sys.stderr)
             try:
                 # Fallback to older Tkinter GUI
                 from ui.gui import run_gui
@@ -68,9 +68,9 @@ def main():
             except ImportError:
                 print("Run 'pip install PySide6' or use CLI mode.", file=sys.stderr)
     else:
-        # We might have axiom.cli or ui.cli
+        # We might have zelyr.cli or ui.cli
         try:
-            from axiom.api.cli import CLI
+            from zelyr.api.cli import CLI
             CLI().cmdloop()
         except ImportError:
             from ui.cli import run_repl
@@ -85,15 +85,16 @@ if __name__ == "__main__":
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as e:
-        crash_log = Path.home() / ".local" / "share" / "axiom" / "axiom_crash.log"
+        from zelyr.compat import data_dir
+        crash_log = data_dir() / "zelyr_crash.log"
         # Make sure directory exists even if it failed before _ensure_directories
         crash_log.parent.mkdir(parents=True, exist_ok=True)
         
         trace = traceback.format_exc()
-        print(f"\n[AXIOM FATAL CRASH]\n{trace}", file=sys.stderr)
+        print(f"\n[Zelyr FATAL CRASH]\n{trace}", file=sys.stderr)
         
         with open(crash_log, "w") as log_file:
-            log_file.write(f"AXIOM CRASH REPORT\n")
+            log_file.write(f"Zelyr CRASH REPORT\n")
             log_file.write(f"==================\n")
             log_file.write(trace)
             

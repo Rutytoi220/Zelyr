@@ -7,8 +7,8 @@ from unittest.mock import patch, MagicMock
 
 import httpx
 
-from axiom.agents.native_orchestrator import NativeOrchestrator
-from axiom.core.plugins import get_tool_schemas, filter_tool_schemas_by_tier, load_plugins
+from zelyr.agents.native_orchestrator import NativeOrchestrator
+from zelyr.core.plugins import get_tool_schemas, filter_tool_schemas_by_tier, load_plugins
 
 
 class TestContextBudgetFix(unittest.IsolatedAsyncioTestCase):

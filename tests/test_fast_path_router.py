@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from axiom.core.fast_path_router import FastPathPlan, FastestPathRouter
+from zelyr.core.fast_path_router import FastPathPlan, FastestPathRouter
 from instruction_parser import execute_instruction_fast_path, parse as parse_instruction
 
 
@@ -29,7 +29,7 @@ def guard_desktop_processes(monkeypatch):
 def test_url_routing(mock_browser):
     """Verify web URLs are intercepted and routed to xdg-open."""
     urls = [
-        "https://github.com/ChienGPT/Axiom",
+        "https://github.com/ChienGPT/Zelyr",
         "http://localhost:8080/dashboard",
         "www.google.com",
     ]
@@ -101,7 +101,7 @@ def test_instruction_parser_pure_gui_fallback():
 @pytest.mark.asyncio
 async def test_desktop_automation_tool_fast_path_interception():
     """Verify DesktopAutomationTool delegates fast path actions instead of calling motor controls."""
-    from axiom.tools.desktop_control import DesktopAutomationTool
+    from zelyr.tools.desktop_control import DesktopAutomationTool
 
     tool = DesktopAutomationTool()
     with patch("subprocess.Popen") as mock_popen, patch("webbrowser.open", return_value=True, create=True):

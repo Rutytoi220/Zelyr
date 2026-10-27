@@ -1,6 +1,6 @@
-# AXIOM Documentation Index & AI Navigation Map
+# Zelyr Documentation Index & AI Navigation Map
 
-Welcome to the technical documentation map for **AXIOM** (v1.0.0).  
+Welcome to the technical documentation map for **Zelyr** (v1.0.0).  
 This index serves as the primary navigation hub for software engineers and local coding agents (including smaller models running via OpenCode and Ollama) navigating the repository.
 
 Every statement, code path, and interface in these documents is grounded in verified source code, active configurations, and observed test executions.
@@ -11,11 +11,11 @@ Every statement, code path, and interface in these documents is grounded in veri
 
 | Developer Objective | Recommended Reading | Primary Source Files |
 | :--- | :--- | :--- |
-| **Trace a User Request** | [`ARCHITECTURE.md: Request Lifecycle`](ARCHITECTURE.md#2-request-lifecycle-execution-flow-verified) | [`axiom/cli/main.py`](../axiom/cli/main.py), [`axiom/agents/native_orchestrator.py`](../axiom/agents/native_orchestrator.py) |
-| **Add or Modify a Tool** | [`TOOLS.md: Tool Creation & Extension`](TOOLS.md) | [`axiom/core/plugins.py`](../axiom/core/plugins.py), [`axiom/tools/base.py`](../axiom/tools/base.py) |
-| **Understand Subsystems** | [`SUBSYSTEMS.md: Subsystem Catalog`](SUBSYSTEMS.md) | [`axiom/`](../axiom/) |
-| **Inspect Security & SSRF** | [`SECURITY.md: Security Architecture`](SECURITY.md) | [`axiom/security/network.py`](../axiom/security/network.py), [`axiom/tools/__init__.py`](../axiom/tools/__init__.py) |
-| **Manage Context & Tokens** | [`ARCHITECTURE.md: Context Budgeting`](ARCHITECTURE.md#4-context-budgeting-sliding-window-algorithm-verified) | [`axiom/config.py`](../axiom/config.py), [`axiom/agents/native_orchestrator.py`](../axiom/agents/native_orchestrator.py) |
+| **Trace a User Request** | [`ARCHITECTURE.md: Request Lifecycle`](ARCHITECTURE.md#2-request-lifecycle-execution-flow-verified) | [`zelyr/cli/main.py`](../zelyr/cli/main.py), [`zelyr/agents/native_orchestrator.py`](../zelyr/agents/native_orchestrator.py) |
+| **Add or Modify a Tool** | [`TOOLS.md: Tool Creation & Extension`](TOOLS.md) | [`zelyr/core/plugins.py`](../zelyr/core/plugins.py), [`zelyr/tools/base.py`](../zelyr/tools/base.py) |
+| **Understand Subsystems** | [`SUBSYSTEMS.md: Subsystem Catalog`](SUBSYSTEMS.md) | [`zelyr/`](../zelyr/) |
+| **Inspect Security & SSRF** | [`SECURITY.md: Security Architecture`](SECURITY.md) | [`zelyr/security/network.py`](../zelyr/security/network.py), [`zelyr/tools/__init__.py`](../zelyr/tools/__init__.py) |
+| **Manage Context & Tokens** | [`ARCHITECTURE.md: Context Budgeting`](ARCHITECTURE.md#4-context-budgeting-sliding-window-algorithm-verified) | [`zelyr/config.py`](../zelyr/config.py), [`zelyr/agents/native_orchestrator.py`](../zelyr/agents/native_orchestrator.py) |
 | **Run Tests & Verify Headless** | [`DEVELOPER_GUIDE.md: Testing`](DEVELOPER_GUIDE.md#2-testing-verification-standards-verified) | [`tests/`](../tests/), [`tests/conftest.py`](../tests/conftest.py), [`pyproject.toml`](../pyproject.toml) |
 | **Build Wheels & Bootstrap** | [`DEVELOPER_GUIDE.md: Release & Packaging`](DEVELOPER_GUIDE.md#4-packaging-distribution-bootstrapping-verified) | [`pyproject.toml`](../pyproject.toml), [`tests/test_install_bootstrap.py`](../tests/test_install_bootstrap.py) |
 | **Agent Operational Rules** | [`../AGENTS.md`](../AGENTS.md) | [`AGENTS.md`](../AGENTS.md) |
@@ -24,7 +24,7 @@ Every statement, code path, and interface in these documents is grounded in veri
 
 ## 2. Repository Topology & "Where to Look First"
 
-When tasked with investigating or modifying AXIOM, start at these verified entry points:
+When tasked with investigating or modifying Zelyr, start at these verified entry points:
 
 ```
 ChienGPT/
@@ -38,19 +38,19 @@ ChienGPT/
 │   ├── TOOLS.md               # Tool creation guide, dynamic plugin format, capability tiers
 │   ├── SECURITY.md            # SSRF protection, prompt injection boundaries, shell auth
 │   └── DEVELOPER_GUIDE.md     # Development workflows, test suites, headless requirements
-├── axiom/                     # Core application source code
+├── zelyr/                     # Core application source code
 │   ├── agents/                # Orchestration engines and actuator arbitration
 │   │   ├── native_orchestrator.py  # [VERIFIED] Active ReAct orchestrator used by CLI REPL/TUI
 │   │   ├── actuator_arbiter.py     # [VERIFIED] Dynamic 3-tier capability router (IPC/DOM/Vision)
 │   │   └── orchestrator_agent.py   # [PARTIALLY VERIFIED] Heavy state-machine agent
 │   ├── cli/                   # Console interfaces and user entry points
-│   │   ├── main.py            # [VERIFIED] Console script entry point (`axiom`)
+│   │   ├── main.py            # [VERIFIED] Console script entry point (`zelyr`)
 │   │   ├── repl.py            # [VERIFIED] Modern inline streaming CLI (Tokyo Night theme)
 │   │   └── tui.py             # [VERIFIED] Fullscreen OpenCode-tier TUI
 │   ├── config.py              # [VERIFIED] Configuration, path resolution, context clamping
 │   ├── core/                  # Kernel components, fast-path routing, and plugin loader
 │   │   ├── fast_path_router.py# [VERIFIED] Intercepts URL/app launches to bypass LLM
-│   │   ├── plugins.py         # [VERIFIED] Dynamic plugin loader (~/.config/axiom/tools.d/)
+│   │   ├── plugins.py         # [VERIFIED] Dynamic plugin loader (~/.config/zelyr/tools.d/)
 │   │   ├── events.py          # [VERIFIED] In-process synchronous/asynchronous EventBus
 │   │   └── transaction.py     # [VERIFIED] Workspace transaction and staging rollback
 │   ├── db/                    # Persistent storage engines
@@ -64,7 +64,7 @@ ChienGPT/
 │   ├── security/              # Security and network validation
 │   │   └── network.py         # [VERIFIED] SSRF guard, IP subnet validation, safe HTTP client
 │   ├── server/                # Headless background service
-│   │   └── daemon.py          # [VERIFIED] AxiomDaemonServer background WebSocket daemon (`axiomd`)
+│   │   └── daemon.py          # [VERIFIED] ZelyrDaemonServer background WebSocket daemon (`zelyrd`)
 │   └── tools/                 # Tool implementations and base definitions
 │       ├── base.py            # [VERIFIED] BaseTool, ToolParameter, ToolResult definitions
 │       ├── core.py            # [VERIFIED] ToolCapability metadata definitions

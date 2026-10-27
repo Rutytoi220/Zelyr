@@ -6,10 +6,10 @@ import os
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from axiom.core.plugins import get_tier_timeout
-from axiom.tools.hyprland_ipc import ManageDesktopWindowTool
-from axiom.tools.os_desktop import ManageMediaPlaybackTool, SendDesktopNotificationTool
-from axiom.tools.os_system import (
+from zelyr.core.plugins import get_tier_timeout
+from zelyr.tools.hyprland_ipc import ManageDesktopWindowTool
+from zelyr.tools.os_desktop import ManageMediaPlaybackTool, SendDesktopNotificationTool
+from zelyr.tools.os_system import (
     InspectNetworkTool,
     ManageSystemClipboardTool,
     ManageSystemProcessTool,
@@ -34,7 +34,7 @@ class TestSendDesktopNotificationTool(unittest.IsolatedAsyncioTestCase):
                 "title": "Build Finished",
                 "message": "All 146 tests passed successfully.",
                 "urgency": "low",
-                "app_name": "AXIOM-Test",
+                "app_name": "Zelyr-Test",
             })
 
             self.assertTrue(res.success)
@@ -47,7 +47,7 @@ class TestSendDesktopNotificationTool(unittest.IsolatedAsyncioTestCase):
                 "-u",
                 "low",
                 "-a",
-                "AXIOM-Test",
+                "Zelyr-Test",
                 "Build Finished",
                 "All 146 tests passed successfully.",
                 stdout=asyncio.subprocess.PIPE,

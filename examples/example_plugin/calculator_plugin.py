@@ -1,7 +1,7 @@
-"""Calculator plugin — an AXIOM v2 plugin example.
+"""Calculator plugin — an Zelyr v2 plugin example.
 
 This module replaces the legacy ``examples/example_custom_tool.py`` with the
-RFC-001 compliant ``AxiomPlugin`` structure.  It declares no special
+RFC-001 compliant ``ZelyrPlugin`` structure.  It declares no special
 permissions and cannot access the network, shell, or files outside its
 sandboxed workspace.
 """
@@ -10,7 +10,7 @@ import math
 import operator
 from typing import Any, Dict
 
-from axiom.plugins.axiom_plugin import AxiomPlugin, HookResult
+from zelyr.plugins.zelyr_plugin import ZelyrPlugin, HookResult
 
 
 # Safe operators and math functions available to the evaluator.
@@ -36,7 +36,7 @@ _SAFE_ENV: Dict[str, Any] = {
 }
 
 
-class CalculatorPlugin(AxiomPlugin):
+class CalculatorPlugin(ZelyrPlugin):
     """Sandboxed arithmetic calculator."""
 
     def on_load(self, context: Any) -> None:

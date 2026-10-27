@@ -1,4 +1,4 @@
-"""Settings Registry for AXIOM.
+"""Settings Registry for Zelyr.
 
 Defines the typed, centralized registry of all configurable settings.
 Supports metadata, validation, and future plugin-defined settings.
@@ -7,6 +7,8 @@ Supports metadata, validation, and future plugin-defined settings.
 from typing import Any, Callable, Optional, Dict, List, Protocol, runtime_checkable
 from enum import Enum
 import inspect
+from pathlib import Path
+from zelyr.compat import resolve_file
 
 
 @runtime_checkable
@@ -115,7 +117,7 @@ class SettingMetadata:
 
 
 class SettingsRegistry:
-    """Centralized typed registry of all AXIOM settings."""
+    """Centralized typed registry of all Zelyr settings."""
     
     def __init__(self):
         """Initialize the settings registry with built-in settings."""
@@ -123,7 +125,7 @@ class SettingsRegistry:
         self._register_builtin_settings()
     
     def _register_builtin_settings(self) -> None:
-        """Register all built-in AXIOM settings."""
+        """Register all built-in Zelyr settings."""
         
         # ============ OLLAMA SETTINGS ============
         self.register(SettingMetadata(
@@ -246,7 +248,7 @@ class SettingsRegistry:
             key="logging.file",
             category=SettingCategory.LOGGING,
             setting_type=str,
-            default="axiom.log",
+            default="zelyr.log",
             description="Log file path",
             mutable=True,
             requires_restart=False,
@@ -277,7 +279,7 @@ class SettingsRegistry:
             key="storage.db_path",
             category=SettingCategory.STORAGE,
             setting_type=str,
-            default="data/axiom.db",
+            default=str(resolve_file(Path("data/zelyr.db"), Path("data/axiom.db"))),
             description="SQLite database path",
             mutable=False,  # Should not change at runtime
             requires_restart=True,

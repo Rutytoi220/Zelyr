@@ -15,10 +15,10 @@ import contextlib
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from axiom.agents.native_orchestrator import NativeOrchestrator
-from axiom.tools.base import ToolResult
-from axiom.tools.browser_cdp import InteractWithBrowserTool
-from axiom.tools.browser_extension import BrowserResult
+from zelyr.agents.native_orchestrator import NativeOrchestrator
+from zelyr.tools.base import ToolResult
+from zelyr.tools.browser_cdp import InteractWithBrowserTool
+from zelyr.tools.browser_extension import BrowserResult
 
 
 class TestErrorEscalation(unittest.IsolatedAsyncioTestCase):
@@ -48,7 +48,7 @@ class TestErrorEscalation(unittest.IsolatedAsyncioTestCase):
         """Verify interact_with_browser emits structured failure envelopes with remedy hints."""
         tool = InteractWithBrowserTool()
 
-        with patch("axiom.tools.browser_extension.get_bridge") as mock_get_bridge:
+        with patch("zelyr.tools.browser_extension.get_bridge") as mock_get_bridge:
             mock_bridge = MagicMock()
             mock_bridge.is_connected.return_value = True
             mock_bridge.server = object()
@@ -86,7 +86,7 @@ class TestErrorEscalation(unittest.IsolatedAsyncioTestCase):
                 })
             )
 
-            res_fill = await tool.execute({"action": "fill_element", "element_id": 99, "text": "axiom"})
+            res_fill = await tool.execute({"action": "fill_element", "element_id": 99, "text": "zelyr"})
             self.assertFalse(res_fill.success)
             self.assertIn("Element ID 99 not found on page.", res_fill.error)
             self.assertEqual(
@@ -99,7 +99,7 @@ class TestErrorEscalation(unittest.IsolatedAsyncioTestCase):
         """Verify switch_tab failure envelope advises list_tabs or open_tab."""
         tool = InteractWithBrowserTool()
 
-        with patch("axiom.tools.browser_extension.get_bridge") as mock_get_bridge:
+        with patch("zelyr.tools.browser_extension.get_bridge") as mock_get_bridge:
             mock_bridge = MagicMock()
             mock_bridge.is_connected.return_value = True
             mock_bridge.server = object()
@@ -187,7 +187,7 @@ class TestErrorEscalation(unittest.IsolatedAsyncioTestCase):
             "messages": [{"role": "user", "content": "Click button 42 on the active web page"}],
         }
 
-        with patch("axiom.agents.native_orchestrator.execute_tool", side_effect=mock_execute), \
+        with patch("zelyr.agents.native_orchestrator.execute_tool", side_effect=mock_execute), \
              patch.object(orch, "get_active_window_context", return_value=None), \
              patch("httpx.AsyncClient") as mock_client:
 
@@ -283,7 +283,7 @@ class TestErrorEscalation(unittest.IsolatedAsyncioTestCase):
             "messages": [{"role": "user", "content": "Switch to my reddit tab"}],
         }
 
-        with patch("axiom.agents.native_orchestrator.execute_tool", side_effect=mock_execute), \
+        with patch("zelyr.agents.native_orchestrator.execute_tool", side_effect=mock_execute), \
              patch.object(orch, "get_active_window_context", return_value=None), \
              patch("httpx.AsyncClient") as mock_client:
 

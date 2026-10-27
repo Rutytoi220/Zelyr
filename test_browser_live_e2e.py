@@ -1,19 +1,19 @@
 import asyncio
 from pathlib import Path
 from playwright.async_api import async_playwright
-from axiom.tools.browser_extension import get_bridge
-from axiom.tools.browser_cdp import InteractWithBrowserTool
+from zelyr.tools.browser_extension import get_bridge
+from zelyr.tools.browser_cdp import InteractWithBrowserTool
 
-EXT_DIR = Path(__file__).resolve().parent / "axiom" / "tools" / "extension"
+EXT_DIR = Path(__file__).resolve().parent / "zelyr" / "tools" / "extension"
 
 async def main():
-    print("[1/5] Starting AXIOM WebSocket daemon on 127.0.0.1:41144...")
+    print("[1/5] Starting Zelyr WebSocket daemon on 127.0.0.1:41144...")
     bridge = get_bridge()
     asyncio.create_task(bridge.start_server())
     await asyncio.sleep(0.3)
 
     print(f"[2/5] Launching Playwright Chromium with unpacked extension from {EXT_DIR}...")
-    user_data_dir = Path("/tmp/playwright_axiom_profile")
+    user_data_dir = Path("/tmp/playwright_zelyr_profile")
     if user_data_dir.exists():
         import shutil
         shutil.rmtree(user_data_dir, ignore_errors=True)
@@ -50,7 +50,7 @@ async def main():
             await bridge.stop_server()
             return
 
-        print("✓ Extension connected to AXIOM daemon.")
+        print("✓ Extension connected to Zelyr daemon.")
 
         print("[4/5] Opening test tabs (DuckDuckGo & Gemini)...")
         page_ddg = await context.new_page()

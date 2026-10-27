@@ -1,12 +1,12 @@
-"""Regression tests for ``axiom.api.cli`` system initialization.
+"""Regression tests for ``zelyr.api.cli`` system initialization.
 
 The post-cleanup audit found that ``CLI._register_tools`` imported a module
-(``axiom.tools.vision_tools``) and a class (``VisionCaptureTool``) that no
+(``zelyr.tools.vision_tools``) and a class (``VisionCaptureTool``) that no
 longer exist.  Because ``_init_system`` is called from ``CLI.__init__``, every
 construction of the CLI failed — including the core subsystem of the
-``axiomd`` daemon and the legacy ``main.py`` entry point.
+``zelyrd`` daemon and the legacy ``main.py`` entry point.
 
-A second startup blocker was found while repairing it: ``axiom.core.routine``
+A second startup blocker was found while repairing it: ``zelyr.core.routine``
 imports ``croniter`` at module scope and that package is not a declared
 dependency, so an optional scheduling backend made the whole CLI unusable.
 """
@@ -24,7 +24,7 @@ import pytest
 def cli(tmp_path, monkeypatch):
     """Construct the real CLI with its home directory isolated to a temp dir."""
     monkeypatch.chdir(tmp_path)
-    from axiom.api.cli import CLI
+    from zelyr.api.cli import CLI
 
     instance = CLI()
     try:
@@ -42,10 +42,10 @@ def test_cli_initializes_and_registers_replacement_vision_tools(cli):
     assert "vision_capture" not in tools
 
     screen_capture = cli.engine.registry.get_tool("screen_capture")
-    assert type(screen_capture).__module__ == "axiom.tools"
+    assert type(screen_capture).__module__ == "zelyr.tools"
 
     interact_with_ui = cli.engine.registry.get_tool("interact_with_ui")
-    assert type(interact_with_ui).__module__ == "axiom.tools.vision"
+    assert type(interact_with_ui).__module__ == "zelyr.tools.vision"
 
 
 def test_cli_starts_when_optional_cron_backend_is_missing(tmp_path, monkeypatch):
@@ -53,9 +53,9 @@ def test_cli_starts_when_optional_cron_backend_is_missing(tmp_path, monkeypatch)
     monkeypatch.chdir(tmp_path)
     # Force ``import croniter`` to raise ImportError even if it is installed.
     monkeypatch.setitem(sys.modules, "croniter", None)
-    monkeypatch.delitem(sys.modules, "axiom.core.routine", raising=False)
+    monkeypatch.delitem(sys.modules, "zelyr.core.routine", raising=False)
 
-    from axiom.api.cli import CLI
+    from zelyr.api.cli import CLI
 
     instance = CLI()
     try:
@@ -81,7 +81,7 @@ def test_cmdloop_eof_terminates_cleanly(cli):
     output = _run_cmdloop(cli, "")
 
     assert cli._closed is True
-    assert "Shutting down AXIOM..." in output
+    assert "Shutting down Zelyr..." in output
     assert "Goodbye!" in output
 
 
@@ -109,5 +109,5 @@ def test_cmdloop_ordinary_command_runs_then_eof_exits(cli):
     """Normal commands execute and are followed by a clean EOF shutdown."""
     output = _run_cmdloop(cli, "/help\n")
 
-    assert "AXIOM Commands" in output
+    assert "Zelyr Commands" in output
     assert "Goodbye!" in output

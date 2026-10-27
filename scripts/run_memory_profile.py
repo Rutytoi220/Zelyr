@@ -1,11 +1,11 @@
 import asyncio
 import tracemalloc
 import time
-from axiom.agents.orchestrator_agent import OrchestratorAgent
-from axiom.config import get_config
+from zelyr.agents.orchestrator_agent import OrchestratorAgent
+from zelyr.config import get_config
 
 async def profile_memory():
-    print("[*] Starting AXIOM Memory Leak Profiling...")
+    print("[*] Starting Zelyr Memory Leak Profiling...")
     tracemalloc.start()
     
     agent = OrchestratorAgent()

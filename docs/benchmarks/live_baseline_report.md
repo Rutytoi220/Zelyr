@@ -1,4 +1,4 @@
-# AXIOM Live Benchmark Baseline Report
+# Zelyr Live Benchmark Baseline Report
 
 **Execution Date:** 2026-10-10  
 **Target:** Local-Model Autonomous Tool Dispatch, Telemetry & Multi-Turn Resilience  
@@ -9,7 +9,7 @@
 
 ## 1. Executive Summary & Verification Milestones
 
-This report presents the ground-truth benchmark results executed against local Ollama models on consumer hardware (RTX 4060 Laptop, 8GB VRAM) before and after the AXIOM runtime fix.
+This report presents the ground-truth benchmark results executed against local Ollama models on consumer hardware (RTX 4060 Laptop, 8GB VRAM) before and after the Zelyr runtime fix.
 
 ### Key Milestones Proven by Empirical Execution:
 1. **CUDA OOM Elimination on 8B Models (`qwen3:8b`):**
@@ -32,7 +32,7 @@ This report presents the ground-truth benchmark results executed against local O
 | **NVIDIA Driver** | 580.95.05 / CUDA 13.0 |
 | **Ollama Daemon** | version 0.40.1 (`http://127.0.0.1:11434`) |
 | **Python Runtime** | CPython 3.11.15 via `uv` |
-| **Benchmark Harness** | `axiom.eval` (Phase 1/2/3 Deterministic & Live Engine) |
+| **Benchmark Harness** | `zelyr.eval` (Phase 1/2/3 Deterministic & Live Engine) |
 | **Active Context Budget** | 8,192 tokens (`ollama_num_ctx: 8192`) |
 
 ---
@@ -61,7 +61,7 @@ This report presents the ground-truth benchmark results executed against local O
 ### A. Resolution of the 8B CUDA OOM Failure (`qwen3:8b`)
 - **Root Cause Confirmed:** In `NativeOrchestrator.generate_stream()` and `LiveOllamaStreamAdapter`, options were forcibly overridden to `num_ctx: 32768`. Allocating a 32K context buffer in llama.cpp requires approximately 4.83 GB of VRAM. Combined with the 5.2 GB model footprint of `qwen3:8b`, the total required memory exceeded 10.0 GB, causing immediate CUDA out-of-memory errors on the 8 GB RTX 4060 GPU.
 - **Verification Evidence:**
-  - With the context window unified and clamped to `num_ctx: 8192` in `axiom/config.py`, GPU VRAM allocation during inference remained under ~6.5 GB.
+  - With the context window unified and clamped to `num_ctx: 8192` in `zelyr/config.py`, GPU VRAM allocation during inference remained under ~6.5 GB.
   - Zero CUDA OOM exceptions occurred across all Level 2 and Level 3 runs.
   - In `task_live_metric_formatting`, `qwen3:8b` performed 3 complete ReAct turns, generating 11,162 measured tokens at 24.62 seconds total duration, successfully producing the required `summary.json` artifact matching ground-truth numerical calculations (`avg_latency=200`, `total_errors=1`).
 

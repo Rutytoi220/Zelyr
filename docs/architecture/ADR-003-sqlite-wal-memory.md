@@ -2,19 +2,19 @@
 
 **Status:** Accepted  
 **Date:** 2026-07-18  
-**Authors:** AXIOM Core Team
+**Authors:** Zelyr Core Team
 
 ---
 
 ## Context
 
-AXIOM's AI agents require persistent semantic memory: the ability to store conversation history, episodic summaries, tool execution traces, and embedding vectors, then retrieve them via both key-value lookup and cosine similarity search. This is the foundation that allows AXIOM to "remember" across sessions and perform contextual retrieval-augmented generation (RAG).
+Zelyr's AI agents require persistent semantic memory: the ability to store conversation history, episodic summaries, tool execution traces, and embedding vectors, then retrieve them via both key-value lookup and cosine similarity search. This is the foundation that allows Zelyr to "remember" across sessions and perform contextual retrieval-augmented generation (RAG).
 
 We evaluated the following storage strategies:
 
-1. **Cloud vector databases (Pinecone, Weaviate, Milvus).** Industry-standard for production RAG pipelines. However, they require network connectivity, API keys, and ongoing subscription costs. This fundamentally violates AXIOM's local-first, offline-capable philosophy. A user's private conversation history must never leave their machine.
+1. **Cloud vector databases (Pinecone, Weaviate, Milvus).** Industry-standard for production RAG pipelines. However, they require network connectivity, API keys, and ongoing subscription costs. This fundamentally violates Zelyr's local-first, offline-capable philosophy. A user's private conversation history must never leave their machine.
 2. **PostgreSQL + pgvector.** Powerful, but requires a running PostgreSQL server. Unacceptable overhead for a desktop application.
-3. **Local SQLite + embedded vector store.** Zero-configuration, single-file persistence, crash-resilient with WAL journaling. The database is just a file in `~/.axiom/` that the user owns completely.
+3. **Local SQLite + embedded vector store.** Zero-configuration, single-file persistence, crash-resilient with WAL journaling. The database is just a file in `~/.zelyr/` that the user owns completely.
 
 For the vector similarity layer specifically, we needed a strategy that scales from "first install with zero dependencies" to "power user with optimized HNSW indexing":
 
@@ -26,7 +26,7 @@ For the vector similarity layer specifically, we needed a strategy that scales f
 
 We implemented a three-tier storage architecture:
 
-### Tier 1: SQLite with WAL Journaling ([database.py](file:///home/rutytoi/Documents/ChienGPT/axiom/core/database.py))
+### Tier 1: SQLite with WAL Journaling ([db/memory.py](../../zelyr/db/memory.py))
 
 All structured data — conversations, messages, events, agent sessions, tool calls, and raw embedding blobs — is stored in a single SQLite database with explicit crash-resilience configuration:
 
@@ -37,7 +37,7 @@ await conn.execute("PRAGMA cache_size = -10000;")     # 10MB page cache
 await conn.execute("PRAGMA busy_timeout = 5000;")     # 5-second retry on lock contention
 ```
 
-The schema ([schema.sql](file:///home/rutytoi/Documents/ChienGPT/axiom/memory/schema.sql)) defines 7 tables with 16 indexes:
+The schema ([schema.sql](../../zelyr/memory/schema.sql)) defines 7 tables with 16 indexes:
 
 | Table | Purpose |
 |-------|---------|
@@ -49,7 +49,7 @@ The schema ([schema.sql](file:///home/rutytoi/Documents/ChienGPT/axiom/memory/sc
 | `messages` | Conversation history with metadata |
 | `embeddings` | Raw embedding vectors (JSON-serialized) |
 
-### Tier 2: Vectorized NumPy Cosine Similarity ([semantic.py](file:///home/rutytoi/Documents/ChienGPT/axiom/memory/semantic.py))
+### Tier 2: Vectorized NumPy Cosine Similarity ([semantic.py](../../zelyr/memory/semantic.py))
 
 The fallback search path loads all embeddings from the `embeddings` table into a NumPy matrix and performs fully vectorized cosine similarity in a single pass:
 
@@ -61,7 +61,7 @@ similarities = np.dot(s_matrix, q_vec) / (s_norms * q_norm)
 
 This approach has zero external dependencies and achieves microsecond retrieval times for collections under ~50,000 vectors.
 
-### Tier 3: Optional HNSW Vector Stores ([vector_store.py](file:///home/rutytoi/Documents/ChienGPT/axiom/memory/vector_store.py))
+### Tier 3: Optional HNSW Vector Stores ([vector_store.py](../../zelyr/memory/vector_store.py))
 
 A `BaseVectorStore` protocol defines the contract:
 
@@ -74,14 +74,14 @@ class BaseVectorStore(Protocol):
 ```
 
 Two concrete implementations are provided:
-- **`QdrantLocalStore`** — Persists to `~/.axiom/vector_db/` using Qdrant's embedded Rust engine. Handles stale lock file recovery automatically.
-- **`ChromaDBStore`** — Persists to `~/.local/share/axiom/chromadb/` using ChromaDB's embedded engine.
+- **`QdrantLocalStore`** — Persists to `~/.zelyr/vector_db/` using Qdrant's embedded Rust engine. Handles stale lock file recovery automatically.
+- **`ChromaDBStore`** — Persists to `~/.local/share/zelyr/chromadb/` using ChromaDB's embedded engine.
 
 The `SemanticIndex` class auto-detects available backends at initialization:
 
 ```python
 try:
-    from axiom.memory.vector_store import QdrantLocalStore
+    from zelyr.memory.vector_store import QdrantLocalStore
     self._vector_store = QdrantLocalStore()
 except ImportError:
     logger.warning("Falling back to NumPy+SQLite.")
@@ -89,7 +89,7 @@ except ImportError:
 
 ### Memory Lifecycle: The Sleep Cycle
 
-The `SleepCycleDaemon` ([sleep_cycle.py](file:///home/rutytoi/Documents/ChienGPT/axiom/memory/sleep_cycle.py)) monitors EventBus activity and triggers two maintenance operations when the system has been idle for 15 minutes:
+The `SleepCycleDaemon` ([sleep_cycle.py](../../zelyr/memory/sleep_cycle.py)) monitors EventBus activity and triggers two maintenance operations when the system has been idle for 15 minutes:
 
 1. **Episodic Consolidation** — The last 50 messages are compressed by the LLM into a structured JSON summary (`key_facts` + `user_preferences`) and stored as an `episodic_summary` memory. The conversation is then rotated to prevent unbounded context growth.
 2. **Memory Compaction** — The `MemoryCompactor` scans for expired TTL entries, duplicate embeddings, and orphaned records, then prunes them.
@@ -113,7 +113,7 @@ Memories tagged `core_belief` are exempt from decay, ensuring foundational user 
 - **Zero-configuration first boot.** A new user gets working semantic memory immediately — no database server, no API keys, no cloud signup. The SQLite file is created automatically.
 - **Microsecond retrieval.** For collections under 50K vectors, the vectorized NumPy fallback completes full-index cosine similarity in under 1ms. This is faster than the network round-trip to any cloud vector database.
 - **Progressive enhancement.** Power users who install `qdrant-client` automatically get HNSW-indexed approximate nearest neighbor search without changing any configuration. The upgrade path is `pip install qdrant-client` and restart.
-- **Full user data sovereignty.** All memory lives in `~/.axiom/` and `~/.local/share/axiom/`. No data ever leaves the machine. Users can back up, inspect, or delete their entire memory with standard filesystem tools.
+- **Full user data sovereignty.** All memory lives in `~/.zelyr/` and `~/.local/share/zelyr/`. No data ever leaves the machine. Users can back up, inspect, or delete their entire memory with standard filesystem tools.
 
 ### Negative
 

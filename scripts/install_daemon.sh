@@ -14,14 +14,14 @@ else
     RUN_GROUP=$(id -gn "$RUN_USER")
 fi
 
-echo "Installing AXIOM Node daemon to run as user: $RUN_USER"
+echo "Installing Zelyr Node daemon to run as user: $RUN_USER"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-NODE_SCRIPT="$PROJECT_ROOT/axiom-node.py"
+NODE_SCRIPT="$PROJECT_ROOT/zelyr-node.py"
 
 if [ ! -f "$NODE_SCRIPT" ]; then
-    echo "Error: Could not find axiom-node.py at $NODE_SCRIPT"
+    echo "Error: Could not find zelyr-node.py at $NODE_SCRIPT"
     exit 1
 fi
 
@@ -39,13 +39,13 @@ else
     fi
 fi
 
-SERVICE_FILE="/etc/systemd/system/axiom-node.service"
+SERVICE_FILE="/etc/systemd/system/zelyr-node.service"
 
 echo "Generating systemd service file at $SERVICE_FILE..."
 
 cat <<EOF > "$SERVICE_FILE"
 [Unit]
-Description=AXIOM Headless Remote Swarm Node
+Description=Zelyr Headless Remote Swarm Node
 After=network.target
 
 [Service]
@@ -64,13 +64,13 @@ EOF
 echo "Reloading systemd daemon..."
 systemctl daemon-reload
 
-echo "Enabling axiom-node.service..."
-systemctl enable axiom-node.service
+echo "Enabling zelyr-node.service..."
+systemctl enable zelyr-node.service
 
-echo "Starting axiom-node.service..."
-systemctl restart axiom-node.service
+echo "Starting zelyr-node.service..."
+systemctl restart zelyr-node.service
 
 echo ""
-echo "AXIOM Node daemon installed and started successfully!"
-echo "Check status with: sudo systemctl status axiom-node.service"
-echo "View logs with: sudo journalctl -u axiom-node.service -f"
+echo "Zelyr Node daemon installed and started successfully!"
+echo "Check status with: sudo systemctl status zelyr-node.service"
+echo "View logs with: sudo journalctl -u zelyr-node.service -f"

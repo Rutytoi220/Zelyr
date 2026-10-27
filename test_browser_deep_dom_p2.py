@@ -16,8 +16,8 @@ import subprocess
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from axiom.tools.browser_cdp import InteractWithBrowserTool
-from axiom.tools.browser_extension import BrowserExtensionBridge, BrowserResult
+from zelyr.tools.browser_cdp import InteractWithBrowserTool
+from zelyr.tools.browser_extension import BrowserExtensionBridge, BrowserResult
 
 
 def _run_node(script: str) -> dict:
@@ -40,11 +40,11 @@ class TestBrowserDeepDomP2(unittest.IsolatedAsyncioTestCase):
     def test_open_shadow_dom_discovery_in_snapshot(self):
         """Simulate a custom web component with an open shadow root containing a button.
 
-        Verify get_page_snapshot discovers the button, stamps a data-axiom-id,
-        and includes it in the snapshot summary and __axiomFingerprints.
+        Verify get_page_snapshot discovers the button, stamps a data-zelyr-id,
+        and includes it in the snapshot summary and __zelyrFingerprints.
         """
         js_code = """
-const { collectInteractiveElements, handleCommand } = require('./axiom/tools/extension/background.js');
+const { collectInteractiveElements, handleCommand } = require('./zelyr/tools/extension/background.js');
 
 class MockElement {
   constructor(tag, attrs = {}, text = '') {
@@ -119,7 +119,7 @@ global.document = {
 
 global.window = {
   location: { href: 'http://localhost/test' },
-  __axiomFingerprints: {}
+  __zelyrFingerprints: {}
 };
 
 let capturedReply = null;
@@ -135,7 +135,7 @@ global.chrome = {
   }
 };
 
-global.__axiomSendReplyHook = (reply) => { capturedReply = reply; };
+global.__zelyrSendReplyHook = (reply) => { capturedReply = reply; };
 
 async function run() {
   await handleCommand({ id: 101, action: 'get_page_snapshot' });
@@ -144,8 +144,8 @@ async function run() {
     count: capturedReply.count,
     elements: capturedReply.elements,
     summary: capturedReply.summary,
-    shadowBtnAxiomId: shadowBtn.getAttribute('data-axiom-id'),
-    fingerprints: global.window.__axiomFingerprints
+    shadowBtnZelyrId: shadowBtn.getAttribute('data-zelyr-id'),
+    fingerprints: global.window.__zelyrFingerprints
   }));
 }
 run();
@@ -153,23 +153,23 @@ run();
         result = _run_node(js_code)
         self.assertTrue(result["success"])
         self.assertEqual(result["count"], 2)
-        # Verify shadow button discovered and assigned transient data-axiom-id
-        self.assertEqual(result["shadowBtnAxiomId"], "2")
+        # Verify shadow button discovered and assigned transient data-zelyr-id
+        self.assertEqual(result["shadowBtnZelyrId"], "2")
         # Verify shadow button appears in snapshot summary
         self.assertIn("<button", result["summary"])
         self.assertIn('"Shadow Action"', result["summary"])
-        # Verify indexed into __axiomFingerprints
+        # Verify indexed into __zelyrFingerprints
         self.assertIn("2", result["fingerprints"])
         self.assertEqual(result["fingerprints"]["2"]["tag"], "button")
         self.assertEqual(result["fingerprints"]["2"]["textSnippet"], "Shadow Action")
 
     def test_click_element_inside_open_shadow_root(self):
-        """Simulate clicking a button located inside an open shadow root via its data-axiom-id.
+        """Simulate clicking a button located inside an open shadow root via its data-zelyr-id.
 
         Verify element resolution locates the shadow button and triggers click cleanly.
         """
         js_code = """
-const { handleCommand } = require('./axiom/tools/extension/background.js');
+const { handleCommand } = require('./zelyr/tools/extension/background.js');
 
 class MockElement {
   constructor(tag, attrs = {}, text = '') {
@@ -192,7 +192,7 @@ class MockElement {
   getRootNode() { return global.shadow; }
   _matches(sel) {
     if (sel === '*') return true;
-    if (sel.includes('[data-axiom-id="3"]') && this.attrs['data-axiom-id'] === '3') return true;
+    if (sel.includes('[data-zelyr-id="3"]') && this.attrs['data-zelyr-id'] === '3') return true;
     return false;
   }
   querySelectorAll(sel) {
@@ -231,7 +231,7 @@ class MockShadowRoot {
 const host = new MockElement('modal-dialog');
 const shadow = new MockShadowRoot('open');
 global.shadow = shadow;
-const shadowSubmitBtn = new MockElement('button', { 'data-axiom-id': '3', role: 'button' }, 'Confirm Order');
+const shadowSubmitBtn = new MockElement('button', { 'data-zelyr-id': '3', role: 'button' }, 'Confirm Order');
 shadow.children.push(shadowSubmitBtn);
 host.shadowRoot = shadow;
 
@@ -248,7 +248,7 @@ global.document = {
 };
 
 global.window = {
-  __axiomFingerprints: {
+  __zelyrFingerprints: {
     3: { tag: 'button', role: 'button', textSnippet: 'Confirm Order' }
   }
 };
@@ -263,7 +263,7 @@ global.chrome = {
     }
   }
 };
-global.__axiomSendReplyHook = (reply) => { capturedReply = reply; };
+global.__zelyrSendReplyHook = (reply) => { capturedReply = reply; };
 
 async function run() {
   await handleCommand({ id: 102, action: 'click_element', element_id: 3 });
@@ -283,13 +283,13 @@ run();
         self.assertTrue(result["btnClicked"])
 
     def test_stale_shadow_element_recovers_via_fingerprint(self):
-        """Remount a shadow DOM component where data-axiom-id is stripped.
+        """Remount a shadow DOM component where data-zelyr-id is stripped.
 
         Verify fingerprint fallback successfully traverses the shadow root
         and recovers the replacement element.
         """
         js_code = """
-const { resolveElement } = require('./axiom/tools/extension/background.js');
+const { resolveElement } = require('./zelyr/tools/extension/background.js');
 
 class MockElement {
   constructor(tag, attrs = {}, text = '') {
@@ -336,7 +336,7 @@ class MockShadowRoot {
 }
 
 global.window = {
-  __axiomFingerprints: {
+  __zelyrFingerprints: {
     5: {
       tag: 'button',
       role: 'button',
@@ -348,7 +348,7 @@ global.window = {
   }
 };
 
-// Remounted custom host with new shadow root and button without data-axiom-id
+// Remounted custom host with new shadow root and button without data-zelyr-id
 const host = new MockElement('payment-widget');
 const shadow = new MockShadowRoot('open');
 const remountedShadowBtn = new MockElement('button', {
@@ -372,13 +372,13 @@ const res = resolveElement(null, 5);
 
 console.log(JSON.stringify({
   success: res.element !== null,
-  newAxiomId: remountedShadowBtn.getAttribute('data-axiom-id'),
+  newZelyrId: remountedShadowBtn.getAttribute('data-zelyr-id'),
   errorResult: res.errorResult
 }));
 """
         result = _run_node(js_code)
         self.assertTrue(result["success"])
-        self.assertEqual(result["newAxiomId"], "5")
+        self.assertEqual(result["newZelyrId"], "5")
         self.assertIsNone(result["errorResult"])
 
     def test_accessible_iframe_discovery(self):
@@ -388,7 +388,7 @@ console.log(JSON.stringify({
         in the page snapshot with sequential IDs.
         """
         js_code = """
-const { handleCommand } = require('./axiom/tools/extension/background.js');
+const { handleCommand } = require('./zelyr/tools/extension/background.js');
 
 class MockElement {
   constructor(tag, attrs = {}, text = '') {
@@ -459,7 +459,7 @@ global.document = {
 
 global.window = {
   location: { href: 'http://localhost/frame-test' },
-  __axiomFingerprints: {}
+  __zelyrFingerprints: {}
 };
 
 let capturedReply = null;
@@ -472,7 +472,7 @@ global.chrome = {
     }
   }
 };
-global.__axiomSendReplyHook = (reply) => { capturedReply = reply; };
+global.__zelyrSendReplyHook = (reply) => { capturedReply = reply; };
 
 async function run() {
   await handleCommand({ id: 103, action: 'get_page_snapshot' });
@@ -502,7 +502,7 @@ run();
         and annotates the restricted iframe in the summary.
         """
         js_code = """
-const { handleCommand } = require('./axiom/tools/extension/background.js');
+const { handleCommand } = require('./zelyr/tools/extension/background.js');
 
 class MockElement {
   constructor(tag, attrs = {}, text = '') {
@@ -568,7 +568,7 @@ global.document = {
 
 global.window = {
   location: { href: 'http://localhost/cross' },
-  __axiomFingerprints: {}
+  __zelyrFingerprints: {}
 };
 
 let capturedReply = null;
@@ -581,7 +581,7 @@ global.chrome = {
     }
   }
 };
-global.__axiomSendReplyHook = (reply) => { capturedReply = reply; };
+global.__zelyrSendReplyHook = (reply) => { capturedReply = reply; };
 
 async function run() {
   await handleCommand({ id: 104, action: 'get_page_snapshot' });
@@ -609,7 +609,7 @@ run();
         and safely handles circular references.
         """
         js_code = """
-const { collectInteractiveElements } = require('./axiom/tools/extension/background.js');
+const { collectInteractiveElements } = require('./zelyr/tools/extension/background.js');
 
 class MockElement {
   constructor(tag, attrs = {}, text = '') {
@@ -721,7 +721,7 @@ console.log(JSON.stringify({
             elements=[{"id": 1, "tag": "button"}]
         ))
 
-        with patch("axiom.tools.browser_extension.get_bridge", return_value=mock_bridge):
+        with patch("zelyr.tools.browser_extension.get_bridge", return_value=mock_bridge):
             res = await tool.execute({"action": "get_page_snapshot"})
             self.assertTrue(res.success)
             self.assertEqual(res.output, "[1] <button>")

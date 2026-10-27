@@ -1,4 +1,4 @@
-"""Context memory system for AXIOM - tracks running apps and active windows/tabs."""
+"""Context memory system for Zelyr - tracks running apps and active windows/tabs."""
 
 import time
 import subprocess
@@ -14,7 +14,7 @@ _MAX_HISTORY = 50
 
 
 class ContextMemory:
-    """Lightweight in-memory context tracker for AXIOM."""
+    """Lightweight in-memory context tracker for Zelyr."""
     
     def __init__(self):
         """Initialize the context memory."""

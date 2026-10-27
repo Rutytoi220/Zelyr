@@ -26,24 +26,24 @@ Before modifying code or running commands:
    - **Test Framework:** `pytest` (`uv run pytest -v`).
    - **Linter & Formatter:** `ruff` (`uv run ruff check .`).
 4. **Mandatory Project Commands:**
-   - **Full Test Suite:** `uv run pytest -v` (runs all 61 consolidated tests across `tests/test_*.py`).
+   - **Full Test Suite:** `uv run pytest -v` (runs the consolidated test suite in `tests/test_*.py`).
    - **Static Linter Audit:** `uv run ruff check .`
-   - **CLI Smoke Test:** `uv run axiom --help`
+   - **CLI Smoke Test:** `uv run zelyr --help`
 5. **Verified "Where to Look First" Repository Topology:**
-   - **Entry Points:** [`axiom/cli/main.py`](axiom/cli/main.py) (CLI dispatch), [`axiom/cli/repl.py`](axiom/cli/repl.py) (Inline REPL), [`axiom/server/daemon.py`](axiom/server/daemon.py) (Daemon).
-   - **Active ReAct Orchestrator:** [`axiom/agents/native_orchestrator.py`](axiom/agents/native_orchestrator.py).
-   - **Actuator Routing & Negative Gating:** [`axiom/agents/actuator_arbiter.py`](axiom/agents/actuator_arbiter.py), [`axiom/core/fast_path_router.py`](axiom/core/fast_path_router.py).
-   - **Dynamic Tools Directory:** `~/.config/axiom/tools.d/` (configured in [`axiom/core/plugins.py`](axiom/core/plugins.py)).
-   - **SSRF & Network Security:** [`axiom/security/network.py`](axiom/security/network.py).
-   - **Shell Execution Authorization:** [`axiom/tools/__init__.py`](axiom/tools/__init__.py) (`_request_shell_authorization`).
-   - **Configuration & Context Precedence:** [`axiom/config.py`](axiom/config.py).
-   - **Swarm Blackboard:** [`axiom/memory/blackboard.py`](axiom/memory/blackboard.py).
+   - **Entry Points:** [`zelyr/cli/main.py`](zelyr/cli/main.py) (CLI dispatch), [`zelyr/cli/repl.py`](zelyr/cli/repl.py) (Inline REPL), [`zelyr/server/daemon.py`](zelyr/server/daemon.py) (Daemon).
+   - **Active ReAct Orchestrator:** [`zelyr/agents/native_orchestrator.py`](zelyr/agents/native_orchestrator.py).
+   - **Actuator Routing & Negative Gating:** [`zelyr/agents/actuator_arbiter.py`](zelyr/agents/actuator_arbiter.py), [`zelyr/core/fast_path_router.py`](zelyr/core/fast_path_router.py).
+   - **Dynamic Tools Directory:** `~/.config/zelyr/tools.d/` (configured in [`zelyr/core/plugins.py`](zelyr/core/plugins.py)).
+   - **SSRF & Network Security:** [`zelyr/security/network.py`](zelyr/security/network.py).
+   - **Shell Execution Authorization:** [`zelyr/tools/__init__.py`](zelyr/tools/__init__.py) (`_request_shell_authorization`).
+   - **Configuration & Context Precedence:** [`zelyr/config.py`](zelyr/config.py).
+   - **Swarm Blackboard:** [`zelyr/memory/blackboard.py`](zelyr/memory/blackboard.py).
    - **Consolidated Test Battery:** [`tests/`](tests/) (configured via [`pyproject.toml`](pyproject.toml)).
 6. **Non-Negotiable Headless & Isolation Safeguards:**
    - **Headless Only:** Tests must run without opening browser windows or desktop popups. Calls to `webbrowser.open` and subprocesses must be mocked.
    - **Zero Unprompted Git Mutations:** Never run `git add`, `git commit`, `git push`, or `git reset` unless explicitly ordered by the user. Leave changes unstaged in the working tree.
    - **Preserve Pre-Existing Work:** Never overwrite, delete, or absorb pre-existing files without explicit instruction.
-   - **Fail-Closed Security:** Shell commands must fail closed in non-interactive sessions unless `AXIOM_TESTING=1` or `AXIOM_AUTOPILOT=1` is explicitly set.
+   - **Fail-Closed Security:** Shell commands must fail closed in non-interactive sessions unless `ZELYR_TESTING=1` or `ZELYR_AUTOPILOT=1` is explicitly set.
 
 ---
 

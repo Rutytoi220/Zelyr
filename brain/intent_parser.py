@@ -1,4 +1,4 @@
-"""Improved intent parser for AXIOM - converts natural language to multi-step actions."""
+"""Improved intent parser for Zelyr - converts natural language to multi-step actions."""
 
 import re
 from typing import List, Dict, Optional, Tuple

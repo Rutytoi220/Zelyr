@@ -1,4 +1,4 @@
-"""Verification Harness for AXIOM Browser Extension & Local WebSocket Bridge."""
+"""Verification Harness for Zelyr Browser Extension & Local WebSocket Bridge."""
 
 import asyncio
 import contextlib
@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 import websockets
 
-from axiom.tools.browser_extension import (
+from zelyr.tools.browser_extension import (
     BrowserExtensionBridge,
     get_bridge,
     interact_with_browser,
@@ -17,7 +17,7 @@ from axiom.tools.browser_extension import (
 
 def test_extension_scaffold():
     print("[CHECK 1] Testing WebExtension Scaffold Files...")
-    ext_dir = Path(__file__).parent / "axiom" / "tools" / "extension"
+    ext_dir = Path(__file__).parent / "zelyr" / "tools" / "extension"
     assert ext_dir.is_dir(), f"Extension directory missing: {ext_dir}"
 
     manifest_file = ext_dir / "manifest.json"
@@ -38,7 +38,7 @@ def test_extension_scaffold():
     assert "41144" in bg_code, "Port 41144 not configured in background.js"
     assert "2000" in bg_code, "2000ms initial reconnect delay not configured in background.js"
     assert "5000" in bg_code, "5000ms max reconnect delay cap not configured in background.js"
-    assert "axiom_keep_alive" in bg_code, "axiom_keep_alive alarm missing in background.js"
+    assert "zelyr_keep_alive" in bg_code, "zelyr_keep_alive alarm missing in background.js"
     assert "ping" in bg_code, "ping keep-alive loop missing in background.js"
     assert "switch_tab" in bg_code, "switch_tab handler missing in background.js"
     assert "open_tab" in bg_code, "open_tab handler missing in background.js"
@@ -62,7 +62,7 @@ def test_extension_scaffold():
 
 async def run_bridge_lifecycle_tests():
     print("[CHECK 2] Testing Local WebSocket Bridge Server Lifecycle & Commands...")
-    from axiom.tools.browser_cdp import InteractWithBrowserTool
+    from zelyr.tools.browser_cdp import InteractWithBrowserTool
     tool = InteractWithBrowserTool()
 
     # 0. Verify InteractWithBrowserTool schema does NOT contain 'port' and contains required parameters
@@ -95,7 +95,7 @@ async def run_bridge_lifecycle_tests():
         assert offline_res.success is False
         expected_msg = (
             f"No browser extension connected on ws://127.0.0.1:{bridge.port}. "
-            "Ensure the AXIOM extension is loaded in Zen Browser (about:debugging) or Chromium. "
+            "Ensure the Zelyr extension is loaded in Zen Browser (about:debugging) or Chromium. "
             "Do not ask for --remote-debugging-port flags."
         )
         assert offline_res.error == expected_msg, f"Expected '{expected_msg}', got '{offline_res.error}'"
@@ -337,9 +337,9 @@ async def run_bridge_lifecycle_tests():
                 print(f"  → click roundtrip verified: {res_click['result']}")
 
                 # 13. Test type
-                res_type = await interact_with_browser("type", selector="input#search", text="hello axiom")
+                res_type = await interact_with_browser("type", selector="input#search", text="hello zelyr")
                 assert res_type.success is True
-                assert "hello axiom" in res_type["result"]
+                assert "hello zelyr" in res_type["result"]
                 print(f"  → type roundtrip verified: {res_type['result']}")
 
                 # 14. Test get_dom

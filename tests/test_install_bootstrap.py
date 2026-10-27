@@ -19,16 +19,16 @@ class TestInstallBootstrap(unittest.TestCase):
     """Test suite covering first-run directory initialization, path portability, and packaging."""
 
     def test_first_run_directory_auto_bootstrap_isolated(self) -> None:
-        """Verify that launching AXIOM when ~/.config/axiom does not exist creates all required directories."""
+        """Verify that launching Zelyr when ~/.config/zelyr does not exist creates all required directories."""
         with tempfile.TemporaryDirectory() as tmp_dir:
             temp_home = Path(tmp_dir) / "home"
             temp_home.mkdir(parents=True, exist_ok=True)
-            custom_config = temp_home / ".config" / "axiom"
+            custom_config = temp_home / ".config" / "zelyr"
 
             self.assertFalse(custom_config.exists())
 
             # Test initialize_directories with custom isolated base path
-            from axiom.config import initialize_directories, get_config_dir
+            from zelyr.config import initialize_directories, get_config_dir
 
             initialize_directories(config_dir=custom_config)
 
@@ -40,13 +40,13 @@ class TestInstallBootstrap(unittest.TestCase):
             self.assertTrue((custom_config / "models").is_dir())
 
     def test_environment_override_config_dir(self) -> None:
-        """Verify that AXIOM_CONFIG_DIR environment variable correctly overrides the config directory."""
+        """Verify that ZELYR_CONFIG_DIR environment variable correctly overrides the config directory."""
         with tempfile.TemporaryDirectory() as tmp_dir:
-            override_path = Path(tmp_dir) / "custom_axiom_conf"
-            old_env = os.environ.get("AXIOM_CONFIG_DIR")
+            override_path = Path(tmp_dir) / "custom_zelyr_conf"
+            old_env = os.environ.get("ZELYR_CONFIG_DIR")
             try:
-                os.environ["AXIOM_CONFIG_DIR"] = str(override_path)
-                from axiom.config import get_config_dir, initialize_directories
+                os.environ["ZELYR_CONFIG_DIR"] = str(override_path)
+                from zelyr.config import get_config_dir, initialize_directories
 
                 resolved_dir = get_config_dir()
                 self.assertEqual(resolved_dir.resolve(), override_path.resolve())
@@ -56,9 +56,9 @@ class TestInstallBootstrap(unittest.TestCase):
                 self.assertTrue((override_path / "tools.d").is_dir())
             finally:
                 if old_env is not None:
-                    os.environ["AXIOM_CONFIG_DIR"] = old_env
+                    os.environ["ZELYR_CONFIG_DIR"] = old_env
                 else:
-                    os.environ.pop("AXIOM_CONFIG_DIR", None)
+                    os.environ.pop("ZELYR_CONFIG_DIR", None)
 
     def _get_repo_root(self) -> Path:
         current = Path(__file__).resolve().parent
@@ -66,13 +66,13 @@ class TestInstallBootstrap(unittest.TestCase):
             return current
         return current.parent
 
-    def test_zero_hardcoded_user_paths_in_axiom(self) -> None:
-        """Audit the entire axiom/ source tree to ensure zero hardcoded personal user home paths exist."""
+    def test_zero_hardcoded_user_paths_in_zelyr(self) -> None:
+        """Audit the entire zelyr/ source tree to ensure zero hardcoded personal user home paths exist."""
         repo_root = self._get_repo_root()
-        axiom_pkg = repo_root / "axiom"
+        zelyr_pkg = repo_root / "zelyr"
 
         violations = []
-        for py_path in axiom_pkg.rglob("*.py"):
+        for py_path in zelyr_pkg.rglob("*.py"):
             content = py_path.read_text(encoding="utf-8")
             # Disallow specific host user names and absolute /home/<specific_user> paths
             if "/home/rutytoi" in content:
@@ -93,8 +93,8 @@ class TestInstallBootstrap(unittest.TestCase):
 
         project = data.get("project", {})
         scripts = project.get("scripts", {})
-        self.assertIn("axiom", scripts, "pyproject.toml must define an 'axiom' console script entry point")
-        self.assertIn("axiomd", scripts, "pyproject.toml must define an 'axiomd' console script entry point")
+        self.assertIn("zelyr", scripts, "pyproject.toml must define an 'zelyr' console script entry point")
+        self.assertIn("zelyrd", scripts, "pyproject.toml must define an 'zelyrd' console script entry point")
 
         for script_name, entry_point in scripts.items():
             self.assertIn(":", entry_point, f"Entry point for '{script_name}' must be 'module:callable'")

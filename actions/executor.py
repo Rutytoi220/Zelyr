@@ -1,4 +1,4 @@
-"""Action executors for AXIOM.
+"""Action executors for Zelyr.
 
 Implements:
 - open_folder(path)

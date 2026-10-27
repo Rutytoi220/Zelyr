@@ -1,15 +1,15 @@
-# AXIOM Tool Creation & Extension Guide
+# Zelyr Tool Creation & Extension Guide
 
-This guide documents the real pattern for adding, configuring, and testing tools in **AXIOM** (v1.0.0).  
-AXIOM supports two complementary tool creation models:
-1. **Dynamic File Plugins (`~/.config/axiom/tools.d/<name>.py`):** Standalone Python files automatically loaded and hot-reloaded by [`axiom/core/plugins.py`](../axiom/core/plugins.py).
-2. **Subclassed Native Tools ([`axiom/tools/base.py`](../axiom/tools/base.py)):** Structured object-oriented tool classes inheriting from `BaseTool`.
+This guide documents the real pattern for adding, configuring, and testing tools in **Zelyr** (v1.0.0).  
+Zelyr supports two complementary tool creation models:
+1. **Dynamic File Plugins (`~/.config/zelyr/tools.d/<name>.py`):** Standalone Python files automatically loaded and hot-reloaded by [`zelyr/core/plugins.py`](../zelyr/core/plugins.py).
+2. **Subclassed Native Tools ([`zelyr/tools/base.py`](../zelyr/tools/base.py)):** Structured object-oriented tool classes inheriting from `BaseTool`.
 
 ---
 
 ## 1. Tool Capability Tiers & Precedence `[VERIFIED]`
 
-Every tool in AXIOM belongs to a capability tier that controls when it is exposed to the local reasoning model:
+Every tool in Zelyr belongs to a capability tier that controls when it is exposed to the local reasoning model:
 
 | Tier | Category | Token Cost | Target Domain | Example Tools |
 | :---: | :--- | :---: | :--- | :--- |
@@ -28,7 +28,7 @@ Every tool in AXIOM belongs to a capability tier that controls when it is expose
 ## 2. Dynamic Plugin Contract (`tools.d/<name>.py`) `[VERIFIED]`
 
 To create a dynamic tool, place a single Python file into the active tools directory:
-`~/.config/axiom/tools.d/<tool_name>.py` (or `$AXIOM_CONFIG_DIR/tools.d/<tool_name>.py`).
+`~/.config/zelyr/tools.d/<tool_name>.py` (or `$ZELYR_CONFIG_DIR/tools.d/<tool_name>.py`).
 
 ### Required Module Exports:
 
@@ -111,12 +111,12 @@ async def execute(repo_path: str = ".", short: bool = True, **kwargs) -> str:
 
 ---
 
-## 3. Subclassing `BaseTool` ([`axiom/tools/core.py`](../axiom/tools/core.py)) `[VERIFIED]`
+## 3. Subclassing `BaseTool` ([`zelyr/tools/core.py`](../zelyr/tools/core.py)) `[VERIFIED]`
 
-For core tools integrated directly into the `axiom.tools` package, inherit from `BaseTool`:
+For core tools integrated directly into the `zelyr.tools` package, inherit from `BaseTool`:
 
 ```python
-from axiom.tools.core import BaseTool, ToolParameter, ToolResult
+from zelyr.tools.core import BaseTool, ToolParameter, ToolResult
 
 class InspectServiceTool(BaseTool):
     """Inspect systemd unit service status."""
@@ -154,7 +154,7 @@ class InspectServiceTool(BaseTool):
 
 ## 4. Execution Timeouts & Closed-Loop Recovery `[VERIFIED]`
 
-Tools are subject to strict per-tier execution timeouts defined in [`axiom/core/plugins.py`](../axiom/core/plugins.py#L655-L666):
+Tools are subject to strict per-tier execution timeouts defined in [`zelyr/core/plugins.py`](../zelyr/core/plugins.py#L655-L666):
 - **Tier 1 (IPC / OS):** 10.0s – 30.0s
 - **Tier 2 (Browser / Web):** 10.0s
 - **Tier 3 (Vision / SoM):** 35.0s
@@ -172,13 +172,13 @@ The model is then prompted to execute the recommended recovery tool without outp
 
 When testing newly authored tools, adhere to the non-negotiable headless safeguards:
 1. **Never spawn browser windows or desktop popups:** Mock `webbrowser.open` and subprocesses.
-2. **Never connect to live external networks:** Mock `httpx.AsyncClient` or use `axiom.security.network.validate_safe_url`.
+2. **Never connect to live external networks:** Mock `httpx.AsyncClient` or use `zelyr.security.network.validate_safe_url`.
 3. **Execute unit tests using pytest:**
    ```bash
    uv run pytest -v tests/test_context_budget_fix.py
    ```
 4. **Test Dynamic Loading via CLI:**
    ```bash
-   uv run axiom tool list
-   uv run axiom tool run inspect_git_status --args '{"repo_path": "."}'
+   uv run zelyr tool list
+   uv run zelyr tool run inspect_git_status --args '{"repo_path": "."}'
    ```

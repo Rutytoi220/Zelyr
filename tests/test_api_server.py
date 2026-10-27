@@ -1,6 +1,6 @@
 """API regression tests for the FastAPI server surface.
 
-The webhook/watcher worker subsystem referenced by ``axiom/api/server.py`` is
+The webhook/watcher worker subsystem referenced by ``zelyr/api/server.py`` is
 not present in the repository (only stale ``.pyc`` files remain), so no test
 asserts webhook behavior.  These tests pin the parts of the server that are
 still supported: the app imports, liveness endpoints answer, and invalid
@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 
 
 def test_v1_health_returns_online():
-    from axiom.api.server import app
+    from zelyr.api.server import app
 
     client = TestClient(app)
     response = client.get("/v1/health")
@@ -26,7 +26,7 @@ def test_v1_health_returns_online():
 
 
 def test_legacy_health_and_invalid_requests():
-    from axiom.api.server import app
+    from zelyr.api.server import app
 
     client = TestClient(app)
 
@@ -43,24 +43,24 @@ def test_legacy_health_and_invalid_requests():
 
 def test_optional_worker_reports_missing_dependency(caplog):
     """A missing webhook/watcher module must be logged, not left unretrieved."""
-    from axiom.api.server import _supervise_optional_worker
+    from zelyr.api.server import _supervise_optional_worker
 
     async def worker_with_missing_import() -> None:
-        raise ImportError("No module named 'axiom.core.webhooks'")
+        raise ImportError("No module named 'zelyr.core.webhooks'")
 
-    with caplog.at_level(logging.ERROR, logger="axiom.api.server"):
+    with caplog.at_level(logging.ERROR, logger="zelyr.api.server"):
         asyncio.run(
             _supervise_optional_worker("webhook", worker_with_missing_import)
         )
 
     assert "Optional webhook background worker disabled" in caplog.text
-    assert "axiom.core.webhooks" in caplog.text
+    assert "zelyr.core.webhooks" in caplog.text
     assert "rest of the API server remains available" in caplog.text
 
 
 def test_api_remains_usable_when_optional_workers_are_missing():
     """Startup must not be aborted by the absent webhook/watcher subsystem."""
-    from axiom.api.server import app
+    from zelyr.api.server import app
 
     with TestClient(app) as client:
         response = client.get("/v1/health")

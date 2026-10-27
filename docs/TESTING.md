@@ -1,10 +1,10 @@
-# AXIOM Testing & CI Baseline
+# Zelyr Testing & CI Baseline
 
-This document outlines the strict testing conventions, environment isolation protocols, and execution boundaries for the AXIOM V11+ codebase. 
+This document outlines the strict testing conventions, environment isolation protocols, and execution boundaries for the Zelyr V11+ codebase. 
 
 ## Philosophy
 
-AXIOM interacts with the host desktop (Vision, Mouse, Keyboard, Filesystem). Testing these components blindly leads to flakiness, corrupted developer environments, and false-positive test passes. We enforce a zero-trust execution sandbox for our tests.
+Zelyr interacts with the host desktop (Vision, Mouse, Keyboard, Filesystem). Testing these components blindly leads to flakiness, corrupted developer environments, and false-positive test passes. We enforce a zero-trust execution sandbox for our tests.
 
 ## 1. Pytest Markers
 
@@ -21,7 +21,7 @@ All tests **must** be explicitly marked in `pyproject.toml`. Unmarked tests or i
 By default, the `block_external_io` autouse fixture in `tests/conftest.py` **brutally blocks** any outgoing HTTP requests (`httpx`) and `litellm` calls. Tests that intentionally trigger external IO will raise a `RuntimeError`. If you need to test network interactions, you must either write a mock, or explicit test isolation. 
 
 ### Filesystem Isolation (`mock_home_directory`)
-Tests should **never** write to the developer's real `~/.axiom` state. The `mock_home_directory` autouse fixture explicitly overrides `$HOME`, `$XDG_CONFIG_HOME`, `$XDG_DATA_HOME`, and `Path.home()` to redirect all state storage to a temporary directory.
+Tests should **never** write to the developer's real `~/.zelyr` state. The `mock_home_directory` autouse fixture explicitly overrides `$HOME`, `$XDG_CONFIG_HOME`, `$XDG_DATA_HOME`, and `Path.home()` to redirect all state storage to a temporary directory.
 
 ### GUI Teardowns (`robust_teardown_qt_widgets`)
 Headless Qt widgets often leak memory or crash `_Py_Dealloc` during Python GC. We use a global `robust_teardown_qt_widgets` fixture to call `.deleteLater()` and flush the Qt event loop (`processEvents()`) to prevent segfaults.
@@ -45,4 +45,4 @@ QT_QPA_PLATFORM=offscreen uv run pytest tests/integration/test_critical_path.py 
 ```
 
 ## 4. The Critical Path Test
-The `test_critical_path_websocket_to_sandbox` test is the gold standard of AXIOM's functionality. It spawns the FastAPI server, connects to the Swarm WebSocket, injects a mocked LLM response, and verifies that the `SandboxRunner` executes the tool payload (using Bubblewrap containment) and returns the output successfully through the full pipeline.
+The `test_critical_path_websocket_to_sandbox` test is the gold standard of Zelyr's functionality. It spawns the FastAPI server, connects to the Swarm WebSocket, injects a mocked LLM response, and verifies that the `SandboxRunner` executes the tool payload (using Bubblewrap containment) and returns the output successfully through the full pipeline.

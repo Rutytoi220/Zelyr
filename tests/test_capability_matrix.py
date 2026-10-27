@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from axiom.core.plugins import (
+from zelyr.core.plugins import (
     CORE_TOOLS,
     TIER_1_TOOLS,
     TIER_2_TOOLS,
@@ -17,10 +17,10 @@ from axiom.core.plugins import (
     load_plugins,
     reload_plugin,
 )
-from axiom.tools.browser_cdp import InteractWithBrowserTool
-from axiom.tools.core import ToolCapability
-from axiom.tools.hyprland_ipc import ManageDesktopWindowTool
-from axiom.tools.vision import InteractWithUITool
+from zelyr.tools.browser_cdp import InteractWithBrowserTool
+from zelyr.tools.core import ToolCapability
+from zelyr.tools.hyprland_ipc import ManageDesktopWindowTool
+from zelyr.tools.vision import InteractWithUITool
 
 
 class TestCapabilityMatrix(unittest.TestCase):

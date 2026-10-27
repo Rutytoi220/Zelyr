@@ -1,6 +1,6 @@
-# AXIOM Developer Workflow & Verification Guide
+# Zelyr Developer Workflow & Verification Guide
 
-This guide details the development environment setup, testing standards, linting procedures, and packaging workflows for **AXIOM** (v1.0.0).
+This guide details the development environment setup, testing standards, linting procedures, and packaging workflows for **Zelyr** (v1.0.0).
 
 ---
 
@@ -14,8 +14,8 @@ This guide details the development environment setup, testing standards, linting
 ### Virtual Environment Initialization:
 ```bash
 # Clone the repository
-git clone https://github.com/Rutytoi220/Axiom.git
-cd Axiom
+git clone https://github.com/Rutytoi220/Zelyr.git
+cd Zelyr
 
 # Sync virtual environment using uv
 uv sync
@@ -35,16 +35,16 @@ uv run pytest -v
 ```
 
 ### B. Test Topology & Ignored Subdirectories
-AXIOM's test configuration is declared in [`pyproject.toml`](../pyproject.toml):
+Zelyr's test configuration is declared in [`pyproject.toml`](../pyproject.toml):
 ```toml
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 norecursedirs = [
     "tests/fixtures", "tests/unit", "tests/gui", "tests/e2e",
     "tests/integration", "tests/optional", "tests/simulation",
-    "axiom/tests", "dist", "build", ".venv"
+    "zelyr/tests", "dist", "build", ".venv"
 ]
-addopts = "--ignore=tests/fixtures --ignore=tests/unit --ignore=tests/gui --ignore=tests/e2e --ignore=tests/integration --ignore=tests/optional --ignore=tests/simulation --ignore=axiom/tests -m 'not e2e and not requires_wayland and not hardware'"
+addopts = "--ignore=tests/fixtures --ignore=tests/unit --ignore=tests/gui --ignore=tests/e2e --ignore=tests/integration --ignore=tests/optional --ignore=tests/simulation --ignore=zelyr/tests -m 'not e2e and not requires_wayland and not hardware'"
 ```
 
 The active, consolidated test battery consists of 61 tests located directly in `tests/`:
@@ -100,7 +100,7 @@ All code must pass clean with zero errors before considering any task complete.
 ## 4. Packaging, Distribution & Bootstrapping `[VERIFIED]`
 
 ### A. Wheel Package Build
-AXIOM is packaged as a standard Python wheel distribution via `setuptools`.
+Zelyr is packaged as a standard Python wheel distribution via `setuptools`.
 
 Build through the isolated-source wrapper rather than invoking
 `uv build --wheel` or `python -m build --wheel` directly. Setuptools reuses
@@ -110,35 +110,35 @@ can be silently re-added to the wheel:
 ```bash
 uv run python scripts/build_dist.py --wheel --no-isolation
 ```
-This produces `dist/axiom_core-1.0.0-py3-none-any.whl`.
+This produces `dist/zelyr_core-1.0.0-py3-none-any.whl`.
 
 The script copies only the build inputs (`pyproject.toml`, metadata files and
-the `axiom` package) into a temporary directory, builds there, and verifies
+the `zelyr` package) into a temporary directory, builds there, and verifies
 that every `.py` file in the wheel exists in the current source tree.
 
 ### B. Clean Installation Smoke Test
 To verify the distribution in an isolated environment without polluting the host:
 ```bash
 # Create ephemeral virtualenv
-python3 -m venv /tmp/axiom_smoke_env
-source /tmp/axiom_smoke_env/bin/activate
+python3 -m venv /tmp/zelyr_smoke_env
+source /tmp/zelyr_smoke_env/bin/activate
 
 # Install the built wheel
-pip install dist/axiom_core-1.0.0-py3-none-any.whl
+pip install dist/zelyr_core-1.0.0-py3-none-any.whl
 
 # Verify executable console entry points
-axiom --help
-axiomd --help
+zelyr --help
+zelyrd --help
 
 # Teardown
 deactivate
-rm -rf /tmp/axiom_smoke_env
+rm -rf /tmp/zelyr_smoke_env
 ```
 
 ### C. Automatic First-Run Directory Bootstrapping
-When AXIOM is executed on a clean machine where `~/.config/axiom/` does not exist, [`axiom.config.initialize_directories()`](../axiom/config.py#L20-L36) automatically creates the required hierarchy:
-- `~/.config/axiom/tools.d/` (Dynamic tool plugin drop-in directory)
-- `~/.config/axiom/plugins/` (Extension modules)
-- `~/.config/axiom/sessions/` (Saved session databases)
-- `~/.config/axiom/logs/` (System execution logs)
-- `~/.config/axiom/models/` (Local model configuration cache)
+When Zelyr is executed on a clean machine where `~/.config/zelyr/` does not exist, [`zelyr.config.initialize_directories()`](../zelyr/config.py#L20-L36) automatically creates the required hierarchy:
+- `~/.config/zelyr/tools.d/` (Dynamic tool plugin drop-in directory)
+- `~/.config/zelyr/plugins/` (Extension modules)
+- `~/.config/zelyr/sessions/` (Saved session databases)
+- `~/.config/zelyr/logs/` (System execution logs)
+- `~/.config/zelyr/models/` (Local model configuration cache)

@@ -7,12 +7,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from axiom.tools.workspace_file import ManageWorkspaceFileTool, get_last_modified_file
+from zelyr.tools.workspace_file import ManageWorkspaceFileTool, get_last_modified_file
 
 
 class TestWorkspaceFileOperations(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.test_dir = Path(tempfile.mkdtemp(prefix="axiom_test_workspace_"))
+        self.test_dir = Path(tempfile.mkdtemp(prefix="zelyr_test_workspace_"))
         self.tool = ManageWorkspaceFileTool()
 
     async def asyncTearDown(self):

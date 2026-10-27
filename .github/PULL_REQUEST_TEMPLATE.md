@@ -3,7 +3,7 @@ Provide a clear description of the changes introduced by this PR. Link any relev
 
 ## Subsystem Affected
 - [ ] Kernel / Self-Patcher
-- [ ] AxiomFS (FUSE)
+- [ ] ZelyrFS (FUSE)
 - [ ] Multimodal HUD (GUI)
 - [ ] Security / Sandbox
 - [ ] Swarm / Networking

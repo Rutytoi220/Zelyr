@@ -14,9 +14,9 @@ from scripts import build_dist
 
 def test_copy_inputs_includes_packaging_files_and_excludes_caches(tmp_path, monkeypatch):
     root = tmp_path / "repo"
-    package = root / "axiom" / "pkg"
+    package = root / "zelyr" / "pkg"
     package.mkdir(parents=True)
-    (root / "axiom" / "__init__.py").write_text("")
+    (root / "zelyr" / "__init__.py").write_text("")
     (package / "__init__.py").write_text("")
     (package / "module.py").write_text("VALUE = 1\n")
     cache = package / "__pycache__"
@@ -32,8 +32,8 @@ def test_copy_inputs_includes_packaging_files_and_excludes_caches(tmp_path, monk
 
     assert (destination / "pyproject.toml").is_file()
     assert (destination / "README.md").is_file()
-    assert (destination / "axiom" / "pkg" / "module.py").is_file()
-    assert not (destination / "axiom" / "pkg" / "__pycache__").exists()
+    assert (destination / "zelyr" / "pkg" / "module.py").is_file()
+    assert not (destination / "zelyr" / "pkg" / "__pycache__").exists()
 
 
 def _write_wheel(path: Path, members: dict[str, str]) -> None:
@@ -44,31 +44,31 @@ def _write_wheel(path: Path, members: dict[str, str]) -> None:
 
 def test_verify_wheel_rejects_module_absent_from_source(tmp_path):
     source = tmp_path / "source"
-    (source / "axiom").mkdir(parents=True)
-    (source / "axiom" / "present.py").write_text("")
-    wheel = tmp_path / "axiom_core-1.0.0-py3-none-any.whl"
+    (source / "zelyr").mkdir(parents=True)
+    (source / "zelyr" / "present.py").write_text("")
+    wheel = tmp_path / "zelyr_core-1.0.0-py3-none-any.whl"
     _write_wheel(
         wheel,
         {
-            "axiom/present.py": "",
-            "axiom/deleted_module.py": "",
+            "zelyr/present.py": "",
+            "zelyr/deleted_module.py": "",
         },
     )
 
-    with pytest.raises(SystemExit, match="axiom/deleted_module.py"):
+    with pytest.raises(SystemExit, match="zelyr/deleted_module.py"):
         build_dist._verify_wheel(wheel, source)
 
 
 def test_verify_wheel_accepts_modules_present_in_source(tmp_path):
     source = tmp_path / "source"
-    (source / "axiom").mkdir(parents=True)
-    (source / "axiom" / "present.py").write_text("")
-    wheel = tmp_path / "axiom_core-1.0.0-py3-none-any.whl"
+    (source / "zelyr").mkdir(parents=True)
+    (source / "zelyr" / "present.py").write_text("")
+    wheel = tmp_path / "zelyr_core-1.0.0-py3-none-any.whl"
     _write_wheel(
         wheel,
         {
-            "axiom/present.py": "",
-            "axiom_core-1.0.0.dist-info/METADATA": "Name: axiom-core\n",
+            "zelyr/present.py": "",
+            "zelyr_core-1.0.0.dist-info/METADATA": "Name: zelyr-core\n",
         },
     )
 
@@ -82,7 +82,7 @@ def test_main_cleans_temp_source_on_failure_and_preserves_outdir(
     outdir.mkdir()
     sentinel = outdir / "keep.txt"
     sentinel.write_text("keep me")
-    temp_root = tmp_path / "axiom-build-src-test"
+    temp_root = tmp_path / "zelyr-build-src-test"
     temp_root.mkdir()
 
     monkeypatch.setattr(build_dist.tempfile, "mkdtemp", lambda **_: str(temp_root))
@@ -108,9 +108,9 @@ def test_main_cleans_temp_source_on_failure_and_preserves_outdir(
 
 def test_main_builds_from_isolated_source_and_cleans_up(tmp_path, monkeypatch):
     outdir = tmp_path / "dist"
-    temp_root = tmp_path / "axiom-build-src-success"
+    temp_root = tmp_path / "zelyr-build-src-success"
     temp_root.mkdir()
-    wheel = outdir / "axiom_core-1.0.0-py3-none-any.whl"
+    wheel = outdir / "zelyr_core-1.0.0-py3-none-any.whl"
     observed: dict[str, object] = {}
 
     monkeypatch.setattr(build_dist.tempfile, "mkdtemp", lambda **_: str(temp_root))

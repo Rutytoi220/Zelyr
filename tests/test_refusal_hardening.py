@@ -6,7 +6,7 @@ import json
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from axiom.agents.native_orchestrator import REFUSAL_PHRASES, NativeOrchestrator
+from zelyr.agents.native_orchestrator import REFUSAL_PHRASES, NativeOrchestrator
 
 
 class TestRefusalHardening(unittest.IsolatedAsyncioTestCase):
@@ -120,7 +120,7 @@ class TestRefusalHardening(unittest.IsolatedAsyncioTestCase):
         }
 
         with patch(
-            "axiom.agents.native_orchestrator.execute_tool",
+            "zelyr.agents.native_orchestrator.execute_tool",
             new=AsyncMock(return_value={"status": "clicked"}),
         ), patch.object(orch, "get_active_window_context", return_value=None), patch(
             "httpx.AsyncClient"

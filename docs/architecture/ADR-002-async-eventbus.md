@@ -2,25 +2,25 @@
 
 **Status:** Accepted  
 **Date:** 2026-07-18  
-**Authors:** AXIOM Core Team
+**Authors:** Zelyr Core Team
 
 ---
 
 ## Context
 
-AXIOM is a modular AI orchestration framework composed of loosely coupled subsystems — agents, tools, plugins, memory compaction daemons, and telemetry pipelines — that must communicate without direct dependencies on each other. The framework operates as both an interactive desktop application (via PySide6/qasync) and a headless background daemon, often simultaneously.
+Zelyr is a modular AI orchestration framework composed of loosely coupled subsystems — agents, tools, plugins, memory compaction daemons, and telemetry pipelines — that must communicate without direct dependencies on each other. The framework operates as both an interactive desktop application (via PySide6/qasync) and a headless background daemon, often simultaneously.
 
 We evaluated three approaches for inter-component communication:
 
 1. **Direct synchronous function calls.** Simple, but creates tight coupling. Adding a new telemetry listener would require modifying the engine core. Unacceptable for a plugin-extensible architecture.
-2. **Heavy message brokers (RabbitMQ, Redis Pub/Sub, ZeroMQ).** Battle-tested at scale, but introduces an external service dependency. This directly violates AXIOM's local-first, zero-dependency philosophy. A user should not need to run a Redis server to use a desktop AI assistant.
+2. **Heavy message brokers (RabbitMQ, Redis Pub/Sub, ZeroMQ).** Battle-tested at scale, but introduces an external service dependency. This directly violates Zelyr's local-first, zero-dependency philosophy. A user should not need to run a Redis server to use a desktop AI assistant.
 3. **A pure-Python in-process pub/sub EventBus.** Zero external dependencies, tight integration with the Python runtime, and full control over dispatch semantics.
 
-The critical constraint was that AXIOM's GUI event loop (`qasync` wrapping `asyncio`) and its background daemon both needed to publish and consume events without blocking either runtime.
+The critical constraint was that Zelyr's GUI event loop (`qasync` wrapping `asyncio`) and its background daemon both needed to publish and consume events without blocking either runtime.
 
 ## Decision
 
-We built a custom, single-class `EventBus` ([events.py](file:///home/rutytoi/Documents/ChienGPT/axiom/core/events.py)) that is both synchronous-safe and async-aware:
+We built a custom, single-class `EventBus` ([events.py](file:///home/rutytoi/Documents/ChienGPT/zelyr/core/events.py)) that is both synchronous-safe and async-aware:
 
 ### Core Design
 
@@ -76,5 +76,5 @@ class Event:
 ### Negative
 
 - **Async stack traces are harder to debug.** When a handler is dispatched via `create_task()`, exceptions surface as unhandled task exceptions in the asyncio event loop rather than at the `publish()` call site. This requires disciplined `try/except` wrapping inside every handler.
-- **No delivery guarantees.** Unlike a proper message broker, there is no persistent queue, no retry policy, and no dead-letter mechanism. If a handler crashes, the event is lost. This is acceptable for AXIOM's use case (desktop telemetry), but would not be for a distributed microservice.
+- **No delivery guarantees.** Unlike a proper message broker, there is no persistent queue, no retry policy, and no dead-letter mechanism. If a handler crashes, the event is lost. This is acceptable for Zelyr's use case (desktop telemetry), but would not be for a distributed microservice.
 - **In-process only.** The bus cannot span multiple OS processes. The daemon-to-GUI bridge uses a separate Unix Domain Socket (UDS) JSON-RPC protocol for IPC, which must manually re-publish events across the boundary.

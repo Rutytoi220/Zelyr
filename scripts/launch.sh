@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════
-#  AXIOM Desktop — Launch Wrapper
+#  Zelyr Desktop — Launch Wrapper
 # ═══════════════════════════════════════════════════════════════
 set -euo pipefail
 
@@ -8,7 +8,7 @@ set -euo pipefail
 export QT_QPA_PLATFORM="wayland;xcb"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VENV_DIR="${HOME}/.local/share/axiom/venv"
+VENV_DIR="${HOME}/.local/share/zelyr/venv"
 
 if [ ! -d "${VENV_DIR}" ]; then
     echo -e "\033[0;31m[ERROR]\033[0m Virtual environment not found at ${VENV_DIR}."
@@ -16,8 +16,8 @@ if [ ! -d "${VENV_DIR}" ]; then
     exit 1
 fi
 
-echo -e "\033[1;36m[INFO]\033[0m Activating AXIOM environment..."
+echo -e "\033[1;36m[INFO]\033[0m Activating Zelyr environment..."
 source "${VENV_DIR}/bin/activate"
 
-echo -e "\033[1;32m[OK]\033[0m Launching AXIOM Engine..."
+echo -e "\033[1;32m[OK]\033[0m Launching Zelyr Engine..."
 exec python3 "${SCRIPT_DIR}/main.py" "$@"

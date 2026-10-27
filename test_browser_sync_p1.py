@@ -19,8 +19,8 @@ import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from axiom.tools.browser_cdp import InteractWithBrowserTool
-from axiom.tools.browser_extension import BrowserExtensionBridge, BrowserResult
+from zelyr.tools.browser_cdp import InteractWithBrowserTool
+from zelyr.tools.browser_extension import BrowserExtensionBridge, BrowserResult
 
 
 def _run_node(script: str) -> dict:
@@ -49,7 +49,7 @@ global.MutationObserver = MockMutationObserver;
 global.document = { body: {}, documentElement: {} };
 global.requestAnimationFrame = (cb) => setTimeout(cb, 5);
 
-const { waitForSettled } = require('./axiom/tools/extension/background.js');
+const { waitForSettled } = require('./zelyr/tools/extension/background.js');
 
 async function run() {
   const start = Date.now();
@@ -84,7 +84,7 @@ global.MutationObserver = MockMutationObserver;
 global.document = { body: {}, documentElement: {} };
 global.requestAnimationFrame = (cb) => setTimeout(cb, 5);
 
-const { waitForSettled } = require('./axiom/tools/extension/background.js');
+const { waitForSettled } = require('./zelyr/tools/extension/background.js');
 
 async function run() {
   const start = Date.now();
@@ -135,7 +135,7 @@ global.MutationObserver = MockMutationObserver;
 global.document = { body: {}, documentElement: {} };
 global.requestAnimationFrame = (cb) => setTimeout(cb, 5);
 
-const { waitForSettled } = require('./axiom/tools/extension/background.js');
+const { waitForSettled } = require('./zelyr/tools/extension/background.js');
 
 async function run() {
   const start = Date.now();
@@ -175,7 +175,7 @@ global.MutationObserver = MockMutationObserver;
 global.document = { body: {}, documentElement: {} };
 global.requestAnimationFrame = (cb) => setTimeout(cb, 5);
 
-const { waitForSettled } = require('./axiom/tools/extension/background.js');
+const { waitForSettled } = require('./zelyr/tools/extension/background.js');
 
 async function run() {
   // 1. Normal resolution
@@ -204,9 +204,9 @@ run();
         self.assertTrue(result["timeoutCleaned"])
 
     def test_stale_element_id_recovers_via_unique_fingerprint(self):
-        """Simulate a React-style component remount where data-axiom-id is stripped but the element's semantic fingerprint (tag, text, role) is identical and unique. Verify recovery succeeds."""
+        """Simulate a React-style component remount where data-zelyr-id is stripped but the element's semantic fingerprint (tag, text, role) is identical and unique. Verify recovery succeeds."""
         js_code = """
-const { resolveElement } = require('./axiom/tools/extension/background.js');
+const { resolveElement } = require('./zelyr/tools/extension/background.js');
 
 class MockElement {
   constructor(tag, attrs = {}, text = '') {
@@ -222,7 +222,7 @@ class MockElement {
 }
 
 global.window = {
-  __axiomFingerprints: {
+  __zelyrFingerprints: {
     7: {
       tag: 'button',
       role: 'button',
@@ -234,7 +234,7 @@ global.window = {
   }
 };
 
-// Remounted replacement button without data-axiom-id attribute
+// Remounted replacement button without data-zelyr-id attribute
 const remountedButton = new MockElement('button', {
   role: 'button',
   type: 'submit',
@@ -243,26 +243,26 @@ const remountedButton = new MockElement('button', {
 }, 'Pay $25.00');
 
 global.document = {
-  querySelector: (sel) => null, // Stale: not found by [data-axiom-id="7"]
+  querySelector: (sel) => null, // Stale: not found by [data-zelyr-id="7"]
   querySelectorAll: (sel) => [remountedButton]
 };
 
 const res = resolveElement(null, 7);
 console.log(JSON.stringify({
   success: res.element !== null,
-  newAxiomId: remountedButton.getAttribute('data-axiom-id'),
+  newZelyrId: remountedButton.getAttribute('data-zelyr-id'),
   errorResult: res.errorResult
 }));
 """
         result = _run_node(js_code)
         self.assertTrue(result["success"])
-        self.assertEqual(result["newAxiomId"], "7")
+        self.assertEqual(result["newZelyrId"], "7")
         self.assertIsNone(result["errorResult"])
 
     def test_ambiguous_fingerprint_refuses_action(self):
         """Simulate an element unmount where multiple replacement elements match the fingerprint. Verify refusal with ambiguous error."""
         js_code = """
-const { resolveElement } = require('./axiom/tools/extension/background.js');
+const { resolveElement } = require('./zelyr/tools/extension/background.js');
 
 class MockElement {
   constructor(tag, attrs = {}, text = '') {
@@ -278,7 +278,7 @@ class MockElement {
 }
 
 global.window = {
-  __axiomFingerprints: {
+  __zelyrFingerprints: {
     12: {
       tag: 'button',
       role: 'button',
@@ -317,10 +317,10 @@ console.log(JSON.stringify({
     async def test_zero_match_fingerprint_returns_structured_remedy(self):
         """Simulate element removal with 0 matching elements. Verify structured error envelope matches the expected recovery contract."""
         js_code = """
-const { resolveElement } = require('./axiom/tools/extension/background.js');
+const { resolveElement } = require('./zelyr/tools/extension/background.js');
 
 global.window = {
-  __axiomFingerprints: {
+  __zelyrFingerprints: {
     99: {
       tag: 'button',
       role: 'button',
@@ -352,7 +352,7 @@ console.log(JSON.stringify({
 
         # Also test Python InteractWithBrowserTool preserves this envelope
         tool = InteractWithBrowserTool()
-        with patch("axiom.tools.browser_extension.get_bridge") as mock_get_bridge:
+        with patch("zelyr.tools.browser_extension.get_bridge") as mock_get_bridge:
             mock_bridge = MagicMock()
             mock_bridge.is_connected.return_value = True
             mock_bridge.server = object()
@@ -375,7 +375,7 @@ console.log(JSON.stringify({
     async def test_tier2_budget_preservation(self):
         """Verify actions executing waitForSettled complete well within the Tier 2 10.0s budget."""
         tool = InteractWithBrowserTool()
-        with patch("axiom.tools.browser_extension.get_bridge") as mock_get_bridge:
+        with patch("zelyr.tools.browser_extension.get_bridge") as mock_get_bridge:
             mock_bridge = MagicMock()
             mock_bridge.is_connected.return_value = True
             mock_bridge.server = object()

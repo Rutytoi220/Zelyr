@@ -1,4 +1,4 @@
-"""Test harness for expanded AXIOM Tier 2 WebExtension automation suite.
+"""Test harness for expanded Zelyr Tier 2 WebExtension automation suite.
 
 Verifies:
 1. Static validation of background.js handlers (scroll_page, extract_page_content, duplicate_tab, reload_tab, pin_tab).
@@ -12,13 +12,13 @@ import json
 from pathlib import Path
 import websockets
 
-from axiom.tools.browser_cdp import InteractWithBrowserTool
-from axiom.tools.browser_extension import BrowserExtensionBridge
+from zelyr.tools.browser_cdp import InteractWithBrowserTool
+from zelyr.tools.browser_extension import BrowserExtensionBridge
 
 
 def test_static_extension_handlers():
     print("[CHECK 1] Validating expanded background.js handlers...")
-    ext_dir = Path("axiom/tools/extension")
+    ext_dir = Path("zelyr/tools/extension")
     bg_js = ext_dir / "background.js"
     assert bg_js.is_file(), "background.js missing!"
 
@@ -212,7 +212,7 @@ async def test_live_bridge_expanded_actions():
 
 async def main():
     print("=" * 60)
-    print("AXIOM EXPANDED BROWSER SUITE VERIFICATION")
+    print("Zelyr EXPANDED BROWSER SUITE VERIFICATION")
     print("=" * 60)
     test_static_extension_handlers()
     test_tool_schema()

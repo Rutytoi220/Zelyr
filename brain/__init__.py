@@ -1,1 +1,1 @@
-"""Brain package for AXIOM."""
+"""Brain package for Zelyr."""

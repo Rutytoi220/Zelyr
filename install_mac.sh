@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════
-#  AXIOM Desktop v6.8 — macOS Installer
+#  Zelyr Desktop v6.8 — macOS Installer
 #  Installs the launchd background daemon and Applications shortcut
 # ═══════════════════════════════════════════════════════════════
 set -euo pipefail
@@ -25,14 +25,14 @@ DEPLOY_DIR="${SCRIPT_DIR}/deploy"
 LAUNCHD_DIR="${HOME}/Library/LaunchAgents"
 APP_DIR="${HOME}/Applications"
 
-PLIST_SRC="${DEPLOY_DIR}/com.axiom.daemon.plist"
-ICON_SRC="${SCRIPT_DIR}/axiom/gui/assets/logo.png"
+PLIST_SRC="${DEPLOY_DIR}/com.zelyr.daemon.plist"
+ICON_SRC="${SCRIPT_DIR}/zelyr/gui/assets/logo.png"
 
 # ── Banner ──────────────────────────────────────────────────────
 echo ""
 echo -e "${BOLD}${CYAN}"
 echo "  ╔═══════════════════════════════════════════════════════╗"
-echo "  ║          AXIOM Desktop v6.8 — macOS Installer         ║"
+echo "  ║          Zelyr Desktop v6.8 — macOS Installer         ║"
 echo "  ║       Local-First AI Orchestration for Apple Mac      ║"
 echo "  ╚═══════════════════════════════════════════════════════╝"
 echo -e "${NC}"
@@ -51,8 +51,8 @@ if ! command -v launchctl &>/dev/null; then
 fi
 success "macOS launchd detected."
 
-if ! command -v axiom &>/dev/null; then
-    warn "'axiom' command not found in PATH."
+if ! command -v zelyr &>/dev/null; then
+    warn "'zelyr' command not found in PATH."
     warn "Make sure the package is installed (pip install -e .) before enabling the service."
 fi
 
@@ -66,20 +66,20 @@ if [ ! -f "${PLIST_SRC}" ]; then
 fi
 
 mkdir -p "${LAUNCHD_DIR}"
-cp "${PLIST_SRC}" "${LAUNCHD_DIR}/com.axiom.daemon.plist"
-success "Copied com.axiom.daemon.plist → ${LAUNCHD_DIR}/"
+cp "${PLIST_SRC}" "${LAUNCHD_DIR}/com.zelyr.daemon.plist"
+success "Copied com.zelyr.daemon.plist → ${LAUNCHD_DIR}/"
 
 # Unload if it already exists, then load
-launchctl unload "${LAUNCHD_DIR}/com.axiom.daemon.plist" 2>/dev/null || true
-launchctl load "${LAUNCHD_DIR}/com.axiom.daemon.plist"
+launchctl unload "${LAUNCHD_DIR}/com.zelyr.daemon.plist" 2>/dev/null || true
+launchctl load "${LAUNCHD_DIR}/com.zelyr.daemon.plist"
 success "Loaded and started launchd daemon."
 
 # ── Step 2: AppleScript Application Shortcut ───────────────────
 echo ""
-info "Step 2/2: Creating AXIOM.app shortcut..."
+info "Step 2/2: Creating Zelyr.app shortcut..."
 
 mkdir -p "${APP_DIR}"
-APP_BUNDLE="${APP_DIR}/AXIOM.app"
+APP_BUNDLE="${APP_DIR}/Zelyr.app"
 APP_MACOS="${APP_BUNDLE}/Contents/MacOS"
 APP_RESOURCES="${APP_BUNDLE}/Contents/Resources"
 
@@ -88,12 +88,12 @@ mkdir -p "${APP_MACOS}"
 mkdir -p "${APP_RESOURCES}"
 
 # Create the launcher script
-cat > "${APP_MACOS}/axiom_launcher" << 'EOF'
+cat > "${APP_MACOS}/zelyr_launcher" << 'EOF'
 #!/bin/bash
 export PATH="/usr/local/bin:/opt/homebrew/bin:$HOME/.local/bin:$PATH"
-exec axiom-gui
+exec zelyr-gui
 EOF
-chmod +x "${APP_MACOS}/axiom_launcher"
+chmod +x "${APP_MACOS}/zelyr_launcher"
 
 # Create minimal Info.plist
 cat > "${APP_BUNDLE}/Contents/Info.plist" << EOF
@@ -102,13 +102,13 @@ cat > "${APP_BUNDLE}/Contents/Info.plist" << EOF
 <plist version="1.0">
 <dict>
     <key>CFBundleExecutable</key>
-    <string>axiom_launcher</string>
+    <string>zelyr_launcher</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
-    <string>com.axiom.desktop</string>
+    <string>com.zelyr.desktop</string>
     <key>CFBundleName</key>
-    <string>AXIOM</string>
+    <string>Zelyr</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -121,7 +121,7 @@ EOF
 
 # Convert PNG to ICNS (macOS format) via sips if available
 if command -v sips &>/dev/null && command -v iconutil &>/dev/null && [ -f "${ICON_SRC}" ]; then
-    ICONSET_DIR="/tmp/axiom.iconset"
+    ICONSET_DIR="/tmp/zelyr.iconset"
     mkdir -p "${ICONSET_DIR}"
     sips -z 16 16     "${ICON_SRC}" --out "${ICONSET_DIR}/icon_16x16.png" &>/dev/null
     sips -z 32 32     "${ICON_SRC}" --out "${ICONSET_DIR}/icon_16x16@2x.png" &>/dev/null
@@ -148,8 +148,8 @@ echo -e "${BOLD}${GREEN}"
 echo "  ╔═══════════════════════════════════════════════════════╗"
 echo "  ║            Installation Complete!                     ║"
 echo "  ╠═══════════════════════════════════════════════════════╣"
-echo "  ║  Daemon:   launchctl list | grep axiom               ║"
-echo "  ║  Logs:     tail -f /tmp/axiom-daemon.log             ║"
-echo "  ║  GUI:      Open ~/Applications/AXIOM.app             ║"
+echo "  ║  Daemon:   launchctl list | grep zelyr               ║"
+echo "  ║  Logs:     tail -f /tmp/zelyr-daemon.log             ║"
+echo "  ║  GUI:      Open ~/Applications/Zelyr.app             ║"
 echo "  ╚═══════════════════════════════════════════════════════╝"
 echo -e "${NC}"

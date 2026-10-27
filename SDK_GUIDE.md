@@ -1,14 +1,14 @@
-# AXIOM SDK Developer Guide
+# Zelyr SDK Developer Guide
 
-The `axiom-sdk` is the official Python client library for integrating with the AXIOM JSON-RPC 2.0 daemon. It provides both asynchronous and synchronous wrappers around the core Unix Domain Socket API, featuring automatic authentication, strict Pydantic typings, and event streaming.
+The `zelyr-sdk` is the official Python client library for integrating with the Zelyr JSON-RPC 2.0 daemon. It provides both asynchronous and synchronous wrappers around the core Unix Domain Socket API, featuring automatic authentication, strict Pydantic typings, and event streaming.
 
 ## Installation
 
-Since AXIOM SDK is bundled with the OS environment, you can import it directly from your Python scripts running on the system:
+Since Zelyr SDK is bundled with the OS environment, you can import it directly from your Python scripts running on the system:
 
 ```python
-from axiom.sdk import AxiomClient, SyncAxiomClient
-from axiom.sdk import PromptRequest, TelemetryPayload
+from zelyr.sdk import ZelyrClient, SyncZelyrClient
+from zelyr.sdk import PromptRequest, TelemetryPayload
 ```
 
 ## Quick Start (Async)
@@ -17,11 +17,11 @@ The primary interface is asynchronous, which is ideal for high-throughput or eve
 
 ```python
 import asyncio
-from axiom.sdk import AxiomClient
+from zelyr.sdk import ZelyrClient
 
 async def main():
-    # Automatically locates ~/.axiom/axiom.sock and ~/.axiom/daemon.token
-    client = AxiomClient()
+    # Automatically locates ~/.zelyr/zelyr.sock and ~/.zelyr/daemon.token
+    client = ZelyrClient()
     await client.connect()
 
     # 1. Check System Status
@@ -30,7 +30,7 @@ async def main():
 
     # 2. Submit a Prompt
     result = await client.prompt("Analyze the current directory and summarize its purpose.")
-    print("AXIOM response:", result)
+    print("Zelyr response:", result)
     
     await client.disconnect()
 
@@ -40,31 +40,31 @@ if __name__ == "__main__":
 
 ## Quick Start (Sync Wrapper)
 
-For simple scripts, use `SyncAxiomClient`. This wrapper runs an internal background thread and event loop, allowing you to seamlessly integrate with synchronous code.
+For simple scripts, use `SyncZelyrClient`. This wrapper runs an internal background thread and event loop, allowing you to seamlessly integrate with synchronous code.
 
 ```python
-from axiom.sdk import SyncAxiomClient
+from zelyr.sdk import SyncZelyrClient
 
-client = SyncAxiomClient()
+client = SyncZelyrClient()
 
 # Blocks until the response is ready
 status = client.get_status()
 print(status.model_dump())
 
-result = client.prompt("Hello AXIOM!")
+result = client.prompt("Hello Zelyr!")
 print(result)
 ```
 
 ## EventBus Streaming
 
-You can subscribe directly to the daemon's EventBus to observe the inner workings of AXIOM, including Multi-Agent Swarm proposals, system state changes, and proactive perception events.
+You can subscribe directly to the daemon's EventBus to observe the inner workings of Zelyr, including Multi-Agent Swarm proposals, system state changes, and proactive perception events.
 
 ```python
 import asyncio
-from axiom.sdk import AxiomClient
+from zelyr.sdk import ZelyrClient
 
 async def monitor_swarm():
-    client = AxiomClient()
+    client = ZelyrClient()
     await client.connect()
     
     print("Listening for sub-agent proposals...")

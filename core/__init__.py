@@ -1,1 +1,1 @@
-"""Core package (LLM client) for AXIOM."""
+"""Core package (LLM client) for Zelyr."""

@@ -9,6 +9,9 @@ __pycache__/
 # Distribution / packaging
 .Python
 build/
+# Keep the project-owned packaging sources under zelyr/build tracked.
+!zelyr/build/
+!zelyr/build/**
 develop-eggs/
 dist/
 downloads/
@@ -30,6 +33,7 @@ MANIFEST
 # PyInstaller
 *.manifest
 *.spec
+!zelyr.spec
 
 # Unit test / coverage reports
 htmlcov/
@@ -118,15 +122,21 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
-# AXIOM-specific
-axiom.db
+# Zelyr-specific
+zelyr.db
 *.db
 *.db-shm
 *.db-wal
-.axiom/
+.zelyr/
 logs/
 *.pyc
 .DS_Store
+
+# Legacy AXIOM runtime data (read in place; never migrated or removed)
+axiom.db
+axiom_memory.db
+.axiom/
+axiom/tests/
 
 # Multi-agent experimentation sandbox (qwen3 8b <-> qwen3-coder)
 INFINITE POWER/
@@ -147,7 +157,7 @@ tests/e2e/
 tests/integration/
 tests/optional/
 tests/simulation/
-axiom/tests/
+zelyr/tests/
 *.AppImage
 *.rpm
 *.deb
@@ -165,6 +175,7 @@ patch_*.py
 !patch_daemon.py
 fix_*.py
 verify_*.py
+!scripts/verify_zelyr.py
 summary*.md
 restart_server.sh
 refactor*.py
@@ -174,3 +185,4 @@ rewrite_*.py
 *.sqlite
 *.sqlite3
 server.log
+.aider*

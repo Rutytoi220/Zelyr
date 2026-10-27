@@ -1,4 +1,4 @@
-"""Tests for Shell authorization and safety boundaries in axiom.tools."""
+"""Tests for Shell authorization and safety boundaries in zelyr.tools."""
 
 import os
 import shutil
@@ -6,8 +6,8 @@ import sys
 import unittest
 from unittest.mock import patch
 
-from axiom.config import get_config, set_config, AxiomConfig, AuthMode
-from axiom.tools import _request_shell_authorization, ShellTool, ShellCommandTool
+from zelyr.config import get_config, set_config, ZelyrConfig, AuthMode
+from zelyr.tools import _request_shell_authorization, ShellTool, ShellCommandTool
 
 
 class TestShellAuthorization(unittest.TestCase):
@@ -15,15 +15,15 @@ class TestShellAuthorization(unittest.TestCase):
 
     def setUp(self):
         self._orig_env = os.environ.copy()
-        os.environ.pop("AXIOM_AUTOPILOT", None)
-        os.environ.pop("AXIOM_TESTING", None)
+        os.environ.pop("ZELYR_AUTOPILOT", None)
+        os.environ.pop("ZELYR_TESTING", None)
         os.environ.pop("PYTEST_CURRENT_TEST", None)
-        set_config(AxiomConfig(auth_mode=AuthMode.BASIC))
+        set_config(ZelyrConfig(auth_mode=AuthMode.BASIC))
 
     def tearDown(self):
         os.environ.clear()
         os.environ.update(self._orig_env)
-        set_config(AxiomConfig())
+        set_config(ZelyrConfig())
 
     def test_non_interactive_fails_closed(self):
         """In a non-interactive environment without autopilot, authorization fails closed."""
@@ -54,14 +54,14 @@ class TestShellAuthorization(unittest.TestCase):
                 self.assertFalse(_request_shell_authorization("shell", "echo test"))
 
     def test_autopilot_env_bypass(self):
-        """AXIOM_AUTOPILOT=1 allows execution without interactive confirmation."""
-        os.environ["AXIOM_AUTOPILOT"] = "1"
+        """ZELYR_AUTOPILOT=1 allows execution without interactive confirmation."""
+        os.environ["ZELYR_AUTOPILOT"] = "1"
         with patch.object(sys.stdin, "isatty", return_value=False):
             self.assertTrue(_request_shell_authorization("shell", "echo test"))
 
     def test_testing_env_bypass(self):
-        """AXIOM_TESTING=1 allows execution during automated test harnesses."""
-        os.environ["AXIOM_TESTING"] = "1"
+        """ZELYR_TESTING=1 allows execution during automated test harnesses."""
+        os.environ["ZELYR_TESTING"] = "1"
         with patch.object(sys.stdin, "isatty", return_value=False):
             self.assertTrue(_request_shell_authorization("shell", "echo test"))
 
@@ -89,7 +89,7 @@ class TestShellAuthorization(unittest.TestCase):
 
     def test_sync_shell_command_tool_autopilot_allowed(self):
         """Sync ShellCommandTool execution proceeds when in autopilot mode."""
-        os.environ["AXIOM_AUTOPILOT"] = "1"
+        os.environ["ZELYR_AUTOPILOT"] = "1"
         with patch.object(sys.stdin, "isatty", return_value=False), \
              patch("shutil.which", side_effect=lambda x: None if x == "bwrap" else shutil.which(x)):
             tool = ShellCommandTool()

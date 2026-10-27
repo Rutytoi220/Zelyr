@@ -15,13 +15,13 @@ import contextlib
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from axiom.agents.actuator_arbiter import (
+from zelyr.agents.actuator_arbiter import (
     ActuatorArbiter,
     is_browser_window,
     is_terminal_or_ide_window,
 )
-from axiom.agents.native_orchestrator import NativeOrchestrator
-from axiom.core.plugins import filter_tool_schemas_by_tier, get_tool_schemas, load_plugins
+from zelyr.agents.native_orchestrator import NativeOrchestrator
+from zelyr.core.plugins import filter_tool_schemas_by_tier, get_tool_schemas, load_plugins
 
 
 class TestActuatorArbiter(unittest.IsolatedAsyncioTestCase):
@@ -179,7 +179,7 @@ class TestActuatorArbiter(unittest.IsolatedAsyncioTestCase):
 
         # Mock active window as browser, bridge as connected, and Ollama request
         with patch.object(orch, "get_active_window", AsyncMock(return_value=browser_window)), \
-             patch("axiom.tools.browser_extension.get_bridge") as mock_get_bridge, \
+             patch("zelyr.tools.browser_extension.get_bridge") as mock_get_bridge, \
              patch("httpx.AsyncClient") as mock_client:
 
             mock_bridge = mock_get_bridge.return_value

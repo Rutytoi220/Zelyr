@@ -1,7 +1,7 @@
 """Example: Creating a custom agent."""
 
-from axiom.agents.base_agent import BaseAgent, AgentResponse, AgentState
-from axiom import Engine
+from zelyr.agents.base_agent import BaseAgent, AgentResponse, AgentState
+from zelyr import Engine
 from typing import Optional, Dict, Any
 
 

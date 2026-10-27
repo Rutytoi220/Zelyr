@@ -6,10 +6,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from axiom.eval.cli import get_all_available_tasks
-from axiom.eval.harness import EvalHarness
-from axiom.eval.metrics import EvalStatus
-from axiom.eval.tasks.self_repair_l3 import (
+from zelyr.eval.cli import get_all_available_tasks
+from zelyr.eval.harness import EvalHarness
+from zelyr.eval.metrics import EvalStatus
+from zelyr.eval.tasks.self_repair_l3 import (
     build_task_self_repair_bounded_retries,
     build_task_self_repair_invalid_rejection,
     build_task_self_repair_security_bypass,
@@ -17,11 +17,11 @@ from axiom.eval.tasks.self_repair_l3 import (
     build_task_self_repair_unrecoverable_failure,
     get_self_repair_l3_tasks,
 )
-from axiom.eval.tasks.synthetic_workflows_p2 import build_task_tool_crafting_self_repair
+from zelyr.eval.tasks.synthetic_workflows_p2 import build_task_tool_crafting_self_repair
 
 
 class TestLevel3SelfRepairEvaluations(unittest.IsolatedAsyncioTestCase):
-    """Deterministic evaluation battery for AXIOM Level 3 autonomous self-repair and tool crafting."""
+    """Deterministic evaluation battery for Zelyr Level 3 autonomous self-repair and tool crafting."""
 
     async def asyncSetUp(self) -> None:
         self.harness = EvalHarness()

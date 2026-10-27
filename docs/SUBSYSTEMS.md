@@ -1,37 +1,37 @@
-# AXIOM Subsystem Catalog & Module Reference
+# Zelyr Subsystem Catalog & Module Reference
 
-This document provides a comprehensive, module-by-module reference of verified subsystems across **AXIOM** (v1.0.0).  
+This document provides a comprehensive, module-by-module reference of verified subsystems across **Zelyr** (v1.0.0).  
 Each section specifies module responsibilities, public interfaces, state mutations, failure modes, and backing unit tests.
 
 ---
 
 ## 1. CLI & User Interfaces
 
-### A. Universal CLI Entry Point ([`axiom/cli/main.py`](../axiom/cli/main.py))
+### A. Universal CLI Entry Point ([`zelyr/cli/main.py`](../zelyr/cli/main.py))
 - **Primary Responsibilities:**  
-  Acts as the primary executable entry point (`axiom`). Resolves command-line arguments and dispatches to appropriate UI modes, diagnostic utilities, or headless test runners.
+  Acts as the primary executable entry point (`zelyr`). Resolves command-line arguments and dispatches to appropriate UI modes, diagnostic utilities, or headless test runners.
 - **Non-Responsibilities:**  
   Does not execute LLM inference directly; delegates to `repl.py`, `tui.py`, or `app.py`.
 - **Verified Public Interfaces:**  
   `main() -> None`: Main console dispatcher.  
   `_build_parser() -> ArgumentParser`: Configures CLI arguments (`repl`, `chat`, `ui`, `server`, `run`, `send`, `status`, `test`, `daemon`, `serve`, `tool list`, `tool run`).
-- **Dependencies:** `argparse`, `rich` (optional graceful degradation), `axiom.config`.
-- **State Mutations:** Triggers `axiom.config.initialize_directories()`.
+- **Dependencies:** `argparse`, `rich` (optional graceful degradation), `zelyr.config`.
+- **State Mutations:** Triggers `zelyr.config.initialize_directories()`.
 - **Failure Modes:** Falls back to standard `print()` if `rich` is unavailable.
 - **Backing Tests:** [`tests/test_install_bootstrap.py:test_pyproject_entrypoints_and_callables`](../tests/test_install_bootstrap.py).
 
-### B. Modern Streaming REPL ([`axiom/cli/repl.py`](../axiom/cli/repl.py))
+### B. Modern Streaming REPL ([`zelyr/cli/repl.py`](../zelyr/cli/repl.py))
 - **Primary Responsibilities:**  
   Provides an inline, non-fullscreen streaming REPL with Tokyo Night aesthetics, prompt auto-suggestion, slash command autocompletion, and reasoning `<think>` token toggles.
 - **Verified Public Interfaces:**  
   `run_repl() -> None`: Starts interactive prompt session.  
   `COMMANDS: Dict[str, str]`: Slash command registry (`/help`, `/model`, `/session`, `/thought`, `/tools`, `/memory`, `/doctor`, `/undo`, `/exit`).
-- **Dependencies:** `prompt_toolkit`, `rich`, `axiom.agents.native_orchestrator.NativeOrchestrator`.
+- **Dependencies:** `prompt_toolkit`, `rich`, `zelyr.agents.native_orchestrator.NativeOrchestrator`.
 - **Backing Tests:** Interactive verification via pseudo-terminal (PTY) harnesses.
 
-### C. Desktop Graphical Client ([`axiom/gui/app.py`](../axiom/gui/app.py))
+### C. Desktop Graphical Client ([`zelyr/gui/app.py`](../zelyr/gui/app.py))
 - **Primary Responsibilities:**  
-  Thin PySide6 client running the desktop interface with dynamic QSS themes (`ThemeManager`) and non-blocking asynchronous event bridging (`AxiomGuiBridge`).
+  Thin PySide6 client running the desktop interface with dynamic QSS themes (`ThemeManager`) and non-blocking asynchronous event bridging (`ZelyrGuiBridge`).
 - **Verified Public Interfaces:**  
   `main() -> None`: Initializes PySide6 application loop.
 - **Dependencies:** `PySide6.QtWidgets`, `qasync`.
@@ -42,7 +42,7 @@ Each section specifies module responsibilities, public interfaces, state mutatio
 
 ## 2. Core Orchestration & Routing
 
-### A. Native Orchestrator ([`axiom/agents/native_orchestrator.py`](../axiom/agents/native_orchestrator.py))
+### A. Native Orchestrator ([`zelyr/agents/native_orchestrator.py`](../zelyr/agents/native_orchestrator.py))
 - **Primary Responsibilities:**  
   Runs the streaming ReAct loop. Handles sliding-window context budgeting, window context introspection (`hyprctl`), tier-aware tool filtering, tolerant JSON/XML tool call extraction, and closed-loop error recovery.
 - **Verified Public Interfaces:**  
@@ -51,12 +51,12 @@ Each section specifies module responsibilities, public interfaces, state mutatio
   `route_tier(task_description, active_window, bridge_connected) -> str`: Resolves automation tier.  
   `prune_messages(messages, max_context_tokens, reserve_tokens) -> list[dict]`: Applies sliding window context pruning.  
   `extract_first_tool_call(text, known_tools) -> Optional[dict]`: Extracts first valid tool call from prose or raw JSON.
-- **Dependencies:** `httpx`, `axiom.config`, `axiom.core.plugins`, `axiom.agents.actuator_arbiter`.
-- **State Mutations:** Appends assistant tool calls and tool observation messages to the session history in `axiom.db.memory`.
+- **Dependencies:** `httpx`, `zelyr.config`, `zelyr.core.plugins`, `zelyr.agents.actuator_arbiter`.
+- **State Mutations:** Appends assistant tool calls and tool observation messages to the session history in `zelyr.db.memory`.
 - **Failure Modes:** If Ollama is unreachable, yields structured `[Connection Error]` chunk without raising uncaught exceptions.
 - **Backing Tests:** [`tests/test_context_budget_fix.py`](../tests/test_context_budget_fix.py), [`tests/test_multi_turn_payload.py`](../tests/test_multi_turn_payload.py).
 
-### B. Actuator Arbiter ([`axiom/agents/actuator_arbiter.py`](../axiom/agents/actuator_arbiter.py))
+### B. Actuator Arbiter ([`zelyr/agents/actuator_arbiter.py`](../zelyr/agents/actuator_arbiter.py))
 - **Primary Responsibilities:**  
   Arbitrates between Tier 1 (IPC/OS), Tier 2 (Browser DOM), and Tier 3 (Vision Grounding) based on user query intent, active window class/title, and browser bridge state.
 - **Verified Public Interfaces:**  
@@ -64,7 +64,7 @@ Each section specifies module responsibilities, public interfaces, state mutatio
   `is_browser_window(active_window) -> bool`: Checks whether active window is a known browser.
 - **Backing Tests:** [`tests/test_context_budget_fix.py`](../tests/test_context_budget_fix.py).
 
-### C. Fastest Path Tool Router ([`axiom/core/fast_path_router.py`](../axiom/core/fast_path_router.py))
+### C. Fastest Path Tool Router ([`zelyr/core/fast_path_router.py`](../zelyr/core/fast_path_router.py))
 - **Primary Responsibilities:**  
   Intercepts standard deterministic actions (URLs, known binary launches, systemctl units) to execute them directly via CLI, bypassing LLM inference entirely.
 - **Verified Public Interfaces:**  
@@ -75,9 +75,9 @@ Each section specifies module responsibilities, public interfaces, state mutatio
 
 ## 3. Tool Plugin System & Dynamic Provisioning
 
-### A. Plugin Core ([`axiom/core/plugins.py`](../axiom/core/plugins.py))
+### A. Plugin Core ([`zelyr/core/plugins.py`](../zelyr/core/plugins.py))
 - **Primary Responsibilities:**  
-  Provisions built-in tools into `~/.config/axiom/tools.d/` on initialization, dynamically loads external plugins, registers capability metadata, and filters schemas by tier.
+  Provisions built-in tools into `~/.config/zelyr/tools.d/` on initialization, dynamically loads external plugins, registers capability metadata, and filters schemas by tier.
 - **Verified Public Interfaces:**  
   `load_plugins() -> None`: Discovers and reloads all `.py` plugin files in `TOOLS_DIR`.  
   `get_tool_schemas(ring, tier, is_browser) -> List[Dict[str, Any]]`: Returns filtered OpenAPI schemas.  
@@ -101,7 +101,7 @@ Each section specifies module responsibilities, public interfaces, state mutatio
 
 ## 4. Security & Isolation Boundaries
 
-### A. SSRF Network Security Guard ([`axiom/security/network.py`](../axiom/security/network.py))
+### A. SSRF Network Security Guard ([`zelyr/security/network.py`](../zelyr/security/network.py))
 - **Primary Responsibilities:**  
   Validates all outbound URLs before network connection to prevent Server-Side Request Forgery (SSRF). Enforces per-hop IP validation across HTTP redirects.
 - **Verified Public Interfaces:**  
@@ -117,20 +117,20 @@ Each section specifies module responsibilities, public interfaces, state mutatio
   - IPv6 Documentation (RFC 3849: `2001:db8::/32`).
 - **Backing Tests:** [`tests/test_web_search.py:TestSSRFSecurity`](../tests/test_web_search.py).
 
-### B. Shell Authorization Confirmation ([`axiom/tools/__init__.py`](../axiom/tools/__init__.py))
+### B. Shell Authorization Confirmation ([`zelyr/tools/__init__.py`](../zelyr/tools/__init__.py))
 - **Primary Responsibilities:**  
   Guards arbitrary shell command execution behind an explicit human confirmation prompt in interactive TTY sessions. Fails closed in non-interactive environments.
 - **Verified Public Interfaces:**  
   `_request_shell_authorization(tool_id: str, command: str) -> bool`: Prompts via `rich.prompt.Confirm.ask`.
 - **Bypass Conditions:**  
-  Returns `True` without prompting only if `AXIOM_AUTOPILOT="1"` or `AXIOM_TESTING="1"` is set.
+  Returns `True` without prompting only if `ZELYR_AUTOPILOT="1"` or `ZELYR_TESTING="1"` is set.
 - **Backing Tests:** [`tests/test_shell_authorization.py`](../tests/test_shell_authorization.py).
 
 ---
 
 ## 5. Storage & Swarm Memory
 
-### A. SQLite Persistent Memory ([`axiom/db/memory.py`](../axiom/db/memory.py))
+### A. SQLite Persistent Memory ([`zelyr/db/memory.py`](../zelyr/db/memory.py))
 - **Primary Responsibilities:**  
   Stores conversational session history, messages, and semantic memories in SQLite with Write-Ahead Logging (`WAL`).
 - **Verified Public Interfaces:**  
@@ -139,7 +139,7 @@ Each section specifies module responsibilities, public interfaces, state mutatio
   `get_session_messages(session_id, db_path) -> List[Dict[str, Any]]`: Retrieves session history.  
   `remember_fact(fact, category, db_path) -> None`: Inserts facts with full-text search indexing (`FTS5`).
 
-### B. Swarm Blackboard Store ([`axiom/memory/blackboard.py`](../axiom/memory/blackboard.py))
+### B. Swarm Blackboard Store ([`zelyr/memory/blackboard.py`](../zelyr/memory/blackboard.py))
 - **Primary Responsibilities:**  
   Maintains in-memory key-value state for multi-agent swarm collaboration with strict session and agent isolation.
 - **Verified Public Interfaces:**  
@@ -153,11 +153,11 @@ Each section specifies module responsibilities, public interfaces, state mutatio
 
 ## 6. System Configuration & Directory Bootstrap
 
-### A. Configuration Module ([`axiom/config.py`](../axiom/config.py))
+### A. Configuration Module ([`zelyr/config.py`](../zelyr/config.py))
 - **Primary Responsibilities:**  
   Resolves environment overrides, initializes required directory structures on first launch, and provides clamped context lengths.
 - **Verified Public Interfaces:**  
-  `get_config_dir() -> Path`: Resolves `AXIOM_CONFIG_DIR` or defaults to `~/.config/axiom`.  
+  `get_config_dir() -> Path`: Resolves `ZELYR_CONFIG_DIR` or defaults to `~/.config/zelyr`.  
   `initialize_directories(config_dir: Optional[Path] = None) -> None`: Creates `tools.d/`, `plugins/`, `sessions/`, `logs/`, `models/`.  
   `validate_and_clamp_num_ctx(val: Any) -> int`: Validates context integers within `[1024, 65536]`, defaulting to `8192`.  
   `get_effective_num_ctx(caller_override: Optional[Any] = None) -> int`: Resolves context with 4-level precedence.

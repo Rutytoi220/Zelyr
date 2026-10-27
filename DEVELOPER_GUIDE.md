@@ -1,4 +1,4 @@
-# AXIOM Developer Guide (v1.0.0)
+# Zelyr Developer Guide (v1.0.0)
 
 > [!IMPORTANT]
 > The authoritative, source-verified developer workflow and testing guide is located in [`docs/DEVELOPER_GUIDE.md`](docs/DEVELOPER_GUIDE.md).  
@@ -7,12 +7,12 @@
 
 # Creating Custom Tools
 
-Tools in AXIOM extend the `BaseTool` class in [`axiom.tools.core`](axiom/tools/core.py) or are authored as dynamic single-file plugins in `~/.config/axiom/tools.d/<name>.py` (see [`docs/TOOLS.md`](docs/TOOLS.md)).
+Tools in Zelyr extend the `BaseTool` class in [`zelyr.tools.core`](zelyr/tools/core.py) or are authored as dynamic single-file plugins in `~/.config/zelyr/tools.d/<name>.py` (see [`docs/TOOLS.md`](docs/TOOLS.md)).
 
 ## Example: Creating a Native Tool Class
 
 ```python
-from axiom.tools.core import BaseTool, ToolResult, ToolParameter
+from zelyr.tools.core import BaseTool, ToolResult, ToolParameter
 import requests
 from bs4 import BeautifulSoup
 
@@ -75,7 +75,7 @@ Agents extend `BaseAgent` and implement the `run` method, returning an
 ## Example: Database Query Agent
 
 ```python
-from axiom import BaseAgent, AgentResult
+from zelyr import BaseAgent, AgentResult
 from typing import Optional, List
 import sqlite3
 
@@ -142,7 +142,7 @@ Plugins extend `BasePlugin` and provide additional functionality.
 ## Example: Notification Plugin
 
 ```python
-from axiom import BasePlugin
+from zelyr import BasePlugin
 from typing import Dict, Optional, Any, Callable, List
 import smtplib
 from email.mime.text import MIMEText
@@ -185,7 +185,7 @@ class NotificationPlugin(BasePlugin):
         """Send notification."""
         try:
             msg = MIMEText(message)
-            msg["Subject"] = f"AXIOM: {event_type}"
+            msg["Subject"] = f"Zelyr: {event_type}"
             msg["From"] = self.config["email"]
             msg["To"] = recipient
             
@@ -201,12 +201,12 @@ class NotificationPlugin(BasePlugin):
 
 # Event-Driven Architecture
 
-AXIOM uses events for all inter-component communication.
+Zelyr uses events for all inter-component communication.
 
 ## Subscribing to Events
 
 ```python
-from axiom import Engine, Event
+from zelyr import Engine, Event
 
 engine = Engine()
 engine.initialize()
@@ -228,7 +228,7 @@ engine.event_bus.subscribe("*", on_any_event)
 ## Publishing Events
 
 ```python
-from axiom import Event
+from zelyr import Event
 
 event = Event(
     event_type="custom.event",
@@ -242,12 +242,12 @@ engine.event_bus.publish(event)
 
 # Memory Management
 
-AXIOM provides persistent storage via SQLite.
+Zelyr provides persistent storage via SQLite.
 
 ## Working with Conversations
 
 ```python
-from axiom import MemoryManager
+from zelyr import MemoryManager
 
 memory = MemoryManager()
 
@@ -368,7 +368,7 @@ def execute(self, path: str, **kwargs) -> ToolResult:
 
 ```python
 import pytest
-from axiom import Engine
+from zelyr import Engine
 
 
 def test_my_tool():
@@ -396,7 +396,7 @@ def test_my_agent():
 ## Multi-Agent Conversation
 
 ```python
-from axiom import Engine, OrchestratorAgent
+from zelyr import Engine, OrchestratorAgent
 from my_agents import DataAnalysisAgent, SynthesisAgent
 
 engine = Engine()
@@ -425,7 +425,7 @@ engine.event_bus.subscribe("agent.complete", on_agent_complete)
 ## Custom LLM Integration
 
 ```python
-from axiom import OllamaClient, OllamaConfig
+from zelyr import OllamaClient, OllamaConfig
 
 # Configure for different model
 config = OllamaConfig(
@@ -453,7 +453,7 @@ response = llm.chat(messages)
 
 # Resources
 
-- AXIOM GitHub: https://github.com/yourusername/axiom
+- Zelyr GitHub: https://github.com/yourusername/zelyr
 - Python Logging: https://docs.python.org/3/library/logging.html
 - SQLite: https://www.sqlite.org/
 - Ollama: https://ollama.ai/

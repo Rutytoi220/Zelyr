@@ -1,4 +1,4 @@
-"""Example: Loading a plugin using the AXIOM v2 Plugin Ecosystem (RFC-001).
+"""Example: Loading a plugin using the Zelyr v2 Plugin Ecosystem (RFC-001).
 
 This script supersedes the v1 ``example_custom_tool.py`` (which registered a
 raw ``BaseTool`` directly).  It shows how to load a manifest-driven,
@@ -10,8 +10,8 @@ the recommended v2 pattern.
 
 from pathlib import Path
 
-from axiom.core.engine import Engine
-from axiom.plugins.manager import PluginManager
+from zelyr.core.engine import Engine
+from zelyr.plugins.manager import PluginManager
 
 PLUGIN_DIR = Path(__file__).parent / "example_plugin"
 
@@ -22,7 +22,7 @@ def main() -> None:
     engine.initialize()
 
     # Create the PluginManager and point it at our example plugin directory.
-    # In production this would scan ~/.axiom/plugins/ automatically.
+    # In production this would scan ~/.zelyr/plugins/ automatically.
     manager = PluginManager(
         registry=engine.registry,
         event_bus=engine.event_bus,
@@ -32,7 +32,7 @@ def main() -> None:
     # Load only the example plugin for this demo
     success = manager.load_from_path(PLUGIN_DIR)
 
-    print("AXIOM v2 Plugin Example")
+    print("Zelyr v2 Plugin Example")
     print("=" * 60)
 
     if not success:
@@ -49,7 +49,7 @@ def main() -> None:
 
     # Call the sandboxed tool — runs in an isolated child process.
     print("\nTesting sandboxed 'calculate' tool:")
-    tool = engine.registry.get_tool("axiom-calculator::calculate")
+    tool = engine.registry.get_tool("zelyr-calculator::calculate")
     if tool:
         result = tool(expression="2 + sqrt(16)")
         print(f"  2 + sqrt(16) = {result.output}")

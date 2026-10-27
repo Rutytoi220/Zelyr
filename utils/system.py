@@ -1,4 +1,4 @@
-"""Shared system utilities for AXIOM.
+"""Shared system utilities for Zelyr.
 
 Single source of truth for system detection (default browser, known browsers, etc.).
 Avoids duplicating detection logic across agent.py and executor.py.

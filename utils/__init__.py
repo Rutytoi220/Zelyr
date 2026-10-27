@@ -1,1 +1,1 @@
-"""Utilities package for AXIOM."""
+"""Utilities package for Zelyr."""

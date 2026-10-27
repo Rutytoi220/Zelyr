@@ -1,10 +1,10 @@
 [plugin]
-name = "axiom-calculator"
+name = "zelyr-calculator"
 version = "1.0.0"
-description = "A safe arithmetic calculator demonstrating the AXIOM v2 Plugin Ecosystem."
-author = "AXIOM Team <team@axiom.local>"
+description = "A safe arithmetic calculator demonstrating the Zelyr v2 Plugin Ecosystem."
+author = "Zelyr Team <team@zelyr.local>"
 license = "MIT"
-axiom_version = ">=2.0.0"
+zelyr_version = ">=2.0.0"
 
 [entrypoint]
 module = "calculator_plugin"

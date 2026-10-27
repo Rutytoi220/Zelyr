@@ -1,4 +1,4 @@
-"""Observer system for AXIOM — detects behavioral patterns and generates suggestions.
+"""Observer system for Zelyr — detects behavioral patterns and generates suggestions.
 
 Analyzes persistent action history to identify repeating patterns and offers
 proactive suggestions. All suggestions are advisory — the agent NEVER acts

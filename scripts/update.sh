@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════
-#  AXIOM Autonomous Updater
+#  Zelyr Autonomous Updater
 # ═══════════════════════════════════════════════════════════════
 set -euo pipefail
 
@@ -15,7 +15,7 @@ git fetch --all
 git reset --hard origin/main
 
 echo "[updater] Updating dependencies..."
-VENV_DIR="${HOME}/.local/share/axiom/venv"
+VENV_DIR="${HOME}/.local/share/zelyr/venv"
 if [ -d "${VENV_DIR}" ]; then
     source "${VENV_DIR}/bin/activate"
     pip install -r requirements.txt
@@ -24,10 +24,17 @@ else
     echo "[updater] WARNING: Virtual environment not found at ${VENV_DIR}"
 fi
 
-echo "[updater] Update complete. Relaunching AXIOM..."
-if [ -f "${HOME}/.local/share/applications/axiom.desktop" ]; then
+echo "[updater] Update complete. Relaunching Zelyr..."
+if [ -f "${HOME}/.local/share/applications/Zelyr.desktop" ]; then
+    DESKTOP_ID="Zelyr.desktop"
+elif [ -f "${HOME}/.local/share/applications/zelyr.desktop" ]; then
+    DESKTOP_ID="zelyr.desktop"
+else
+    DESKTOP_ID=""
+fi
+if [ -n "${DESKTOP_ID}" ]; then
     if command -v gtk-launch &>/dev/null; then
-        gtk-launch axiom.desktop > /dev/null 2>&1 &
+        gtk-launch "${DESKTOP_ID}" > /dev/null 2>&1 &
     else
         nohup "${VENV_DIR}/bin/python" main.py --gui > /dev/null 2>&1 &
     fi

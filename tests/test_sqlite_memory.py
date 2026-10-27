@@ -6,8 +6,8 @@ import threading
 import unittest
 from pathlib import Path
 
-from axiom.agents.native_orchestrator import NativeOrchestrator
-from axiom.db.memory import (
+from zelyr.agents.native_orchestrator import NativeOrchestrator
+from zelyr.db.memory import (
     VALID_CATEGORIES,
     MemoryStore,
     add_message,
@@ -16,7 +16,7 @@ from axiom.db.memory import (
     get_session_messages,
     search_historical_context,
 )
-from axiom.memory.hydration import format_contextual_memory, hydrate_context_memory
+from zelyr.memory.hydration import format_contextual_memory, hydrate_context_memory
 
 
 class TestSqliteMemoryStore(unittest.TestCase):
@@ -24,12 +24,12 @@ class TestSqliteMemoryStore(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.db_path = str(Path(self.temp_dir.name) / "test_memory_p1.db")
         self.store = MemoryStore(db_path=self.db_path)
-        os.environ["AXIOM_MEMORY_DB"] = self.db_path
+        os.environ["ZELYR_MEMORY_DB"] = self.db_path
 
     def tearDown(self):
         self.temp_dir.cleanup()
-        if "AXIOM_MEMORY_DB" in os.environ:
-            del os.environ["AXIOM_MEMORY_DB"]
+        if "ZELYR_MEMORY_DB" in os.environ:
+            del os.environ["ZELYR_MEMORY_DB"]
 
     def test_crud_lifecycle(self):
         """Verify full lifecycle: store, get, update, soft-delete, purge, hard-delete."""
@@ -251,12 +251,12 @@ class TestMemoryHydration(unittest.IsolatedAsyncioTestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.db_path = str(Path(self.temp_dir.name) / "test_hydration_p2.db")
         self.store = MemoryStore(db_path=self.db_path)
-        os.environ["AXIOM_MEMORY_DB"] = self.db_path
+        os.environ["ZELYR_MEMORY_DB"] = self.db_path
 
     async def asyncTearDown(self):
         self.temp_dir.cleanup()
-        if "AXIOM_MEMORY_DB" in os.environ:
-            del os.environ["AXIOM_MEMORY_DB"]
+        if "ZELYR_MEMORY_DB" in os.environ:
+            del os.environ["ZELYR_MEMORY_DB"]
 
     def test_query_matching_and_category_formatting(self):
         """Verify matched memories are formatted cleanly into [Contextual Memory] block."""

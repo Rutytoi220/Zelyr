@@ -12,7 +12,7 @@ logger = get_logger(__name__)
 # ── Primary Wayland Controller (ydotool) ──────────────────────────────────
 WAYLAND_CONTROLLER = None
 try:
-    from axiom.tools.input_controller import WaylandInputController
+    from zelyr.tools.input_controller import WaylandInputController
     WAYLAND_CONTROLLER = WaylandInputController()
     logger.info("actions/desktop: WaylandInputController (ydotool) initialized.")
 except Exception as e:
@@ -31,7 +31,7 @@ def _get_wayland_ctrl() -> Optional[WaylandInputController]:
     global WAYLAND_CONTROLLER
     if WAYLAND_CONTROLLER is None:
         try:
-            from axiom.tools.input_controller import WaylandInputController
+            from zelyr.tools.input_controller import WaylandInputController
             WAYLAND_CONTROLLER = WaylandInputController()
         except Exception:
             pass
@@ -161,7 +161,7 @@ def take_screenshot(encode_base64: bool = True) -> Tuple[bool, str]:
             return True, img_base64
         else:
             # Save to file
-            screenshot_path = '/tmp/axiom_screenshot.png'
+            screenshot_path = '/tmp/zelyr_screenshot.png'
             screenshot.save(screenshot_path)
             logger.info("Screenshot saved to %s", screenshot_path)
             return True, screenshot_path

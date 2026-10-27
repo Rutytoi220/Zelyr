@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Zelyr
+Comment=AI Operating System — Local-First LLM Framework
+Exec=/usr/bin/zelyr-gui
+Icon=zelyr
+Terminal=false
+Type=Application
+Categories=Utility;Development;Science;
+Keywords=AI;LLM;Agent;Automation;
+StartupWMClass=Zelyr

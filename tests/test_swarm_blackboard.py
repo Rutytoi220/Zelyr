@@ -1,5 +1,5 @@
 import pytest
-pytest.importorskip("axiom.agents.swarm")
+pytest.importorskip("zelyr.agents.swarm")
 """Tests for Swarm Blackboard Distributed Memory Namespace."""
 
 import threading
@@ -8,11 +8,11 @@ from unittest.mock import MagicMock, patch
 from pathlib import Path
 import tempfile
 
-from axiom.memory.blackboard import BlackboardStore, BlackboardNamespace
-from axiom.agents.swarm import BaseSubagent
-from axiom.agents.swarm.consensus import ConsensusEngine, ProposalState
-from axiom.core.events import EventBus, Event
-from axiom.core.transaction import WorkspaceTransactionManager
+from zelyr.memory.blackboard import BlackboardStore, BlackboardNamespace
+from zelyr.agents.swarm import BaseSubagent
+from zelyr.agents.swarm.consensus import ConsensusEngine, ProposalState
+from zelyr.core.events import EventBus, Event
+from zelyr.core.transaction import WorkspaceTransactionManager
 
 
 # ---------------------------------------------------------------------------

@@ -9,26 +9,26 @@ import unittest
 from typing import Any, AsyncGenerator, Dict, List
 from unittest.mock import patch
 
-from axiom.agents.native_orchestrator import NativeOrchestrator
-from axiom.config import AxiomConfig, get_config, get_effective_num_ctx, set_config, validate_and_clamp_num_ctx
+from zelyr.agents.native_orchestrator import NativeOrchestrator
+from zelyr.config import ZelyrConfig, get_config, get_effective_num_ctx, set_config, validate_and_clamp_num_ctx
 
 
 class TestMultiTurnPayload(unittest.IsolatedAsyncioTestCase):
     """Verifies authoritative context precedence, Turn 2 serialization, and thinking preservation."""
 
     def setUp(self) -> None:
-        self.original_env = os.environ.get("AXIOM_NUM_CTX")
-        if "AXIOM_NUM_CTX" in os.environ:
-            del os.environ["AXIOM_NUM_CTX"]
+        self.original_env = os.environ.get("ZELYR_NUM_CTX")
+        if "ZELYR_NUM_CTX" in os.environ:
+            del os.environ["ZELYR_NUM_CTX"]
         self.original_config = get_config()
-        self.test_config = AxiomConfig()
+        self.test_config = ZelyrConfig()
         set_config(self.test_config)
 
     def tearDown(self) -> None:
         if self.original_env is not None:
-            os.environ["AXIOM_NUM_CTX"] = self.original_env
-        elif "AXIOM_NUM_CTX" in os.environ:
-            del os.environ["AXIOM_NUM_CTX"]
+            os.environ["ZELYR_NUM_CTX"] = self.original_env
+        elif "ZELYR_NUM_CTX" in os.environ:
+            del os.environ["ZELYR_NUM_CTX"]
         set_config(self.original_config)
 
     def test_context_precedence_hierarchy(self) -> None:
@@ -38,13 +38,13 @@ class TestMultiTurnPayload(unittest.IsolatedAsyncioTestCase):
         orch_default = NativeOrchestrator()
         self.assertEqual(orch_default.max_context_tokens, 8192)
 
-        # Tier 3: Config setting in AxiomConfig
+        # Tier 3: Config setting in ZelyrConfig
         self.test_config.ollama_num_ctx = 4096
         self.assertEqual(get_effective_num_ctx(), 4096)
         self.assertEqual(orch_default.max_context_tokens, 4096)
 
-        # Tier 2: Environment variable AXIOM_NUM_CTX overrides config
-        os.environ["AXIOM_NUM_CTX"] = "16384"
+        # Tier 2: Environment variable ZELYR_NUM_CTX overrides config
+        os.environ["ZELYR_NUM_CTX"] = "16384"
         self.assertEqual(get_effective_num_ctx(), 16384)
         self.assertEqual(orch_default.max_context_tokens, 16384)
 

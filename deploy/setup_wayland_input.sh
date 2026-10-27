@@ -2,10 +2,10 @@
 set -e
 
 echo "==============================================="
-echo " AXIOM Linux User-Space Input Setup Script"
+echo " Zelyr Linux User-Space Input Setup Script"
 echo "==============================================="
 echo "This script configures udev rules and user services to allow"
-echo "AXIOM to control the mouse and keyboard on Linux (Wayland/X11)"
+echo "Zelyr to control the mouse and keyboard on Linux (Wayland/X11)"
 echo "without requiring root/sudo privileges during execution."
 echo ""
 
@@ -67,5 +67,5 @@ echo ""
 echo "==============================================="
 echo "Setup Complete!"
 echo "ydotoold is now running as a user service."
-echo "AXIOM can now physically interact with your OS in user-space."
+echo "Zelyr can now physically interact with your OS in user-space."
 echo "==============================================="

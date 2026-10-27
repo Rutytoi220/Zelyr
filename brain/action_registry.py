@@ -1,4 +1,4 @@
-"""Action registry for AXIOM - handles different types of actions."""
+"""Action registry for Zelyr - handles different types of actions."""
 
 import time
 from typing import Tuple, Dict, Callable, Optional

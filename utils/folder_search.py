@@ -1,4 +1,4 @@
-"""Folder/File searching utilities for AXIOM.
+"""Folder/File searching utilities for Zelyr.
 
 Provides:
 - Generic filesystem search for any folder or file

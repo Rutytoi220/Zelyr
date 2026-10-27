@@ -9,12 +9,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from axiom.eval.cli import get_all_available_tasks, run_benchmark_cli
-from axiom.eval.harness import EvalHarness, LiveOllamaStreamAdapter, check_ollama_status_async
-from axiom.eval.metrics import EvalStatus, TaskResult, export_json_report, format_summary_table
-from axiom.eval.task import EvalContext, EvalTask
-from axiom.eval.tasks.deterministic_p1 import build_task_tool_dispatch
-from axiom.eval.tasks.model_tasks_p3 import (
+from zelyr.eval.cli import get_all_available_tasks, run_benchmark_cli
+from zelyr.eval.harness import EvalHarness, LiveOllamaStreamAdapter, check_ollama_status_async
+from zelyr.eval.metrics import EvalStatus, TaskResult, export_json_report, format_summary_table
+from zelyr.eval.task import EvalContext, EvalTask
+from zelyr.eval.tasks.deterministic_p1 import build_task_tool_dispatch
+from zelyr.eval.tasks.model_tasks_p3 import (
     build_task_live_metric_formatting,
     build_task_live_workspace_diagnostic,
     check_ollama_status,
@@ -160,7 +160,7 @@ class TestLiveAdapterAndTelemetry(unittest.IsolatedAsyncioTestCase):
                     ]
                 }
 
-        with patch("axiom.eval.harness.check_ollama_status_async", return_value=(True, "Ollama ready")), \
+        with patch("zelyr.eval.harness.check_ollama_status_async", return_value=(True, "Ollama ready")), \
              patch.object(LiveOllamaStreamAdapter, "stream_chat", mock_stream_chat):
 
             res = await harness.run_task(task, use_live_model=True)
@@ -345,7 +345,7 @@ class TestBenchmarkCLI(unittest.TestCase):
 
     def test_live_timeout_cli_argument(self) -> None:
         """Verify --live-timeout parses float and defaults to 60.0."""
-        from axiom.eval.cli import build_arg_parser
+        from zelyr.eval.cli import build_arg_parser
         parser = build_arg_parser()
         args_default = parser.parse_args([])
         self.assertEqual(args_default.live_timeout, 60.0)
@@ -400,7 +400,7 @@ class TestConfigurableLiveTimeouts(unittest.IsolatedAsyncioTestCase):
             validator_fn=lambda ctx: (True, "Live task succeeded"),
         )
 
-        with patch("axiom.eval.harness.check_ollama_status_async", return_value=(True, "Ready")):
+        with patch("zelyr.eval.harness.check_ollama_status_async", return_value=(True, "Ready")):
             with patch.object(LiveOllamaStreamAdapter, "stream_chat", moderately_slow_stream):
                 # When live_timeout is 0.5s, 0.05s execution completes within timeout
                 res = await harness.run_task(task, use_live_model=True, live_timeout=0.5)
@@ -428,7 +428,7 @@ class TestConfigurableLiveTimeouts(unittest.IsolatedAsyncioTestCase):
             timeout_seconds=10.0,
         )
 
-        with patch("axiom.eval.harness.check_ollama_status_async", return_value=(True, "Ready")):
+        with patch("zelyr.eval.harness.check_ollama_status_async", return_value=(True, "Ready")):
             with patch("asyncio.wait_for", side_effect=mock_wait_for):
                 res = await harness.run_task(task, use_live_model=True, live_timeout=None)
                 self.assertEqual(res.status, EvalStatus.TIMEOUT)

@@ -13,8 +13,8 @@ try:
 except ImportError:
     from websockets import connect as ws_connect  # type: ignore[no-redef]
 
-from axiom.tools.browser_cdp import InteractWithBrowserTool
-from axiom.tools.browser_extension import (
+from zelyr.tools.browser_cdp import InteractWithBrowserTool
+from zelyr.tools.browser_extension import (
     BrowserExtensionBridge,
     _is_client_open,
     get_bridge,

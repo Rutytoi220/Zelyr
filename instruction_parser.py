@@ -1,4 +1,4 @@
-"""Instruction parser and Hybrid Fastest Path Router for AXIOM brain.
+"""Instruction parser and Hybrid Fastest Path Router for Zelyr brain.
 
 Parses LLM output into structured instructions and prioritizes native CLI/API execution
 (e.g., xdg-open, systemctl, curl) over slow/brittle GUI mouse and keyboard automation.
@@ -6,7 +6,7 @@ Parses LLM output into structured instructions and prioritizes native CLI/API ex
 
 from typing import Any, Dict, Optional, Tuple
 from brain.parser import parse as _brain_parse
-from axiom.core.fast_path_router import FastestPathRouter, FastPathPlan
+from zelyr.core.fast_path_router import FastestPathRouter, FastPathPlan
 
 
 def parse(text: str) -> Dict[str, Any]:

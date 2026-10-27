@@ -8,12 +8,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from axiom.core.plugins import get_tool_schemas, load_plugins, reload_plugin
-from axiom.db.memory import MemoryStore
-from axiom.memory.capability_indexer import index_tool_capabilities
-from axiom.tools.tool_crafter import craft_tool
-from axiom.tools.tool_manager import ToolManager, delete_dynamic_tool, update_dynamic_tool
-from axiom.tools.validator import ToolValidator
+from zelyr.core.plugins import get_tool_schemas, load_plugins, reload_plugin
+from zelyr.db.memory import MemoryStore
+from zelyr.memory.capability_indexer import index_tool_capabilities
+from zelyr.tools.tool_crafter import craft_tool
+from zelyr.tools.tool_manager import ToolManager, delete_dynamic_tool, update_dynamic_tool
+from zelyr.tools.validator import ToolValidator
 
 VALID_TOOL_CODE = '''
 TOOL_SCHEMA = {
@@ -173,11 +173,11 @@ def execute(**kwargs): return "ok"
         """Verify ring validation rejects negative, out-of-bounds, or non-integer values."""
         ok_neg, err_neg = self.validator.validate_ring_conformance(-1)
         self.assertFalse(ok_neg)
-        self.assertIn("must conform to AXIOM ring hierarchy", err_neg)
+        self.assertIn("must conform to Zelyr ring hierarchy", err_neg)
 
         ok_high, err_high = self.validator.validate_ring_conformance(4)
         self.assertFalse(ok_high)
-        self.assertIn("must conform to AXIOM ring hierarchy", err_high)
+        self.assertIn("must conform to Zelyr ring hierarchy", err_high)
 
         ok_bool, err_bool = self.validator.validate_ring_conformance(True)
         self.assertFalse(ok_bool)
@@ -243,12 +243,12 @@ TUI_HINT = "Crashing..."
 async def execute(**kwargs) -> str:
     raise ValueError("Simulated runtime failure in execute()")
 '''
-        before_scratch = set(glob.glob("/tmp/axiom_stage_*.py"))
+        before_scratch = set(glob.glob("/tmp/zelyr_stage_*.py"))
         res = await self.validator.validate_all(failing_code)
         self.assertFalse(res.is_valid)
         self.assertIn("Simulated runtime failure in execute()", res.error)
 
-        after_scratch = set(glob.glob("/tmp/axiom_stage_*.py"))
+        after_scratch = set(glob.glob("/tmp/zelyr_stage_*.py"))
         diff = after_scratch - before_scratch
         self.assertEqual(len(diff), 0, f"Lingering scratch files detected in /tmp: {diff}")
 
@@ -273,24 +273,24 @@ class TestToolCraftingResilience(unittest.IsolatedAsyncioTestCase):
         self.tools_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = Path(self.tmp_dir) / "test_memory.db"
 
-        os.environ["AXIOM_TOOLS_DIR"] = str(self.tools_dir)
-        os.environ["AXIOM_MEMORY_DB"] = str(self.db_path)
+        os.environ["ZELYR_TOOLS_DIR"] = str(self.tools_dir)
+        os.environ["ZELYR_MEMORY_DB"] = str(self.db_path)
 
         self.store = MemoryStore(db_path=self.db_path)
         load_plugins()
 
     async def asyncTearDown(self):
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
-        if "AXIOM_MEMORY_DB" in os.environ:
-            del os.environ["AXIOM_MEMORY_DB"]
-        if "AXIOM_TOOLS_DIR" in os.environ:
-            del os.environ["AXIOM_TOOLS_DIR"]
+        if "ZELYR_MEMORY_DB" in os.environ:
+            del os.environ["ZELYR_MEMORY_DB"]
+        if "ZELYR_TOOLS_DIR" in os.environ:
+            del os.environ["ZELYR_TOOLS_DIR"]
 
     async def test_new_tool_reload_failure_rolls_back_file_and_runtime(self):
         """Simulate a new tool where reload_plugin() fails, verifying rollback."""
         tool_file = self.tools_dir / "failed_new_tool.py"
 
-        with patch("axiom.tools.tool_crafter.reload_plugin", side_effect=RuntimeError("Simulated reload failure")):
+        with patch("zelyr.tools.tool_crafter.reload_plugin", side_effect=RuntimeError("Simulated reload failure")):
             res = await craft_tool(
                 name="failed_new_tool",
                 code=SAMPLE_TOOL_V1.replace("resilient_adder", "failed_new_tool"),
@@ -339,7 +339,7 @@ class TestToolCraftingResilience(unittest.IsolatedAsyncioTestCase):
                 raise RuntimeError("Simulated reload error for v2")
             return real_reload(path)
 
-        with patch("axiom.tools.tool_manager.reload_plugin", side_effect=failing_reload):
+        with patch("zelyr.tools.tool_manager.reload_plugin", side_effect=failing_reload):
             up_res = await update_dynamic_tool(
                 name="resilient_adder",
                 code=SAMPLE_TOOL_V2,

@@ -1,23 +1,23 @@
-# AXIOM Architecture Specification (v1.0.0)
+# Zelyr Architecture Specification (v1.0.0)
 
 > [!IMPORTANT]
 > The authoritative, source-verified architecture documentation is located in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).  
 > For the complete task-oriented navigation index, see [`docs/INDEX.md`](docs/INDEX.md).
 
-AXIOM is a local-first autonomous AI operating system engineered for Linux (specifically Wayland compositors such as Hyprland). It connects local reasoning models to physical desktop workflows through structured system IPC, semantic web DOM automation, persistent memory, and hot-reloadable dynamic tool crafting.
+Zelyr is a local-first autonomous AI operating system engineered for Linux (specifically Wayland compositors such as Hyprland). It connects local reasoning models to physical desktop workflows through structured system IPC, semantic web DOM automation, persistent memory, and hot-reloadable dynamic tool crafting.
 
 ## 1. Subsystem Map & Core Architecture
 
-* **UI & Console Layer (`axiom/cli`, `axiom/gui`)**: The modern inline streaming REPL (`axiom repl`), OpenCode-tier TUI (`axiom chat`), and thin PySide6 client (`axiom ui`).
-* **Fast-Path Routing (`axiom/core/fast_path_router.py`)**: Intercepts standard actions (URLs, app launches, service actions) to execute via native CLI commands in sub-10ms without consuming LLM tokens.
-* **Active Orchestrator (`axiom/agents/native_orchestrator.py`)**: The streaming ReAct execution environment providing sliding-window context budgeting, active window context introspection (`hyprctl activewindow -j`), tolerant tool-call extraction, and closed-loop error recovery.
-* **Three-Tier Actuator Hierarchy (`axiom/agents/actuator_arbiter.py`)**:
+* **UI & Console Layer (`zelyr/cli`, `zelyr/gui`)**: The modern inline streaming REPL (`zelyr repl`), OpenCode-tier TUI (`zelyr chat`), and thin PySide6 client (`zelyr ui`).
+* **Fast-Path Routing (`zelyr/core/fast_path_router.py`)**: Intercepts standard actions (URLs, app launches, service actions) to execute via native CLI commands in sub-10ms without consuming LLM tokens.
+* **Active Orchestrator (`zelyr/agents/native_orchestrator.py`)**: The streaming ReAct execution environment providing sliding-window context budgeting, active window context introspection (`hyprctl activewindow -j`), tolerant tool-call extraction, and closed-loop error recovery.
+* **Three-Tier Actuator Hierarchy (`zelyr/agents/actuator_arbiter.py`)**:
   - **Tier 1 (System IPC):** `manage_desktop_window`, `manage_system_process`, `manage_system_clipboard`, `query_system_journal`, `manage_media_playback`, `manage_workspace_file`, `send_desktop_notification`.
   - **Tier 2 (Browser DOM & Web Search):** `interact_with_browser` (WebExtension bridge at `ws://127.0.0.1:41144`), `web_search`, `fetch_web_page`.
   - **Tier 3 (Visual Grounding Fallback):** `interact_with_ui` (Set-of-Mark / OCR / VLM). Strictly purged when browser is active.
-* **Context Budgeting (`axiom/config.py`, `axiom/agents/native_orchestrator.py`)**: Authoritative 4-tier context hierarchy clamped to `[1024, 65536]` with an 8,192 default.
-* **Security & SSRF Guard (`axiom/security/network.py`, `axiom/tools/__init__.py`)**: Outbound URL validation, RFC 1918 / CGNAT / Tailscale blocking, per-hop redirect re-validation, containment tag escaping, and fail-closed shell execution authorization.
-* **Memory & Swarm Subsystem (`axiom/db/memory.py`, `axiom/memory/blackboard.py`)**: SQLite Write-Ahead Logging (`WAL`) with FTS5 fact indexing, context hydration, and multi-agent swarm blackboard with namespace isolation.
+* **Context Budgeting (`zelyr/config.py`, `zelyr/agents/native_orchestrator.py`)**: Authoritative 4-tier context hierarchy clamped to `[1024, 65536]` with an 8,192 default.
+* **Security & SSRF Guard (`zelyr/security/network.py`, `zelyr/tools/__init__.py`)**: Outbound URL validation, RFC 1918 / CGNAT / Tailscale blocking, per-hop redirect re-validation, containment tag escaping, and fail-closed shell execution authorization.
+* **Memory & Swarm Subsystem (`zelyr/db/memory.py`, `zelyr/memory/blackboard.py`)**: SQLite Write-Ahead Logging (`WAL`) with FTS5 fact indexing, context hydration, and multi-agent swarm blackboard with namespace isolation.
 
 ---
 
@@ -107,16 +107,16 @@ sequenceDiagram
 
 ## 6. Sandboxing & Execution Boundaries (Bubblewrap)
 
-To protect the host operating system from rogue shell commands and untrusted tool executions, AXIOM implements a strict containment boundary utilizing **Bubblewrap (bwrap)**.
+To protect the host operating system from rogue shell commands and untrusted tool executions, Zelyr implements a strict containment boundary utilizing **Bubblewrap (bwrap)**.
 
-* **Capability Detection:** The `SandboxRunner` abstraction verifies the presence of `bwrap`. If absent, AXIOM intentionally falls back to native execution but broadcasts a `DEGRADED_SECURITY` alert to the EventBus.
-* **Isolation Mechanics:** When `bwrap` is active, the Orchestrator executes payloads inside an isolated namespace. The host filesystem is mounted as entirely read-only (`--ro-bind / /`), network access can be disabled dynamically (`--unshare-net`), and the system provisions an ephemeral read-write workspace (`/tmp/axiom_sandbox`) bound locally for the payload to operate within.
+* **Capability Detection:** The `SandboxRunner` abstraction verifies the presence of `bwrap`. If absent, Zelyr intentionally falls back to native execution but broadcasts a `DEGRADED_SECURITY` alert to the EventBus.
+* **Isolation Mechanics:** When `bwrap` is active, the Orchestrator executes payloads inside an isolated namespace. The host filesystem is mounted as entirely read-only (`--ro-bind / /`), network access can be disabled dynamically (`--unshare-net`), and the system provisions an ephemeral read-write workspace (`/tmp/zelyr_sandbox`) bound locally for the payload to operate within.
 
 ---
 
 ## 7. Desktop & OS Control Abstraction
 
-AXIOM utilizes a capability-aware abstraction layer to manage global OS interactions (mouse, keyboard, and window management), ensuring graceful degradation when specific compositors limit programmatic input.
+Zelyr utilizes a capability-aware abstraction layer to manage global OS interactions (mouse, keyboard, and window management), ensuring graceful degradation when specific compositors limit programmatic input.
 
 * **Capability Verification:** The `get_os_controller()` factory detects the environment (`$XDG_SESSION_TYPE`, `$XDG_CURRENT_DESKTOP`) and provides a tailored `BaseOSController` implementation. Instead of blindly executing commands, tools inspect boolean capabilities (e.g., `can_click`, `can_type`) prior to execution.
 * **Graceful Degradation:** On unsupported environments (e.g., standard GNOME Wayland), the system yields an `UnsupportedController` which proactively intercepts and communicates the environment limitations to the orchestrator, preventing unhandled runtime exceptions.
@@ -126,19 +126,19 @@ AXIOM utilizes a capability-aware abstraction layer to manage global OS interact
 
 ## 8. OTA Reliability & Rollbacks
 
-AXIOM implements a highly secure, self-healing Over-The-Air (OTA) update pipeline to prevent broken releases from bricking the user's OS integration.
+Zelyr implements a highly secure, self-healing Over-The-Air (OTA) update pipeline to prevent broken releases from bricking the user's OS integration.
 
-* **Cryptographic Verification:** When the `UpdateManager` fetches a new binary payload, it simultaneously retrieves the `sha256sum.txt` artifact from the GitHub Release. The downloaded payload (`AXIOM.tar.gz`) is cryptographically verified against the signed hash before any extraction or execution occurs. Mismatches trigger an immediate `VerificationError` and payload deletion, preventing Man-in-the-Middle (MitM) attacks or execution of corrupted downloads.
-* **Health-Check Swap Script:** The `swap_axiom.sh` generated during update executes a multi-stage atomic swap. It backs up the existing installation to `AXIOM.bak`, moves the new binary into place, and performs a dry-run execution with the `--health-check` flag. 
+* **Cryptographic Verification:** When the `UpdateManager` fetches a new binary payload, it simultaneously retrieves the `sha256sum.txt` artifact from the GitHub Release. The downloaded payload (`Zelyr.tar.gz`) is cryptographically verified against the signed hash before any extraction or execution occurs. Mismatches trigger an immediate `VerificationError` and payload deletion, preventing Man-in-the-Middle (MitM) attacks or execution of corrupted downloads.
+* **Health-Check Swap Script:** The `swap_zelyr.sh` generated during update executes a multi-stage atomic swap. It backs up the existing installation to `Zelyr.bak`, moves the new binary into place, and performs a dry-run execution with the `--health-check` flag.
 * **Self-Healing Rollbacks:** If the `--health-check` boot fails (non-zero exit code due to missing dependencies, corrupt compilation, or environment crashes), the swap script intercepts the failure, automatically restores the `.bak` directory, and relaunches the previous working version seamlessly.
 
 ---
 
 ## 9. Packaging & Distribution (AppImage)
 
-AXIOM utilizes a heavily optimized PyInstaller pipeline to distribute the application as a single, portable AppImage for Linux environments.
+Zelyr utilizes a heavily optimized PyInstaller pipeline to distribute the application as a single, portable AppImage for Linux environments.
 
-* **Binary Size Optimization:** To prevent extreme bundle bloat, `AXIOM.spec` implements an aggressive pruning protocol. It categorically excludes `tkinter`, data-science modules (`matplotlib`, `jupyter`, `IPython`, `scipy`, `pandas`), and massive unneeded `PySide6` submodules (`QtWebEngine`, `QtQml`, `Qt3D`, `QtQuick`). This guarantees the final `.AppImage` is remarkably lean.
+* **Binary Size Optimization:** To prevent extreme bundle bloat, `Zelyr.spec` implements an aggressive pruning protocol. It categorically excludes `tkinter`, data-science modules (`matplotlib`, `jupyter`, `IPython`, `scipy`, `pandas`), and massive unneeded `PySide6` submodules (`QtWebEngine`, `QtQml`, `Qt3D`, `QtQuick`). This guarantees the final `.AppImage` is remarkably lean.
 * **Smart AppRun Wrapper:** The generated `.AppImage` does not execute the payload blindly. It utilizes a custom `AppRun` Bash wrapper that inspects the host operating system dynamically via `/sbin/ldconfig` prior to booting.
 * **Host Dependency Safety:** The `AppRun` wrapper strictly verifies the existence of PySide6 platform requisites (`libxcb.so.1` for X11/Wayland plugin and `libGL.so.1`). If missing, it halts execution and utilizes `zenity`, `kdialog`, or standard terminal output to provide the user with clear instructions for installing the missing dependencies via their system's package manager, preventing silent PySide6 core dumps.
 * **Model Asset Preservation:** PyInstaller hooks explicitly leverage `collect_all` for `faster_whisper` and `openwakeword` to ensure their dynamic C-libraries and hidden assets are preserved inside the payload.
@@ -147,7 +147,7 @@ AXIOM utilizes a heavily optimized PyInstaller pipeline to distribute the applic
 
 ## 10. Hardware Telemetry Agnosticism
 
-AXIOM's `TelemetryService` is designed to be completely hardware agnostic. It does not enforce a monoculture or hardcode binary calls that crash non-compliant environments.
+Zelyr's `TelemetryService` is designed to be completely hardware agnostic. It does not enforce a monoculture or hardcode binary calls that crash non-compliant environments.
 
 * **Capability Probing:** On boot, the service utilizes `shutil.which` to dynamically probe for `nvidia-smi` (Nvidia Discrete) and `rocm-smi` (AMD ROCm).
 * **Graceful Fallbacks:** If neither telemetry binary is found, it automatically detects an `Integrated / CPU-Only` state. It suppresses VRAM polling and securely returns zeroed values rather than spamming the internal logger with exceptions.

@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/local-axiom-agent
+      url: https://pypi.org/p/zelyr-core
     permissions:
       id-token: write  # IMPORTANT: mandatory for trusted publishing
       contents: write  # IMPORTANT: mandatory for creating GitHub Releases

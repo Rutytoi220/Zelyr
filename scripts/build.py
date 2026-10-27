@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Build script for packaging AXIOM into a standalone executable using PyInstaller.
+Build script for packaging Zelyr into a standalone executable using PyInstaller.
 """
 import os
 import sys
@@ -8,7 +8,7 @@ import subprocess
 from pathlib import Path
 
 def main():
-    print("=== AXIOM Standalone Packager ===")
+    print("=== Zelyr Standalone Packager ===")
     
     # Ensure PyInstaller is installed
     try:
@@ -28,7 +28,7 @@ def main():
     # Build the pyinstaller arguments
     args = [
         str(main_py),
-        '--name=axiom',
+        '--name=zelyr',
         '--onefile',
         '--windowed', # No console window (can be omitted if CLI output is desired)
         '--clean',
@@ -39,10 +39,10 @@ def main():
     ]
     
     # Add assets
-    assets_dir = root_dir / "axiom" / "gui" / "assets"
+    assets_dir = root_dir / "zelyr" / "gui" / "assets"
     if assets_dir.exists():
         # For cross-platform compatibility, use os.pathsep
-        args.append(f'--add-data={assets_dir}{os.pathsep}axiom/gui/assets')
+        args.append(f'--add-data={assets_dir}{os.pathsep}zelyr/gui/assets')
         
     # Add generic hidden imports for robustness
     args.extend([
