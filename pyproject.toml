@@ -3,10 +3,10 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "axiom-core"
+name = "zelyr-core"
 version = "1.0.0"
 authors = [
-  { name="AXIOM Contributors", email="admin@axiom.local" },
+  { name="Zelyr Contributors", email="admin@zelyr.local" },
 ]
 description = "A Local-First AI Operating System for Linux."
 readme = "README.md"
@@ -43,6 +43,8 @@ dependencies = [
     "prompt_toolkit>=3.0.0",
     "requests>=2.28.0",
     "beautifulsoup4>=4.12.0",
+    "croniter>=2.0.0",
+    "mcp>=1.0.0",
 ]
 
 [project.optional-dependencies]
@@ -66,14 +68,19 @@ experimental = [
 ]
 
 [project.scripts]
-axiom = "axiom.cli.main:main"
-axiomd = "axiom.server.daemon:main"
+zelyr = "zelyr.cli.main:main"
+zelyrd = "zelyr.server.daemon:main"
+zelyr-gui = "zelyr.gui.app:main"
+# Legacy command aliases kept for existing installations and scripts.
+axiom = "zelyr.cli.main:main"
+axiomd = "zelyr.server.daemon:main"
+axiom-gui = "zelyr.gui.app:main"
 
 [tool.setuptools.packages.find]
-include = ["axiom*"]
+include = ["zelyr*", "axiom*"]
 
 [tool.setuptools.package-data]
-"*" = ["*.sql", "*.qss", "*.json", "*.tcss", "*.png", "*.svg", "*.ttf", "*.js", "*.template", "*.txt"]
+"*" = ["*.sql", "*.qss", "*.json", "*.tcss", "*.png", "*.svg", "*.ttf", "*.js", "*.template", "*.txt", "*.desktop", "*.service", "*.sh"]
 
 [dependency-groups]
 dev = [
@@ -90,8 +97,8 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-norecursedirs = ["tests/fixtures", "tests/unit", "tests/gui", "tests/e2e", "tests/integration", "tests/optional", "tests/simulation", "axiom/tests", "dist", "build", "node_modules", ".venv"]
-addopts = "--ignore=tests/fixtures --ignore=tests/unit --ignore=tests/gui --ignore=tests/e2e --ignore=tests/integration --ignore=tests/optional --ignore=tests/simulation --ignore=axiom/tests -m 'not e2e and not requires_wayland and not hardware'"
+norecursedirs = ["tests/fixtures", "tests/unit", "tests/gui", "tests/e2e", "tests/integration", "tests/optional", "tests/simulation", "zelyr/tests", "dist", "build", "node_modules", ".venv"]
+addopts = "--ignore=tests/fixtures --ignore=tests/unit --ignore=tests/gui --ignore=tests/e2e --ignore=tests/integration --ignore=tests/optional --ignore=tests/simulation --ignore=zelyr/tests -m 'not e2e and not requires_wayland and not hardware'"
 markers = [
     "unit: purely isolated unit tests",
     "integration: tests combining multiple systems",
@@ -117,7 +124,7 @@ exclude = [
     "tests/integration",
     "tests/optional",
     "tests/simulation",
-    "axiom/tests",
+    "zelyr/tests",
 ]
 
 [tool.ruff.lint]
