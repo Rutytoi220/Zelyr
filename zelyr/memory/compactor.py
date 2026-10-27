@@ -1,4 +1,4 @@
-"""Memory compaction algorithm for AXIOM."""
+"""Memory compaction algorithm for Zelyr."""
 import json
 import logging
 from typing import Any, List, Dict

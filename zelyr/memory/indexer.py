@@ -1,3 +1,4 @@
+from zelyr.compat import data_dir, state_file
 import os
 import time
 import logging
@@ -7,12 +8,12 @@ from pathlib import Path
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-logger = logging.getLogger("axiom.memory.indexer")
+logger = logging.getLogger("zelyr.memory.indexer")
 
 IGNORE_DIRS = {".git", "node_modules", "__pycache__", ".venv", "dist", "build"}
 IGNORE_EXTS = {".AppImage", ".deb", ".pyc", ".whl"}
 
-class AxiomFSHandler(FileSystemEventHandler):
+class ZelyrFSHandler(FileSystemEventHandler):
     def __init__(self, indexer_service):
         self.indexer = indexer_service
 
@@ -27,14 +28,14 @@ class AxiomFSHandler(FileSystemEventHandler):
         self.indexer.queue_file(event.src_path)
 
 class IndexerService:
-    """Background Daemon for AxiomFS that indexes local files async."""
+    """Background Daemon for ZelyrFS that indexes local files async."""
     
     def __init__(self, event_bus=None):
         self.event_bus = event_bus
-        self.workspace_dir = Path.home() / ".local" / "share" / "axiom" / "workspace"
+        self.workspace_dir = data_dir() / "workspace"
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
         
-        self.db_path = Path.home() / ".axiom" / "memory.db"
+        self.db_path = state_file("memory.db", "memory.db")
         
         self._running = False
         self._task = None
@@ -51,11 +52,11 @@ class IndexerService:
         self._task = asyncio.create_task(self._process_queue_async())
         
         self._observer = Observer()
-        handler = AxiomFSHandler(self)
+        handler = ZelyrFSHandler(self)
         self._observer.schedule(handler, str(self.workspace_dir), recursive=True)
         self._observer.start()
         
-        logger.info("[AxiomFS] Started Async Indexer Daemon.")
+        logger.info("[ZelyrFS] Started Async Indexer Daemon.")
         self._emit_status("Idle")
         
     def stop(self):
@@ -78,9 +79,9 @@ class IndexerService:
                 
     def _emit_status(self, status: str):
         if self.event_bus:
-            from axiom.core.events import Event
+            from zelyr.core.events import Event
             try:
-                self.event_bus.publish(Event(event_type="axiomfs.status", source="IndexerService", data={"status": status}))
+                self.event_bus.publish(Event(event_type="zelyrfs.status", source="IndexerService", data={"status": status}))
             except Exception:
                 pass
 
@@ -91,9 +92,9 @@ class IndexerService:
         return await asyncio.to_thread(_read)
 
     async def _process_queue_async(self):
-        from axiom.memory.semantic import SemanticIndex
-        from axiom.llm.universal_client import UniversalLLMClient
-        from axiom.config import get_config
+        from zelyr.memory.semantic import SemanticIndex
+        from zelyr.llm.universal_client import UniversalLLMClient
+        from zelyr.config import get_config
         import aiosqlite
         
         try:
@@ -101,7 +102,7 @@ class IndexerService:
             llm = UniversalLLMClient(default_model=config.ollama_model)
             semantic = SemanticIndex(provider=llm, event_bus=self.event_bus)
         except Exception as e:
-            logger.error(f"[AxiomFS] Failed to initialize semantic indexing: {e}")
+            logger.error(f"[ZelyrFS] Failed to initialize semantic indexing: {e}")
             return
             
         db = None
@@ -115,7 +116,7 @@ class IndexerService:
                         
                 if files_to_process:
                     if db is None:
-                        from axiom.memory.db import MemoryDatabaseManager
+                        from zelyr.memory.db import MemoryDatabaseManager
                         db_mgr = await MemoryDatabaseManager.get_instance(self.db_path)
                         db = await db_mgr.get_connection()
                     
@@ -150,19 +151,21 @@ class IndexerService:
                             
                             success = await semantic.store_texts_batch(db, items, model=config.ollama_model)
                             if not success:
-                                logger.warning("[AxiomFS] Embedding provider unavailable. Skipping semantic batch for now.")
+                                logger.warning("[ZelyrFS] Embedding provider unavailable. Skipping semantic batch for now.")
                             await asyncio.sleep(0)
                             
-                        logger.info(f"[AxiomFS] Indexed {file_path} ({len(chunks)} chunks)")
+                        logger.info(f"[ZelyrFS] Indexed {file_path} ({len(chunks)} chunks)")
                     
                     self._emit_status("Idle")
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                print(f"ERROR: {e}"); logger.error(f"[AxiomFS] Indexing error: {e}")
+                print(f"ERROR: {e}"); logger.error(f"[ZelyrFS] Indexing error: {e}")
                 
             await asyncio.sleep(0.5)
             
         if db:
             await db.close()
 
+# Legacy AXIOM API compatibility aliases
+AxiomFSHandler = ZelyrFSHandler

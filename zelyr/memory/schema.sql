@@ -1,4 +1,4 @@
--- AXIOM Memory Schema
+-- Zelyr Memory Schema
 
 -- Events table for audit trail and event logging
 CREATE TABLE IF NOT EXISTS events (

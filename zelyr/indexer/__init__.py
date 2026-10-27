@@ -1,4 +1,4 @@
-"""AST Knowledge Graph Indexer for AXIOM.
+"""AST Knowledge Graph Indexer for Zelyr.
 
 Provides workspace-level AST parsing, directed dependency graph generation,
 and impact analysis queries for agents.

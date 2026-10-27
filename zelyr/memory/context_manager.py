@@ -1,4 +1,4 @@
-"""Token-aware context management for AXIOM.
+"""Token-aware context management for Zelyr.
 
 Prevents context overflow by tracking approximate token usage,
 summarizing old conversation turns, and assembling prompts within
@@ -93,7 +93,7 @@ Returns:
 
     def build_system_prompt(self, task: str, tool_schemas: List[Dict[str, Any]], intent: str) -> List[Dict[str, Any]]:
         import json
-        from axiom.agents.prompts import _build_react_prompt, _build_tool_guidelines
+        from zelyr.agents.prompts import _build_react_prompt, _build_tool_guidelines
         
         prompt = _build_react_prompt(intent)
         prompt += "\n\n" + _build_tool_guidelines()

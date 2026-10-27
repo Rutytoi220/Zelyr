@@ -2,7 +2,7 @@
 
 from typing import List, Set
 
-from axiom.indexer.graph_engine import CodeGraphIndex
+from zelyr.indexer.graph_engine import CodeGraphIndex
 
 
 def get_dependent_files(symbol_name: str, index: CodeGraphIndex) -> List[str]:

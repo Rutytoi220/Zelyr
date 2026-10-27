@@ -1,4 +1,4 @@
-"""AXIOM Tool Capability Indexer & Reconciliation Engine.
+"""Zelyr Tool Capability Indexer & Reconciliation Engine.
 
 Auto-indexes all registered tools into persistent MemoryStore under category 'capability',
 keyed by 'tool.<tool_name>'. Automatically supersedes older entries when tool schemas
@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from axiom.db.memory import MemoryStore, get_db_path
+from zelyr.db.memory import MemoryStore, get_db_path
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 def _sync_disk_unlinked_tools(tools_dir: Optional[Path] = None) -> None:
     """Detect dynamic tools whose files have been removed from disk and unregister them."""
     try:
-        from axiom.core.plugins import get_plugin_file_paths, unregister_plugin
+        from zelyr.core.plugins import get_plugin_file_paths, unregister_plugin
         for name, p in get_plugin_file_paths().items():
             if not p.exists():
                 unregister_plugin(name)
@@ -30,13 +30,13 @@ def _sync_disk_unlinked_tools(tools_dir: Optional[Path] = None) -> None:
 
     # Check sys.modules for any loaded dynamic tools
     for mod_name in list(sys.modules.keys()):
-        if mod_name.startswith("axiom.dynamic_tools."):
-            tool_name = mod_name[len("axiom.dynamic_tools."):]
+        if mod_name.startswith("zelyr.dynamic_tools."):
+            tool_name = mod_name[len("zelyr.dynamic_tools."):]
             mod = sys.modules.get(mod_name)
             file_path = getattr(mod, "__file__", None)
             if file_path and not Path(file_path).exists():
                 try:
-                    from axiom.core.plugins import unregister_plugin
+                    from zelyr.core.plugins import unregister_plugin
                     unregister_plugin(tool_name)
                 except Exception:
                     pass
@@ -63,7 +63,7 @@ def reconcile_tool_capabilities(
 
     if schemas is None:
         try:
-            from axiom.core.plugins import get_tool_schemas
+            from zelyr.core.plugins import get_tool_schemas
             schemas = get_tool_schemas(0)
         except Exception as e:
             logger.warning("Could not load tool schemas for capability reconciliation: %s", e)
@@ -120,7 +120,7 @@ def index_tool_capabilities(
 
     if schemas is None:
         try:
-            from axiom.core.plugins import get_tool_schemas
+            from zelyr.core.plugins import get_tool_schemas
             schemas = get_tool_schemas(0)
         except Exception as e:
             logger.warning("Could not load tool schemas for capability indexing: %s", e)

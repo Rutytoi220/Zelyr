@@ -1,4 +1,4 @@
-"""AXIOM Session Memory Promotion Engine.
+"""Zelyr Session Memory Promotion Engine.
 
 Extracts high-signal user preferences, environment configurations, and workflow directives
 from conversational session history and promotes them to persistent long-term memory.
@@ -11,7 +11,7 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Set
 
-from axiom.db.memory import MemoryStore, get_session_messages
+from zelyr.db.memory import MemoryStore, get_session_messages
 
 logger = logging.getLogger(__name__)
 

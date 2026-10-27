@@ -3,6 +3,7 @@
 Provides a unified interface for connecting to dedicated local vector
 databases like Qdrant or Chroma, replacing the legacy NumPy+SQLite approach.
 """
+from zelyr.compat import data_dir, state_dir
 import logging
 import uuid
 from typing import Any, Dict, List, Optional, Protocol
@@ -38,10 +39,10 @@ class BaseVectorStore(Protocol):
 class QdrantLocalStore:
     """Local, embedded Qdrant vector database store.
     
-    Persists data to ~/.axiom/vector_db/ or runs entirely in-memory if
+    Persists data to ~/.zelyr/vector_db/ or runs entirely in-memory if
     location=":memory:" is provided.
     """
-    COLLECTION_NAME = 'axiom_semantic_memory'
+    COLLECTION_NAME = 'zelyr_semantic_memory'
 
     def __init__(self, location: Optional[str]=None):
         """Auto-generated docstring.
@@ -64,7 +65,7 @@ Returns:
             logger.info('QdrantLocalStore initialized in memory.')
         else:
             if location is None:
-                db_dir = Path.home() / '.axiom' / 'vector_db'
+                db_dir = state_dir() / 'vector_db'
             else:
                 db_dir = Path(location)
             db_dir.mkdir(parents=True, exist_ok=True)
@@ -160,7 +161,7 @@ Returns:
 
 class ChromaDBStore:
     """Local, embedded Chroma vector database store."""
-    COLLECTION_NAME = 'axiom_semantic_memory'
+    COLLECTION_NAME = 'zelyr_semantic_memory'
 
     def __init__(self, location: Optional[str] = None):
         try:
@@ -173,7 +174,7 @@ class ChromaDBStore:
             self.client = chromadb.Client()
             logger.info("ChromaDBStore initialized in memory.")
         else:
-            db_dir = Path(location) if location else Path.home() / ".local" / "share" / "axiom" / "chromadb"
+            db_dir = Path(location) if location else data_dir() / "chromadb"
             db_dir.mkdir(parents=True, exist_ok=True)
             self.client = chromadb.PersistentClient(path=str(db_dir))
             logger.info(f"ChromaDBStore initialized at {db_dir}")
@@ -266,14 +267,14 @@ class VectorMemoryEngine:
     
     def __init__(self, llm_client=None, store: Optional[BaseVectorStore] = None):
         if store is None:
-            db_path = str(Path.home() / ".local" / "share" / "axiom" / "memory.db")
+            db_path = str(data_dir() / "memory.db")
             store = ChromaDBStore(location=db_path)
             
         self.store = store
         self.llm = llm_client
         if self.llm is None:
-            from axiom.llm.universal_client import UniversalLLMClient
-            from axiom.config import get_config
+            from zelyr.llm.universal_client import UniversalLLMClient
+            from zelyr.config import get_config
             self.llm = UniversalLLMClient(get_config())
             
         self.embedding_model = self._find_embedding_model()
@@ -412,7 +413,7 @@ class LongTermMemory:
         except ImportError:
             raise ImportError("chromadb is not installed. Run `pip install chromadb`.")
             
-        db_dir = Path(location) if location else Path.home() / ".local" / "share" / "axiom" / "memory"
+        db_dir = Path(location) if location else data_dir() / "memory"
         db_dir.mkdir(parents=True, exist_ok=True)
         if hasattr(chromadb.PersistentClient, "return_value"):
             self.client = chromadb.PersistentClient(path=str(db_dir))
@@ -423,7 +424,7 @@ class LongTermMemory:
                 LongTermMemory._shared_clients[str(db_dir)] = chromadb.PersistentClient(path=str(db_dir))
             self.client = LongTermMemory._shared_clients[str(db_dir)]
         self.collection = self.client.get_or_create_collection(
-            name="axiom_hippocampus",
+            name="zelyr_hippocampus",
             metadata={"hnsw:space": "cosine"}
         )
         self.embedding_url = "http://127.0.0.1:11434/api/embeddings"

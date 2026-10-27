@@ -1,4 +1,4 @@
-from axiom.core.events import Event
+from zelyr.core.events import Event
 import asyncio
 import logging
 from typing import List, Dict, Any
@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 class DeepMemoryConsolidation:
     """
-    Background maintenance daemon for AXIOM GraphRAG Memory.
+    Background maintenance daemon for Zelyr GraphRAG Memory.
     Mimics biological REM sleep to deduplicate, fuse, and decay memory graphs
     without locking the SQLite WAL while PySide6 UI is active.
     """

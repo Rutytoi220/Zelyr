@@ -1,4 +1,4 @@
-"""AXIOM Contextual Memory Hydration Engine.
+"""Zelyr Contextual Memory Hydration Engine.
 
 Implements relevance-based retrieval, composite ranking (BM25 + recency + utility),
 and hard token-budgeted prompt hydration for NativeOrchestrator.
@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
-from axiom.db.memory import MemoryStore, get_db_path
+from zelyr.db.memory import MemoryStore, get_db_path
 
 logger = logging.getLogger(__name__)
 

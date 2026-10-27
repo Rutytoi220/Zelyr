@@ -1,4 +1,4 @@
-"""Sleep Cycle Daemon for AXIOM.
+"""Sleep Cycle Daemon for Zelyr.
 
 Monitors EventBus activity and triggers memory compaction when idle.
 """
@@ -8,9 +8,9 @@ import logging
 import asyncio
 import json
 from typing import Any, Optional
-from axiom.core.events import EventBus
-from axiom.core.async_bridge import run_sync
-from axiom.memory.compactor import MemoryCompactor
+from zelyr.core.events import EventBus
+from zelyr.core.async_bridge import run_sync
+from zelyr.memory.compactor import MemoryCompactor
 logger = logging.getLogger(__name__)
 
 class SleepCycleDaemon:

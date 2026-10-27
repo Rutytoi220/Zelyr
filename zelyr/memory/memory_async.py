@@ -1,4 +1,4 @@
-"""Async SQLite-backed memory store for AXIOM."""
+"""Async SQLite-backed memory store for Zelyr."""
 import json
 import time
 import uuid
@@ -9,14 +9,16 @@ import shutil
 import sqlite3
 import aiosqlite
 logger = logging.getLogger(__name__)
-from axiom.memory.protocol import MemoryBackend
-from axiom.memory.semantic import SemanticIndex
+from zelyr.memory.protocol import MemoryBackend
+from zelyr.memory.semantic import SemanticIndex
 import sys
 import os
 
+from zelyr.compat import resolve_file
+
 if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
     # Running in a PyInstaller bundle
-    base_dir = Path(sys._MEIPASS) / 'axiom' / 'memory'
+    base_dir = Path(sys._MEIPASS) / 'zelyr' / 'memory'
 else:
     # Running in normal Python environment
     base_dir = Path(__file__).parent
@@ -30,7 +32,7 @@ class MemoryStore(MemoryBackend):
     event logging, and agent session tracking.
     """
 
-    def __init__(self, db_path: str='axiom.db', semantic_index: Optional[SemanticIndex]=None):
+    def __init__(self, db_path: Optional[str]=None, semantic_index: Optional[SemanticIndex]=None):
         """Auto-generated docstring.
 
 Args:
@@ -40,6 +42,8 @@ Args:
 Returns:
     Return value.
 """
+        if db_path is None:
+            db_path = str(resolve_file(Path.cwd() / "zelyr.db", Path.cwd() / "axiom.db"))
         self.db_path = db_path
         self._db: Optional[aiosqlite.Connection] = None
         self._initialized = False
@@ -82,7 +86,7 @@ Returns:
 
     async def _init_db_connection(self) -> None:
         """Initialize database connection using MemoryDatabaseManager."""
-        from axiom.memory.db import MemoryDatabaseManager
+        from zelyr.memory.db import MemoryDatabaseManager
         self._db_mgr = await MemoryDatabaseManager.get_instance(self.db_path)
         self._db = await self._db_mgr.get_connection()
         
@@ -102,7 +106,7 @@ Returns:
             async with self._db.execute('PRAGMA user_version = 2'): pass
             await self._db.commit()
         if current_version > 2:
-            raise sqlite3.DatabaseError(f'Database version {current_version} is higher than supported version 2. Please upgrade AXIOM.')
+            raise sqlite3.DatabaseError(f'Database version {current_version} is higher than supported version 2. Please upgrade Zelyr.')
         self._initialized = True
         import asyncio
         asyncio.create_task(self._migrate_legacy_embeddings())

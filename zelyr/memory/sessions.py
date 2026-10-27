@@ -1,3 +1,4 @@
+from zelyr.compat import data_dir as _zelyr_data_dir
 import asyncio
 import json
 import logging
@@ -7,7 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Any, Optional
 
 import aiosqlite
-from axiom.memory.db import MemoryDatabaseManager
+from zelyr.memory.db import MemoryDatabaseManager
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +17,7 @@ class SessionDatabase:
     
     def __init__(self, db_path: Optional[str] = None):
         if db_path is None:
-            data_dir = Path.home() / ".local" / "share" / "axiom"
+            data_dir = _zelyr_data_dir()
             data_dir.mkdir(parents=True, exist_ok=True)
             self.db_path = str(data_dir / "sessions.db")
         else:

@@ -1,9 +1,10 @@
-"""Semantic search index for AXIOM memory.
+"""Semantic search index for Zelyr memory.
 
 Stores embedding vectors and performs cosine similarity search.
 Uses local vector database (Qdrant) if available, falling back
 to in-memory NumPy + SQLite.
 """
+from zelyr.compat import state_dir
 import json
 import math
 import time
@@ -57,7 +58,7 @@ class SemanticIndex:
         self._cache_max_size = 5000
         
         try:
-            from axiom.memory.vector_store import QdrantLocalStore
+            from zelyr.memory.vector_store import QdrantLocalStore
             import sys
             if 'pytest' in sys.modules:
                 self._vector_store = QdrantLocalStore(location=':memory:')
@@ -69,7 +70,7 @@ class SemanticIndex:
             if 'lock' in str(e).lower() or 'accessed by another instance' in str(e).lower():
                 import os
                 from pathlib import Path
-                lock_file = Path.home() / '.axiom' / 'vector_db' / '.lock'
+                lock_file = state_dir() / 'vector_db' / '.lock'
                 if lock_file.exists():
                     try:
                         os.remove(lock_file)
@@ -111,7 +112,7 @@ class SemanticIndex:
 
     def _emit_error(self, message: str):
         if self._event_bus:
-            from axiom.core.events import Event
+            from zelyr.core.events import Event
             try:
                 self._event_bus.publish(Event(event_type="system.alert", source="SemanticIndex", data={"message": message, "level": "warning"}))
             except Exception:
@@ -295,7 +296,7 @@ import struct
 import re
 from collections import Counter
 import httpx
-from axiom.db.memory import get_db_path, get_connection, init_db
+from zelyr.db.memory import get_db_path, get_connection, init_db
 
 
 def generate_embedding(
@@ -309,7 +310,7 @@ def generate_embedding(
 
     if base_url is None:
         try:
-            from axiom.config import get_config
+            from zelyr.config import get_config
             cfg = get_config()
             base_url = getattr(cfg, "ollama_base_url", "http://127.0.0.1:11434").rstrip("/")
         except Exception:

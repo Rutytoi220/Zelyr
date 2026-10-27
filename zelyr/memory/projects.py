@@ -1,3 +1,4 @@
+from zelyr.compat import data_dir
 import os
 import json
 import uuid
@@ -14,7 +15,7 @@ class ProjectManager:
     
     def __init__(self, data_dir: Optional[str] = None):
         if data_dir is None:
-            self.base_dir = Path.home() / ".local" / "share" / "axiom" / "projects"
+            self.base_dir = data_dir() / "projects"
         else:
             self.base_dir = Path(data_dir)
         self.base_dir.mkdir(parents=True, exist_ok=True)

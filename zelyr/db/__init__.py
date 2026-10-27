@@ -1,5 +1,5 @@
-"""AXIOM database and persistent memory package."""
-from axiom.db.memory import (
+"""Zelyr database and persistent memory package."""
+from zelyr.db.memory import (
     init_db,
     create_session,
     get_latest_session_id,

@@ -1,8 +1,8 @@
 """EventBus watcher to trigger AST Graph Index incremental updates."""
 import logging
 from typing import Any, Dict
-from axiom.core.events import EventBus, Event
-from axiom.indexer.graph_engine import CodeGraphIndex
+from zelyr.core.events import EventBus, Event
+from zelyr.indexer.graph_engine import CodeGraphIndex
 logger = logging.getLogger(__name__)
 
 class GraphWatcher:

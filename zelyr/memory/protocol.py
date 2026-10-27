@@ -1,4 +1,4 @@
-"""Protocol defining the memory backend interface for AXIOM."""
+"""Protocol defining the memory backend interface for Zelyr."""
 
 from __future__ import annotations
 

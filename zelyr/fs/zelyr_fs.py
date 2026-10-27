@@ -2,12 +2,21 @@ import os
 import stat
 import time
 import logging
-from fuse import FUSE, FuseOSError, Operations
+try:  # FUSE is optional for import-time compatibility on headless systems.
+    from fuse import FUSE, FuseOSError, Operations
+except (ImportError, OSError):  # pragma: no cover - depends on host libraries
+    FUSE = None
+
+    class FuseOSError(OSError):
+        """Fallback error type when libfuse is unavailable."""
+
+    class Operations:  # type: ignore[no-redef]
+        """Fallback base class when libfuse is unavailable."""
 
 logger = logging.getLogger(__name__)
 
-class AxiomFS(Operations):
-    """Semantic FUSE filesystem intercepting paths as queries to AXIOM memory."""
+class ZelyrFS(Operations):
+    """Semantic FUSE filesystem intercepting paths as queries to Zelyr memory."""
 
     def __init__(self):
         self.start_time = time.time()
@@ -75,8 +84,8 @@ class AxiomFS(Operations):
         if len(parts) == 3 and parts[2].endswith(".md"):
             # Synthesize markdown content dynamically
             query = parts[1]
-            content = f"# AXIOM Synthesized Context: {query}\n\n"
-            content += f"This is a dynamically generated view into the AXIOM Relational Index for `{query}`.\n"
+            content = f"# Zelyr Synthesized Context: {query}\n\n"
+            content += f"This is a dynamically generated view into the Zelyr Relational Index for `{query}`.\n"
             content += "## Historical Logs\n"
             content += "- No critical failures recorded.\n"
             content += "## Dependencies\n"
@@ -87,8 +96,14 @@ class AxiomFS(Operations):
             
         raise FuseOSError(2)
 
-def mount_axiom_fs(mount_point: str):
-    """Mounts the AxiomFS to the specified mount point. Blocks indefinitely."""
+def mount_zelyr_fs(mount_point: str):
+    """Mounts the ZelyrFS to the specified mount point. Blocks indefinitely."""
+    if FUSE is None:
+        raise RuntimeError("libfuse is required to mount the ZelyrFS filesystem")
     if not os.path.exists(mount_point):
         os.makedirs(mount_point)
-    FUSE(AxiomFS(), mount_point, nothreads=True, foreground=True)
+    FUSE(ZelyrFS(), mount_point, nothreads=True, foreground=True)
+
+# Legacy AXIOM API compatibility aliases
+AxiomFS = ZelyrFS
+mount_axiom_fs = mount_zelyr_fs

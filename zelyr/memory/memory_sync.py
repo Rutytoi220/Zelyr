@@ -1,11 +1,11 @@
-"""Synchronous adapter over the async MemoryStore for AXIOM.
+"""Synchronous adapter over the async MemoryStore for Zelyr.
 
 Provides a sync interface for consumers that cannot use async/await
 (OrchestratorAgent, Engine, CLI). Delegates all work to MemoryStore.
 """
 from typing import Any, Dict, List, Optional
-from axiom.core.async_bridge import run_sync as _run
-from axiom.memory.memory_async import MemoryStore
+from zelyr.core.async_bridge import run_sync as _run
+from zelyr.memory.memory_async import MemoryStore
 import logging
 import threading
 import uuid
@@ -17,7 +17,7 @@ class SyncMemoryStore:
     Also provides conversation tracking and semantic search for the CLI.
     """
 
-    def __init__(self, db_path: str='axiom.db', embedding_provider: Optional[Any]=None):
+    def __init__(self, db_path: Optional[str]=None, embedding_provider: Optional[Any]=None):
         """Auto-generated docstring.
 
 Args:

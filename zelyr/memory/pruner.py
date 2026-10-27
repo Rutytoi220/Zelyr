@@ -1,4 +1,4 @@
-"""Memory Pruner Daemon for AXIOM.
+"""Memory Pruner Daemon for Zelyr.
 
 Runs a daily sweep to summarize and compress old messages, and run VACUUM on the database.
 """
@@ -55,13 +55,13 @@ class MemoryPrunerDaemon:
                 break
 
     async def _prune_and_vacuum(self) -> None:
-        from axiom.config import get_config
+        from zelyr.config import get_config
         config = get_config()
         quota = getattr(config, 'max_vector_memories', 5000)
 
         # Get the database path dynamically from the store
         db_path = self._memory_store.store.db_path if hasattr(self._memory_store, "store") else self._memory_store.db_path
-        from axiom.memory.db import MemoryDatabaseManager
+        from zelyr.memory.db import MemoryDatabaseManager
         db_mgr = await MemoryDatabaseManager.get_instance(db_path)
         db = await db_mgr.get_connection()
         
