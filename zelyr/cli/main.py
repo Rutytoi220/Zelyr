@@ -262,53 +262,59 @@ def cmd_tool_run(args: argparse.Namespace) -> None:
 
 def cmd_status(_args: argparse.Namespace) -> None:
     """Show system + daemon telemetry and optional extras status."""
-    async def _status() -> None:
-        import psutil
-        from zelyr.utils.optional_deps import is_extra_available
+    import psutil
+    from zelyr.utils.optional_deps import is_extra_available
 
-        cpu = psutil.cpu_percent(interval=None)
-        if cpu == 0.0:
-            try:
-                load1, _, _ = os.getloadavg()
-                cpu_cnt = os.cpu_count() or 1
-                cpu = min(100.0, max(0.0, (load1 / cpu_cnt) * 100.0))
-            except (AttributeError, OSError):
-                cpu = psutil.cpu_percent(interval=0.01)
-        ram = psutil.virtual_memory().percent
-
-        extras = {
-            "ml": is_extra_available("torch") and is_extra_available("transformers"),
-            "browser": is_extra_available("playwright"),
-            "audio": is_extra_available("faster_whisper") or is_extra_available("sounddevice"),
-            "gui": is_extra_available("PySide6"),
-        }
-        extras_lines = []
-        for extra_name, available in extras.items():
-            status_text = "[green]installed[/green]" if available else "[dim yellow]missing[/dim yellow]"
-            extras_lines.append(f"    • {extra_name:7s}: {status_text}")
-        extras_body = "\n".join(extras_lines)
-
-        _panel(
-            "Zelyr System Status",
-            f"  [cyan]CPU:[/cyan]     {cpu:.1f}%\n"
-            f"  [cyan]RAM:[/cyan]     {ram:.1f}%\n"
-            f"  [cyan]Daemon:[/cyan]  checking…\n\n"
-            f"  [cyan]Optional Extras:[/cyan]\n"
-            f"{extras_body}",
-            style="bold blue",
-        )
+    cpu = psutil.cpu_percent(interval=None)
+    if cpu == 0.0:
         try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection("127.0.0.1", 8000),
-                timeout=0.02,
-            )
-            writer.close()
-            await writer.wait_closed()
-            _print("[green]  Daemon: ONLINE[/green] (ws://127.0.0.1:8000)")
-        except Exception:
-            _print("[yellow]  Daemon: OFFLINE[/yellow]")
+            load1, _, _ = os.getloadavg()
+            cpu_cnt = os.cpu_count() or 1
+            cpu = min(100.0, max(0.0, (load1 / cpu_cnt) * 100.0))
+        except (AttributeError, OSError):
+            cpu = psutil.cpu_percent(interval=0.01)
+    ram = psutil.virtual_memory().percent
 
-    asyncio.run(_status())
+    extras = {
+        "ml": is_extra_available("torch") and is_extra_available("transformers"),
+        "browser": is_extra_available("playwright"),
+        "audio": is_extra_available("faster_whisper") or is_extra_available("sounddevice"),
+        "gui": is_extra_available("PySide6"),
+    }
+    extras_lines = []
+    for extra_name, available in extras.items():
+        status_text = "[green]installed[/green]" if available else "[dim yellow]missing[/dim yellow]"
+        extras_lines.append(f"    • {extra_name:7s}: {status_text}")
+    extras_body = "\n".join(extras_lines)
+
+    _panel(
+        "Zelyr System Status",
+        f"  [cyan]CPU:[/cyan]     {cpu:.1f}%\n"
+        f"  [cyan]RAM:[/cyan]     {ram:.1f}%\n"
+        f"  [cyan]Daemon:[/cyan]  checking…\n\n"
+        f"  [cyan]Optional Extras:[/cyan]\n"
+        f"{extras_body}",
+        style="bold blue",
+    )
+
+    daemon_online = False
+    try:
+        import socket
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.02)
+        try:
+            s.connect(("127.0.0.1", 8000))
+            daemon_online = True
+        finally:
+            s.close()
+    except OSError:
+        daemon_online = False
+
+    if daemon_online:
+        _print("[green]  Daemon: ONLINE[/green] (ws://127.0.0.1:8000)")
+    else:
+        _print("[yellow]  Daemon: OFFLINE[/yellow]")
 
 
 def cmd_test(_args: argparse.Namespace) -> None:

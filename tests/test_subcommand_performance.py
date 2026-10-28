@@ -33,7 +33,7 @@ class TestSubcommandPerformance(unittest.TestCase):
 
         latencies = []
         last_stdout = ""
-        for _ in range(3):
+        for _ in range(5):
             t0 = time.perf_counter()
             res = subprocess.run(cmd, capture_output=True, text=True, env=env)
             latencies.append(time.perf_counter() - t0)
