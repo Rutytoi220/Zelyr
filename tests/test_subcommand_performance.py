@@ -27,6 +27,9 @@ class TestSubcommandPerformance(unittest.TestCase):
         cmd = [sys.executable, "-m", "zelyr.cli.main", "status"]
         env = os.environ.copy()
         env["QT_QPA_PLATFORM"] = "offscreen"
+        # Prevent coverage tracing from injecting into the benchmark subprocess
+        env.pop("COV_CORE_SOURCE", None)
+        env.pop("COVERAGE_PROCESS_START", None)
 
         # Warm-up run to prime pyc / disk cache
         subprocess.run(cmd, capture_output=True, env=env, check=True)
