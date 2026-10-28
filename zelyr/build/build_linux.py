@@ -20,7 +20,7 @@ BUILD_DIR = PROJECT_ROOT / "build"
 BUILD_TEMPLATES = Path(__file__).resolve().parent / "templates"
 BUILD_SCRIPTS = Path(__file__).resolve().parent / "scripts"
 
-ZELYR_VERSION = "5.2.0"
+ZELYR_VERSION = "1.0.0"
 
 
 # ------------------------------------------------------------------

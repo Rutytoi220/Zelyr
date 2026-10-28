@@ -107,7 +107,7 @@ fi
 
 echo -e "${BLUE}[INFO]${NC} Packaging AppImage..."
 # Run appimagetool silently to avoid noisy stdout, but set -e ensures we catch exit codes
-./appimagetool-x86_64.AppImage "$APPDIR" Zelyr-v11.2.0-x86_64.AppImage > /dev/null
+./appimagetool-x86_64.AppImage "$APPDIR" Zelyr-v1.0.0-x86_64.AppImage > /dev/null
 
 echo -e "${BLUE}[INFO]${NC} Cleaning up temporary AppDir..."
 rm -rf "$APPDIR"

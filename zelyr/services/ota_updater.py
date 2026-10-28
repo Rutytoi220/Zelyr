@@ -16,7 +16,7 @@ from urllib.error import URLError
 
 logger = logging.getLogger(__name__)
 
-ZELYR_VERSION = "5.0.0"
+ZELYR_VERSION = "1.0.0"
 AXIOM_VERSION = ZELYR_VERSION  # legacy public constant
 GITHUB_API_URL = "https://api.github.com/repos/Rutytoi220/Zelyr/releases/latest"
 STAGING_DIR = data_dir() / "staging"

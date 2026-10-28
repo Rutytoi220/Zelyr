@@ -13,7 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DIST_DIR = PROJECT_ROOT / "dist"
 RELEASES_DIR = PROJECT_ROOT / "releases"
 BUILD_DIR = PROJECT_ROOT / "build"
-ZELYR_VERSION = "5.2.0"
+ZELYR_VERSION = "1.0.0"
 
 
 def generate_inno_setup_script() -> str:
