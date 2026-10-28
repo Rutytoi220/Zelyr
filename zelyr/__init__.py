@@ -34,7 +34,7 @@ from zelyr.config import ZelyrConfig, get_config, set_config
 # Legacy public names retained for existing AXIOM integrations.
 AxiomConfig = ZelyrConfig
 
-__version__ = "1.0.0"
+__version__ = "1.1.0.dev0"
 __author__ = "Zelyr Team"
 __description__ = "Local-first AI orchestration framework"
 

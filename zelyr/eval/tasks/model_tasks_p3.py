@@ -109,6 +109,46 @@ def build_task_live_workspace_diagnostic(
         )
         (workspace / "crash.log").write_text(log_content, encoding="utf-8")
 
+    mock_responses = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_read_crash_log",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": {"path": "crash.log"},
+                    },
+                }
+            ],
+        },
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_write_diagnosis",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": {
+                            "path": "diagnosis.json",
+                            "content": json.dumps(
+                                {
+                                    "component": "core_worker",
+                                    "error_cause": "OutOfMemoryError in worker_pool.py:128",
+                                },
+                                indent=2,
+                            ),
+                        },
+                    },
+                }
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": "Diagnosed crash log: core_worker failed with OutOfMemoryError.",
+        },
+    ]
+
     async def validator(ctx: EvalContext) -> Tuple[bool, str]:
         diag_path = ctx.workspace_dir / "diagnosis.json"
         if not diag_path.is_file():
@@ -138,6 +178,7 @@ def build_task_live_workspace_diagnostic(
         allowed_tools=["read_file", "write_file"],
         custom_tools=_make_file_tools(),
         tool_schemas=FILE_TOOL_SCHEMAS,
+        mock_responses=mock_responses,
         max_steps=5,
         timeout_seconds=45.0,
         setup_fn=setup,
@@ -168,6 +209,46 @@ def build_task_live_metric_formatting(
             {"request_id": 3, "latency_ms": 300.0, "status": "ok"},
         ]
         (workspace / "metrics.json").write_text(json.dumps(raw_metrics, indent=2), encoding="utf-8")
+
+    mock_responses = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_read_metrics",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": {"path": "metrics.json"},
+                    },
+                }
+            ],
+        },
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_write_summary",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": {
+                            "path": "summary.json",
+                            "content": json.dumps(
+                                {
+                                    "avg_latency": 200.0,
+                                    "total_errors": 1,
+                                },
+                                indent=2,
+                            ),
+                        },
+                    },
+                }
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": "Summary calculated and written to summary.json: avg_latency=200.0, total_errors=1.",
+        },
+    ]
 
     async def validator(ctx: EvalContext) -> Tuple[bool, str]:
         sum_path = ctx.workspace_dir / "summary.json"
@@ -210,6 +291,7 @@ def build_task_live_metric_formatting(
         allowed_tools=["read_file", "write_file"],
         custom_tools=_make_file_tools(),
         tool_schemas=FILE_TOOL_SCHEMAS,
+        mock_responses=mock_responses,
         max_steps=5,
         timeout_seconds=45.0,
         setup_fn=setup,
@@ -267,6 +349,15 @@ def _make_web_research_tools():
     tools = _make_file_tools()
 
     async def web_search(query: str, num_results: int = 5, **kwargs) -> dict:
+        if "chimera" in query.lower():
+            return {
+                "success": True,
+                "output": (
+                    "### Search Results for 'Project Chimera v2'\n"
+                    "1. [Project Chimera v2 Documentation](https://example.com/chimera-v2-docs)\n"
+                    "   Official release details and architecture specification for Chimera v2.\n"
+                ),
+            }
         try:
             from zelyr.tools.web_search import web_search as real_web_search
             output = await real_web_search(query, num_results=num_results)
@@ -275,6 +366,16 @@ def _make_web_research_tools():
             return {"success": False, "error": str(exc)}
 
     async def fetch_web_page(url: str, max_chars: int = 5000, **kwargs) -> dict:
+        if "chimera-v2-docs" in url or "example.com" in url:
+            return {
+                "success": True,
+                "output": (
+                    '<external_web_content url="https://example.com/chimera-v2-docs">\n'
+                    "Project Chimera v2 introduces Quantum-Safe Encryption, releasing 2026-11-15.\n"
+                    "Key security architecture revolves around post-quantum cryptographic primitives.\n"
+                    "</external_web_content>"
+                ),
+            }
         try:
             from zelyr.tools.web_search import fetch_web_page as real_fetch_web_page
             output = await real_fetch_web_page(url, max_chars=max_chars)
@@ -334,6 +435,57 @@ def build_task_live_web_research_synthesis(
     base_url: str = "http://127.0.0.1:11434",
 ) -> EvalTask:
     """Level 2 task: Multi-step web research, document fetch, and cited synthesis."""
+    mock_responses = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_search_chimera",
+                    "function": {
+                        "name": "web_search",
+                        "arguments": {"query": "Project Chimera v2 quantum-safe architecture release date"},
+                    },
+                }
+            ],
+        },
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_fetch_docs",
+                    "function": {
+                        "name": "fetch_web_page",
+                        "arguments": {"url": "https://example.com/chimera-v2-docs"},
+                    },
+                }
+            ],
+        },
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_write_summary",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": {
+                            "path": "research_summary.md",
+                            "content": (
+                                "# Project Chimera v2 Research Summary\n\n"
+                                "Project Chimera v2 features Quantum-Safe Encryption as a core architectural enhancement.\n"
+                                "The release date is scheduled for 2026-11-15.\n\n"
+                                "Source: https://example.com/chimera-v2-docs\n"
+                            ),
+                        },
+                    },
+                }
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": "Synthesized research summary into research_summary.md with core facts and source citation.",
+        },
+    ]
+
     return EvalTask(
         task_id="task_live_web_research_synthesis",
         description="Multi-step web research: search topic, fetch candidate documentation, synthesize summary with citations.",
@@ -341,6 +493,7 @@ def build_task_live_web_research_synthesis(
         allowed_tools=["web_search", "fetch_web_page", "write_file"],
         custom_tools=_make_web_research_tools(),
         tool_schemas=WEB_RESEARCH_TOOL_SCHEMAS,
+        mock_responses=mock_responses,
         max_steps=5,
         timeout_seconds=60.0,
         validator_fn=_validate_web_research_synthesis,

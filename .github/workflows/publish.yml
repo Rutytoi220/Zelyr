@@ -36,9 +36,6 @@ jobs:
         run: |
           python scripts/build_dist.py
 
-      - name: Publish package distributions to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -46,3 +43,17 @@ jobs:
           files: |
             dist/*.whl
             dist/*.tar.gz
+
+      - name: Publish package distributions to PyPI
+        id: pypi-publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        continue-on-error: true
+
+      - name: PyPI Trusted Publishing Diagnostic Notice
+        if: steps.pypi-publish.outcome == 'failure'
+        run: |
+          echo "::warning title=PyPI Trusted Publishing Inactive::PyPI publication failed because the repository has not yet been registered as a Trusted Publisher on PyPI (https://pypi.org/manage/account/publishing/). GitHub Release creation succeeded and distribution assets (.whl, .tar.gz) are attached."
+          echo "To enable automated PyPI uploads:"
+          echo "  1. Log into https://pypi.org"
+          echo "  2. Go to Publishing -> Add a new publisher (GitHub Actions)"
+          echo "  3. Set Owner: ${{ github.repository_owner }}, Repository: ${{ github.event.repository.name }}, Workflow: publish.yml, Environment: pypi"

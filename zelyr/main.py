@@ -5,7 +5,7 @@ from zelyr.llm import OllamaClient
 from zelyr.api.cli import CLI, run_cli
 from zelyr.config import ZelyrConfig, get_config, set_config
 
-__version__ = "1.0.0"
+__version__ = "1.1.0.dev0"
 __author__ = "Zelyr Team"
 
 __all__ = [
