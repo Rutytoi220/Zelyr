@@ -16,6 +16,18 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Install Linux GUI and Headless Qt Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 \
+            libgl1-mesa-dev \
+            libxkbcommon-x11-0 \
+            libxcb-cursor0 \
+            libxcb-icccm4 \
+            libxcb-keysyms1 \
+            libxcb-shape0
+
       - name: Set up uv
         run: curl -LsSf https://astral.sh/uv/install.sh | sh
 
@@ -39,11 +51,22 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up uv and fuse
+      - name: Install Linux GUI and Headless Qt Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y fuse libfuse2
-          curl -LsSf https://astral.sh/uv/install.sh | sh
+          sudo apt-get install -y --no-install-recommends \
+            fuse \
+            libfuse2 \
+            libegl1 \
+            libgl1-mesa-dev \
+            libxkbcommon-x11-0 \
+            libxcb-cursor0 \
+            libxcb-icccm4 \
+            libxcb-keysyms1 \
+            libxcb-shape0
+
+      - name: Set up uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
 
       - name: Build AppImage
         run: |
