@@ -1,16 +1,29 @@
 import asyncio
+from collections import deque
+from enum import Enum
 import json
 import logging
 import os
-import sys
 from pathlib import Path
-from collections import deque
-from enum import Enum
+import secrets
+import sys
 import time
 from typing import Any, Callable, Deque, Dict, List, Optional
+import urllib.parse
 import websockets
 
+from zelyr.compat import data_dir
 from zelyr.core.events import Event
+from zelyr.server.protocol import (
+    JSONRPCRequest,
+    MAX_PAYLOAD_SIZE,
+    METHOD_NOT_FOUND,
+    RATE_LIMIT_EXCEEDED,
+    SlidingWindowRateLimiter,
+    make_error_response,
+    make_success_response,
+    parse_and_validate_message,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -235,12 +248,16 @@ class DaemonWorkerSupervisor:
 
 
 class ZelyrDaemonServer:
-    def __init__(self):
+    def __init__(self, auth_token: Optional[str] = None):
         from zelyr.core.events import EventBus
         self.event_bus = EventBus()
         self.supervisor = DaemonWorkerSupervisor(event_bus=self.event_bus)
         self.lifecycle = None
         self.cli = None
+
+        self.auth_token = auth_token or os.environ.get("ZELYR_AUTH_TOKEN") or secrets.token_urlsafe(32)
+        self.token_file = data_dir() / "daemon.token"
+        self._write_token_file()
         
         self.scheduler_service = None
         self.telemetry = None
@@ -254,6 +271,37 @@ class ZelyrDaemonServer:
         
         self.clients = set()
         self.event_bus.subscribe("*", self._on_bus_event)
+
+    def _write_token_file(self) -> None:
+        """Write active runtime auth token with strict 0600 POSIX permissions."""
+        try:
+            self.token_file.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(self.token_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with open(fd, "w", encoding="utf-8") as f:
+                f.write(self.auth_token)
+            os.chmod(self.token_file, 0o600)
+        except Exception as e:
+            logger.warning("[Daemon] Could not write secure daemon.token: %s", e)
+
+    def _extract_token(self, websocket: Any) -> Optional[str]:
+        """Extract auth token from Authorization header or ?token= query parameter."""
+        req = getattr(websocket, "request", None)
+        headers = getattr(req, "headers", None) if req else getattr(websocket, "request_headers", None)
+        path = getattr(req, "path", None) if req else getattr(websocket, "path", None)
+
+        if headers:
+            auth_header = headers.get("Authorization") or headers.get("authorization")
+            if auth_header and auth_header.startswith(("Bearer ", "bearer ")):
+                return auth_header.split(" ", 1)[1].strip()
+
+        if path:
+            parsed = urllib.parse.urlparse(path)
+            q = urllib.parse.parse_qs(parsed.query)
+            tokens = q.get("token")
+            if tokens and tokens[0]:
+                return tokens[0].strip()
+
+        return None
 
     async def initialize_background(self):
         from zelyr.core.lifecycle import AppLifecycleState, LifecycleManager
@@ -433,12 +481,62 @@ class ZelyrDaemonServer:
             pass
 
     async def handle_client(self, websocket):
+        provided_token = self._extract_token(websocket)
+        if not provided_token or not secrets.compare_digest(provided_token, self.auth_token):
+            logger.warning("[Daemon] Unauthorized connection attempt rejected.")
+            try:
+                await websocket.close(code=4401, reason="Unauthorized")
+            except Exception:
+                pass
+            return
+
         self.clients.add(websocket)
         logger.info("Client connected. Total clients: %d", len(self.clients))
+        rate_limiter = SlidingWindowRateLimiter(max_requests=50, window_seconds=1.0)
         try:
             async for message in websocket:
+                msg_len = len(message.encode("utf-8") if isinstance(message, str) else message)
+                if msg_len > MAX_PAYLOAD_SIZE:
+                    logger.warning("[Daemon] Message size %d exceeds 1MB. Closing with code 4409.", msg_len)
+                    await websocket.close(code=4409, reason="Message Too Big")
+                    break
+
+                if not rate_limiter.allow_request():
+                    logger.warning("[Daemon] Rate limit exceeded for client.")
+                    err_env = make_error_response(None, RATE_LIMIT_EXCEEDED, "Rate limit exceeded: max 50 requests/sec")
+                    await websocket.send(json.dumps(err_env))
+                    continue
+
+                parsed_req, val_err = parse_and_validate_message(message)
+                if val_err:
+                    await websocket.send(json.dumps(val_err))
+                    continue
+
                 try:
-                    data = json.loads(message)
+                    if isinstance(parsed_req, JSONRPCRequest):
+                        method = parsed_req.method
+                        req_id = parsed_req.id
+
+                        if method in ("sync_state", "get_state"):
+                            state_val = self.lifecycle.state.value if self.lifecycle else "BOOTING"
+                            await websocket.send(json.dumps(make_success_response(req_id, {"state": state_val})))
+                        elif method == "get_tools":
+                            tools_list = []
+                            if self.cli:
+                                tools = self.cli.orchestrator._tool_registry._core_registry.list_tools()
+                                from zelyr.config import get_config
+                                disabled = getattr(get_config(), "disabled_plugins", [])
+                                for tid, t in sorted(tools.items()):
+                                    desc = getattr(t, 'description', '') or (t.__doc__.strip().split('\n')[0] if t.__doc__ else "")
+                                    tools_list.append({"id": tid, "description": desc, "enabled": tid not in disabled})
+                            await websocket.send(json.dumps(make_success_response(req_id, tools_list)))
+                        elif method == "ping":
+                            await websocket.send(json.dumps(make_success_response(req_id, "pong")))
+                        else:
+                            await websocket.send(json.dumps(make_error_response(req_id, METHOD_NOT_FOUND, f"Method '{method}' not found")))
+                        continue
+
+                    data = parsed_req
                     action = data.get("action")
                     if not self.cli:
                         if action == "get_tools":
@@ -556,6 +654,11 @@ class ZelyrDaemonServer:
 
     async def stop(self):
         """Cleanly stop the daemon server, supervisor, and disconnect all clients."""
+        if hasattr(self, "token_file") and self.token_file and self.token_file.exists():
+            try:
+                self.token_file.unlink()
+            except Exception:
+                pass
         if hasattr(self, "supervisor") and self.supervisor:
             await self.supervisor.shutdown(timeout=5.0)
         for ws in list(self.clients):
