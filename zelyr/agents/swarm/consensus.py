@@ -52,50 +52,146 @@ class ConsensusEngine:
 
     def _handle_vote(self, event: Event) -> None:
         """Process an incoming vote."""
-        proposal_id = event.data.get('proposal_id')
-        vote = event.data.get('vote')
-        voter = event.data.get('voter')
-        if proposal_id not in self._proposals:
-            return
-        proposal = self._proposals[proposal_id]
-        if proposal['state'] != ProposalState.PROPOSED:
-            return
+        try:
+            proposal_id = event.data.get('proposal_id')
+            vote = event.data.get('vote')
+            voter = event.data.get('voter')
+            if proposal_id not in self._proposals:
+                return
+            proposal = self._proposals[proposal_id]
+            if proposal['state'] != ProposalState.PROPOSED:
+                return
 
-        votes = proposal.setdefault('votes', {})
-        if voter:
-            votes[voter] = vote
+            votes = proposal.setdefault('votes', {})
+            if voter:
+                votes[voter] = vote
 
-        total = proposal.get('total_voters') or self.total_voters or 1
-        quorum_ratio = proposal.get('required_quorum', self.required_quorum)
+            total = proposal.get('total_voters') or self.total_voters or 1
+            quorum_ratio = proposal.get('required_quorum', self.required_quorum)
 
-        if total <= 1:
-            if vote == 'APPROVED':
+            if total <= 1:
+                if vote == 'APPROVED':
+                    proposal['state'] = ProposalState.APPROVED
+                    logger.info(f'Consensus: Proposal {proposal_id} APPROVED by {voter}')
+                    self._commit_blackboard_artifact(proposal)
+                    self._publish_resolution(proposal, approved=True)
+                else:
+                    proposal['state'] = ProposalState.REJECTED
+                    logger.info(f'Consensus: Proposal {proposal_id} REJECTED by {voter} (vote: {vote})')
+                    self._rollback_blackboard_artifact(proposal)
+                    self._publish_resolution(proposal, approved=False, reason="rejected", is_split=False)
+                return
+
+            approved_count = sum(1 for v in votes.values() if v == 'APPROVED')
+            non_approved_count = sum(1 for v in votes.values() if v != 'APPROVED')
+
+            # Check if quorum has been reached
+            if (approved_count / total) >= (quorum_ratio - 1e-6):
                 proposal['state'] = ProposalState.APPROVED
-                logger.info(f'Consensus: Proposal {proposal_id} APPROVED by {voter}')
+                logger.info(
+                    f'Consensus: Proposal {proposal_id} reached quorum '
+                    f'({approved_count}/{total} APPROVED by {list(votes.keys())})'
+                )
                 self._commit_blackboard_artifact(proposal)
-            elif vote == 'REJECTED':
+                self._publish_resolution(proposal, approved=True)
+                return
+
+            # Check if quorum is mathematically impossible with remaining votes or all voters cast
+            max_possible_approvals = total - non_approved_count
+            is_impossible = (max_possible_approvals / total) < (quorum_ratio - 1e-6)
+            all_voted = len(votes) >= total
+
+            if is_impossible or all_voted:
                 proposal['state'] = ProposalState.REJECTED
-                logger.info(f'Consensus: Proposal {proposal_id} REJECTED by {voter}')
-            return
+                is_split = approved_count > 0 and non_approved_count > 0
 
-        approved_count = sum(1 for v in votes.values() if v == 'APPROVED')
-        rejected_count = sum(1 for v in votes.values() if v == 'REJECTED')
+                if is_split:
+                    logger.warning(
+                        f"Consensus: Proposal {proposal_id} failed quorum due to split vote / tie "
+                        f"({approved_count} APPROVED, {non_approved_count} NON-APPROVAL/REJECTED "
+                        f"out of {total} total voters, votes={votes}). Safely rejecting and rolling back."
+                    )
+                else:
+                    logger.info(
+                        f'Consensus: Proposal {proposal_id} failed quorum '
+                        f'({non_approved_count}/{total} NON-APPROVAL/REJECTED by {list(votes.keys())})'
+                    )
 
-        if (approved_count / total) >= (quorum_ratio - 1e-6):
-            proposal['state'] = ProposalState.APPROVED
-            logger.info(
-                f'Consensus: Proposal {proposal_id} reached quorum '
-                f'({approved_count}/{total} APPROVED by {list(votes.keys())})'
+                self._rollback_blackboard_artifact(proposal)
+                self._publish_resolution(
+                    proposal,
+                    approved=False,
+                    reason="split_decision" if is_split else "rejected",
+                    is_split=is_split,
+                )
+        except Exception as exc:
+            logger.error("Consensus: Error handling vote event: %s", exc, exc_info=True)
+
+    def create_proposal(
+        self,
+        agent_name: str,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        proposal_id: Optional[str] = None,
+        total_voters: Optional[int] = None,
+        required_quorum: Optional[float] = None,
+    ) -> str:
+        """Submit and register a proposal without entering a blocking wait loop.
+
+        Args:
+            agent_name: Name of the agent proposing the action.
+            tool_name: Name of the destructive tool.
+            arguments: Arguments to be passed to the tool.
+            proposal_id: Optional explicit proposal ID.
+            total_voters: Optional override for total voters in quorum.
+            required_quorum: Optional override for quorum fraction (e.g. 0.6667).
+
+        Returns:
+            The proposal ID.
+        """
+        pid = proposal_id or str(uuid.uuid4())
+        voters_count = total_voters if total_voters is not None else self.total_voters
+        quorum = required_quorum if required_quorum is not None else self.required_quorum
+
+        snapshot = None
+        if self._blackboard is not None and self._session_id is not None:
+            try:
+                if hasattr(self._blackboard, "create_snapshot"):
+                    snapshot = self._blackboard.create_snapshot(self._session_id)
+                elif hasattr(self._blackboard, "dump_session"):
+                    import copy
+                    snapshot = copy.deepcopy(self._blackboard.dump_session(self._session_id))
+            except Exception as e:
+                logger.warning("Consensus: Failed to capture blackboard snapshot: %s", e)
+
+        self._proposals[pid] = {
+            'id': pid,
+            'agent': agent_name,
+            'tool': tool_name,
+            'arguments': arguments,
+            'state': ProposalState.PROPOSED,
+            'timestamp': time.time(),
+            'votes': {},
+            'total_voters': voters_count,
+            'required_quorum': quorum,
+            'blackboard_snapshot': snapshot,
+        }
+        self.event_bus.publish(
+            Event(
+                event_type='swarm.proposal',
+                source='ConsensusEngine',
+                data={
+                    'proposal_id': pid,
+                    'agent': agent_name,
+                    'tool': tool_name,
+                    'arguments': arguments,
+                },
             )
-            self._commit_blackboard_artifact(proposal)
-        elif ((total - rejected_count) / total) < (quorum_ratio - 1e-6) or (
-            len(votes) >= total and (approved_count / total) < (quorum_ratio - 1e-6)
-        ):
-            proposal['state'] = ProposalState.REJECTED
-            logger.info(
-                f'Consensus: Proposal {proposal_id} failed quorum '
-                f'({rejected_count}/{total} REJECTED by {list(votes.keys())})'
-            )
+        )
+        logger.info(
+            f"Consensus: Agent '{agent_name}' proposed mutating tool '{tool_name}' (ID: {pid}, voters: {voters_count})"
+        )
+        return pid
 
     def propose(
         self,
@@ -107,7 +203,7 @@ class ConsensusEngine:
         required_quorum: Optional[float] = None,
     ) -> bool:
         """Submit a proposal to the swarm and wait for consensus.
-        
+
         Args:
             agent_name: Name of the agent proposing the action.
             tool_name: Name of the destructive tool.
@@ -115,38 +211,16 @@ class ConsensusEngine:
             timeout: Max seconds to wait before auto-rejecting.
             total_voters: Optional override for total voters in quorum.
             required_quorum: Optional override for quorum fraction (e.g. 0.6667).
-            
+
         Returns:
             True if APPROVED, False if REJECTED or timed out.
         """
-        proposal_id = str(uuid.uuid4())
-        voters_count = total_voters if total_voters is not None else self.total_voters
-        quorum = required_quorum if required_quorum is not None else self.required_quorum
-        self._proposals[proposal_id] = {
-            'id': proposal_id,
-            'agent': agent_name,
-            'tool': tool_name,
-            'arguments': arguments,
-            'state': ProposalState.PROPOSED,
-            'timestamp': time.time(),
-            'votes': {},
-            'total_voters': voters_count,
-            'required_quorum': quorum,
-        }
-        self.event_bus.publish(
-            Event(
-                event_type='swarm.proposal',
-                source='ConsensusEngine',
-                data={
-                    'proposal_id': proposal_id,
-                    'agent': agent_name,
-                    'tool': tool_name,
-                    'arguments': arguments,
-                },
-            )
-        )
-        logger.info(
-            f"Consensus: Agent '{agent_name}' proposed mutating tool '{tool_name}' (ID: {proposal_id}, voters: {voters_count})"
+        proposal_id = self.create_proposal(
+            agent_name=agent_name,
+            tool_name=tool_name,
+            arguments=arguments,
+            total_voters=total_voters,
+            required_quorum=required_quorum,
         )
         start_time = time.time()
         while time.time() - start_time < timeout:
@@ -155,10 +229,64 @@ class ConsensusEngine:
                 return True
             if state == ProposalState.REJECTED:
                 return False
-            time.sleep(0.05)
+            time.sleep(0.02)
+
         self._proposals[proposal_id]['state'] = ProposalState.REJECTED
-        logger.warning(f'Consensus: Proposal {proposal_id} TIMED OUT. Automatically REJECTED to prevent deadlock.')
+        logger.warning(
+            f'Consensus: Proposal {proposal_id} TIMED OUT after {timeout}s. Automatically REJECTED to prevent deadlock.'
+        )
+        self._rollback_blackboard_artifact(self._proposals[proposal_id])
+        self._publish_resolution(
+            self._proposals[proposal_id],
+            approved=False,
+            reason="timeout",
+        )
         return False
+
+    def _rollback_blackboard_artifact(self, proposal: Dict[str, Any]) -> None:
+        """Roll back blackboard mutations if proposal failed consensus or timed out."""
+        if self._blackboard is None or self._session_id is None:
+            return
+        snapshot = proposal.get("blackboard_snapshot")
+        if snapshot is not None and hasattr(self._blackboard, "restore_snapshot"):
+            try:
+                self._blackboard.restore_snapshot(self._session_id, snapshot)
+                logger.info(
+                    "Consensus: Rolled back blackboard snapshot for session '%s' on proposal %s.",
+                    self._session_id,
+                    proposal.get("id"),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Consensus: Failed to restore blackboard snapshot for proposal %s: %s",
+                    proposal.get("id"),
+                    exc,
+                )
+
+    def _publish_resolution(
+        self,
+        proposal: Dict[str, Any],
+        approved: bool,
+        reason: str = "consensus",
+        is_split: bool = False,
+    ) -> None:
+        """Publish consensus resolution event to EventBus."""
+        event_type = 'swarm.consensus.approved' if approved else 'swarm.consensus.rejected'
+        data = {
+            'proposal_id': proposal.get('id'),
+            'agent': proposal.get('agent'),
+            'tool': proposal.get('tool'),
+            'approved': approved,
+            'reason': reason,
+            'votes': dict(proposal.get('votes', {})),
+            'is_split': is_split,
+        }
+        try:
+            self.event_bus.publish(
+                Event(event_type=event_type, source='ConsensusEngine', data=data)
+            )
+        except Exception as exc:
+            logger.debug("Consensus: Failed to publish resolution event: %s", exc)
 
     def _commit_blackboard_artifact(self, proposal: Dict[str, Any]) -> None:
         """Commit the approved agent's final Blackboard artifact to persistent memory.

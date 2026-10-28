@@ -19,10 +19,25 @@ Usage::
     bb.purge_session("session_1")
 """
 from __future__ import annotations
+import copy
 import logging
 import threading
-from typing import Any, Dict, List, Optional
+import uuid
+from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
+
+def _safe_copy_value(val: Any) -> Any:
+    """Safely copy an artifact value for blackboard snapshotting."""
+    try:
+        return copy.deepcopy(val)
+    except Exception:
+        if isinstance(val, dict):
+            return dict(val)
+        if isinstance(val, list):
+            return list(val)
+        if isinstance(val, set):
+            return set(val)
+        return val
 
 class BlackboardNamespace:
     """A single agent's scratchpad within a session."""
@@ -105,13 +120,9 @@ class BlackboardStore:
     """
 
     def __init__(self):
-        """Auto-generated docstring.
-
-
-Returns:
-    Return value.
-"""
+        """Initialize BlackboardStore with empty session partitions and transactions."""
         self._sessions: Dict[str, Dict[str, BlackboardNamespace]] = {}
+        self._transactions: Dict[str, List[Tuple[str, Dict[str, Dict[str, Any]]]]] = {}
         self._lock = threading.RLock()
 
     def _get_namespace(self, session_id: str, agent_id: str) -> BlackboardNamespace:
@@ -179,6 +190,124 @@ Returns:
                 result[agent_id] = dict(ns._store)
             return result
 
+    def create_snapshot(self, session_id: str) -> Dict[str, Dict[str, Any]]:
+        """Return an isolated point-in-time snapshot of the session's blackboard state.
+
+        The snapshot can later be passed to ``restore_snapshot`` to revert mutations.
+        Returns ``{agent_id: {key: deepcopied_value}}`` mapping.
+        """
+        with self._lock:
+            snapshot: Dict[str, Dict[str, Any]] = {}
+            for agent_id, ns in self._sessions.get(session_id, {}).items():
+                snapshot[agent_id] = {k: _safe_copy_value(v) for k, v in ns._store.items()}
+            return snapshot
+
+    def restore_snapshot(self, session_id: str, snapshot: Dict[str, Dict[str, Any]]) -> None:
+        """Restore the session's blackboard state to a previous snapshot.
+
+        Reverts modified values, removes keys added after the snapshot,
+        and deletes namespaces created after the snapshot.
+        """
+        with self._lock:
+            current_session = self._sessions.get(session_id, {})
+            # Remove any namespaces created after snapshot
+            for agent_id in list(current_session.keys()):
+                if agent_id not in snapshot:
+                    current_session[agent_id].clear()
+                    del current_session[agent_id]
+                else:
+                    ns_store = current_session[agent_id]._store
+                    snap_store = snapshot[agent_id]
+                    # Remove keys added after snapshot
+                    for key in list(ns_store.keys()):
+                        if key not in snap_store:
+                            del ns_store[key]
+                    # Restore keys present in snapshot
+                    for key, val in snap_store.items():
+                        ns_store[key] = _safe_copy_value(val)
+
+            # Recreate any namespaces that existed in snapshot but were deleted
+            for agent_id, snap_store in snapshot.items():
+                if agent_id not in current_session:
+                    ns = BlackboardNamespace(session_id, agent_id)
+                    ns._store = {k: _safe_copy_value(v) for k, v in snap_store.items()}
+                    current_session[agent_id] = ns
+
+            if session_id not in self._sessions and snapshot:
+                self._sessions[session_id] = current_session
+            logger.info("Blackboard: restored snapshot for session '%s'.", session_id)
+
+    def begin_transaction(self, session_id: str, txn_id: Optional[str] = None) -> str:
+        """Begin a transactional savepoint on the blackboard for session_id.
+
+        Args:
+            session_id: Swarm session identifier.
+            txn_id: Optional explicit transaction ID.
+
+        Returns:
+            The transaction ID of the created savepoint.
+        """
+        with self._lock:
+            tid = txn_id or str(uuid.uuid4())
+            snapshot = self.create_snapshot(session_id)
+            if session_id not in self._transactions:
+                self._transactions[session_id] = []
+            self._transactions[session_id].append((tid, snapshot))
+            logger.debug("Blackboard: begin_transaction '%s' for session '%s'.", tid, session_id)
+            return tid
+
+    def rollback_transaction(self, session_id: str, txn_id: Optional[str] = None) -> bool:
+        """Roll back blackboard state to a previous transaction savepoint.
+
+        If txn_id is specified, rolls back to that savepoint and removes it and subsequent savepoints.
+        If txn_id is None, rolls back to the most recent savepoint.
+
+        Returns:
+            True if a savepoint was rolled back, False if no savepoints exist.
+        """
+        with self._lock:
+            stack = self._transactions.get(session_id, [])
+            if not stack:
+                return False
+            if txn_id is None:
+                _, snapshot = stack.pop()
+                self.restore_snapshot(session_id, snapshot)
+                return True
+            idx = None
+            for i, (tid, _) in enumerate(stack):
+                if tid == txn_id:
+                    idx = i
+                    break
+            if idx is None:
+                return False
+            _, snapshot = stack[idx]
+            self._transactions[session_id] = stack[:idx]
+            self.restore_snapshot(session_id, snapshot)
+            return True
+
+    def commit_transaction(self, session_id: str, txn_id: Optional[str] = None) -> bool:
+        """Commit a transaction savepoint without reverting blackboard state.
+
+        Returns:
+            True if a savepoint was committed, False if no savepoints exist.
+        """
+        with self._lock:
+            stack = self._transactions.get(session_id, [])
+            if not stack:
+                return False
+            if txn_id is None:
+                stack.pop()
+                return True
+            idx = None
+            for i, (tid, _) in enumerate(stack):
+                if tid == txn_id:
+                    idx = i
+                    break
+            if idx is None:
+                return False
+            self._transactions[session_id] = stack[:idx]
+            return True
+
     def purge_session(self, session_id: str) -> int:
         """Completely destroy all data for *session_id*, freeing RAM.
 
@@ -189,6 +318,7 @@ Returns:
             Number of namespace entries purged.
         """
         with self._lock:
+            self._transactions.pop(session_id, None)
             session = self._sessions.pop(session_id, {})
             total = sum((len(ns.list_keys()) for ns in session.values()))
             for ns in session.values():

@@ -34,9 +34,13 @@ Returns:
         super().__init__(name, description, event_bus, tool_registry)
         self.topic = topic
         self.llm_client = llm_client
-        self.consensus = ConsensusEngine(event_bus) if event_bus else None
         self.blackboard = blackboard
         self.session_id = session_id or 'default_session'
+        self.consensus = (
+            ConsensusEngine(event_bus, blackboard=self.blackboard, session_id=self.session_id)
+            if event_bus
+            else None
+        )
         self.system_prompt = ""
         self._memory = []
         if self.event_bus:
