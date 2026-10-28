@@ -349,3 +349,161 @@ class ToolValidator:
             return ast_res
 
         return await self.test_isolated_execution(code, test_params=test_params)
+
+    def validate_code(
+        self,
+        code: str,
+        allow_ring0: bool = False,
+    ) -> ValidationResult:
+        """Validate dynamic tool code against security, syntax, and privilege boundaries.
+
+        Inspects AST to ensure the code does not:
+        - Call or import dynamic import primitives (__import__, importlib, sys.modules)
+        - Invoke reflection or execution primitives (eval, exec, compile, getattr on builtins)
+        - Attempt privilege escalation by declaring REQUIRED_RING = 0 or mutating PROTECTED_TOOLS
+        - Attempt path traversal in tool naming or exported strings
+        """
+        # First, run syntax and base AST checks
+        res = self.validate_syntax_and_ast(code)
+        if not res.is_valid:
+            return res
+
+        try:
+            tree = ast.parse(code)
+        except Exception as e:
+            return ValidationResult(is_valid=False, error=f"Parse error: {e}")
+
+        # Security AST walk
+        for node in ast.walk(tree):
+            # Check dynamic imports and execution calls
+            if isinstance(node, ast.Call):
+                # __import__(...)
+                if isinstance(node.func, ast.Name) and node.func.id == "__import__":
+                    return ValidationResult(
+                        is_valid=False,
+                        error="Security violation: Dynamic import primitive '__import__' is disallowed.",
+                    )
+                # importlib.import_module(...)
+                if isinstance(node.func, ast.Attribute) and node.func.attr == "import_module":
+                    return ValidationResult(
+                        is_valid=False,
+                        error="Security violation: 'importlib.import_module' is disallowed.",
+                    )
+                # eval(...), exec(...), compile(...)
+                if isinstance(node.func, ast.Name) and node.func.id in ("eval", "exec", "compile"):
+                    return ValidationResult(
+                        is_valid=False,
+                        error=f"Security violation: Execution primitive '{node.func.id}' is disallowed.",
+                    )
+                # getattr targeting builtins
+                if isinstance(node.func, ast.Name) and node.func.id == "getattr":
+                    for arg in node.args:
+                        if isinstance(arg, ast.Name) and arg.id in ("__builtins__", "builtins"):
+                            return ValidationResult(
+                                is_valid=False,
+                                error="Security violation: Reflection escalation targeting builtins is disallowed.",
+                            )
+                        if isinstance(arg, ast.Constant) and str(arg.value) in ("__builtins__", "builtins"):
+                            return ValidationResult(
+                                is_valid=False,
+                                error="Security violation: Reflection escalation targeting builtins is disallowed.",
+                            )
+
+            # Check imports of importlib
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.split(".")[0] == "importlib":
+                        return ValidationResult(
+                            is_valid=False,
+                            error="Security violation: Importing 'importlib' is disallowed in dynamic tools.",
+                        )
+            if isinstance(node, ast.ImportFrom):
+                if node.module and node.module.split(".")[0] == "importlib":
+                    return ValidationResult(
+                        is_valid=False,
+                        error="Security violation: Importing from 'importlib' is disallowed in dynamic tools.",
+                    )
+
+            # Check sys.modules access or __builtins__ access
+            if isinstance(node, ast.Attribute):
+                if node.attr == "modules" and isinstance(node.value, ast.Name) and node.value.id == "sys":
+                    return ValidationResult(
+                        is_valid=False,
+                        error="Security violation: Direct access to 'sys.modules' is disallowed.",
+                    )
+                if node.attr in ("__builtins__", "__subclasses__", "__globals__"):
+                    return ValidationResult(
+                        is_valid=False,
+                        error=f"Security violation: Access to '{node.attr}' is disallowed.",
+                    )
+
+            if isinstance(node, ast.Name) and node.id == "__builtins__":
+                return ValidationResult(
+                    is_valid=False,
+                    error="Security violation: Direct access to '__builtins__' is disallowed.",
+                )
+
+            # Check attempts to modify or assign to PROTECTED_TOOLS
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                targets = []
+                if isinstance(node, ast.Assign):
+                    targets = node.targets
+                elif isinstance(node, ast.AnnAssign):
+                    targets = [node.target]
+                elif isinstance(node, ast.AugAssign):
+                    targets = [node.target]
+                for target in targets:
+                    if isinstance(target, ast.Name) and target.id == "PROTECTED_TOOLS":
+                        return ValidationResult(
+                            is_valid=False,
+                            error="Security violation: Attempt to modify PROTECTED_TOOLS is disallowed.",
+                        )
+
+            # Check method calls on PROTECTED_TOOLS (e.g. PROTECTED_TOOLS.add, .clear, .pop)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                if isinstance(node.func.value, ast.Name) and node.func.value.id == "PROTECTED_TOOLS":
+                    return ValidationResult(
+                        is_valid=False,
+                        error="Security violation: Modifying PROTECTED_TOOLS is disallowed.",
+                    )
+
+        # Check privilege escalation via REQUIRED_RING
+        if not allow_ring0 and res.ring == 0:
+            return ValidationResult(
+                is_valid=False,
+                error="Privilege escalation rejected: dynamic tools cannot claim REQUIRED_RING = 0.",
+            )
+
+        # Check path traversal in tool naming or exports
+        for node in tree.body:
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                target_name = None
+                if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                    target_name = node.targets[0].id
+                elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                    target_name = node.target.id
+
+                val_node = node.value
+                if target_name in ("TUI_HINT", "TOOL_NAME") and isinstance(val_node, ast.Constant) and isinstance(val_node.value, str):
+                    val_str = val_node.value
+                    if any(seq in val_str for seq in ("../", "..\\", "/..", "\\..")) or val_str in ("..", "."):
+                        return ValidationResult(
+                            is_valid=False,
+                            error=f"Security violation: Path traversal sequence detected in {target_name}.",
+                        )
+
+        # Check tool name in TOOL_SCHEMA for path traversal or invalid characters
+        match = re.search(r'["\']name["\']\s*:\s*["\']([^"\']+)["\']', code)
+        if match:
+            tool_name = match.group(1)
+            if (
+                any(seq in tool_name for seq in ("..", "/", "\\"))
+                or not re.match(r"^[a-zA-Z_][a-zA-Z0-9_-]*$", tool_name)
+            ):
+                return ValidationResult(
+                    is_valid=False,
+                    error=f"Security violation: Invalid tool name or path traversal detected in TOOL_SCHEMA ('{tool_name}').",
+                )
+            res.tool_name = tool_name
+
+        return res

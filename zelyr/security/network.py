@@ -54,22 +54,62 @@ def validate_safe_url(url: str) -> str:
     if not hostname:
         raise ValueError("SSRF blocked: Empty hostname in URL")
 
-    # Resolve IP addresses (handles both IP literals and domain names)
+    # Reject cloud metadata hostnames immediately
+    blocked_hostnames = {
+        "metadata.google.internal",
+        "metadata.internal",
+        "metadata",
+        "instance-data",
+    }
+    if hostname.lower() in blocked_hostnames or hostname.lower().endswith(".google.internal"):
+        raise ValueError(f"SSRF blocked: Cloud metadata endpoint disallowed ({hostname})")
+
+    # Resolve IP addresses (handles direct IP literals, obfuscated formats, and domain names)
     ips: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
     try:
         ip_literal = ipaddress.ip_address(hostname)
         ips.append(ip_literal)
     except ValueError:
-        # Not a direct IP literal; resolve via DNS
-        try:
-            addr_info = socket.getaddrinfo(hostname, None)
-            for item in addr_info:
-                sockaddr = item[4]
-                if sockaddr:
-                    ip_str = sockaddr[0]
-                    ips.append(ipaddress.ip_address(ip_str))
-        except socket.gaierror as e:
-            raise ValueError(f"SSRF blocked: Could not resolve hostname '{hostname}': {e}") from e
+        # Check integer or hex IP literal (e.g. 2130706433 or 0x7f000001)
+        if hostname.isdigit():
+            try:
+                ips.append(ipaddress.IPv4Address(int(hostname)))
+            except (ValueError, OverflowError):
+                pass
+        elif hostname.lower().startswith("0x"):
+            try:
+                ips.append(ipaddress.IPv4Address(int(hostname, 16)))
+            except (ValueError, OverflowError):
+                pass
+        else:
+            # Check octal / dotted quad notation with leading zeroes (e.g. 0177.0.0.1)
+            parts = hostname.split(".")
+            if len(parts) == 4:
+                try:
+                    def _parse_octet(p: str) -> int:
+                        if p.startswith(("0x", "0X")):
+                            return int(p, 16)
+                        if p.startswith("0") and len(p) > 1 and p.isdigit():
+                            return int(p, 8)
+                        return int(p, 10)
+
+                    octets = [_parse_octet(p) for p in parts]
+                    if all(0 <= o <= 255 for o in octets):
+                        ips.append(ipaddress.IPv4Address(bytes(octets)))
+                except (ValueError, OverflowError):
+                    pass
+
+        # If not an obfuscated IP literal, resolve via DNS
+        if not ips:
+            try:
+                addr_info = socket.getaddrinfo(hostname, None)
+                for item in addr_info:
+                    sockaddr = item[4]
+                    if sockaddr:
+                        ip_str = sockaddr[0]
+                        ips.append(ipaddress.ip_address(ip_str))
+            except socket.gaierror as e:
+                raise ValueError(f"SSRF blocked: Could not resolve hostname '{hostname}': {e}") from e
 
     if not ips:
         raise ValueError(f"SSRF blocked: No IP addresses resolved for hostname '{hostname}'")

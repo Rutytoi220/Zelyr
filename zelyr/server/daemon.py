@@ -24,6 +24,8 @@ class ZelyrDaemonServer:
         self.sys_watchdog = None
         self.governor_service = None
         self.indexer_service = None
+        self._server = None
+        self._loop = None
         
         self.clients = set()
         self.event_bus.subscribe("*", self._on_bus_event)
@@ -316,19 +318,32 @@ class ZelyrDaemonServer:
             self.clients.discard(websocket)
             logger.info("Client disconnected.")
 
-    async def run(self, host: str = "127.0.0.1", port: int = 8000):
+    async def start(self, host: str = "127.0.0.1", port: int = 8000, start_background: bool = True):
         loop = asyncio.get_running_loop()
         self._loop = loop
-        
+
         logger.info(f"Starting Zelyr Daemon WebSocket server on ws://{host}:{port}")
-        
-        # We start the server in the background
-        start_server = websockets.serve(self.handle_client, host, port)
-        await start_server
-        
-        # Now spawn the heavy loading tasks in the background
-        asyncio.create_task(self.initialize_background())
-        
+        self._server = await websockets.serve(self.handle_client, host, port)
+
+        if start_background:
+            asyncio.create_task(self.initialize_background())
+        return self._server
+
+    async def stop(self):
+        """Cleanly stop the daemon server and disconnect all clients."""
+        for ws in list(self.clients):
+            try:
+                await ws.close()
+            except Exception:
+                pass
+        self.clients.clear()
+        if self._server:
+            self._server.close()
+            await self._server.wait_closed()
+            self._server = None
+
+    async def run(self, host: str = "127.0.0.1", port: int = 8000):
+        await self.start(host=host, port=port, start_background=True)
         await asyncio.Future()  # run forever
 
 def main():
