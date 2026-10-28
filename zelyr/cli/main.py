@@ -29,7 +29,7 @@ import json
 import asyncio
 import argparse
 import subprocess
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 # ---------------------------------------------------------------------------
 # Optional rich integration — graceful degradation to plain print() if absent.
@@ -37,10 +37,6 @@ from typing import Any, List, Optional
 try:
     from rich.console import Console
     from rich.panel import Panel
-    from rich.markdown import Markdown
-    from rich.spinner import Spinner
-    from rich.live import Live
-    from rich.text import Text
     from rich import box
     import time as _time
 
@@ -74,6 +70,10 @@ def _panel(title: str, body: str, style: str = "bold violet") -> None:
 def _spinner_context(label: str):
     """Return a context manager that shows a rich spinner or a no-op."""
     if _RICH and _console:
+        from rich.live import Live
+        from rich.spinner import Spinner
+        from rich.text import Text
+
         return Live(
             Spinner("dots", text=Text(f" {label}", style="bold cyan")),
             console=_console,
@@ -202,46 +202,57 @@ def cmd_send(args: argparse.Namespace) -> None:
     asyncio.run(_send())
 
 
-def cmd_tool_list(_args: argparse.Namespace) -> None:
+def cmd_tool_list(args: argparse.Namespace) -> None:
     """List all registered tools."""
-    from zelyr.core.plugin_manager import PluginManager
     from zelyr.tool_registry import ToolRegistry
 
     registry = ToolRegistry()
-    pm = PluginManager()
-    for ut in pm.load_user_tools():
-        registry.register_tool(ut.tool_id, ut)
+    tools: Dict[str, Any] = dict(registry.get_builtin_tools())
 
-    tools = registry._core_registry.list_tools()
+    if getattr(args, "include_plugins", False):
+        try:
+            from zelyr.core.plugin_manager import PluginManager
+
+            pm = PluginManager()
+            for ut in pm.load_user_tools():
+                tools[ut.tool_id] = ut
+        except Exception:
+            pass
+
     _print("[bold]Available Tools:[/bold]")
     for tid, t in sorted(tools.items()):
         desc = getattr(t, "description", "")
-        if not desc and t.__doc__:
+        if not desc and getattr(t, "__doc__", None):
             desc = t.__doc__.strip().split("\n")[0]
         _print(f"  [cyan]•[/cyan] [bold]{tid}[/bold]: {desc}")
 
 
 def cmd_tool_run(args: argparse.Namespace) -> None:
     """Execute a tool by ID."""
-    from zelyr.core.plugin_manager import PluginManager
     from zelyr.tool_registry import ToolRegistry
 
     registry = ToolRegistry()
-    for ut in PluginManager().load_user_tools():
-        registry.register_tool(ut.tool_id, ut)
+    tool = registry.get_tool(args.tool_id)
+    if tool is None:
+        try:
+            from zelyr.core.plugin_manager import PluginManager
 
-    tools = registry._core_registry.list_tools()
-    if args.tool_id not in tools:
+            for ut in PluginManager().load_user_tools():
+                registry.register_tool(ut.tool_id, ut)
+            tool = registry.get_tool(args.tool_id)
+        except Exception:
+            pass
+
+    if tool is None:
         _print(f"[red]✗[/red] Tool '{args.tool_id}' not found.")
         return
 
-    tool = tools[args.tool_id]
     tool_args = json.loads(args.args) if args.args else {}
 
     async def _run() -> None:
         _print(f"[bold]Running[/bold] {args.tool_id} with args {tool_args}…")
         try:
-            result = await tool.execute(**tool_args)
+            result = await registry.execute_async(args.tool_id, **tool_args)
             _print(f"[green]Result:[/green] {result}")
         except Exception as exc:
             _print(f"[red]Execution failed:[/red] {exc}")
@@ -255,7 +266,14 @@ def cmd_status(_args: argparse.Namespace) -> None:
         import psutil
         from zelyr.utils.optional_deps import is_extra_available
 
-        cpu = psutil.cpu_percent(interval=0.1)
+        cpu = psutil.cpu_percent(interval=None)
+        if cpu == 0.0:
+            try:
+                load1, _, _ = os.getloadavg()
+                cpu_cnt = os.cpu_count() or 1
+                cpu = min(100.0, max(0.0, (load1 / cpu_cnt) * 100.0))
+            except (AttributeError, OSError):
+                cpu = psutil.cpu_percent(interval=0.01)
         ram = psutil.virtual_memory().percent
 
         extras = {
@@ -280,9 +298,13 @@ def cmd_status(_args: argparse.Namespace) -> None:
             style="bold blue",
         )
         try:
-            import websockets  # type: ignore[import]
-            async with websockets.connect("ws://127.0.0.1:8000", close_timeout=1):
-                _print("[green]  Daemon: ONLINE[/green] (ws://127.0.0.1:8000)")
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", 8000),
+                timeout=0.02,
+            )
+            writer.close()
+            await writer.wait_closed()
+            _print("[green]  Daemon: ONLINE[/green] (ws://127.0.0.1:8000)")
         except Exception:
             _print("[yellow]  Daemon: OFFLINE[/yellow]")
 
@@ -380,7 +402,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_tool = sub.add_parser("tool", help="Manage tools")
     tool_sub = p_tool.add_subparsers(dest="tool_cmd")
-    tool_sub.add_parser("list", help="List all available tools")
+    p_tool_list = tool_sub.add_parser("list", help="List all available tools")
+    p_tool_list.add_argument(
+        "--all",
+        "--plugins",
+        dest="include_plugins",
+        action="store_true",
+        default=False,
+        help="Include custom third-party plugins in tool listing",
+    )
     p_tool_run = tool_sub.add_parser("run", help="Run a specific tool")
     p_tool_run.add_argument("tool_id", type=str)
     p_tool_run.add_argument("--args", type=str, default="{}")

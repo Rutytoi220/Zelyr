@@ -1,7 +1,5 @@
 import asyncio
 import logging
-import cv2
-import numpy as np
 import time
 from typing import Dict, Any
 from zelyr.tools.core import BaseTool

@@ -29,7 +29,100 @@ from __future__ import annotations
 from zelyr.compat import config_dir
 import threading
 from typing import Any, Dict, List, Optional
-from zelyr.tools import BaseTool, ToolResult
+from zelyr.tools.core import BaseTool, ToolResult
+
+class BuiltinToolDef:
+    """Lightweight metadata descriptor for a built-in tool."""
+
+    def __init__(
+        self,
+        tool_id: str,
+        description: str,
+        module_path: str,
+        class_name: str,
+        constructor_kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        self.tool_id = tool_id
+        self.name = tool_id
+        self.description = description
+        self.module_path = module_path
+        self.class_name = class_name
+        self.constructor_kwargs = constructor_kwargs or {}
+        self._instance: Optional[BaseTool] = None
+
+    def instantiate(self) -> BaseTool:
+        if self._instance is None:
+            import importlib
+            mod = importlib.import_module(self.module_path)
+            cls = getattr(mod, self.class_name)
+            self._instance = cls(**self.constructor_kwargs)
+        return self._instance
+
+
+BUILTIN_TOOLS: Dict[str, BuiltinToolDef] = {
+    "app_launcher": BuiltinToolDef(
+        tool_id="app_launcher",
+        description="Launch common default apps (e.g. browser, calculator, terminal, file_explorer)",
+        module_path="zelyr.tools.os_assist",
+        class_name="AppLauncherTool",
+    ),
+    "clipboard_read": BuiltinToolDef(
+        tool_id="clipboard_read",
+        description="Read the current text content of the system clipboard.",
+        module_path="zelyr.tools.clipboard_tools",
+        class_name="ClipboardReadTool",
+    ),
+    "clipboard_write": BuiltinToolDef(
+        tool_id="clipboard_write",
+        description="Write text content to the system clipboard.",
+        module_path="zelyr.tools.clipboard_tools",
+        class_name="ClipboardWriteTool",
+    ),
+    "echo": BuiltinToolDef(
+        tool_id="echo",
+        description="Echoes the input back to verify tool calls are working.",
+        module_path="zelyr.tools",
+        class_name="EchoTool",
+    ),
+    "file_read": BuiltinToolDef(
+        tool_id="file_read",
+        description="Reads files and extracts text. Supports plain text (.txt, .py, .json, .md) and document extraction (.pdf).",
+        module_path="zelyr.tools",
+        class_name="FileReadTool",
+        constructor_kwargs={"base_dir": "."},
+    ),
+    "file_search": BuiltinToolDef(
+        tool_id="file_search",
+        description="Find files safely in standard user directories (Desktop, Documents, etc.)",
+        module_path="zelyr.tools.os_assist",
+        class_name="SafeFileSearchTool",
+    ),
+    "file_write": BuiltinToolDef(
+        tool_id="file_write",
+        description="Write, append, or delete files safely.",
+        module_path="zelyr.tools",
+        class_name="FileWriteTool",
+        constructor_kwargs={"base_dir": "."},
+    ),
+    "shell": BuiltinToolDef(
+        tool_id="shell",
+        description="Execute Linux shell commands. Do NOT run interactive commands.",
+        module_path="zelyr.tools",
+        class_name="ShellTool",
+    ),
+    "system_info": BuiltinToolDef(
+        tool_id="system_info",
+        description="Retrieve CPU, Memory, Disk, and OS information.",
+        module_path="zelyr.tools",
+        class_name="SystemInfoTool",
+    ),
+    "task_scheduler": BuiltinToolDef(
+        tool_id="task_scheduler",
+        description="Schedule a task to run at a specific future time. Supports natural language like 'in 1 hour', 'in 30 minutes', or a cron expression.",
+        module_path="zelyr.tools.task_scheduler",
+        class_name="TaskSchedulerTool",
+    ),
+}
 
 class ToolRegistryError(Exception):
     """Raised when a tool registry operation is invalid."""
@@ -101,9 +194,29 @@ Returns:
                 "shell_command": "shell",
                 "run_command": "shell",
             }
-            if tool_id in aliases:
-                tool = self._core_registry.get_tool(aliases[tool_id])
+            resolved_id = aliases.get(tool_id, tool_id)
+            tool = self._core_registry.get_tool(resolved_id)
+            if tool is None:
+                if resolved_id in BUILTIN_TOOLS:
+                    tool = self._load_builtin_tool(resolved_id)
+                elif tool_id in BUILTIN_TOOLS:
+                    tool = self._load_builtin_tool(tool_id)
         return tool
+
+    def get_builtin_tools(self) -> Dict[str, BuiltinToolDef]:
+        """Return metadata descriptors for all standard built-in tools."""
+        return dict(BUILTIN_TOOLS)
+
+    def _load_builtin_tool(self, tool_id: str) -> Optional[BaseTool]:
+        defn = BUILTIN_TOOLS.get(tool_id)
+        if defn is None:
+            return None
+        with self._lock:
+            if not self._core_registry.has_tool(tool_id):
+                instance = defn.instantiate()
+                self._core_registry.register_tool(tool_id, instance)
+                return instance
+            return self._core_registry.get_tool(tool_id)
 
     def list_tools(self) -> Dict[str, BaseTool]:
         """Return a shallow copy of all registered tools keyed by ``tool_id``."""
@@ -156,7 +269,7 @@ Returns:
 
     def _pre_validate_path(self, tool_id: str, arguments: Dict[str, Any]) -> Optional[ToolResult]:
         """Intercept slang or hallucinatory file paths before execution."""
-        from zelyr.tools import ToolResult
+        from zelyr.tools.core import ToolResult
         import os
         
         path_arg = None
@@ -230,7 +343,7 @@ Returns:
         """
         import asyncio
         import inspect
-        from zelyr.tools import ToolResult
+        from zelyr.tools.core import ToolResult
         tool = self.get_tool(tool_id)
         if tool is None:
             return ToolResult(success=False, error=f'Tool not found: {tool_id}')

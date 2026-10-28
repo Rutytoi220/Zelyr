@@ -8,9 +8,6 @@ import re
 import urllib.parse
 from typing import Any, Dict, Optional
 
-import httpx
-from bs4 import BeautifulSoup
-
 from zelyr.security.network import fetch_with_ssrf_guard, validate_safe_url
 from zelyr.tools.core import BaseTool, ToolParameter, ToolResult
 
@@ -137,6 +134,8 @@ async def web_search(query: str, num_results: int = 5) -> str:
         try:
             resp = await fetch_with_ssrf_guard(ddg_url, headers=headers, timeout=10.0)
             if resp.status_code == 200:
+                from bs4 import BeautifulSoup
+
                 soup = BeautifulSoup(resp.text, "html.parser")
                 blocks = soup.select(".result, .web-result, .results_links")
                 if not blocks:
@@ -241,6 +240,8 @@ async def fetch_web_page(url: str, max_chars: int = 5000) -> str:
     if "text/plain" in content_type:
         extracted_text = resp.text.strip()
     else:
+        from bs4 import BeautifulSoup
+
         soup = BeautifulSoup(resp.text, "html.parser")
 
         # Decompose noise elements

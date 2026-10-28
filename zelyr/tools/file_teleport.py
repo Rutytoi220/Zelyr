@@ -1,5 +1,4 @@
 import os
-import httpx
 from typing import Dict, Any, Optional
 import logging
 from zelyr.tools.core import BaseTool, ToolParameter, ToolResult
@@ -27,6 +26,7 @@ class FileTeleportTool(BaseTool):
         base_url = f"http://{host}:8000"
         
         try:
+            import httpx
             async with httpx.AsyncClient(timeout=30.0) as client:
                 if action == "push":
                     local_file = os.path.expanduser(local_path)

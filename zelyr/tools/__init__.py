@@ -1205,26 +1205,40 @@ Returns:
             return ToolResult(success=True, output=result)
         except Exception as e:
             return ToolResult(success=False, error=f'Graph query failed: {e}')
-from zelyr.tools.os_assist import SafeFileSearchTool, FileOpenerTool, AppLauncherTool
-from zelyr.tools.gui_actuator import GUIInspectTool, GUIActuateTool
-from zelyr.tools.workspace_manager import WorkspaceOrchestrateTool
-from zelyr.tools.web_engine import PlaywrightWebTool
-from zelyr.tools.live_vision import LiveVisionStreamTool
+_EXTRA_TOOL_EXPORTS = {
+    "SafeFileSearchTool": ("zelyr.tools.os_assist", "SafeFileSearchTool"),
+    "FileOpenerTool": ("zelyr.tools.os_assist", "FileOpenerTool"),
+    "AppLauncherTool": ("zelyr.tools.os_assist", "AppLauncherTool"),
+    "GUIInspectTool": ("zelyr.tools.gui_actuator", "GUIInspectTool"),
+    "GUIActuateTool": ("zelyr.tools.gui_actuator", "GUIActuateTool"),
+    "WorkspaceOrchestrateTool": ("zelyr.tools.workspace_manager", "WorkspaceOrchestrateTool"),
+    "PlaywrightWebTool": ("zelyr.tools.web_engine", "PlaywrightWebTool"),
+    "LiveVisionStreamTool": ("zelyr.tools.live_vision", "LiveVisionStreamTool"),
+    "CaptureSomScreenTool": ("zelyr.tools.som_tools", "CaptureSomScreenTool"),
+    "SomClickTool": ("zelyr.tools.som_tools", "SomClickTool"),
+    "SomTypeTool": ("zelyr.tools.som_tools", "SomTypeTool"),
+    "SomKeyTool": ("zelyr.tools.som_tools", "SomKeyTool"),
+}
 
-# ── Vimium-style Set-of-Mark vision tools ──────────────────────────────────
-try:
-    from zelyr.tools.som_tools import CaptureSomScreenTool, SomClickTool, SomTypeTool, SomKeyTool
-except ImportError as _e:  # opencv-python not installed — degrade gracefully
-    import logging as _logging
-    _logging.getLogger(__name__).warning(
-        "SoM tools unavailable (missing dependency): %s", _e
-    )
-    # Provide stub classes so __all__ doesn't cause NameError on import
-    class CaptureSomScreenTool:  # type: ignore[no-redef]
-        pass
-    class SomClickTool:  # type: ignore[no-redef]
-        pass
-    class SomTypeTool:  # type: ignore[no-redef]
-        pass
-    class SomKeyTool:  # type: ignore[no-redef]
-        pass
+
+def __getattr__(name: str) -> Any:
+    if name in _EXTRA_TOOL_EXPORTS:
+        mod_name, attr_name = _EXTRA_TOOL_EXPORTS[name]
+        try:
+            import importlib
+            mod = importlib.import_module(mod_name)
+            val = getattr(mod, attr_name)
+        except ImportError:
+            if name in ("CaptureSomScreenTool", "SomClickTool", "SomTypeTool", "SomKeyTool"):
+                class _Stub:
+                    pass
+                val = _Stub
+            else:
+                raise
+        globals()[name] = val
+        return val
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(list(globals().keys()) + list(_EXTRA_TOOL_EXPORTS.keys()))
