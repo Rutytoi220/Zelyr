@@ -154,30 +154,35 @@ class TestCLIStartupInvariance(unittest.TestCase):
     """Test 4: Verify fast-path CLI operations never import optional packages."""
 
     def test_version_fast_path_invariance(self):
-        """Importing version and running main with -v must not import torch, transformers, playwright, PySide6."""
-        from zelyr.cli.main import main
+        """Running zelyr --version in a clean process must not import torch, transformers, playwright."""
+        import subprocess
 
-        saved_argv = sys.argv
-        buf = io.StringIO()
-        try:
-            sys.argv = ["zelyr", "--version"]
-            with patch("sys.stdout", buf):
-                main()
-        finally:
-            sys.argv = saved_argv
-
-        self.assertIn("zelyr", buf.getvalue())
-        for mod in ["torch", "transformers", "playwright", "playwright.async_api"]:
-            self.assertNotIn(mod, sys.modules, f"Forbidden module {mod} was imported during --version!")
+        code = (
+            "import sys\n"
+            "from zelyr.cli.main import main\n"
+            "sys.argv = ['zelyr', '--version']\n"
+            "main()\n"
+            "for mod in ['torch', 'transformers', 'playwright', 'playwright.async_api']:\n"
+            "    assert mod not in sys.modules, f'Forbidden module {mod} was imported during --version!'\n"
+        )
+        res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, f"Error output: {res.stderr}")
+        self.assertIn("zelyr", res.stdout)
 
     def test_parser_construction_does_not_import_optional_extras(self):
-        """Building the CLI argument parser must not import heavy optional dependencies."""
-        from zelyr.cli.main import _build_parser
+        """Building the CLI argument parser in a clean process must not import heavy optional dependencies."""
+        import subprocess
 
-        parser = _build_parser()
-        self.assertIsNotNone(parser)
-        for mod in ["torch", "transformers", "playwright", "playwright.async_api"]:
-            self.assertNotIn(mod, sys.modules, f"Forbidden module {mod} was imported during _build_parser!")
+        code = (
+            "import sys\n"
+            "from zelyr.cli.main import _build_parser\n"
+            "parser = _build_parser()\n"
+            "assert parser is not None\n"
+            "for mod in ['torch', 'transformers', 'playwright', 'playwright.async_api']:\n"
+            "    assert mod not in sys.modules, f'Forbidden module {mod} was imported during _build_parser!'\n"
+        )
+        res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, f"Error output: {res.stderr}")
 
 
 class TestStatusReportingAccuracy(unittest.TestCase):
