@@ -45,7 +45,7 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
-          pytest -v --cov=zelyr --cov-report=xml --cov-report=term
+          pytest -v --no-qt-log --cov=zelyr --cov-report=xml --cov-report=term
 
       - name: Upload coverage reports to Codecov
         uses: codecov/codecov-action@v4

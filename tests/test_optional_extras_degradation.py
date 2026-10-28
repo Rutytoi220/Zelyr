@@ -127,9 +127,11 @@ class TestMissingGUIDependencies(unittest.TestCase):
     def test_zelyr_gui_exits_cleanly_when_pyside6_missing(self):
         """Invoking cmd_ui when PySide6 is missing must exit with code 1 and actionable message."""
         import argparse
+        import subprocess
         from zelyr.cli.main import cmd_ui
 
-        with mask_modules("PySide6", "PySide6.QtWidgets", "PySide6.QtCore"):
+        # Test in-process via mocked availability without evicting C-extension bindings from sys.modules
+        with patch("zelyr.utils.optional_deps.is_extra_available", return_value=False):
             buf = io.StringIO()
             with patch("sys.stdout", buf), patch("sys.stderr", buf):
                 with self.assertRaises(SystemExit) as ctx:
@@ -140,6 +142,20 @@ class TestMissingGUIDependencies(unittest.TestCase):
             self.assertIn("'PySide6' is required for the desktop graphical interface", output)
             self.assertIn("pip install 'zelyr-core[gui]'", output)
             self.assertNotIn("Traceback (most recent call last)", output)
+
+        # Also test end-to-end in an isolated subprocess to verify genuine missing-module behavior
+        sub_code = (
+            "import sys, argparse\n"
+            "sys.modules['PySide6'] = None\n"
+            "from zelyr.cli.main import cmd_ui\n"
+            "cmd_ui(argparse.Namespace())\n"
+        )
+        sub_res = subprocess.run([sys.executable, "-c", sub_code], capture_output=True, text=True)
+        self.assertEqual(sub_res.returncode, 1)
+        sub_output = sub_res.stdout + sub_res.stderr
+        self.assertIn("'PySide6' is required for the desktop graphical interface", sub_output)
+        self.assertIn("pip install 'zelyr-core[gui]'", sub_output)
+        self.assertNotIn("Traceback (most recent call last)", sub_output)
 
     def test_zelyr_gui_alias_dispatches_to_cmd_ui(self):
         """zelyr gui alias must be accepted by the CLI dispatcher."""
