@@ -300,11 +300,83 @@ Returns:
                 pass
         return None
 
-    def execute(self, tool_id: str, **arguments: Any) -> ToolResult:  # type: ignore[override]
+    def _get_tool_ring(self, tool_id: str, tool: Optional[BaseTool] = None) -> int:
+        """Resolve the required security ring for a tool [0, 3]. Ring 0 is highest privilege."""
+        import sys
+
+        if tool is not None:
+            if hasattr(tool, "required_ring") and isinstance(tool.required_ring, int):
+                return tool.required_ring
+            if hasattr(tool, "REQUIRED_RING") and isinstance(tool.REQUIRED_RING, int):
+                return tool.REQUIRED_RING
+            cls = type(tool)
+            if hasattr(cls, "REQUIRED_RING") and isinstance(cls.REQUIRED_RING, int):
+                return cls.REQUIRED_RING
+            mod_name = cls.__module__
+            if mod_name in sys.modules:
+                mod = sys.modules[mod_name]
+                if hasattr(mod, "REQUIRED_RING") and isinstance(mod.REQUIRED_RING, int):
+                    return mod.REQUIRED_RING
+
+        try:
+            from zelyr.core.plugins import _rings
+            if tool_id in _rings:
+                return _rings[tool_id]
+        except Exception:
+            pass
+
+        if tool_id in BUILTIN_TOOLS:
+            return 0
+        return 1
+
+    def _authorize_execution(
+        self,
+        tool_id: str,
+        tool: BaseTool,
+        caller_ring: Optional[int] = None,
+        allowed_tools: Optional[Any] = None,
+    ) -> Optional[ToolResult]:
+        """Verify that caller has permission to execute the specified tool."""
+        if allowed_tools is not None and tool_id not in allowed_tools:
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"AuthorizationError: Tool '{tool_id}' is not in allowed tools list.",
+            )
+
+        if caller_ring is not None:
+            required_ring = self._get_tool_ring(tool_id, tool)
+            if caller_ring > required_ring:
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=(
+                        f"AuthorizationError: Tool '{tool_id}' requires higher permissions "
+                        f"(requires ring {required_ring}, caller ring is {caller_ring})."
+                    ),
+                )
+        return None
+
+    def execute(
+        self,
+        tool_id: str,
+        caller_ring: Optional[int] = None,
+        allowed_tools: Optional[Any] = None,
+        **arguments: Any,
+    ) -> ToolResult:  # type: ignore[override]
         """Execute a registered tool safely, regardless of its calling convention."""
+        if caller_ring is None and "caller_ring" in arguments:
+            caller_ring = arguments.pop("caller_ring")
+        if allowed_tools is None and "allowed_tools" in arguments:
+            allowed_tools = arguments.pop("allowed_tools")
+
         tool = self.get_tool(tool_id)
         if tool is None:
             return ToolResult(success=False, error=f'Tool not found: {tool_id}')
+
+        auth_error = self._authorize_execution(tool_id, tool, caller_ring, allowed_tools)
+        if auth_error:
+            return auth_error
         
         if getattr(tool, 'requires_approval', False):
             try:
@@ -335,7 +407,13 @@ Returns:
                 )
             return ToolResult(success=False, error=str(exc))
 
-    async def execute_async(self, tool_id: str, **arguments: Any) -> ToolResult:
+    async def execute_async(
+        self,
+        tool_id: str,
+        caller_ring: Optional[int] = None,
+        allowed_tools: Optional[Any] = None,
+        **arguments: Any,
+    ) -> ToolResult:
         """Async version of execute.
 
         Directly invokes the tool's execute method and awaits it if it is
@@ -344,9 +422,19 @@ Returns:
         import asyncio
         import inspect
         from zelyr.tools.core import ToolResult
+
+        if caller_ring is None and "caller_ring" in arguments:
+            caller_ring = arguments.pop("caller_ring")
+        if allowed_tools is None and "allowed_tools" in arguments:
+            allowed_tools = arguments.pop("allowed_tools")
+
         tool = self.get_tool(tool_id)
         if tool is None:
             return ToolResult(success=False, error=f'Tool not found: {tool_id}')
+
+        auth_error = self._authorize_execution(tool_id, tool, caller_ring, allowed_tools)
+        if auth_error:
+            return auth_error
             
         if getattr(tool, 'requires_approval', False):
             try:

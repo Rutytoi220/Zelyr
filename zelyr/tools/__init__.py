@@ -1002,43 +1002,72 @@ Returns:
         super().__init__(tool_id='python_exec', name='Python Exec', description='Execute Python code in a safe sandbox')
         self.add_parameter(ToolParameter(name='code', type='string', description='Python code to execute', required=True))
 
-    def execute(self, code: str, **kwargs) -> ToolResult:  # type: ignore[override]
-        """Execute Python code with temporal debugging."""
-        from zelyr.engine.temporal_debugger import TemporalDebuggerService
-        import json
-        
-        try:
-            safe_globals: Dict[str, Any] = {'__builtins__': {'print': print, 'len': len, 'range': range, 'str': str, 'int': int, 'float': float, 'list': list, 'dict': dict, 'sum': sum, 'max': max, 'min': min}}
-            output_buffer = []
+    def execute(self, code: str = "", **kwargs) -> ToolResult:  # type: ignore[override]
+        """Execute Python code in an isolated subprocess with strict AST verification."""
+        from zelyr.security.ast_validator import SecurityASTValidator, SecurityViolationError
+        import subprocess
+        import sys
+        import tempfile
+        from pathlib import Path
 
-            def safe_print(*args, **kwargs):
-                output_buffer.append(' '.join((str(a) for a in args)))
-            safe_globals['print'] = safe_print
-            
-            # Wrap execution in a function for the debugger
-            def _run_code():
-                exec(code, safe_globals)
-                
-            debugger = TemporalDebuggerService(buffer_size=50)
-            res = debugger.execute_with_time_travel(_run_code)
-            
-            if res["success"]:
-                return ToolResult(success=True, output={'stdout': '\n'.join(output_buffer), 'result': 'Code executed successfully'})
-            else:
-                # Execution failed, return the temporal trace!
-                error_context = f"{res['error']}\n\n[TEMPORAL TIME-TRAVEL TRACE]\n"
-                error_context += "The following shows the state of local variables leading up to the crash:\n"
-                
-                trace = res["temporal_trace"]
-                for i, state in enumerate(trace):
-                    # We only show the last 10 states to save context window, or format it cleanly
-                    if i > len(trace) - 15:
-                        error_context += f"Step {i} [Line {state.get('line')}]: {json.dumps(state.get('locals', {}))}\n"
-                        
-                return ToolResult(success=False, output=None, error=error_context)
-                
+        if not code and "params" in kwargs and isinstance(kwargs["params"], dict):
+            code = kwargs["params"].get("code", "")
+        if not code and "code" in kwargs:
+            code = kwargs["code"]
+
+        try:
+            SecurityASTValidator.validate(code)
+        except SecurityViolationError as err:
+            return ToolResult(success=False, output="", error=f"SecurityViolation: {err}")
+        except SyntaxError as err:
+            return ToolResult(success=False, output="", error=f"SyntaxError: {err}")
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                script_path = Path(tmp_dir) / "sandbox_exec.py"
+                script_path.write_text(code, encoding="utf-8")
+
+                sterile_env = {
+                    "PATH": "/usr/bin:/bin",
+                    "PYTHONUNBUFFERED": "1",
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                    "PYTHONNOUSERSITE": "1",
+                    "LC_ALL": "C.UTF-8",
+                    "LANG": "C.UTF-8",
+                }
+
+                proc = subprocess.run(
+                    [sys.executable, "-I", "-s", str(script_path)],
+                    cwd=tmp_dir,
+                    env=sterile_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=10.0,
+                )
+
+                if proc.returncode == 0:
+                    return ToolResult(
+                        success=True,
+                        output={
+                            "stdout": proc.stdout,
+                            "stderr": proc.stderr,
+                            "result": "Code executed successfully",
+                        },
+                    )
+                else:
+                    return ToolResult(
+                        success=False,
+                        output={"stdout": proc.stdout, "stderr": proc.stderr},
+                        error=proc.stderr.strip() or f"Process exited with code {proc.returncode}",
+                    )
+        except subprocess.TimeoutExpired:
+            return ToolResult(
+                success=False,
+                output="",
+                error="Execution timed out after 10.0 seconds",
+            )
         except Exception as e:
-            return ToolResult(success=False, output=None, error=str(e))
+            return ToolResult(success=False, output="", error=str(e))
 
 class ScreenCaptureTool(BaseTool):
     """Tool for capturing screenshots."""
