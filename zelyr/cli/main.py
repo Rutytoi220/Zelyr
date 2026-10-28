@@ -302,7 +302,7 @@ def cmd_status(_args: argparse.Namespace) -> None:
         import socket
 
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(0.02)
+        s.settimeout(0.01)
         try:
             s.connect(("127.0.0.1", 8000))
             daemon_online = True
