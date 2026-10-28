@@ -7,15 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0-rc.1] - 2026-10-28
+
+Release Candidate 1 for Zelyr v1.1.0, delivering end-to-end security hardening, resilient OTA updates, authenticated IPC, autonomous multi-turn evaluation benchmarks, and distribution builds.
+
+### Highlights & Architecture Pillars
+
+- **Pillar 1: Ring-0 AST Validation & Transport-Level SSRF Protection**
+  - Integrated `SecurityASTValidator` inspecting dynamic Python code for dangerous AST nodes, forbidden imports (`os`, `subprocess`, `sys`), and dynamic code execution (`eval`, `exec`).
+  - Added strict Ring-0 authorization enforcement in `ToolRegistry` preventing dynamic tools from claiming Ring 0 or mutating core tools.
+  - Implemented transport-level SSRF defense with strict IP pinning, defeating DNS rebinding attacks and validating against loopback, private, link-local, multicast, and cloud metadata endpoints.
+- **Pillar 2: Resilient OTA Auto-Updater & Daemon Self-Healing Supervisor**
+  - Implemented atomic staging pipeline (`staging_<version>`) with SHA256 verification, pre-flight dry-run health checks, and automated directory rollback on failure.
+  - Built `DaemonWorkerSupervisor` featuring exponential backoff (1s -> 30s) and a 5-crash circuit breaker to contain repeated process or task crashes.
+  - Hardened daemon shutdown sequence with SIGTERM, bounded 5s wait, and SIGKILL escalation.
+- **Pillar 3: Authenticated IPC Protocol, Rate Limiting & Frame Ceilings**
+  - Enforced POSIX 0600 cryptographic token authentication (`daemon.token`) across WebSocket connections via bearer headers or query tokens.
+  - Established strict JSON-RPC 2.0 Pydantic schema validation with standard error codes (-32700, -32600, -32601, -32029).
+  - Implemented 1MB payload ceilings (`PayloadTooLargeError`, code 4409) and sliding window rate limiting (50 req/s).
+- **Pillar 4: Autonomous Multi-Turn Benchmark Expansion (24/24 Tasks)**
+  - Expanded benchmark evaluation suite from 18 to 24 tasks with the introduction of Level 4 autonomous self-repair and resilient subsystems.
+  - Tasks include runtime bug patching, Swarm blackboard coordination, corrupted state rollback, ETL pipelines, sandbox containment, and proactive memory decay.
+  - Achieved a 100.0% offline pass rate across all 24 tasks in ~1.16s execution time.
+- **Pillar 5: Multi-Platform Distribution Build Verification**
+  - Verified wheel and sdist package builds from clean isolated source trees with `scripts/build_dist.py`.
+  - Version alignment synchronized to `1.1.0rc1` across Python packages, Web UI (`1.1.0-rc.1`), and browser extension manifest (`1.1.0.1`).
+
+### Distribution Release Assets
+
+| Artifact Name | Platform / Type | SHA256 Checksum | Size |
+| :--- | :--- | :--- | :--- |
+| `zelyr_core-1.1.0rc1-py3-none-any.whl` | Python Wheel (`any`) | `ac470442195d1e2a8499b79570486c99ed6f4486a23096fd6ae77133397b2d0e` | 2.1 MiB |
+| `zelyr_core-1.1.0rc1.tar.gz` | Source Distribution (`sdist`) | `39468d09336782edb3ff951f28aba409bcc9efc6b1c5482967a454f2c97f3851` | 2.0 MiB |
+
 ### Added
-- **Deterministic Offline Evaluation Benchmarks:** Full 18/18 offline benchmark execution via deterministic ReAct mock queues for live workspace diagnostic, metric calculation, and web research synthesis tasks (`zelyr/eval/tasks/model_tasks_p3.py`).
+- **Deterministic Offline Evaluation Benchmarks:** Full 24/24 offline benchmark execution via deterministic ReAct mock queues for Levels 1, 2, 3, and 4.
 - **Standardized Optional Dependency Boundary Guards:** Added `OptionalDependencyError`, zero-import `is_extra_available`, and `require_extra` helpers in `zelyr.utils.optional_deps` for robust degradation when optional extras are missing.
 - **Structured Tool Failure Envelopment:** Integrated structured `ToolResult` failure envelopment into `ToolRegistry` to safely report missing optional dependencies and prevent agent ReAct loops from crashing.
 - **Hardened Swarm Multi-Agent Consensus Quorum & Rollback:** Hardened $\ge 2/3$ quorum evaluation against voter timeouts and exceptions, added automatic ephemeral Blackboard point-in-time snapshot rollback upon rejected proposals, and implemented fail-safe diagnostic logging for split-decision ties.
-
-### Changed
-- **Decoupled CI Release Publishing:** Decoupled GitHub Release creation from PyPI publishing in `.github/workflows/publish.yml` to allow standalone release asset generation and distribution independently of PyPI token availability.
-- **Development Version Alignment:** Advanced development baseline to `1.1.0.dev0` across all metadata manifests, packages, and services.
 
 ### Performance
 - **PEP 562 Lazy Module Exports:** Implemented PEP 562 package-level lazy exports across `zelyr/__init__.py`, `axiom/__init__.py`, and `zelyr/main.py`, reducing root import module count from 4,322 to 77 and cutting CLI cold-start latency from ~2.7s to <90ms (32x faster).
