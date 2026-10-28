@@ -54,7 +54,7 @@ except ImportError:  # pragma: no cover
 def _print(msg: str) -> None:
     """Print via rich Console when available, otherwise plain print."""
     if _RICH and _console:
-        _console.print(msg)
+        _console.print(msg, soft_wrap=True)
     else:
         print(msg)
 
@@ -115,6 +115,19 @@ def cmd_repl(_args: argparse.Namespace) -> None:
 
 def cmd_ui(_args: argparse.Namespace) -> None:
     """Launch the Zelyr PySide6 desktop UI."""
+    from zelyr.utils.optional_deps import require_extra, OptionalDependencyError
+
+    try:
+        require_extra("PySide6", "gui", "the desktop graphical interface")
+    except OptionalDependencyError as exc:
+        try:
+            from rich.markup import escape
+            err_msg = escape(str(exc))
+        except Exception:
+            err_msg = str(exc)
+        _print(f"[bold red]✗[/bold red] {err_msg}")
+        sys.exit(1)
+
     _panel(
         "Zelyr UI",
         "[bold]Launching Zelyr desktop interface…[/bold]\n"
@@ -237,16 +250,33 @@ def cmd_tool_run(args: argparse.Namespace) -> None:
 
 
 def cmd_status(_args: argparse.Namespace) -> None:
-    """Show system + daemon telemetry."""
+    """Show system + daemon telemetry and optional extras status."""
     async def _status() -> None:
         import psutil
+        from zelyr.utils.optional_deps import is_extra_available
+
         cpu = psutil.cpu_percent(interval=0.1)
         ram = psutil.virtual_memory().percent
+
+        extras = {
+            "ml": is_extra_available("torch") and is_extra_available("transformers"),
+            "browser": is_extra_available("playwright"),
+            "audio": is_extra_available("faster_whisper") or is_extra_available("sounddevice"),
+            "gui": is_extra_available("PySide6"),
+        }
+        extras_lines = []
+        for extra_name, available in extras.items():
+            status_text = "[green]installed[/green]" if available else "[dim yellow]missing[/dim yellow]"
+            extras_lines.append(f"    • {extra_name:7s}: {status_text}")
+        extras_body = "\n".join(extras_lines)
+
         _panel(
             "Zelyr System Status",
-            f"  [cyan]CPU:[/cyan]  {cpu:.1f}%\n"
-            f"  [cyan]RAM:[/cyan]  {ram:.1f}%\n"
-            f"  [cyan]Daemon:[/cyan]  checking…",
+            f"  [cyan]CPU:[/cyan]     {cpu:.1f}%\n"
+            f"  [cyan]RAM:[/cyan]     {ram:.1f}%\n"
+            f"  [cyan]Daemon:[/cyan]  checking…\n\n"
+            f"  [cyan]Optional Extras:[/cyan]\n"
+            f"{extras_body}",
             style="bold blue",
         )
         try:
@@ -315,7 +345,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
 # ===========================================================================
 
 def _build_parser() -> argparse.ArgumentParser:
-    from zelyr import __version__
+    from zelyr.main import __version__
 
     parser = argparse.ArgumentParser(
         prog="zelyr",
@@ -338,7 +368,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # ── Primary commands ────────────────────────────────────────────────────
     sub.add_parser("repl",   help="Modern inline streaming CLI (Tokyo Night, default)")
     sub.add_parser("chat",   help="Opencode-tier full-screen TUI")
-    sub.add_parser("ui",     help="Launch the PySide6 desktop UI")
+    sub.add_parser("ui",     aliases=["gui"], help="Launch the PySide6 desktop UI")
     sub.add_parser("server", help="Print Zelyr Distributed Server panel (stub)")
 
     p_run = sub.add_parser("run", help="Autonomous agent entry point")
@@ -373,6 +403,11 @@ def _build_parser() -> argparse.ArgumentParser:
 # ===========================================================================
 
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] in ("-v", "--version"):
+        from zelyr.main import __version__
+        print(f"zelyr {__version__}")
+        return
+
     from zelyr.config import initialize_directories
     initialize_directories()
 
@@ -383,6 +418,7 @@ def main() -> None:
         "repl":   cmd_repl,
         "chat":   cmd_chat,
         "ui":     cmd_ui,
+        "gui":    cmd_ui,
         "server": cmd_server,
         "run":    cmd_run,
         "send":   cmd_send,

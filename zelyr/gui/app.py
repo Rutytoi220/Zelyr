@@ -107,14 +107,20 @@ def _build_tray(app: "QApplication", window: "MainWindow") -> "QSystemTrayIcon":
 
 def run_gui() -> None:
     """Launch the Zelyr Desktop GUI (blocking call)."""
+    from zelyr.utils.optional_deps import require_extra, OptionalDependencyError
+
     try:
+        require_extra("PySide6", "gui", "the desktop graphical interface")
         from PySide6.QtWidgets import QApplication
         from PySide6.QtCore import Qt
+    except OptionalDependencyError as exc:
+        print(f"[Zelyr GUI] {exc}")
+        sys.exit(1)
     except ImportError:
         print(
             "[Zelyr GUI] PySide6 is not installed.\n"
-            "Run: pip install PySide6 qasync\n"
-            "Then restart: zelyr-gui"
+            "Run: pip install 'zelyr-core[gui]' or uv add --extra gui zelyr-core\n"
+            "Then restart: zelyr ui"
         )
         sys.exit(1)
 

@@ -36,9 +36,14 @@ class PlaywrightWebTool(BaseTool):
                 self._context = await self._browser.new_context()
                 self._page = await self._context.new_page()
             except ImportError as e:
+                from zelyr.utils.optional_deps import OptionalDependencyError
                 msg = "'playwright' is required for web browser automation. Install it with: pip install 'zelyr-core[browser]'"
                 logger.error(msg)
-                raise ImportError(msg) from e
+                raise OptionalDependencyError(
+                    package_name="playwright",
+                    extra_name="browser",
+                    feature_description="web browser automation",
+                ) from e
 
     async def execute(self, params: Optional[Dict[str, Any]] = None, **kwargs) -> Dict[str, Any]:
         args = dict(params or {})

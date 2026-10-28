@@ -213,6 +213,13 @@ Returns:
             tb = traceback.format_exc()
             if "zelyr/dynamic_plugins" in tb or ".config/zelyr/plugins" in tb or ".config/axiom/plugins" in tb:
                 logging.getLogger("zelyr.plugin_crash").error(tb)
+            from zelyr.utils.optional_deps import OptionalDependencyError
+            if isinstance(exc, (ImportError, OptionalDependencyError)):
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=f"Tool requires optional dependency: {exc}",
+                )
             return ToolResult(success=False, error=str(exc))
 
     async def execute_async(self, tool_id: str, **arguments: Any) -> ToolResult:
@@ -259,4 +266,11 @@ Returns:
             tb = traceback.format_exc()
             if "zelyr/dynamic_plugins" in tb or ".config/zelyr/plugins" in tb or ".config/axiom/plugins" in tb:
                 logging.getLogger("zelyr.plugin_crash").error(tb)
+            from zelyr.utils.optional_deps import OptionalDependencyError
+            if isinstance(exc, (ImportError, OptionalDependencyError)):
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=f"Tool requires optional dependency: {exc}",
+                )
             return ToolResult(success=False, error=str(exc))

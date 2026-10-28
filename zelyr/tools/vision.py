@@ -245,5 +245,11 @@ class InteractWithUITool(BaseTool):
             else:
                 return ToolResult(False, error=f"Unknown action: {action}")
                 
+        except ImportError as e:
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Tool requires optional dependency: {e}",
+            )
         except Exception as e:
             return ToolResult(False, error=f"UI interaction failed: {e}")
