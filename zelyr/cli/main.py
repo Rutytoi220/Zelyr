@@ -368,6 +368,27 @@ def cmd_serve(args: argparse.Namespace) -> None:
     start_server(host=args.host, port=args.port)
 
 
+def cmd_memory(args: argparse.Namespace) -> None:
+    """Handle memory management subcommands."""
+    mem_cmd = getattr(args, "mem_cmd", None)
+    if mem_cmd == "compact":
+        from zelyr.db.memory import MemoryStore
+
+        store = MemoryStore()
+        days = getattr(args, "days", 30.0)
+        metrics = store.compact(older_than_days=days)
+        _print(
+            f"[bold green]✓[/bold green] Memory compaction complete:\n"
+            f"  • Total Scanned: {metrics['total_scanned']}\n"
+            f"  • Merged:        {metrics['merged_count']}\n"
+            f"  • Decayed:       {metrics['decayed_count']}\n"
+            f"  • Purged:        {metrics['purged_count']}\n"
+            f"  • Duration:      {metrics['duration_seconds']:.3f}s"
+        )
+    else:
+        _print("[yellow]Usage: zelyr memory compact [--days N][/yellow]")
+
+
 # ===========================================================================
 # Argument parser
 # ===========================================================================
@@ -421,6 +442,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p_tool_run.add_argument("tool_id", type=str)
     p_tool_run.add_argument("--args", type=str, default="{}")
 
+    p_mem = sub.add_parser("memory", help="Manage persistent memory and compaction")
+    mem_sub = p_mem.add_subparsers(dest="mem_cmd")
+    p_compact = mem_sub.add_parser("compact", help="Trigger REM sleep memory compaction")
+    p_compact.add_argument("--days", type=float, default=30.0, help="Retention threshold in days")
+
     sub.add_parser("status", help="Show system + daemon status")
     sub.add_parser("test",   help="Run the automated test suite")
     p_eval = sub.add_parser("eval", help="Run Zelyr evaluation benchmark suite")
@@ -472,6 +498,8 @@ def main() -> None:
             cmd_tool_run(args)
         else:
             parser.parse_args(["tool", "--help"])
+    elif args.command == "memory":
+        cmd_memory(args)
     elif args.command in dispatch:
         if args.command == "eval":
             cmd_eval(args, extra)

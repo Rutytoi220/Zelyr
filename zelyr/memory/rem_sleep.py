@@ -65,7 +65,19 @@ class DeepMemoryConsolidation:
             elif isinstance(node_time_str, (int, float)):
                 node_time = datetime.fromtimestamp(node_time_str, timezone.utc)
 
-            if node_time < decay_threshold:
+            # Check protected categories & core beliefs
+            category = (node.get("category") or "").lower()
+            key = (node.get("key") or "").lower()
+            tags = [str(t).lower() for t in node.get("tags", [])] if isinstance(node.get("tags"), list) else []
+            is_protected = (
+                node.get("is_core", False)
+                or node.get("core_belief", False)
+                or "core_belief" in tags
+                or "core_belief" in key
+                or category in {"preference", "environment", "capability", "core", "workflow", "homelab"}
+            )
+
+            if not is_protected and node_time < decay_threshold:
                 # Ephemeral log decay: drop it
                 pruned_count += 1
                 continue
@@ -74,17 +86,26 @@ class DeepMemoryConsolidation:
             content = node.get("text") or node.get("content") or node.get("value", "")
             if isinstance(content, str):
                 # Normalize and fuse
-                normalized_content = content.strip().lower()
+                normalized_content = " ".join(content.strip().lower().split())
                 
                 # We can create a simple semantic hash
                 content_hash = hash(normalized_content)
                 
                 if content_hash in seen_hashes:
-                    # Fuse node: keep the oldest/most connected node, append metadata
+                    # Fuse node: keep the oldest/most connected node, inherit retrieval count and boost confidence
                     original_idx = seen_hashes[content_hash]
                     fused_count += 1
                     
-                    # Merge metadata if needed (simplified here by skipping the duplicate)
+                    surviving = consolidated[original_idx]
+                    cur_rc = surviving.get("retrieval_count") or surviving.get("access_count") or 0
+                    dup_rc = node.get("retrieval_count") or node.get("access_count") or 0
+                    surviving["retrieval_count"] = max(cur_rc, dup_rc) + 1
+                    surviving["access_count"] = surviving["retrieval_count"]
+
+                    cur_conf = float(surviving.get("confidence") or surviving.get("confidence_weight") or 1.0)
+                    dup_conf = float(node.get("confidence") or node.get("confidence_weight") or 1.0)
+                    surviving["confidence"] = min(1.0, max(cur_conf, dup_conf) + 0.1)
+                    surviving["confidence_weight"] = surviving["confidence"]
                     continue
                 else:
                     seen_hashes[content_hash] = len(consolidated)
@@ -97,7 +118,11 @@ class DeepMemoryConsolidation:
         )
         
         self.event_bus.publish(
-            Event(event_type="rem_sleep.completed", source="REM", data={"surviving": len(consolidated)})
+            Event(
+                event_type="rem_sleep.completed",
+                source="REM",
+                data={"surviving": len(consolidated), "pruned": pruned_count, "fused": fused_count},
+            )
         )
 
         return consolidated

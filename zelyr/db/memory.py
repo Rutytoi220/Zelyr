@@ -7,6 +7,7 @@ key versioning, category segmentation, and full-text search.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import sqlite3
@@ -167,6 +168,9 @@ def init_db(db_path: Optional[str] = None) -> None:
 
         # FTS5 Virtual Table & Triggers
         conn.execute(MEMORIES_FTS_DDL)
+        conn.execute("DROP TRIGGER IF EXISTS memories_ai;")
+        conn.execute("DROP TRIGGER IF EXISTS memories_ad;")
+        conn.execute("DROP TRIGGER IF EXISTS memories_au;")
         conn.executescript(MEMORIES_TRIGGERS_DDL)
 
         # Synchronize FTS5 index if needed
@@ -616,6 +620,142 @@ class MemoryStore:
                     cursor = conn.execute("DELETE FROM memories WHERE is_active = 0")
                 conn.commit()
                 return cursor.rowcount
+
+    def compact(
+        self,
+        older_than_days: float = 30.0,
+        protected_categories: Optional[Set[str]] = None,
+        protected_tags: Optional[Set[str]] = None,
+        purge_decayed: bool = True,
+    ) -> Dict[str, Any]:
+        """Execute REM sleep memory consolidation, temporal decay, and semantic deduplication.
+
+        Args:
+            older_than_days: Retention threshold in days for ephemeral memories (default: 30.0).
+            protected_categories: Categories strictly immune from decay (defaults to preference, environment, capability, workflow, homelab).
+            protected_tags: Tags / substrings that mark a memory as immune from decay (e.g. 'core_belief').
+            purge_decayed: Whether to immediately hard-delete decayed/merged memories (default: True).
+
+        Returns:
+            Dict containing structured telemetry:
+            total_scanned, merged_count, decayed_count, purged_count, duration_seconds.
+        """
+        start_time = time.perf_counter()
+        now = time.time()
+        cutoff_time = now - (float(older_than_days) * 86400.0)
+
+        prot_cats = {c.lower() for c in (protected_categories if protected_categories is not None else {
+            "preference", "environment", "capability", "workflow", "homelab"
+        })}
+        prot_tags = {t.lower() for t in (protected_tags or {"core_belief", "core", "protected"})}
+
+        total_scanned = 0
+        merged_count = 0
+        decayed_count = 0
+        purged_count = 0
+
+        with self._write_lock:
+            with self._get_conn() as conn:
+                # 1. Scan all active memories
+                cursor = conn.execute(
+                    """
+                    SELECT id, category, key, content, confidence, created_at, updated_at, access_count
+                    FROM memories
+                    WHERE is_active = 1
+                    ORDER BY id ASC
+                    """
+                )
+                rows = [dict(r) for r in cursor.fetchall()]
+                total_scanned = len(rows)
+
+                # 2. Identify decayed ephemeral memories
+                surviving_rows = []
+                for row in rows:
+                    cat = (row.get("category") or "").lower()
+                    key = (row.get("key") or "").lower()
+                    content = (row.get("content") or "").lower()
+                    created = float(row.get("created_at") or now)
+
+                    is_protected = (
+                        cat in prot_cats
+                        or any(t in key for t in prot_tags)
+                        or any(t in content for t in prot_tags)
+                    )
+
+                    if not is_protected and created < cutoff_time:
+                        decayed_count += 1
+                        conn.execute(
+                            "UPDATE memories SET is_active = 0, updated_at = ? WHERE id = ?",
+                            (now, row["id"]),
+                        )
+                    else:
+                        surviving_rows.append(row)
+
+                # 3. Semantic Deduplication among surviving rows
+                seen_normalized: Dict[str, Dict[str, Any]] = {}
+                for row in surviving_rows:
+                    content_norm = " ".join(re.findall(r"\w+", (row.get("content") or "").lower()))
+                    if not content_norm:
+                        continue
+
+                    norm_key = f"{row.get('category')}:{content_norm}"
+                    if norm_key in seen_normalized:
+                        primary = seen_normalized[norm_key]
+                        merged_count += 1
+
+                        new_access = max(int(primary.get("access_count", 0)), int(row.get("access_count", 0))) + 1
+                        new_conf = min(1.0, max(float(primary.get("confidence", 1.0)), float(row.get("confidence", 1.0))) + 0.1)
+
+                        conn.execute(
+                            "UPDATE memories SET access_count = ?, confidence = ?, updated_at = ? WHERE id = ?",
+                            (new_access, new_conf, now, primary["id"]),
+                        )
+                        primary["access_count"] = new_access
+                        primary["confidence"] = new_conf
+
+                        conn.execute(
+                            "UPDATE memories SET is_active = 0, superseded_by = ?, updated_at = ? WHERE id = ?",
+                            (primary["id"], now, row["id"]),
+                        )
+                    else:
+                        seen_normalized[norm_key] = row
+
+                # 4. If purge_decayed is True, hard-delete inactive rows
+                if purge_decayed:
+                    c_del = conn.execute("DELETE FROM memories WHERE is_active = 0")
+                    purged_count = c_del.rowcount
+                else:
+                    purged_count = decayed_count + merged_count
+
+                conn.commit()
+
+        duration = time.perf_counter() - start_time
+        return {
+            "total_scanned": total_scanned,
+            "merged_count": merged_count,
+            "decayed_count": decayed_count,
+            "purged_count": purged_count,
+            "duration_seconds": duration,
+        }
+
+    async def acompact(
+        self,
+        older_than_days: float = 30.0,
+        protected_categories: Optional[Set[str]] = None,
+        protected_tags: Optional[Set[str]] = None,
+        purge_decayed: bool = True,
+    ) -> Dict[str, Any]:
+        """Asynchronous non-blocking wrapper around compact."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.compact(
+                older_than_days=older_than_days,
+                protected_categories=protected_categories,
+                protected_tags=protected_tags,
+                purge_decayed=purge_decayed,
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------

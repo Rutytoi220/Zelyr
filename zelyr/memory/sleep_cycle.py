@@ -77,10 +77,22 @@ Returns:
         except Exception as e:
             logger.error(f'Sleep Cycle consolidation failed: {e}', exc_info=True)
         try:
-            db = self._memory_store.store._conn() if hasattr(self._memory_store, 'store') else self._memory_store._conn()
-            compactor = MemoryCompactor(db)
-            result = run_sync(compactor.run_compaction())
-            logger.info(f"Sleep Cycle compaction complete. Scanned: {result['scanned']}, Merged: {result['merged']}, Deleted: {result['deleted']}")
+            if hasattr(self._memory_store, "compact"):
+                res = self._memory_store.compact()
+                logger.info(
+                    f"Sleep Cycle MemoryStore compaction complete. Scanned: {res['total_scanned']}, "
+                    f"Merged: {res['merged_count']}, Decayed: {res['decayed_count']}, Purged: {res['purged_count']}"
+                )
+            elif hasattr(self._memory_store, 'store') and hasattr(self._memory_store.store, '_conn'):
+                db = self._memory_store.store._conn()
+                compactor = MemoryCompactor(db)
+                result = run_sync(compactor.run_compaction())
+                logger.info(f"Sleep Cycle compaction complete. Scanned: {result['scanned']}, Merged: {result['merged']}, Deleted: {result['deleted']}")
+            elif hasattr(self._memory_store, '_conn'):
+                db = self._memory_store._conn()
+                compactor = MemoryCompactor(db)
+                result = run_sync(compactor.run_compaction())
+                logger.info(f"Sleep Cycle compaction complete. Scanned: {result['scanned']}, Merged: {result['merged']}, Deleted: {result['deleted']}")
         except Exception as e:
             logger.error(f'Sleep Cycle compaction failed: {e}', exc_info=True)
 
