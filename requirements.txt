@@ -1,5 +1,5 @@
 # Core Runtime Dependencies
-PySide6>=6.6.0
+PySide6>=6.6.0,<6.12.0
 pynput>=1.7.6
 watchdog>=4.0.0
 chromadb>=0.4.0
