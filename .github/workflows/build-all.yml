@@ -43,20 +43,16 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install create-dmg
 
-      - name: PyInstaller Build (Linux/macOS)
-        if: runner.os != 'Windows'
-        run: pyinstaller --name zelyr --onefile zelyr/api/cli.py
-        
-      - name: PyInstaller Build (Windows)
-        if: runner.os == 'Windows'
-        run: pyinstaller --name zelyr --onefile zelyr/api/cli.py --noupx
+      - name: PyInstaller Build
+        run: pyinstaller zelyr.spec --clean --noconfirm
 
       - name: Package .deb and .rpm (Linux)
         if: runner.os == 'Linux'
         run: |
-          mkdir -p build_pkg/usr/bin
-          cp dist/zelyr build_pkg/usr/bin/
-          chmod +x build_pkg/usr/bin/zelyr
+          mkdir -p build_pkg/usr/lib/zelyr build_pkg/usr/bin
+          cp -r dist/Zelyr/* build_pkg/usr/lib/zelyr/
+          chmod +x build_pkg/usr/lib/zelyr/Zelyr
+          ln -sf /usr/lib/zelyr/Zelyr build_pkg/usr/bin/zelyr
           
           # Create Post-Install script
           cat << 'EOF' > post_install.sh
@@ -72,8 +68,8 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           mkdir -p build_app/Zelyr.app/Contents/MacOS
-          cp dist/zelyr build_app/Zelyr.app/Contents/MacOS/
-          chmod +x build_app/Zelyr.app/Contents/MacOS/zelyr
+          cp -r dist/Zelyr/* build_app/Zelyr.app/Contents/MacOS/
+          chmod +x build_app/Zelyr.app/Contents/MacOS/Zelyr
           create-dmg --volname "Zelyr Installer" --window-pos 200 120 --window-size 800 400 --icon-size 100 --icon "Zelyr.app" 200 190 --hide-extension "Zelyr.app" --app-drop-link 600 185 "zelyr_latest.dmg" build_app/
 
       - name: Upload Artifacts (Linux)
@@ -98,6 +94,7 @@ jobs:
         if: runner.os == 'Windows'
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/zelyr.exe
+          files: |
+            dist/Zelyr/Zelyr.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

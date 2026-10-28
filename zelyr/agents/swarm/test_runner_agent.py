@@ -10,18 +10,17 @@ class TestRunnerAgent(BaseSubagent):
     """Swarm worker specialized in testing code and voting on proposals."""
     __test__ = False
 
-    def __init__(self, event_bus=None, tool_registry=None, llm_client=None):
-        """Auto-generated docstring.
-
-Args:
-    event_bus: Argument.
-    tool_registry: Argument.
-    llm_client: Argument.
-
-Returns:
-    Return value.
-"""
-        super().__init__(name='TestRunnerAgent', description='Specialized agent for running tests and verifying code.', topic='swarm.task.test', event_bus=event_bus, tool_registry=tool_registry, llm_client=llm_client)
+    def __init__(self, event_bus=None, tool_registry=None, llm_client=None, blackboard=None, session_id: Optional[str]=None):
+        super().__init__(
+            name='TestRunnerAgent',
+            description='Specialized agent for running tests and verifying code.',
+            topic='swarm.task.test',
+            event_bus=event_bus,
+            tool_registry=tool_registry,
+            llm_client=llm_client,
+            blackboard=blackboard,
+            session_id=session_id,
+        )
         if self.event_bus:
             self.event_bus.subscribe('swarm.proposal', self._review_proposal)
 

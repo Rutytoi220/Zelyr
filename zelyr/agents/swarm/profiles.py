@@ -4,7 +4,7 @@ from zelyr.agents.swarm.base_swarm import BaseSubagent
 
 class CoderAgent(BaseSubagent):
     """Specialist for coding, shell execution, and file management."""
-    def __init__(self, event_bus, tool_registry, llm_client, session_id: Optional[str] = None):
+    def __init__(self, event_bus, tool_registry, llm_client, session_id: Optional[str] = None, blackboard=None):
         super().__init__(
             name="CoderAgent",
             description="Executes code, writes files, runs shell commands.",
@@ -12,6 +12,7 @@ class CoderAgent(BaseSubagent):
             event_bus=event_bus,
             tool_registry=tool_registry,
             llm_client=llm_client,
+            blackboard=blackboard,
             session_id=session_id
         )
         self.set_system_prompt(

@@ -14,6 +14,7 @@ zelyr tool list        – List all registered tools.
 zelyr tool run         – Execute a tool by ID.
 zelyr status           – Show system + daemon telemetry.
 zelyr test             – Run the pytest suite in headless mode.
+zelyr eval [args...]   – Run Zelyr evaluation benchmark suite.
 zelyr daemon           – Launch the background Zelyr daemon process.
 zelyr serve            – Start the distributed FastAPI server.
 """
@@ -28,6 +29,7 @@ import json
 import asyncio
 import argparse
 import subprocess
+from typing import Any, List, Optional
 
 # ---------------------------------------------------------------------------
 # Optional rich integration — graceful degradation to plain print() if absent.
@@ -278,6 +280,16 @@ def cmd_test(_args: argparse.Namespace) -> None:
         sys.exit(res.returncode)
 
 
+def cmd_eval(args: argparse.Namespace, extra: Optional[List[str]] = None) -> None:
+    """Run Zelyr evaluation benchmark suite."""
+    from zelyr.eval.cli import run_benchmark_cli
+    eval_argv = list(getattr(args, "eval_args", []) or [])
+    if extra:
+        eval_argv.extend(extra)
+    exit_code = run_benchmark_cli(eval_argv)
+    sys.exit(exit_code)
+
+
 def cmd_daemon(_args: argparse.Namespace) -> None:
     """Launch the background Zelyr daemon process."""
     import runpy
@@ -341,6 +353,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("status", help="Show system + daemon status")
     sub.add_parser("test",   help="Run the automated test suite")
+    p_eval = sub.add_parser("eval", help="Run Zelyr evaluation benchmark suite")
+    p_eval.add_argument("eval_args", nargs=argparse.REMAINDER, help="Arguments passed to evaluation runner")
     sub.add_parser("daemon", help="Run the background daemon")
 
     p_serve = sub.add_parser("serve", help="Start the distributed FastAPI server")
@@ -359,7 +373,7 @@ def main() -> None:
     initialize_directories()
 
     parser = _build_parser()
-    args = parser.parse_args()
+    args, extra = parser.parse_known_args()
 
     dispatch = {
         "repl":   cmd_repl,
@@ -370,6 +384,7 @@ def main() -> None:
         "send":   cmd_send,
         "status": cmd_status,
         "test":   cmd_test,
+        "eval":   cmd_eval,
         "daemon": cmd_daemon,
         "serve":  cmd_serve,
     }
@@ -382,7 +397,12 @@ def main() -> None:
         else:
             parser.parse_args(["tool", "--help"])
     elif args.command in dispatch:
-        dispatch[args.command](args)
+        if args.command == "eval":
+            cmd_eval(args, extra)
+        else:
+            if extra:
+                parser.error(f"unrecognized arguments: {' '.join(extra)}")
+            dispatch[args.command](args)
     else:
         # No sub-command → launch the modern inline streaming CLI.
         cmd_repl(args)

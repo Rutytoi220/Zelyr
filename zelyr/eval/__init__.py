@@ -5,6 +5,12 @@ from zelyr.eval.harness import EvalHarness, EvaluationHarness, LiveOllamaStreamA
 from zelyr.eval.metrics import EvalStatus, TaskResult, export_json_report, format_summary_table
 from zelyr.eval.provider import DeterministicModelProvider, MockTurn
 from zelyr.eval.report import BenchmarkReport
+from zelyr.eval.scorecard import (
+    BenchmarkScorecard,
+    export_scorecard,
+    generate_benchmark_scorecard,
+    render_markdown_scorecard,
+)
 from zelyr.eval.suite_l1 import get_level_1_suite
 from zelyr.eval.task import EvalContext, EvalTask, EvaluationContext, EvaluationTask
 from zelyr.eval.tasks.deterministic_p1 import get_deterministic_p1_tasks
@@ -79,4 +85,8 @@ __all__ = [
     "assert_json_field",
     "assert_tool_updated",
     "combine_validators",
+    "BenchmarkScorecard",
+    "generate_benchmark_scorecard",
+    "render_markdown_scorecard",
+    "export_scorecard",
 ]

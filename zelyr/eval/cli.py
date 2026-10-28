@@ -12,6 +12,7 @@ from typing import List, Optional
 from zelyr.config import get_config
 from zelyr.eval.harness import EvalHarness
 from zelyr.eval.metrics import EvalStatus, TaskResult, export_json_report, format_summary_table
+from zelyr.eval.scorecard import export_scorecard, generate_benchmark_scorecard
 from zelyr.eval.task import EvalTask
 from zelyr.eval.tasks.deterministic_p1 import get_deterministic_p1_tasks
 from zelyr.eval.tasks.model_tasks_p3 import get_model_tasks_p3, task_live_web_research_synthesis
@@ -69,6 +70,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Export benchmark metrics report to the specified JSON file path.",
+    )
+    parser.add_argument(
+        "--scorecard",
+        nargs="?",
+        const="benchmark_scorecard.md",
+        default=None,
+        help="Generate comprehensive Markdown scorecard (optional file path, defaults to 'benchmark_scorecard.md').",
     )
     parser.add_argument(
         "--list-tasks",
@@ -205,6 +213,17 @@ def run_benchmark_cli(args_list: Optional[List[str]] = None) -> int:
         export_json_report(results, out_path)
         if not args.quiet:
             print(f"Report exported to: {out_path}\n")
+
+    # Export Scorecard if requested
+    if args.scorecard:
+        sc_path = Path(args.scorecard).resolve()
+        scorecard = generate_benchmark_scorecard(results)
+        export_scorecard(scorecard, md_path=sc_path)
+        if not args.json:
+            json_sc_path = sc_path.with_suffix(".json")
+            export_scorecard(scorecard, json_path=json_sc_path)
+        if not args.quiet:
+            print(f"Benchmark Scorecard exported to: {sc_path}\n")
 
     # Determine exit code:
     # - If a task defines an expected_status (e.g. containment tests), verify matching status.
