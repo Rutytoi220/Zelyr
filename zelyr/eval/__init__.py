@@ -19,9 +19,18 @@ from zelyr.eval.tasks.model_tasks_p3 import (
     get_model_tasks_p3,
     task_live_web_research_synthesis,
 )
+from zelyr.eval.tasks.model_tasks_p4 import (
+    build_task_autonomous_runtime_bug_patching,
+    build_task_complex_data_pipeline_etl,
+    build_task_corrupted_state_recovery_and_rollback,
+    build_task_dynamic_tool_sandbox_containment,
+    build_task_multi_agent_blackboard_coordination,
+    build_task_proactive_memory_decay_audit,
+    get_model_tasks_p4,
+)
 from zelyr.eval.tasks.self_repair_l3 import get_self_repair_l3_tasks
 from zelyr.eval.tasks.synthetic_workflows_p2 import get_synthetic_workflows_p2_tasks
-from zelyr.eval.types import EvaluationResult, ResultStatus, ValidationResult
+from zelyr.eval.types import EvalLevel, EvaluationResult, ResultStatus, ValidationResult
 from zelyr.eval.validators import (
     assert_file_content,
     assert_file_exists,
@@ -54,10 +63,18 @@ __all__ = [
     "get_synthetic_workflows_p2_tasks",
     "get_self_repair_l3_tasks",
     "get_model_tasks_p3",
+    "get_model_tasks_p4",
+    "build_task_autonomous_runtime_bug_patching",
+    "build_task_multi_agent_blackboard_coordination",
+    "build_task_corrupted_state_recovery_and_rollback",
+    "build_task_complex_data_pipeline_etl",
+    "build_task_dynamic_tool_sandbox_containment",
+    "build_task_proactive_memory_decay_audit",
     "task_live_web_research_synthesis",
     "check_ollama_status",
     "check_ollama_status_async",
     "LiveOllamaStreamAdapter",
+    "EvalLevel",
     "assert_file_exists",
     "assert_file_content",
     "assert_regex_match",

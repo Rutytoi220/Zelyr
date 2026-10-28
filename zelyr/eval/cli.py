@@ -16,17 +16,19 @@ from zelyr.eval.scorecard import export_scorecard, generate_benchmark_scorecard
 from zelyr.eval.task import EvalTask
 from zelyr.eval.tasks.deterministic_p1 import get_deterministic_p1_tasks
 from zelyr.eval.tasks.model_tasks_p3 import get_model_tasks_p3, task_live_web_research_synthesis
+from zelyr.eval.tasks.model_tasks_p4 import get_model_tasks_p4
 from zelyr.eval.tasks.self_repair_l3 import get_self_repair_l3_tasks
 from zelyr.eval.tasks.synthetic_workflows_p2 import get_synthetic_workflows_p2_tasks
 
 
 def get_all_available_tasks(model: str = "qwen3:8b", base_url: str = "http://127.0.0.1:11434") -> List[EvalTask]:
-    """Retrieve all benchmark tasks across Levels 1, 2, and 3."""
+    """Retrieve all benchmark tasks across Levels 1, 2, 3, and 4."""
     tasks: List[EvalTask] = []
     tasks.extend(get_deterministic_p1_tasks())
     tasks.extend(get_model_tasks_p3(model=model, base_url=base_url))
     tasks.extend(get_synthetic_workflows_p2_tasks())
     tasks.extend(get_self_repair_l3_tasks())
+    tasks.extend(get_model_tasks_p4())
     return tasks
 
 
@@ -39,7 +41,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "-l", "--level",
         type=str,
         default=None,
-        help="Evaluation level to execute (1: deterministic, 2: live model, 3: synthetic workflows, 'all': all levels). Defaults to 1.",
+        help="Evaluation level to execute (1: deterministic, 2: live model, 3: synthetic workflows, 4: multi-turn self-repair, 'all': all levels). Defaults to 1.",
     )
     parser.add_argument(
         "-t", "--task",
@@ -148,11 +150,11 @@ def run_benchmark_cli(args_list: Optional[List[str]] = None) -> int:
 
     if args.list_tasks:
         print("Available Zelyr Evaluation Benchmark Tasks:")
-        for lvl in (1, 2, 3):
+        for lvl in (1, 2, 3, 4):
             lvl_tasks = [t for t in all_tasks if t.level == lvl]
             print(f"\n  Level {lvl} ({len(lvl_tasks)} tasks):")
             for t in lvl_tasks:
-                print(f"    - {t.task_id:<36} {t.description}")
+                print(f"    - {t.task_id:<40} {t.description}")
         return 0
 
     # Filter tasks
@@ -166,10 +168,12 @@ def run_benchmark_cli(args_list: Optional[List[str]] = None) -> int:
             selected_tasks = [t for t in selected_tasks if t.level == 2]
         elif lvl_str in ("3", "l3"):
             selected_tasks = [t for t in selected_tasks if t.level == 3]
+        elif lvl_str in ("4", "l4"):
+            selected_tasks = [t for t in selected_tasks if t.level == 4]
         elif lvl_str in ("all", "*"):
             pass
         else:
-            print(f"Error: Unknown level '{args.level}'. Must be 1, 2, 3, or 'all'.", file=sys.stderr)
+            print(f"Error: Unknown level '{args.level}'. Must be 1, 2, 3, 4, or 'all'.", file=sys.stderr)
             return 2
     elif args.task is None:
         # Default to Level 1 if neither level nor specific task is requested

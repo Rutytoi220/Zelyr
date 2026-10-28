@@ -17,6 +17,15 @@ class ResultStatus(str, enum.Enum):
     ERROR = "ERROR"
 
 
+class EvalLevel(str, enum.Enum):
+    """Benchmark evaluation hierarchy tiers."""
+    LEVEL_1 = "level_1"
+    LEVEL_2 = "level_2"
+    LEVEL_3 = "level_3"
+    LEVEL_4 = "level_4"
+    ALL = "all"
+
+
 @dataclass
 class ValidationResult:
     """Outcome of an independent validator inspecting observable system state."""

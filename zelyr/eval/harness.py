@@ -20,7 +20,7 @@ from zelyr.db.memory import MemoryStore
 from zelyr.eval.metrics import EvalStatus, TaskResult
 from zelyr.eval.provider import MockTurn
 from zelyr.eval.task import EvalContext, EvalTask
-from zelyr.eval.types import EvaluationResult, ResultStatus, ValidationResult
+from zelyr.eval.types import EvalLevel, EvaluationResult, ResultStatus, ValidationResult
 from zelyr.tools.core import ToolResult
 
 
@@ -547,6 +547,8 @@ class EvalHarness:
             estimated_tokens=estimated_token_count,
             failure_category=failure_category,
             artifacts={
+                "benchmark_level": task.level,
+                "level": task.level,
                 "final_response": context.final_response,
                 "workspace_dir": str(temp_dir),
                 "db_path": str(db_path),
