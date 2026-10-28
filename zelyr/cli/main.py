@@ -345,7 +345,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
 # ===========================================================================
 
 def _build_parser() -> argparse.ArgumentParser:
-    from zelyr.main import __version__
+    from zelyr import __version__
 
     parser = argparse.ArgumentParser(
         prog="zelyr",
@@ -404,7 +404,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] in ("-v", "--version"):
-        from zelyr.main import __version__
+        from zelyr import __version__
         print(f"zelyr {__version__}")
         return
 

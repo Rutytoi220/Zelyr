@@ -14,7 +14,6 @@ import sys
 from typing import Optional
 
 import zelyr as _zelyr
-from zelyr import *  # noqa: F401,F403
 
 __version__ = _zelyr.__version__
 
@@ -83,11 +82,15 @@ def __getattr__(name: str):
     if name.startswith("Axiom"):
         target_name = f"Zelyr{name[len('Axiom'):]}"
         try:
-            return getattr(_zelyr, target_name)
+            val = getattr(_zelyr, target_name)
+            globals()[name] = val
+            return val
         except AttributeError:
             pass
     try:
-        return getattr(_zelyr, name)
+        val = getattr(_zelyr, name)
+        globals()[name] = val
+        return val
     except AttributeError as exc:
         raise AttributeError(f"module 'axiom' has no attribute {name!r}") from exc
 
@@ -100,3 +103,8 @@ __all__ = list(getattr(_zelyr, "__all__", ())) + [
     for name in getattr(_zelyr, "__all__", ())
     if name.startswith("Zelyr")
 ]
+
+
+def __dir__() -> list[str]:
+    """Ensure legacy exported symbols remain discoverable via dir() and introspection."""
+    return sorted(set(list(globals().keys()) + __all__))
