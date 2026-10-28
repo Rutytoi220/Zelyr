@@ -4,16 +4,241 @@ import logging
 import os
 import sys
 from pathlib import Path
+from collections import deque
+from enum import Enum
+import time
+from typing import Any, Callable, Deque, Dict, List, Optional
 import websockets
 
 from zelyr.core.events import Event
 
 logger = logging.getLogger(__name__)
 
+
+class WorkerState(str, Enum):
+    INITIAL = "INITIAL"
+    RUNNING = "RUNNING"
+    STOPPED = "STOPPED"
+    CRASHED = "CRASHED"
+    DEGRADED = "DEGRADED"
+    CIRCUIT_BROKEN = "CIRCUIT_BROKEN"
+
+
+class SupervisedWorker:
+    """Descriptor and state tracking for a supervised daemon worker process or async task."""
+
+    def __init__(
+        self,
+        name: str,
+        target: Any,
+        is_process: bool = False,
+        env: Optional[Dict[str, str]] = None,
+        cwd: Optional[str] = None,
+    ):
+        self.name = name
+        self.target = target
+        self.is_process = is_process
+        self.env = env
+        self.cwd = cwd
+        self.task: Optional[asyncio.Task] = None
+        self.process: Optional[Any] = None
+        self.crash_timestamps: Deque[float] = deque()
+        self.restart_count: int = 0
+        self.state: WorkerState = WorkerState.INITIAL
+        self.last_error: Optional[str] = None
+        self.next_retry_at: float = 0.0
+
+    def record_crash(self, error: str, now: Optional[float] = None) -> None:
+        ts = time.time() if now is None else now
+        self.crash_timestamps.append(ts)
+        self.restart_count += 1
+        self.last_error = error
+        self.state = WorkerState.CRASHED
+        while self.crash_timestamps and ts - self.crash_timestamps[0] > 60.0:
+            self.crash_timestamps.popleft()
+
+    def should_trip_circuit_breaker(self, now: Optional[float] = None) -> bool:
+        ts = time.time() if now is None else now
+        while self.crash_timestamps and ts - self.crash_timestamps[0] > 60.0:
+            self.crash_timestamps.popleft()
+        return len(self.crash_timestamps) >= 5
+
+    def get_backoff_delay(self) -> float:
+        crashes = len(self.crash_timestamps)
+        if crashes <= 1:
+            return 1.0
+        return min(1.0 * (2 ** (crashes - 1)), 30.0)
+
+
+class DaemonWorkerSupervisor:
+    """Supervises background worker loops and child processes with exponential backoff and circuit breaking."""
+
+    def __init__(self, event_bus: Optional[Any] = None):
+        self.event_bus = event_bus
+        self.workers: Dict[str, SupervisedWorker] = {}
+        self._monitoring_task: Optional[asyncio.Task] = None
+        self._is_running: bool = False
+
+    def register_worker(
+        self,
+        name: str,
+        target: Any,
+        is_process: bool = False,
+        env: Optional[Dict[str, str]] = None,
+        cwd: Optional[str] = None,
+    ) -> SupervisedWorker:
+        worker = SupervisedWorker(name, target, is_process=is_process, env=env, cwd=cwd)
+        self.workers[name] = worker
+        return worker
+
+    async def start_worker(self, name: str) -> bool:
+        worker = self.workers.get(name)
+        if not worker:
+            raise KeyError(f"Unknown worker: {name}")
+
+        now = time.time()
+        if worker.should_trip_circuit_breaker(now):
+            worker.state = WorkerState.CIRCUIT_BROKEN
+            logger.error("Circuit breaker TRIPPED for worker '%s': 5 crashes within 60s.", name)
+            if self.event_bus:
+                self.event_bus.publish_sync(
+                    "supervisor.circuit_breaker.tripped",
+                    {"worker": name, "crashes": len(worker.crash_timestamps), "last_error": worker.last_error},
+                )
+            return False
+
+        worker.state = WorkerState.RUNNING
+        try:
+            if worker.is_process:
+                cmd = worker.target if isinstance(worker.target, list) else [str(worker.target)]
+                worker.process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=worker.env,
+                    cwd=worker.cwd,
+                )
+            else:
+                if asyncio.iscoroutinefunction(worker.target):
+                    worker.task = asyncio.create_task(worker.target())
+                elif callable(worker.target):
+                    worker.task = asyncio.create_task(asyncio.to_thread(worker.target))
+            return True
+        except Exception as e:
+            worker.record_crash(str(e), now)
+            if worker.should_trip_circuit_breaker(now):
+                worker.state = WorkerState.CIRCUIT_BROKEN
+                if self.event_bus:
+                    self.event_bus.publish_sync(
+                        "supervisor.circuit_breaker.tripped",
+                        {"worker": name, "crashes": len(worker.crash_timestamps), "last_error": str(e)},
+                    )
+            return False
+
+    async def monitor_once(self) -> None:
+        """Non-blocking polling sweep across registered workers."""
+        now = time.time()
+        for name, worker in list(self.workers.items()):
+            if worker.state in (WorkerState.STOPPED, WorkerState.CIRCUIT_BROKEN):
+                continue
+
+            if worker.state == WorkerState.RUNNING:
+                if worker.is_process and worker.process:
+                    if worker.process.returncode is not None:
+                        exit_code = worker.process.returncode
+                        stderr_snippet = ""
+                        try:
+                            if worker.process.stderr:
+                                err_bytes = await asyncio.wait_for(worker.process.stderr.read(), timeout=0.1)
+                                stderr_snippet = err_bytes.decode(errors="replace").strip()
+                        except Exception:
+                            pass
+                        err_msg = f"Process exited with code {exit_code}. Stderr: {stderr_snippet}"
+                        worker.record_crash(err_msg, now)
+                        if worker.should_trip_circuit_breaker(now):
+                            worker.state = WorkerState.CIRCUIT_BROKEN
+                            logger.error("Circuit breaker TRIPPED for worker '%s': 5 crashes within 60s.", name)
+                            if self.event_bus:
+                                self.event_bus.publish_sync(
+                                    "supervisor.circuit_breaker.tripped",
+                                    {"worker": name, "crashes": len(worker.crash_timestamps), "last_error": err_msg},
+                                )
+                        else:
+                            delay = worker.get_backoff_delay()
+                            worker.next_retry_at = now + delay
+                            logger.warning("Worker '%s' crashed (exit %s). Retrying in %ss.", name, exit_code, delay)
+
+                elif not worker.is_process and worker.task:
+                    if worker.task.done():
+                        exc = None
+                        try:
+                            exc = worker.task.exception()
+                        except (asyncio.CancelledError, asyncio.InvalidStateError):
+                            pass
+                        err_msg = f"Task failed: {exc}" if exc else "Task finished unexpectedly."
+                        worker.record_crash(err_msg, now)
+                        if worker.should_trip_circuit_breaker(now):
+                            worker.state = WorkerState.CIRCUIT_BROKEN
+                            logger.error("Circuit breaker TRIPPED for worker '%s': 5 crashes within 60s.", name)
+                            if self.event_bus:
+                                self.event_bus.publish_sync(
+                                    "supervisor.circuit_breaker.tripped",
+                                    {"worker": name, "crashes": len(worker.crash_timestamps), "last_error": err_msg},
+                                )
+                        else:
+                            delay = worker.get_backoff_delay()
+                            worker.next_retry_at = now + delay
+                            logger.warning("Worker '%s' crashed (%s). Retrying in %ss.", name, err_msg, delay)
+
+            elif worker.state == WorkerState.CRASHED:
+                if now >= worker.next_retry_at:
+                    await self.start_worker(name)
+
+    async def start(self) -> None:
+        self._is_running = True
+        for name in list(self.workers.keys()):
+            await self.start_worker(name)
+        self._monitoring_task = asyncio.create_task(self._supervision_loop())
+
+    async def _supervision_loop(self) -> None:
+        while self._is_running:
+            try:
+                await self.monitor_once()
+            except Exception as e:
+                logger.error("Error in supervisor monitoring loop: %s", e)
+            await asyncio.sleep(0.5)
+
+    async def shutdown(self, timeout: float = 5.0) -> None:
+        """Safe shutdown & zombie cleanup: SIGTERM, bounded 5s wait, then SIGKILL."""
+        self._is_running = False
+        if self._monitoring_task:
+            self._monitoring_task.cancel()
+
+        for name, worker in self.workers.items():
+            worker.state = WorkerState.STOPPED
+            if worker.task and not worker.task.done():
+                worker.task.cancel()
+
+            if worker.is_process and worker.process and worker.process.returncode is None:
+                try:
+                    worker.process.terminate()
+                    try:
+                        await asyncio.wait_for(worker.process.wait(), timeout=timeout)
+                    except asyncio.TimeoutError:
+                        logger.warning("Worker process '%s' did not terminate in %ss; sending SIGKILL.", name, timeout)
+                        worker.process.kill()
+                        await worker.process.wait()
+                except ProcessLookupError:
+                    pass
+                except Exception as e:
+                    logger.error("Error shutting down worker process '%s': %s", name, e)
+
+
 class ZelyrDaemonServer:
     def __init__(self):
         from zelyr.core.events import EventBus
         self.event_bus = EventBus()
+        self.supervisor = DaemonWorkerSupervisor(event_bus=self.event_bus)
         self.lifecycle = None
         self.cli = None
         
@@ -330,7 +555,9 @@ class ZelyrDaemonServer:
         return self._server
 
     async def stop(self):
-        """Cleanly stop the daemon server and disconnect all clients."""
+        """Cleanly stop the daemon server, supervisor, and disconnect all clients."""
+        if hasattr(self, "supervisor") and self.supervisor:
+            await self.supervisor.shutdown(timeout=5.0)
         for ws in list(self.clients):
             try:
                 await ws.close()
