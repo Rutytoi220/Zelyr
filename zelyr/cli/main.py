@@ -192,8 +192,15 @@ def cmd_send(args: argparse.Namespace) -> None:
     """Send a prompt to the running daemon via WebSocket."""
     async def _send() -> None:
         import websockets  # type: ignore[import]
+        from zelyr.config import data_dir
         try:
-            async with websockets.connect("ws://127.0.0.1:8000") as ws:
+            token_file = data_dir() / "daemon.token"
+            headers = {}
+            if token_file.is_file():
+                tok = token_file.read_text(encoding="utf-8").strip()
+                if tok:
+                    headers["Authorization"] = f"Bearer {tok}"
+            async with websockets.connect("ws://127.0.0.1:8000", additional_headers=headers) as ws:
                 await ws.send(json.dumps({"action": "submit_task", "prompt": args.prompt}))
                 _print(f"[green]✓[/green] Sent prompt to daemon: {args.prompt}")
         except Exception as exc:

@@ -247,17 +247,25 @@ class DaemonWorkerSupervisor:
                     logger.error("Error shutting down worker process '%s': %s", name, e)
 
 
+_AUTH_TOKEN_DEFAULT = object()
+
+
 class ZelyrDaemonServer:
-    def __init__(self, auth_token: Optional[str] = None):
+    def __init__(self, auth_token: Any = _AUTH_TOKEN_DEFAULT):
         from zelyr.core.events import EventBus
         self.event_bus = EventBus()
         self.supervisor = DaemonWorkerSupervisor(event_bus=self.event_bus)
         self.lifecycle = None
         self.cli = None
 
-        self.auth_token = auth_token or os.environ.get("ZELYR_AUTH_TOKEN") or secrets.token_urlsafe(32)
+        if auth_token is _AUTH_TOKEN_DEFAULT:
+            self.auth_token: Optional[str] = os.environ.get("ZELYR_AUTH_TOKEN") or secrets.token_urlsafe(32)
+        else:
+            self.auth_token = auth_token
+
         self.token_file = data_dir() / "daemon.token"
-        self._write_token_file()
+        if self.auth_token:
+            self._write_token_file()
         
         self.scheduler_service = None
         self.telemetry = None
@@ -481,14 +489,15 @@ class ZelyrDaemonServer:
             pass
 
     async def handle_client(self, websocket):
-        provided_token = self._extract_token(websocket)
-        if not provided_token or not secrets.compare_digest(provided_token, self.auth_token):
-            logger.warning("[Daemon] Unauthorized connection attempt rejected.")
-            try:
-                await websocket.close(code=4401, reason="Unauthorized")
-            except Exception:
-                pass
-            return
+        if self.auth_token is not None:
+            provided_token = self._extract_token(websocket)
+            if not provided_token or not secrets.compare_digest(provided_token, self.auth_token):
+                logger.warning("[Daemon] Unauthorized connection attempt rejected.")
+                try:
+                    await websocket.close(code=4401, reason="Unauthorized")
+                except Exception:
+                    pass
+                return
 
         self.clients.add(websocket)
         logger.info("Client connected. Total clients: %d", len(self.clients))

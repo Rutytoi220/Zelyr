@@ -164,7 +164,7 @@ class TestConcurrencyStressSuite(unittest.IsolatedAsyncioTestCase):
 
         async def client_worker(worker_id: int) -> None:
             nonlocal received_count
-            ws_url = f"ws://127.0.0.1:{port}"
+            ws_url = f"ws://127.0.0.1:{port}?token={server.auth_token}"
             async with websockets.connect(ws_url) as ws:
                 for i in range(messages_per_client):
                     frame = {"action": "sync_state", "client_id": worker_id, "seq": i}
