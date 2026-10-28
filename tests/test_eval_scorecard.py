@@ -238,10 +238,14 @@ def test_eval_cli_scorecard_flag(tmp_path: Path):
 
 def test_main_cli_eval_subcommand_dispatch():
     """Verify top-level `zelyr eval --list-tasks` command dispatches cleanly."""
+    import sys
+    root = Path(__file__).resolve().parent.parent
     result = subprocess.run(
-        ["uv", "run", "zelyr", "eval", "--list-tasks"],
+        [sys.executable, "-m", "zelyr.cli.main", "eval", "--list-tasks"],
+        cwd=root,
         capture_output=True,
         text=True,
+        timeout=30,
         check=False,
     )
     assert result.returncode == 0
