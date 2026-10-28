@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from zelyr.agents.native_orchestrator import NativeOrchestrator
 from zelyr.db.memory import MemoryStore
+from zelyr.eval.metrics import EvalStatus
 from zelyr.eval.task import EvalContext, EvalTask
 from zelyr.eval.validators import (
     assert_file_exists,
@@ -609,6 +610,7 @@ def build_task_unrecoverable_actuator_containment() -> EvalTask:
         level=2,
         allowed_tools=["failing_actuator"],
         custom_tools={"failing_actuator": failing_actuator},
+        expected_status=EvalStatus.FAIL,
         tool_schemas=[
             {
                 "type": "function",

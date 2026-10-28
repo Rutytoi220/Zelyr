@@ -34,8 +34,12 @@ def check_ollama_status(
             return False, f"Ollama HTTP {resp.status_code}"
         if model_name:
             models = [m.get("name", "") for m in resp.json().get("models", [])]
-            clean_target = model_name.split(":")[0]
-            if not any(m == model_name or m.startswith(clean_target) for m in models):
+            has_model = (
+                model_name in models
+                or f"{model_name}:latest" in models
+                or (":" not in model_name and any(m.startswith(f"{model_name}:") for m in models))
+            )
+            if not has_model:
                 return False, f"Model '{model_name}' not found in Ollama models: {models}"
         return True, "Ollama ready"
     except Exception as exc:

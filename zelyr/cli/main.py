@@ -283,9 +283,13 @@ def cmd_test(_args: argparse.Namespace) -> None:
 def cmd_eval(args: argparse.Namespace, extra: Optional[List[str]] = None) -> None:
     """Run Zelyr evaluation benchmark suite."""
     from zelyr.eval.cli import run_benchmark_cli
-    eval_argv = list(getattr(args, "eval_args", []) or [])
-    if extra:
-        eval_argv.extend(extra)
+    if "eval" in sys.argv:
+        eval_idx = sys.argv.index("eval")
+        eval_argv = sys.argv[eval_idx + 1 :]
+    else:
+        eval_argv = list(getattr(args, "eval_args", []) or [])
+        if extra:
+            eval_argv.extend(extra)
     exit_code = run_benchmark_cli(eval_argv)
     sys.exit(exit_code)
 

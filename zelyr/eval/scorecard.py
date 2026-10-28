@@ -95,50 +95,82 @@ def _extract_task_dict(result: Union[TaskResult, EvaluationResult, Dict[str, Any
         status_val = result.status.value if isinstance(result.status, EvalStatus) else str(result.status)
         tool_count = len(result.tool_calls) if isinstance(result.tool_calls, list) else 0
         level = _infer_task_level(result.task_id, result.artifacts)
+        exp_status = (
+            result.artifacts.get("expected_status")
+            if isinstance(result.artifacts, dict)
+            else None
+        )
+        is_passed = (status_val in ("PASS", "PASSED")) or (
+            exp_status is not None and status_val == str(exp_status)
+        )
+        fail_cat = None if is_passed or status_val == "UNVERIFIED" else (result.failure_category or status_val)
         return {
             "task_id": result.task_id,
             "status": status_val,
             "level": level,
+            "is_passed": is_passed,
+            "expected_status": exp_status,
             "step_count": result.step_count,
             "tool_call_count": tool_count,
             "duration_seconds": result.duration_seconds,
             "tokens": result.measured_tokens if result.measured_tokens is not None else result.estimated_tokens,
             "message": result.message or "",
-            "failure_category": result.failure_category or (status_val if status_val not in ("PASS", "PASSED") else None),
+            "failure_category": fail_cat,
         }
 
     if isinstance(result, EvaluationResult):
         status_val = result.status.value if isinstance(result.status, ResultStatus) else str(result.status)
         level = result.benchmark_level or _infer_task_level(result.task_id, result.metadata)
+        exp_status = (
+            result.metadata.get("expected_status")
+            if isinstance(result.metadata, dict)
+            else None
+        )
+        is_passed = (status_val in ("PASS", "PASSED")) or (
+            exp_status is not None and status_val == str(exp_status)
+        )
         msg = result.validator_message or result.error_message or ""
+        fail_cat = None if is_passed or status_val == "UNVERIFIED" else (result.failure_category or status_val)
         return {
             "task_id": result.task_id,
             "status": status_val,
             "level": level,
+            "is_passed": is_passed,
+            "expected_status": exp_status,
             "step_count": result.step_count,
             "tool_call_count": result.tool_call_count,
             "duration_seconds": result.duration_seconds,
             "tokens": result.measured_tokens or result.estimated_tokens,
             "message": msg,
-            "failure_category": result.failure_category or (status_val if status_val not in ("PASS", "PASSED") else None),
+            "failure_category": fail_cat,
         }
 
     if isinstance(result, dict):
         status_val = str(result.get("status", "UNVERIFIED")).upper()
         tid = str(result.get("task_id", "unknown_task"))
-        level = int(result.get("level", _infer_task_level(tid, result.get("metadata"))))
+        meta = result.get("metadata") or result.get("artifacts") or {}
+        level = int(result.get("level", _infer_task_level(tid, meta)))
         tools = result.get("tool_calls") or result.get("tool_sequence") or []
         tool_count = int(result.get("tool_call_count", len(tools) if isinstance(tools, list) else 0))
+        exp_status = result.get("expected_status") or meta.get("expected_status")
+        is_passed = (
+            result.get("is_passed")
+            if result.get("is_passed") is not None
+            else ((status_val in ("PASS", "PASSED")) or (exp_status is not None and status_val == str(exp_status)))
+        )
+        fail_cat = None if is_passed or status_val == "UNVERIFIED" else (result.get("failure_category") or status_val)
         return {
             "task_id": tid,
             "status": status_val,
             "level": level,
+            "is_passed": is_passed,
+            "expected_status": exp_status,
             "step_count": int(result.get("step_count", 0)),
             "tool_call_count": tool_count,
             "duration_seconds": float(result.get("duration_seconds", 0.0)),
             "tokens": result.get("measured_tokens") or result.get("estimated_tokens") or result.get("tokens", 0),
             "message": str(result.get("message") or result.get("validator_message") or result.get("error_message") or ""),
-            "failure_category": result.get("failure_category") or (status_val if status_val not in ("PASS", "PASSED") else None),
+            "failure_category": fail_cat,
         }
 
     raise TypeError(f"Unsupported task result type: {type(result)}")
@@ -174,14 +206,15 @@ def generate_benchmark_scorecard(
             tasks=[],
         )
 
-    passed_count = sum(1 for t in normalized_tasks if t["status"] in ("PASS", "PASSED"))
-    failed_count = sum(1 for t in normalized_tasks if t["status"] in ("FAIL", "FAILED", "FALSE_SUCCESS"))
-    timeout_count = sum(1 for t in normalized_tasks if t["status"] == "TIMEOUT")
-    tool_error_count = sum(1 for t in normalized_tasks if t["status"] == "TOOL_ERROR")
-    step_limit_count = sum(1 for t in normalized_tasks if t["status"] == "STEP_LIMIT_EXCEEDED")
+    passed_count = sum(1 for t in normalized_tasks if t.get("is_passed", False))
+    failed_count = sum(1 for t in normalized_tasks if not t.get("is_passed", False) and t["status"] != "UNVERIFIED")
+    timeout_count = sum(1 for t in normalized_tasks if t["status"] == "TIMEOUT" and not t.get("is_passed", False))
+    tool_error_count = sum(1 for t in normalized_tasks if t["status"] == "TOOL_ERROR" and not t.get("is_passed", False))
+    step_limit_count = sum(1 for t in normalized_tasks if t["status"] == "STEP_LIMIT_EXCEEDED" and not t.get("is_passed", False))
     unverified_count = sum(1 for t in normalized_tasks if t["status"] == "UNVERIFIED")
 
-    pass_rate = passed_count / total if total > 0 else 0.0
+    evaluated_tasks = [t for t in normalized_tasks if t["status"] != "UNVERIFIED"]
+    pass_rate = (passed_count / len(evaluated_tasks)) if evaluated_tasks else 1.0
 
     durations = [t["duration_seconds"] for t in normalized_tasks]
     total_duration = sum(durations)
@@ -197,22 +230,24 @@ def generate_benchmark_scorecard(
     # Failure breakdown
     failure_breakdown: Dict[str, int] = {}
     for t in normalized_tasks:
-        if t["status"] not in ("PASS", "PASSED"):
-            cat = t["failure_category"] or t["status"]
+        if not t.get("is_passed", False) and t.get("failure_category"):
+            cat = t["failure_category"]
             failure_breakdown[cat] = failure_breakdown.get(cat, 0) + 1
 
     # Level breakdown
     level_breakdown: Dict[int, Dict[str, Any]] = {}
     for lvl in sorted({t["level"] for t in normalized_tasks}):
         lvl_tasks = [t for t in normalized_tasks if t["level"] == lvl]
-        lvl_passed = sum(1 for t in lvl_tasks if t["status"] in ("PASS", "PASSED"))
+        lvl_passed = sum(1 for t in lvl_tasks if t.get("is_passed", False))
         lvl_total = len(lvl_tasks)
+        lvl_eval = [t for t in lvl_tasks if t["status"] != "UNVERIFIED"]
         lvl_durations = [t["duration_seconds"] for t in lvl_tasks]
         level_breakdown[lvl] = {
             "total": lvl_total,
             "passed": lvl_passed,
-            "failed": lvl_total - lvl_passed,
-            "pass_rate_pct": round((lvl_passed / lvl_total * 100), 1) if lvl_total > 0 else 0.0,
+            "failed": len(lvl_eval) - lvl_passed,
+            "unverified": lvl_total - len(lvl_eval),
+            "pass_rate_pct": round((lvl_passed / len(lvl_eval) * 100), 1) if lvl_eval else 100.0,
             "mean_duration_seconds": round(statistics.mean(lvl_durations), 3) if lvl_durations else 0.0,
             "total_tool_calls": sum(t["tool_call_count"] for t in lvl_tasks),
         }
@@ -269,13 +304,15 @@ def render_markdown_scorecard(scorecard: Union[BenchmarkScorecard, Dict[str, Any
         failures = scorecard.failure_breakdown
         levels = scorecard.level_breakdown
         tasks = scorecard.tasks
+        unverified_count = scorecard.unverified_count
 
-    badge_status = "PASSING" if (total > 0 and passed == total) else ("ACCEPTABLE" if pass_rate >= 80.0 else "FAILING")
+    badge_status = "PASSING" if (total > 0 and passed == (total - unverified_count)) else ("ACCEPTABLE" if pass_rate >= 80.0 else "FAILING")
+    unverified_text = f" | **Unverified (Offline):** `{unverified_count}`" if unverified_count else ""
 
     lines = [
         f"# 📊 Zelyr Autonomous Benchmark Scorecard — `{suite_name}`",
         "",
-        f"> **Overall Status:** `{badge_status}` | **Pass Rate:** `{pass_rate:.1f}%` ({passed}/{total}) | **Duration:** `{dur_total:.2f}s`",
+        f"> **Overall Status:** `{badge_status}` | **Pass Rate:** `{pass_rate:.1f}%` ({passed}/{total - unverified_count}){unverified_text} | **Duration:** `{dur_total:.2f}s`",
         "",
         "## 🎯 Executive KPI Summary",
         "",
@@ -345,8 +382,13 @@ def render_markdown_scorecard(scorecard: Union[BenchmarkScorecard, Dict[str, Any
         if len(msg) > 40:
             msg = msg[:37] + "..."
         msg_clean = msg.replace("|", "/")
+        st = t["status"]
+        if t.get("is_passed"):
+            st_disp = "PASS" if st in ("PASS", "PASSED") else f"PASS ({st})"
+        else:
+            st_disp = st
         lines.append(
-            f"| `{t['task_id']}` | L{t['level']} | `{t['status']}` | {t['step_count']} | "
+            f"| `{t['task_id']}` | L{t['level']} | `{st_disp}` | {t['step_count']} | "
             f"{t['tool_call_count']} | {t['duration_seconds']:.2f}s | {msg_clean} |"
         )
 

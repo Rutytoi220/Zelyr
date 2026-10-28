@@ -115,7 +115,7 @@ async def run_benchmark_async(
             sys.stdout.write(f"[{idx}/{len(tasks)}] Running {task.task_id} (Level {task.level})... ")
             sys.stdout.flush()
 
-        task_is_live = bool(use_live_model or task.level == 2 or (task.metadata and task.metadata.get("use_live_model")))
+        task_is_live = bool(use_live_model)
         res = await harness.run_task(
             task,
             use_live_model=task_is_live,

@@ -37,8 +37,12 @@ async def check_ollama_status_async(
                 return False, f"Ollama HTTP {resp.status_code}"
             if model_name:
                 models = [m.get("name", "") for m in resp.json().get("models", [])]
-                clean_target = model_name.split(":")[0]
-                if not any(m == model_name or m.startswith(clean_target) for m in models):
+                has_model = (
+                    model_name in models
+                    or f"{model_name}:latest" in models
+                    or (":" not in model_name and any(m.startswith(f"{model_name}:") for m in models))
+                )
+                if not has_model:
                     return False, f"Model '{model_name}' not found in Ollama models: {models}"
             return True, "Ollama ready"
     except Exception as exc:
@@ -137,8 +141,28 @@ class EvalHarness:
         """Execute an EvalTask inside an isolated workspace and validate observable state."""
         start_time = time.perf_counter()
 
+        requires_live = bool(
+            (task.metadata and task.metadata.get("use_live_model", False))
+            and mock_responses is None
+            and not task.mock_responses
+            and mock_stream_fn is None
+        )
+        if requires_live and not use_live_model:
+            return TaskResult(
+                task_id=task.task_id,
+                status=EvalStatus.UNVERIFIED,
+                message="Live model evaluation skipped in offline mode (pass --live to execute).",
+                step_count=0,
+                tool_calls=[],
+                duration_seconds=0.0,
+                measured_tokens=None,
+                estimated_tokens=0,
+                failure_category="UNVERIFIED",
+                artifacts={"reason": "offline_mode", "use_live_model": False, "expected_status": None},
+            )
+
         eff_use_live_model = bool(
-            (use_live_model or (task.metadata and task.metadata.get("use_live_model", False)))
+            use_live_model
             and mock_responses is None
             and not task.mock_responses
             and mock_stream_fn is None
@@ -527,6 +551,11 @@ class EvalHarness:
                 "final_response": context.final_response,
                 "workspace_dir": str(temp_dir),
                 "db_path": str(db_path),
+                "expected_status": (
+                    task.expected_status.value
+                    if hasattr(task.expected_status, "value")
+                    else (str(task.expected_status) if task.expected_status is not None else None)
+                ),
                 "latency_breakdown": {
                     "model_latencies": latencies_model,
                     "tool_latencies": list(tool_step_latencies),
