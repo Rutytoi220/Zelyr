@@ -43,9 +43,14 @@ class PluginManager:
                     spec.loader.exec_module(module)
                     
                     for name, obj in inspect.getmembers(module, inspect.isclass):
-                        if issubclass(obj, ZelyrTool) and obj is not ZelyrTool:
+                        from zelyr.tools.core import BaseTool
+                        if (issubclass(obj, ZelyrTool) and obj is not ZelyrTool) or (
+                            issubclass(obj, BaseTool) and obj is not BaseTool
+                        ):
                             instance = obj()
-                            self.active_tools[instance.name] = instance
-                            logger.info(f"Loaded plugin tool: {instance.name}")
+                            from zelyr.core.plugin_sandbox import SandboxedPluginRunner
+                            runner = SandboxedPluginRunner(instance)
+                            self.active_tools[instance.name] = runner
+                            logger.info(f"Loaded isolated plugin tool: {instance.name}")
             except Exception as e:
                 logger.error(f"Failed to load plugin {py_file.name}: {e}")

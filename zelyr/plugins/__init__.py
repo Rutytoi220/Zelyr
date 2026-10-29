@@ -20,6 +20,7 @@ from zelyr.plugins.exceptions import (
 from zelyr.plugins.loader import PluginLoader, PluginManifest, PluginPermissions
 from zelyr.plugins.sandbox import SandboxedToolProxy, static_check_plugin_source
 from zelyr.plugins.manager import PluginManager
+from zelyr.core.plugin_sandbox import SandboxedPluginRunner
 
 __all__ = [
     # v1
@@ -43,6 +44,7 @@ __all__ = [
     "PluginPermissions",
     # sandbox
     "SandboxedToolProxy",
+    "SandboxedPluginRunner",
     "static_check_plugin_source",
     # manager
     "PluginManager",

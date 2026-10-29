@@ -674,6 +674,31 @@ def get_tui_hints() -> Dict[str, str]:
         load_plugins()
     return dict(_tui_hints)
 
+PROVISIONED_TOOLS = {
+    "remember_fact",
+    "manage_system_process",
+    "manage_system_clipboard",
+    "query_system_journal",
+    "manage_media_playback",
+    "manage_workspace_file",
+    "send_desktop_notification",
+    "inspect_network",
+    "interact_with_browser",
+    "interact_with_ui",
+    "vision",
+    "capture_som_screen",
+    "click_tag",
+    "som_click",
+    "som_type",
+    "som_key",
+    "web_search",
+    "fetch_web_page",
+    "create_tool",
+    "manage_tools",
+    "execute_command",
+    "manage_desktop_window",
+}
+
 TIER_TIMEOUTS: Dict[str, float] = {
     "interact_with_ui": 35.0,
     "vision": 35.0,
@@ -699,32 +724,48 @@ async def execute_tool(name: str, **kwargs) -> str:
     import asyncio
     func = _executors[name]
     
-    def thread_worker():
-        if asyncio.iscoroutinefunction(func):
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                return loop.run_until_complete(func(**kwargs))
-            finally:
-                loop.close()
-        else:
-            return func(**kwargs)
-            
     timeout = get_tier_timeout(name)
     timeout_int = int(timeout)
-    try:
-        res = await asyncio.wait_for(
-            asyncio.to_thread(thread_worker),
-            timeout=timeout
-        )
-        return str(res)
-    except (TimeoutError, asyncio.TimeoutError):
-        return json.dumps({
-            "success": False,
-            "error": f"Tool execution timed out after {timeout_int}s. Try a faster Tier 1 command or verify active window.",
-        })
-    except Exception as e:
-        return f"Tool execution failed: {e}"
+    is_builtin = (
+        name in TIER_1_BUILTIN
+        or name in PROVISIONED_TOOLS
+        or getattr(get_tool_capability(name), "is_core", False)
+    )
+
+    if is_builtin:
+        def thread_worker():
+            if asyncio.iscoroutinefunction(func):
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    return loop.run_until_complete(func(**kwargs))
+                finally:
+                    loop.close()
+            else:
+                return func(**kwargs)
+
+        try:
+            res = await asyncio.wait_for(
+                asyncio.to_thread(thread_worker),
+                timeout=timeout
+            )
+            return str(res)
+        except (TimeoutError, asyncio.TimeoutError):
+            return json.dumps({
+                "success": False,
+                "error": f"Tool execution timed out after {timeout_int}s. Try a faster Tier 1 command or verify active window.",
+            })
+        except Exception as e:
+            return f"Tool execution failed: {e}"
+    else:
+        from zelyr.core.plugin_sandbox import SandboxedPluginRunner
+        runner = SandboxedPluginRunner(func, name=name, timeout=timeout)
+        tool_res = await runner.run_async(**kwargs)
+        if not tool_res.success:
+            return json.dumps({"success": False, "error": tool_res.error})
+        if isinstance(tool_res.output, str):
+            return tool_res.output
+        return json.dumps(tool_res.to_dict(tool=name, arguments=kwargs))
 
 
 def reload_plugin(path: Any) -> None:

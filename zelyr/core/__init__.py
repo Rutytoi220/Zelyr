@@ -20,6 +20,7 @@ _LAZY_EXPORTS = {
     "shutdown_bridge": ("zelyr.core.async_bridge", "shutdown_bridge"),
     "WorkspaceTransactionManager": ("zelyr.core.transaction", "WorkspaceTransactionManager"),
     "StagingCapExceeded": ("zelyr.core.transaction", "StagingCapExceeded"),
+    "SandboxedPluginRunner": ("zelyr.core.plugin_sandbox", "SandboxedPluginRunner"),
 }
 
 __all__ = [
@@ -32,6 +33,7 @@ __all__ = [
     "shutdown_bridge",
     "WorkspaceTransactionManager",
     "StagingCapExceeded",
+    "SandboxedPluginRunner",
 ]
 
 

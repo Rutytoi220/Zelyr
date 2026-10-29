@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Isolated Process Execution & Resource Sandboxing for Plugins**:
+  - Implemented `SandboxedPluginRunner` in `zelyr.core.plugin_sandbox` executing plugin tools in dedicated, isolated child processes using IPC pipes.
+  - Enforced POSIX virtual memory limits via `resource.setrlimit(RLIMIT_AS)` with a 512MB default RAM ceiling.
+  - Added supervised crash containment intercepting abnormal exits (SIGSEGV, SIGABRT, non-zero exits) and returning structured `ToolResult` failure envelopes.
+  - Implemented bounded execution timeouts with graceful SIGTERM escalation to SIGKILL, preventing rogue plugin hangs.
+  - Integrated sandboxed runner into `zelyr.core.plugin_manager` and `zelyr.core.plugins.execute_tool`, preserving native built-in fast paths while sandboxing external dynamic plugins.
 - **Remote Model Context Protocol (MCP) Server-Sent Events (SSE) Client Transport**:
   - Implemented asynchronous `MCPSSEClient` in `zelyr.mcp.sse_client` using `httpx.AsyncClient` with streaming response ingestion for remote tool federation.
   - Added protocol handshake and dynamic endpoint negotiation listening for initial SSE `endpoint` events to resolve HTTP POST target URLs.
