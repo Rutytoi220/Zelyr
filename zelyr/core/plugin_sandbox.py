@@ -275,19 +275,18 @@ class SandboxedPluginRunner(BaseTool):
                     has_data = parent_conn.poll(0.0)
                     break
 
-            if not has_data:
+            if not has_data and proc.is_alive():
                 # Execution timed out: escalate termination gracefully then forcefully
                 logger.warning(
                     "Plugin '%s' exceeded timeout %.1fs. Escalating termination...",
                     self.name,
                     self.timeout,
                 )
+                proc.terminate()
+                proc.join(timeout=SIGTERM_GRACE_PERIOD_SECONDS)
                 if proc.is_alive():
-                    proc.terminate()
-                    proc.join(timeout=SIGTERM_GRACE_PERIOD_SECONDS)
-                    if proc.is_alive():
-                        proc.kill()
-                        proc.join(timeout=1.0)
+                    proc.kill()
+                    proc.join(timeout=1.0)
                 return ToolResult(
                     success=False,
                     output="",
@@ -295,13 +294,18 @@ class SandboxedPluginRunner(BaseTool):
                 )
 
             # Read response envelope from child worker
-            try:
-                msg = parent_conn.recv()
-            except EOFError:
-                # Worker terminated prematurely (e.g. SIGSEGV, SIGABRT, OOM kill)
-                proc.join(timeout=1.0)
-                exitcode = proc.exitcode if proc.exitcode is not None else -1
+            msg = None
+            if has_data:
+                try:
+                    msg = parent_conn.recv()
+                except EOFError:
+                    msg = None
 
+            proc.join(timeout=1.0)
+
+            if msg is None:
+                # Worker terminated prematurely (e.g. SIGSEGV, SIGABRT, OOM kill)
+                exitcode = proc.exitcode if proc.exitcode is not None else -1
                 sig_str = self._format_signal_info(exitcode)
                 error_msg = (
                     f"PluginExecutionError: Plugin process terminated unexpectedly "
@@ -309,8 +313,6 @@ class SandboxedPluginRunner(BaseTool):
                 )
                 logger.error("Plugin crash contained for '%s': %s", self.name, error_msg)
                 return ToolResult(success=False, output="", error=error_msg)
-
-            proc.join(timeout=1.0)
 
             # Map response messages to ToolResult
             status = msg[0]
