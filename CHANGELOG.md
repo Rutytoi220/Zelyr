@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+### Changed
+
+### Fixed
+
 ## [1.1.0] - 2026-10-29
 
 General Availability (GA) official production release of Zelyr v1.1.0, delivering comprehensive execution security hardening, sub-100ms CLI startup latency, modular optional dependency boundaries, resilient atomic OTA updates, authenticated WebSocket IPC, Swarm consensus quorum resilience, REM sleep memory consolidation, and full 24/24 autonomous multi-turn evaluation benchmarks.
