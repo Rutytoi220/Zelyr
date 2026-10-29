@@ -153,7 +153,17 @@ class ZelyrMCPServerGateway:
         # ── 1. Tool Discovery: tools/list ────────────────────────────────────
         @self.server.list_tools()
         async def list_tools() -> List[types.Tool]:
-            tools_dict = self.registry.list_tools()
+            tools_dict = dict(self.registry.list_tools())
+            if hasattr(self.registry, "get_builtin_tools"):
+                try:
+                    for builtin_id in self.registry.get_builtin_tools():
+                        if builtin_id not in tools_dict:
+                            t = self.registry.get_tool(builtin_id)
+                            if t is not None:
+                                tools_dict[builtin_id] = t
+                except Exception as exc:
+                    logger.debug("Could not enumerate builtin tools: %s", exc)
+
             result: List[types.Tool] = []
 
             for tool_id, tool_inst in tools_dict.items():
@@ -287,7 +297,13 @@ class ZelyrMCPServerGateway:
                     name="Active Memories",
                     description="List of active persistent memory entries",
                     mimeType="application/json",
-                )
+                ),
+                types.Resource(
+                    uri="zelyr://memory/recent",  # type: ignore[arg-type]
+                    name="Recent Memories",
+                    description="List of recently accessed or modified memory entries",
+                    mimeType="application/json",
+                ),
             ]
             for cat in sorted(VALID_MEMORY_CATEGORIES):
                 resources.append(
@@ -326,6 +342,38 @@ class ZelyrMCPServerGateway:
             if path == "active" or not path:
                 memories = self._query_active_memories(limit=100)
                 payload = json.dumps(memories, indent=2, ensure_ascii=False)
+                return [ReadResourceContents(content=payload, mime_type="application/json")]
+
+            # Route: zelyr://memory/recent
+            if path == "recent":
+                memories = self._query_active_memories(limit=50)
+                payload = json.dumps(memories, indent=2, ensure_ascii=False)
+                return [ReadResourceContents(content=payload, mime_type="application/json")]
+
+            # Route: zelyr://memory/search?q={query} or zelyr://memory/search/{query}
+            if path == "search" or path.startswith("search/"):
+                search_query = ""
+                if path.startswith("search/"):
+                    search_query = path[len("search/") :].strip()
+                elif parsed.query:
+                    import urllib.parse
+                    qs = urllib.parse.parse_qs(parsed.query)
+                    search_query = qs.get("q", [""])[0]
+
+                results = self.memory_store.search(search_query, limit=20) if search_query else []
+                safe_memories = [
+                    {
+                        "id": m.get("id"),
+                        "category": m.get("category"),
+                        "key": m.get("key"),
+                        "content": m.get("content"),
+                        "confidence": m.get("confidence"),
+                        "created_at": m.get("created_at"),
+                        "updated_at": m.get("updated_at"),
+                    }
+                    for m in results
+                ]
+                payload = json.dumps(safe_memories, indent=2, ensure_ascii=False)
                 return [ReadResourceContents(content=payload, mime_type="application/json")]
 
             # Route: zelyr://memory/category/{category}
@@ -504,3 +552,14 @@ def create_mcp_server(
         allowed_tools=allowed_tools,
         expose_memory=expose_memory,
     )
+
+
+# Standard MCP Server alias
+MCPServer = ZelyrMCPServerGateway
+
+__all__ = [
+    "ZelyrMCPServerGateway",
+    "MCPServer",
+    "create_mcp_server",
+    "VALID_MEMORY_CATEGORIES",
+]

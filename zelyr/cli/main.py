@@ -429,7 +429,10 @@ def cmd_mcp(args: argparse.Namespace) -> None:
     except KeyboardInterrupt:
         pass
     except Exception as exc:
-        _print(f"[bold red]Error running MCP server:[/bold red] {exc}")
+        if transport == "stdio":
+            sys.stderr.write(f"Error running MCP server: {exc}\n")
+        else:
+            _print(f"[bold red]Error running MCP server:[/bold red] {exc}")
         sys.exit(1)
 
 

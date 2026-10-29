@@ -93,6 +93,8 @@ from .core import ToolResult, ToolParameter, BaseTool
 class EchoTool(BaseTool):
     """A tool that returns the input string unchanged."""
 
+    REQUIRED_RING: int = 1
+
     @property
     def tool_id(self) -> str:
         """Auto-generated docstring.

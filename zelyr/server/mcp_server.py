@@ -5,6 +5,8 @@ from zelyr.engine.memory_tx import TransactionalMemoryManager
 from zelyr.engine.consensus import SwarmConsensusEngine
 from zelyr.core.engine import Engine
 
+from zelyr.mcp.server import MCPServer, ZelyrMCPServerGateway
+
 logger = logging.getLogger(__name__)
 
 mcp = FastMCP("zelyr")
@@ -92,3 +94,13 @@ if __name__ == "__main__":
 
 # Legacy AXIOM API compatibility alias
 query_axiom_memory = query_zelyr_memory
+
+__all__ = [
+    "run_mcp_server",
+    "MCPServer",
+    "ZelyrMCPServerGateway",
+    "mcp",
+    "query_zelyr_memory",
+    "trigger_swarm_verification",
+    "inspect_security_audit",
+]

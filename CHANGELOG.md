@@ -21,7 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Implemented full MCP protocol lifecycle support: `initialize` (with capability negotiation), `notifications/initialized`, `ping`, `tools/list`, `tools/call`, `resources/list`, and `resources/read`.
   - Added schema conversion mapping Zelyr `BaseTool` instances to MCP-compliant JSON Schemas with strict argument and required-field validation.
   - Enforced capability rings and tool authorization whitelisting within `tools/call` dispatch, preventing permission bypasses.
-  - Exposed safe read-only memory resources (`zelyr://memory/active`, `zelyr://memory/category/{category}`, `zelyr://memory/{id}`) with strict scheme and path validation, preventing access to raw database files or credentials.
+  - Exposed safe read-only memory resources (`zelyr://memory/active`, `zelyr://memory/recent`, `zelyr://memory/search?q={query}`, `zelyr://memory/category/{category}`, `zelyr://memory/{id}`) with strict scheme and path validation, preventing access to raw database files or credentials.
+  - Added standard `MCPServer` alias and exported in `zelyr.mcp` and `zelyr.server.mcp_server`.
   - Supported stdio transport with guaranteed stdout purity (reconfiguring logging exclusively to stderr) and HTTP/SSE transport via Starlette ASGI mounting `/sse` and `/messages/`.
   - Added CLI interface `zelyr mcp serve` supporting `--transport stdio|http|sse`, `--host`, `--port`, `--allowed-tools`, `--caller-ring`, and `--no-memory`.
   - Authored comprehensive test suite in `tests/test_mcp_server_gateway.py` with 15 isolated integration and end-to-end tests verifying protocol negotiation, tool execution, sandboxed plugin crash containment, and side-effects.
