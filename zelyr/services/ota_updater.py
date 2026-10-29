@@ -28,7 +28,7 @@ from zelyr.compat import data_dir
 
 logger = logging.getLogger(__name__)
 
-ZELYR_VERSION = "1.2.0.dev0"
+ZELYR_VERSION = "1.2.0rc1"
 AXIOM_VERSION = ZELYR_VERSION  # legacy public constant
 GITHUB_API_URL = "https://api.github.com/repos/Rutytoi220/Zelyr/releases/latest"
 

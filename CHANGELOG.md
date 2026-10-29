@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0-rc.1] - 2026-10-29
+
+Release Candidate 1 for Zelyr v1.2.0, establishing production-grade Model Context Protocol (MCP) server federation, autonomous background routine scheduling, interactive streaming terminal chat with durable SQLite session persistence, adaptive context window budgeting and historical tool compaction, hierarchical multi-agent subagent delegation with transactional blackboard rollback, autonomous runtime tool crafting with AST and sandbox gatekeepers, and the full 30-task Level 5 evaluation benchmark suite.
+
+### Architecture Pillars & Landmark Capabilities
+
+- **Outbound MCP Server Gateway (`zelyr mcp serve`)**:
+  - Exposes Zelyr's native tool registry and read-only memory resources (`zelyr://memory/active`, `zelyr://memory/recent`, `zelyr://memory/category/{category}`) via Model Context Protocol standard over stdio with strict stdout purity and HTTP/SSE transports.
+- **Autonomous Routine Scheduling & Daemon Persistence (`zelyr routine`)**:
+  - Built SQLite WAL-backed `RoutineEngine` supporting cron expressions and interval schedules with execution timeout isolation, concurrency guards, and execution history tracking.
+- **Interactive Streaming REPL & Multi-Turn Chat Sessions (`zelyr chat` / `zelyr repl`)**:
+  - Full-featured interactive terminal chat interface connected to `NativeOrchestrator` with live token streaming, thought-trace collapsible blocks, durable SQLite session persistence (`SessionManager`), turn interruption safety, and inline slash commands (`/tools`, `/memory`, `/routine`, `/session`).
+- **Adaptive Context Window Budgeting & Historical Tool Compaction**:
+  - Hierarchical context management in `ContextBudgetEngine` with Model Context Catalog (`MODEL_CONTEXT_CATALOG`), two-stage compaction condensing historical tool results (>250 tokens) older than 2 turns, sliding-window turn pruning with semantic digest anchors, and inviolate system/user prompt preservation.
+- **Hierarchical Multi-Agent Subagent Delegation (`delegate_subtask`)**:
+  - First-class subagent delegation dispatching specialized worker profiles (`coder`, `tester`, `researcher`, `reviewer`, `general`) into isolated context bubbles, coordinating via transactional `SwarmBlackboard` with point-in-time rollback upon failure and capability ring inheritance.
+- **Autonomous Tool Crafting & Runtime Skill Compilation (`craft_tool`)**:
+  - On-demand tool synthesis with two-phase gatekeeper: static Ring-0 AST validation and dynamic `SandboxedPluginRunner` companion test execution under POSIX memory ceilings (512MB) and bounded timeouts, hot-loading newly synthesized tools into `ToolRegistry`.
+- **Level 5 Autonomous Evaluation Benchmark Suite (30 Tasks)**:
+  - Expanded deterministic offline evaluation harness (`zelyr/eval/`) from 24 to 30 tasks with Level 5: federation, routines, context budgeting, swarm delegation, tool crafting, and session continuity (100% pass rate in ~1.40s).
+
+### Distribution Artifacts
+
+| Artifact Name | Platform / Type | SHA256 Checksum | Size |
+| :--- | :--- | :--- | :--- |
+| `zelyr_core-1.2.0rc1-py3-none-any.whl` | Python Wheel (`any`) | `353ba1c1a2fb770b576b313deece1281548bc76fddd11797a22f71e10dd5f7fb` | 2.14 MiB (2,248,495 bytes) |
+| `zelyr_core-1.2.0rc1.tar.gz` | Source Distribution (`sdist`) | `5aea17bb5d080be597ac4b729e54034a37163ec97da936b810f4601e7e2d6084` | 2.00 MiB (2,093,715 bytes) |
+
 ### Added
 - **Level 5 Autonomous Federation, Tool Synthesis & Multi-Agent Swarm Evaluation Benchmark**:
   - Expanded Zelyr's deterministic offline evaluation harness (`zelyr/eval/`) from 24 tasks (Levels 1–4) to 30 tasks with Level 5:
@@ -186,6 +214,8 @@ This release hardens the build system, wires in OTA capabilities, and eliminates
 - **AppImage Build Resilience:** Fortified `scripts/build_appimage.sh` with correct `usr/share/applications` AppDir directory structure and explicit `set -e` failure trapping.
 - **Circuit Breakers:** `SystemHealthWatchdog` now survives nested permission errors silently rather than stalling the central EventBus.
 
-[Unreleased]: https://github.com/Rutytoi220/Zelyr/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/Rutytoi220/Zelyr/compare/v1.2.0-rc1...HEAD
+[1.2.0-rc.1]: https://github.com/Rutytoi220/Zelyr/releases/tag/v1.2.0-rc1
+[1.1.0]: https://github.com/Rutytoi220/Zelyr/releases/tag/v1.1.0
 [1.0.0]: https://github.com/Rutytoi220/Zelyr/releases/tag/v1.0.0
 [v11.3.0]: https://github.com/Rutytoi220/Zelyr/releases/tag/v11.3.0

@@ -38,7 +38,7 @@ class TestLazyImportsPublicAPI(unittest.TestCase):
         self.assertIs(zelyr.Engine, Engine)
         self.assertIs(zelyr.ZelyrConfig, ZelyrConfig)
         self.assertIs(zelyr.AxiomConfig, ZelyrConfig)
-        self.assertEqual(zelyr.__version__, "1.2.0.dev0")
+        self.assertEqual(zelyr.__version__, "1.2.0rc1")
 
     def test_dynamic_lookup_and_dir(self):
         """getattr resolves lazy exports, dir() includes them, unknown raises AttributeError."""
@@ -128,7 +128,7 @@ class TestLegacyCompatibility(unittest.TestCase):
             "from zelyr import *\n"
             "assert Engine is not None\n"
             "assert ZelyrConfig is not None\n"
-            "assert __version__ == '1.2.0.dev0'\n"
+            "assert __version__ == '1.2.0rc1'\n"
         )
         res_zelyr = subprocess.run([sys.executable, "-c", code_zelyr], capture_output=True, text=True)
         self.assertEqual(res_zelyr.returncode, 0, f"from zelyr import * failed: {res_zelyr.stderr}")
@@ -137,7 +137,7 @@ class TestLegacyCompatibility(unittest.TestCase):
             "from axiom import *\n"
             "assert Engine is not None\n"
             "assert AxiomConfig is not None\n"
-            "assert __version__ == '1.2.0.dev0'\n"
+            "assert __version__ == '1.2.0rc1'\n"
         )
         res_axiom = subprocess.run([sys.executable, "-c", code_axiom], capture_output=True, text=True)
         self.assertEqual(res_axiom.returncode, 0, f"from axiom import * failed: {res_axiom.stderr}")
@@ -173,7 +173,7 @@ class TestCLIBehaviorAndStartup(unittest.TestCase):
             text=True,
         )
         self.assertEqual(res_ver.returncode, 0)
-        self.assertIn("zelyr 1.2.0.dev0", res_ver.stdout)
+        self.assertIn("zelyr 1.2.0rc1", res_ver.stdout)
 
         # 2. Help command
         res_help = subprocess.run(
