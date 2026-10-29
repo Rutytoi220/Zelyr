@@ -48,13 +48,14 @@ from zelyr.db.memory import add_message, create_session, get_session_messages
 COMMANDS = {
     "/help": "Show this command reference and usage guide",
     "/model": "Switch the active language or vision model",
-    "/session": "Create or switch to a different conversation session",
+    "/session": "Display session stats or switch/create conversation sessions",
     "/resume": "Reload and resume the previous session history",
-    "/clear": "Clear the screen and reset the current viewport",
+    "/clear": "Clear the screen and reset the conversation context window",
     "/effort": "Adjust reasoning effort tier (low -> adhd)",
     "/thought": "Display the last reasoning trace (or toggle with Ctrl+O)",
-    "/tools": "List active Three-Tier tools in registry",
-    "/memory": "Manage persistent semantic memories (/memory list, /memory add <fact>)",
+    "/tools": "List active Three-Tier and built-in tools in registry",
+    "/routine": "View active scheduled background routines and next run times",
+    "/memory": "Manage persistent semantic memories (/memory list, /memory add <fact>, /memory <query>)",
     "/rules": "Display active global and local project instructions",
     "/status": "Display live system, bridge, desktop, and tool telemetry",
     "/doctor": "Run diagnostic health checks across all 6 subsystems",
@@ -63,12 +64,13 @@ COMMANDS = {
 }
 
 slash_completer = WordCompleter(
-    list(COMMANDS.keys()) + ["/memory list", "/memory add", "/thought toggle"],
+    list(COMMANDS.keys()) + ["/memory list", "/memory add", "/thought toggle", "/session new"],
     meta_dict={
         **COMMANDS,
         "/thought toggle": "Toggle reasoning visibility (Expanded <-> Collapsed)",
         "/memory list": "Display all stored semantic memories",
         "/memory add": "Store a permanent fact in semantic memory",
+        "/session new": "Start a fresh conversation session",
         "/doctor": "Run diagnostic health checks across all 6 subsystems",
         "/undo": "Rollback the last modified file to its previous state",
     },
@@ -246,16 +248,30 @@ class InlineRepl:
 
     def __init__(self, session_id: Optional[str] = None):
         self.config = get_config()
-        self.session_id = session_id or f"session_{uuid.uuid4().hex[:12]}"
+        from zelyr.memory.sessions import SessionManager
+
+        self.session_mgr = SessionManager()
+        self.session_id = session_id or self.session_mgr.create_session(
+            title="CLI Session",
+            model_name=getattr(self.config, "ollama_model", "qwen2.5-coder:7b"),
+        )
+        if not self.session_mgr.get_session(self.session_id):
+            self.session_mgr.create_session(
+                self.session_id,
+                title="CLI Session",
+                model_name=getattr(self.config, "ollama_model", "qwen2.5-coder:7b"),
+            )
+        create_session(self.session_id, title="CLI Session")
+
         self.history_dir = config_dir()
         self.history_dir.mkdir(parents=True, exist_ok=True)
         self.history_file = self.history_dir / "repl_history"
 
-        create_session(self.session_id, title="CLI Session")
         self.orchestrator = NativeOrchestrator()
         load_plugins()
 
         self.last_thought: str = ""
+        self._current_task: Optional[asyncio.Task] = None
         kb = KeyBindings()
 
         @kb.add("c-o")
@@ -315,7 +331,13 @@ class InlineRepl:
 
         elif cmd == "/clear":
             clear_screen()
+            self.session_id = self.session_mgr.create_session(
+                title="CLI Session",
+                model_name=getattr(self.config, "ollama_model", "qwen2.5-coder:7b"),
+            )
+            create_session(self.session_id, title="CLI Session")
             self.print_banner()
+            console.print(f"[dim]Context window cleared. Active session: {self.session_id[:8]}[/dim]\n")
             return True
 
         elif cmd == "/help":
@@ -334,16 +356,61 @@ class InlineRepl:
             return True
 
         elif cmd == "/session":
-            if len(parts) > 1:
-                self.session_id = " ".join(parts[1:])
+            if len(parts) > 1 and parts[1].lower() in ("new", "--new"):
+                self.session_id = self.session_mgr.create_session(
+                    title="CLI Session",
+                    model_name=getattr(self.config, "ollama_model", "qwen2.5-coder:7b"),
+                )
+                create_session(self.session_id, title=self.session_id)
+                console.print(f"[success]✓ Started new session '{self.session_id}'.[/success]\n")
+                return True
+            elif len(parts) > 1:
+                target_id = " ".join(parts[1:]).strip()
+                if not self.session_mgr.get_session(target_id):
+                    self.session_mgr.create_session(
+                        target_id,
+                        title=target_id,
+                        model_name=getattr(self.config, "ollama_model", "qwen2.5-coder:7b"),
+                    )
+                self.session_id = target_id
                 create_session(self.session_id, title=self.session_id)
                 console.print(f"[success]✓ Switched to session '{self.session_id}'.[/success]\n")
+                return True
             else:
-                console.print(f"[dim]Current session ID: [/][#9ece6a]{self.session_id}[/]\n")
-            return True
+                sess = self.session_mgr.get_session(self.session_id)
+                messages = self.session_mgr.get_messages(self.session_id)
+                tokens = self.session_mgr.count_tokens(messages)
+                created_at = sess.get("created_at") if sess else time.time()
+                import datetime
+
+                created_str = (
+                    datetime.datetime.fromtimestamp(created_at).strftime("%Y-%m-%d %H:%M:%S")
+                    if isinstance(created_at, (int, float))
+                    else str(created_at)
+                )
+
+                panel_text = (
+                    f"[label]Session ID:[/label] [session]{self.session_id}[/session]\n"
+                    f"[label]Title:[/label] [value]{sess.get('title', 'CLI Session') if sess else 'CLI Session'}[/value]\n"
+                    f"[label]Active Model:[/label] [value]{getattr(self.config, 'ollama_model', 'qwen2.5-coder:7b')}[/value]\n"
+                    f"[label]Message Count:[/label] [value]{len(messages)}[/value] turns\n"
+                    f"[label]Estimated Tokens:[/label] [value]{tokens}[/value]\n"
+                    f"[label]Created At:[/label] [dim]{created_str}[/dim]"
+                )
+                console.print()
+                console.print(Panel(
+                    panel_text,
+                    title="[title]Active Session Information[/title]",
+                    border_style="#bb9af7",
+                    padding=(1, 2),
+                ))
+                console.print()
+                return True
 
         elif cmd == "/resume":
-            messages = get_session_messages(self.session_id)
+            messages = self.session_mgr.get_messages(self.session_id)
+            if not messages:
+                messages = get_session_messages(self.session_id)
             if not messages:
                 console.print(f"[dim]No message history found for session '{self.session_id}'.[/dim]\n")
                 return True
@@ -404,37 +471,85 @@ class InlineRepl:
                     console.print(f"[error]Failed to remove tool '{target_name}': {res.error}[/error]\n")
                 return True
             else:
+                from zelyr.tool_registry import ToolRegistry
                 from zelyr.tools.tool_manager import ToolManager
+
+                registry = ToolRegistry()
+                builtins = registry.get_builtin_tools()
                 dynamic_tools = ToolManager.list_tools()
 
                 table = Table(
-                    title="Active Dynamic Tools",
+                    title="Active Zelyr Tools",
                     box=rich.box.ROUNDED,
                     show_header=True,
                     header_style="bold #7aa2f7",
                 )
                 table.add_column("Tool Name", style="bold #e0af68")
-                table.add_column("Tier", justify="center", style="#7dcfff")
+                table.add_column("Source", justify="center", style="#7dcfff")
                 table.add_column("Ring", justify="center", style="#bb9af7")
                 table.add_column("Description", style="#c0caf5")
 
+                for bname, defn in sorted(builtins.items()):
+                    table.add_row(bname, "Built-in", "0" if bname != "echo" else "1", defn.description[:75])
                 for t in dynamic_tools:
-                    table.add_row(
-                        t["name"],
-                        str(t["tier"]),
-                        str(t["ring"]),
-                        t["description"] or "-",
-                    )
+                    table.add_row(t["name"], f"Dynamic (Tier {t['tier']})", str(t["ring"]), (t["description"] or "-")[:75])
 
                 console.print()
                 console.print(table)
-                console.print(f"[dim]Total: {len(dynamic_tools)} dynamic tools installed. Use /tools remove <name> to delete.[/dim]\n")
+                console.print(f"[dim]Total: {len(builtins) + len(dynamic_tools)} active tools. Use /tools remove <name> to delete dynamic plugins.[/dim]\n")
                 return True
+
+        elif cmd == "/routine":
+            try:
+                from zelyr.core.routine import RoutineDatabase
+
+                rdb = RoutineDatabase()
+                routines = rdb.sync_list_routines(include_disabled=True)
+                if not routines:
+                    console.print("[dim]No scheduled background routines found.[/dim]\n")
+                else:
+                    table = Table(
+                        title="Scheduled Autonomous Routines",
+                        box=rich.box.ROUNDED,
+                        show_header=True,
+                        header_style="bold #7aa2f7",
+                    )
+                    table.add_column("ID", style="#7dcfff")
+                    table.add_column("Name", style="bold #e0af68")
+                    table.add_column("Schedule", style="#bb9af7")
+                    table.add_column("Status", justify="center")
+                    table.add_column("Next Run", style="#9ece6a")
+                    table.add_column("Action", style="#c0caf5")
+
+                    import datetime
+
+                    for r in routines:
+                        status_str = "[green]ENABLED[/green]" if r.get("enabled", 1) else "[dim red]DISABLED[/dim red]"
+                        next_run = r.get("next_run_at")
+                        if isinstance(next_run, (int, float)):
+                            next_run_str = datetime.datetime.fromtimestamp(next_run).strftime("%Y-%m-%d %H:%M:%S")
+                        else:
+                            next_run_str = str(next_run or "Pending")
+                        table.add_row(
+                            str(r.get("id", "")),
+                            str(r.get("name", "")),
+                            f"{r.get('schedule_type')}: {r.get('schedule_expr')}",
+                            status_str,
+                            next_run_str,
+                            str(r.get("action_type", "")),
+                        )
+                    console.print()
+                    console.print(table)
+                    console.print(f"[dim]Total: {len(routines)} scheduled routines. Manage via 'zelyr routine'.[/dim]\n")
+            except Exception as exc:
+                console.print(f"[error]Could not query routine database: {exc}[/error]\n")
+            return True
 
         elif cmd == "/memory":
             subcmd = parts[1].lower().strip() if len(parts) > 1 else "list"
-            if subcmd == "list":
+            if subcmd == "list" or len(parts) == 1:
                 from zelyr.memory.semantic import get_all_memories
+
                 mems = get_all_memories()
                 if not mems:
                     console.print("[dim]No persistent semantic memories stored yet.[/dim]\n")
@@ -453,11 +568,29 @@ class InlineRepl:
                     console.print("[error]Usage: /memory add <fact to remember>[/error]\n")
                     return True
                 from zelyr.memory.semantic import add_memory
+
                 mem_id = add_memory(fact)
                 console.print(f"[success]✓ Remembered permanent fact (#{mem_id}):[/success] [value]{fact}[/value]\n")
                 return True
             else:
-                console.print("[error]Usage: /memory [list | add <fact>][/error]\n")
+                # Query / search
+                search_q = cmd_text.strip().split(" ", 1)[1].strip()
+                if search_q.startswith("search "):
+                    search_q = search_q[len("search "):].strip()
+                try:
+                    from zelyr.db.memory import MemoryStore
+
+                    store = MemoryStore()
+                    results = store.search(search_q, limit=10)
+                    if not results:
+                        console.print(f"[dim]No memories found matching query '{search_q}'.[/dim]\n")
+                    else:
+                        console.print(f"\n[title]Search Results for '{search_q}' ({len(results)}):[/title]")
+                        for r in results:
+                            console.print(f"  [value]#{r.get('id')}[/value] [label][{r.get('category')}][/label] [#c0caf5]{r.get('content')}[/]")
+                        console.print()
+                except Exception as exc:
+                    console.print(f"[error]Memory search error: {exc}[/error]\n")
                 return True
 
         elif cmd == "/rules":
@@ -814,20 +947,24 @@ class InlineRepl:
         # 0. Ensure local AI engine is responsive
         ensure_ollama_running(self.config.ollama_base_url)
 
-        # 1. Commit user message to DB
+        # 1. Commit user message to SessionManager and DB
+        self.session_mgr.append_message(self.session_id, "user", user_prompt)
         add_message(self.session_id, "user", user_prompt)
 
         # 2. Build payload with dynamic tools and session history
         tier = self.orchestrator.route_tier(user_prompt)
         from zelyr.core.plugins import filter_tool_schemas_by_tier
         dynamic_tools = filter_tool_schemas_by_tier(get_tool_schemas(0), tier)
-        history = get_session_messages(self.session_id)
+        history = self.session_mgr.get_messages(self.session_id)
         messages: List[Dict[str, Any]] = []
         for h in history:
             role = h.get("role")
             content = h.get("content")
             if role in ("user", "assistant") and content:
-                messages.append({"role": role, "content": content})
+                msg_entry: Dict[str, Any] = {"role": role, "content": content}
+                if h.get("tool_calls"):
+                    msg_entry["tool_calls"] = h["tool_calls"]
+                messages.append(msg_entry)
         if not messages or messages[-1].get("content") != user_prompt:
             messages.append({"role": "user", "content": user_prompt})
 
@@ -1004,7 +1141,22 @@ class InlineRepl:
                                 break
 
         except Exception as e:
-            console.print(f"\n[error]Streaming error: {e}[/error]")
+            err_str = str(e)
+            if "ConnectionRefused" in err_str or "11434" in err_str or "ConnectError" in err_str:
+                console.print(
+                    "\n[error]✗ LLM Connection Failure:[/error] "
+                    "Could not reach Ollama backend at "
+                    f"{getattr(self.config, 'ollama_base_url', 'http://127.0.0.1:11434')}.\n"
+                    "[dim]Remedy: Verify Ollama is running (`systemctl start ollama` or `ollama serve`).[/dim]\n"
+                )
+            elif "timeout" in err_str.lower():
+                console.print(
+                    "\n[error]✗ Model Inference Timeout:[/error] "
+                    "The model provider did not respond within the allocated timeout window.\n"
+                    "[dim]Remedy: Check model load status or try a smaller quantized model via /model.[/dim]\n"
+                )
+            else:
+                console.print(f"\n[error]✗ LLM Execution Error:[/error] {e}\n")
         finally:
             if in_think:
                 end_thought()
@@ -1017,9 +1169,15 @@ class InlineRepl:
         if last_thought_buffer:
             self.last_thought = "".join(last_thought_buffer).strip()
 
-        # 6. Persist assistant output to DB
+        # 6. Persist assistant output to SessionManager and DB
         final_text = "".join(full_content).strip()
         if final_text:
+            self.session_mgr.append_message(
+                self.session_id,
+                "assistant",
+                final_text,
+                tool_calls=tool_calls_emitted if tool_calls_emitted else None,
+            )
             add_message(self.session_id, "assistant", final_text)
 
     async def start_services(self) -> None:
@@ -1046,7 +1204,6 @@ class InlineRepl:
             await self.bridge.stop_server()
             self._bridge_server = None
 
-
     async def run_loop(self) -> None:
         """Main non-blocking interactive loop."""
         clear_screen()
@@ -1070,7 +1227,20 @@ class InlineRepl:
                         if self.handle_command(user_input):
                             continue
 
-                    await self.stream_response(user_input)
+                    try:
+                        turn_task = asyncio.create_task(self.stream_response(user_input))
+                        self._current_task = turn_task
+                        await turn_task
+                    except (KeyboardInterrupt, asyncio.CancelledError):
+                        if not turn_task.done():
+                            turn_task.cancel()
+                            try:
+                                await turn_task
+                            except (asyncio.CancelledError, KeyboardInterrupt):
+                                pass
+                        console.print("\n[dim yellow]⚡ Turn interrupted by user (Ctrl+C). Prior conversation context preserved.[/dim yellow]\n")
+                    finally:
+                        self._current_task = None
 
                 except (KeyboardInterrupt, EOFError):
                     console.print("\n[dim]Session closed.[/dim]")

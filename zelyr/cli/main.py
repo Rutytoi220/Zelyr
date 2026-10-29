@@ -91,26 +91,101 @@ def _spinner_context(label: str):
 # Command implementations
 # ===========================================================================
 
-def cmd_chat(_args: argparse.Namespace) -> None:
-    """Launch the Opencode-tier TUI (default when no sub-command is given)."""
-    server_proc = subprocess.Popen(
-        [sys.executable, "-m", "zelyr.cli.main", "server"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
-    
-    try:
-        from zelyr.cli.tui import run_tui
-        run_tui()
-    finally:
-        server_proc.terminate()
-        server_proc.wait()
+def cmd_chat(args: argparse.Namespace) -> None:
+    """Launch the interactive streaming chat REPL with multi-turn persistence."""
+    if getattr(args, "tui", False):
+        server_proc = subprocess.Popen(
+            [sys.executable, "-m", "zelyr.cli.main", "server"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            from zelyr.cli.tui import run_tui
+            run_tui()
+        finally:
+            server_proc.terminate()
+            server_proc.wait()
+        return
 
+    from zelyr.memory.sessions import SessionManager
 
-def cmd_repl(_args: argparse.Namespace) -> None:
-    """Launch the modern inline streaming CLI (Tokyo Night theme)."""
+    session_mgr = SessionManager()
+
+    # 1. Handle --list
+    if getattr(args, "list", False):
+        sessions = session_mgr.list_sessions(limit=50)
+        if not sessions:
+            _print("[dim]No conversation sessions found.[/dim]")
+            return
+
+        from rich.table import Table
+        import rich.box
+
+        table = Table(
+            title="Stored Conversation Sessions",
+            box=rich.box.ROUNDED if _RICH else None,
+            show_header=True,
+            header_style="bold #7aa2f7",
+        )
+        table.add_column("Session ID", style="bold #7dcfff")
+        table.add_column("Title", style="#c0caf5")
+        table.add_column("Model", style="#bb9af7")
+        table.add_column("Messages", justify="center", style="#9ece6a")
+        table.add_column("Updated", style="#a9b1d6")
+
+        import datetime
+
+        for s in sessions:
+            up = s.get("updated_at") or s.get("created_at") or 0
+            up_str = datetime.datetime.fromtimestamp(up).strftime("%Y-%m-%d %H:%M:%S") if up else "-"
+            table.add_row(
+                s["session_id"],
+                (s.get("title") or "New Session")[:40],
+                s.get("model_name") or "-",
+                str(s.get("message_count", 0)),
+                up_str,
+            )
+        if _console:
+            _console.print(table)
+        else:
+            _print(str(sessions))
+        return
+
+    # 2. Handle --delete
+    delete_id = getattr(args, "delete", None)
+    if delete_id:
+        deleted = session_mgr.delete_session(delete_id)
+        if deleted:
+            _print(f"[bold green]✓[/bold green] Deleted session [value]{delete_id}[/value].")
+        else:
+            _print(f"[bold red]✗[/bold red] Session not found: [value]{delete_id}[/value].")
+        return
+
+    # 3. Determine session ID
+    session_id = None
+    if getattr(args, "new", False):
+        session_id = session_mgr.create_session(title="New Session", model_name=getattr(args, "model", None))
+    elif getattr(args, "session", None):
+        session_id = args.session
+
+    # 4. Handle model override
+    model_override = getattr(args, "model", None)
+    if model_override:
+        from zelyr.config import get_config
+
+        cfg = get_config()
+        cfg.ollama_model = model_override
+        cfg.save()
+
+    # 5. Launch inline REPL
     from zelyr.cli.repl import run_repl
-    run_repl()
+
+    run_repl(session_id=session_id)
+
+
+def cmd_repl(args: argparse.Namespace) -> None:
+    """Launch the modern inline streaming CLI (alias for cmd_chat)."""
+    cmd_chat(args)
 
 
 def cmd_ui(_args: argparse.Namespace) -> None:
@@ -714,8 +789,14 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", metavar="<command>")
 
     # ── Primary commands ────────────────────────────────────────────────────
-    sub.add_parser("repl",   help="Modern inline streaming CLI (Tokyo Night, default)")
-    sub.add_parser("chat",   help="Opencode-tier full-screen TUI")
+    p_chat = sub.add_parser("chat", aliases=["repl"], help="Interactive streaming chat REPL with multi-turn persistence")
+    p_chat.add_argument("--session", "-s", type=str, default=None, help="Resume an existing session by ID or slug")
+    p_chat.add_argument("--new", "-n", action="store_true", help="Start a new conversation session")
+    p_chat.add_argument("--list", "-l", action="store_true", help="List recent conversation sessions")
+    p_chat.add_argument("--delete", "-d", type=str, default=None, help="Delete a stored session by ID")
+    p_chat.add_argument("--model", "-m", type=str, default=None, help="Override model for the chat session")
+    p_chat.add_argument("--tui", action="store_true", default=False, help="Launch full-screen TUI interface")
+
     sub.add_parser("ui",     aliases=["gui"], help="Launch the PySide6 desktop UI")
     sub.add_parser("server", help="Print Zelyr Distributed Server panel (stub)")
 

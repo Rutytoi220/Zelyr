@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Interactive Streaming REPL & Persistent Multi-Turn Chat Sessions (`zelyr chat` / `zelyr repl`)**:
+  - Implemented `SessionManager` in `zelyr.memory.sessions` providing thread-safe SQLite persistence for multi-turn conversations, tracking sessions, timestamps, model metadata, and turn-by-turn messages with tool call metadata.
+  - Added CLI session discovery commands: `zelyr chat --list`, `zelyr chat --session <id>`, `zelyr chat --new`, and `zelyr chat --delete <id>`.
+  - Built interactive inline streaming chat REPL (`zelyr.cli.repl.InlineRepl`) connected directly to `NativeOrchestrator`, with dynamic token streaming, collapsible thinking traces, and live tool execution telemetry.
+  - Added inline slash commands: `/help`, `/tools` (built-in + dynamic tools), `/memory [query]` (FTS5 search), `/routine` (scheduled background routines), `/session` (active session telemetry and switching), `/clear` (context reset), and `/exit`.
+  - Implemented graceful interruption handling: pressing `Ctrl+C` cancels an in-flight model or tool turn safely without terminating the REPL or corrupting conversational history.
+  - Added structured provider and network error containment for graceful diagnostic reporting without unhandled raw tracebacks.
+  - Preserved pure sub-100ms CLI startup latency invariance across `zelyr --version` and `zelyr --help`.
 - **Autonomous Routine Scheduler & Proactive Daemon Execution**:
   - Implemented persistent SQLite-backed routine engine in `zelyr.core.routine` supporting both cron expressions (`0 8 * * *`, `*/15 * * * *`) and interval schedules (`300s`, `60s`).
   - Added clean routine data models (`Routine`, `RoutineRun`) and `RoutineDatabase` with WAL journaling, schema migrations, and full execution history tracking.
