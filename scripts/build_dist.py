@@ -108,6 +108,19 @@ def main() -> int:
         outdir = ROOT / outdir
     outdir.mkdir(parents=True, exist_ok=True)
 
+    # Snapshot existing files in outdir before the build starts to deterministically
+    # distinguish newly generated artifacts without relying on fragile sub-millisecond
+    # filesystem timestamp inequalities or experiencing clock drift race conditions.
+    existing_meta: dict[Path, tuple[int, int]] = {}
+    if outdir.exists():
+        for path in outdir.iterdir():
+            try:
+                if path.is_file():
+                    st = path.stat()
+                    existing_meta[path] = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                pass
+
     temp_root = Path(tempfile.mkdtemp(prefix="zelyr-build-src-"))
     source = temp_root / "src"
     started = time.time()
@@ -128,15 +141,30 @@ def main() -> int:
         print(f"[build_dist] Building from isolated source: {source}")
         subprocess.run(cmd, cwd=source, check=True)
 
+        def is_new_artifact(path: Path) -> bool:
+            if not path.is_file():
+                return False
+            prev_meta = existing_meta.get(path)
+            if prev_meta is None:
+                return True
+            try:
+                st = path.stat()
+                prev_mtime_ns, prev_size = prev_meta
+                if st.st_mtime_ns > prev_mtime_ns or st.st_size != prev_size:
+                    return True
+                return st.st_mtime >= started
+            except OSError:
+                return False
+
         wheels = [
-            path for path in outdir.glob("*.whl") if path.stat().st_mtime >= started
+            path for path in outdir.glob("*.whl") if is_new_artifact(path)
         ]
         for wheel in wheels:
             _verify_wheel(wheel, source)
             print(f"[build_dist] Verified wheel contents: {wheel}")
 
         artifacts = sorted(
-            path for path in outdir.iterdir() if path.stat().st_mtime >= started
+            path for path in outdir.iterdir() if is_new_artifact(path)
         )
         if not artifacts:
             raise SystemExit("Build completed but no new artifact was found.")

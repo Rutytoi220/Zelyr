@@ -132,3 +132,31 @@ def test_main_builds_from_isolated_source_and_cleans_up(tmp_path, monkeypatch):
     assert observed["cwd"] == temp_root / "src"
     assert wheel.is_file()
     assert not temp_root.exists()
+
+
+def test_main_ignores_preexisting_artifacts_in_outdir(tmp_path, monkeypatch):
+    outdir = tmp_path / "dist"
+    outdir.mkdir()
+    stale_wheel = outdir / "zelyr_core-0.9.0-py3-none-any.whl"
+    stale_wheel.write_bytes(b"stale")
+    temp_root = tmp_path / "zelyr-build-src-preexisting"
+    temp_root.mkdir()
+    new_wheel = outdir / "zelyr_core-1.0.0-py3-none-any.whl"
+
+    monkeypatch.setattr(build_dist.tempfile, "mkdtemp", lambda **_: str(temp_root))
+    monkeypatch.setattr(
+        build_dist, "_copy_inputs", lambda destination: destination.mkdir(exist_ok=True)
+    )
+    verified = []
+    monkeypatch.setattr(build_dist, "_verify_wheel", lambda w, *_: verified.append(w))
+
+    def fake_build(command, cwd, check):
+        new_wheel.write_bytes(b"new")
+
+    monkeypatch.setattr(build_dist.subprocess, "run", fake_build)
+    monkeypatch.setattr(sys, "argv", ["build_dist.py", "--wheel", "--outdir", str(outdir)])
+
+    assert build_dist.main() == 0
+    assert new_wheel in verified
+    assert stale_wheel not in verified
+    assert not temp_root.exists()
