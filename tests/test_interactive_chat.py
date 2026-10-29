@@ -269,6 +269,139 @@ class TestInteractiveReplCommands:
         assert mock_repl.session_id != old_sid
 
 
+class TestReplBannerBranding:
+    """The inline REPL banner must carry canonical Zelyr branding."""
+
+    def test_banner_constant_is_zelyr_not_axiom(self):
+        from zelyr.cli.repl import BANNER
+
+        assert "AXIOM" not in BANNER.upper()
+        assert "Local-First AI Orchestrator" not in BANNER
+        assert "Zelyr" in BANNER
+        # Exact ZELYR ASCII-art rows.
+        for row in (
+            ' _____  _____  _     __   __ ____',
+            '|__  / | ____|| |    \\ \\ / /|  _ \\',
+            '  / /  |  _|  | |     \\ V / | |_) |',
+            ' / /_  | |___ | |___   | |  |  _ <',
+            '/____| |_____||_____|  |_|  |_| \\_\\',
+        ):
+            assert row in BANNER
+
+    def test_print_banner_output_has_no_axiom(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setattr("zelyr.cli.repl.ensure_ollama_running", lambda *a, **k: True)
+        from zelyr.cli.repl import InlineRepl, console
+
+        with patch("zelyr.memory.sessions._zelyr_data_dir", return_value=tmp_path):
+            repl = InlineRepl(session_id="banner-session")
+        with console.capture() as cap:
+            repl.print_banner()
+        out = cap.get()
+        assert "Zelyr" in out
+        assert "AXIOM" not in out.upper()
+
+
+class TestModelSelection:
+    """/model direct switching and arrow-key picker behavior."""
+
+    @pytest.fixture
+    def repl(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setattr("zelyr.cli.repl.ensure_ollama_running", lambda *a, **k: True)
+        from zelyr.cli.repl import InlineRepl
+
+        with patch("zelyr.memory.sessions._zelyr_data_dir", return_value=tmp_path):
+            r = InlineRepl(session_id="model-session")
+            r.session_mgr = SessionManager(tmp_path / "model_test.db")
+            r.session_id = r.session_mgr.create_session(
+                "model-session", title="Model", model_name="old-model:1b"
+            )
+            # Never write the real user config from tests.
+            monkeypatch.setattr(r.config, "ollama_model", "old-model:1b")
+            monkeypatch.setattr(r.config, "save", MagicMock())
+            yield r
+
+    @staticmethod
+    def _pty_pick(monkeypatch, keys: bytes, models, active):
+        """Run select_model_interactive against a real pty fed with ``keys``."""
+        import pty
+
+        from zelyr.cli import repl as repl_mod
+
+        master, slave = pty.openpty()
+        stdin = os.fdopen(slave, "r", closefd=True)
+        monkeypatch.setattr(sys, "stdin", stdin)
+        monkeypatch.setattr(sys, "stdout", open(os.devnull, "w"))
+        try:
+            # Whole sequence arrives in a single write, like a real terminal.
+            os.write(master, keys)
+            return repl_mod.select_model_interactive(models, active)
+        finally:
+            stdin.close()
+            os.close(master)
+
+    def test_arrow_down_then_enter_selects_next_model(self, monkeypatch):
+        models = ["a:1b", "b:3b", "c:7b"]
+        assert self._pty_pick(monkeypatch, b"\x1b[B\r", models, "a:1b") == "b:3b"
+
+    def test_arrow_up_wraps_and_application_mode_arrows(self, monkeypatch):
+        models = ["a:1b", "b:3b", "c:7b"]
+        assert self._pty_pick(monkeypatch, b"\x1b[A\r", models, "a:1b") == "c:7b"
+        assert self._pty_pick(monkeypatch, b"\x1bOB\x1bOB\r", models, "a:1b") == "c:7b"
+
+    def test_modified_arrow_sequence_is_not_cancel(self, monkeypatch):
+        models = ["a:1b", "b:3b"]
+        assert self._pty_pick(monkeypatch, b"\x1b[1;5B\r", models, "a:1b") == "b:3b"
+
+    def test_standalone_escape_and_ctrl_c_cancel(self, monkeypatch):
+        models = ["a:1b", "b:3b"]
+        assert self._pty_pick(monkeypatch, b"\x1b", models, "a:1b") is None
+        assert self._pty_pick(monkeypatch, b"\x03", models, "a:1b") is None
+
+    def test_non_tty_fallback_numbered_prompt(self, monkeypatch):
+        from zelyr.cli import repl as repl_mod
+
+        models = ["a:1b", "b:3b"]
+        monkeypatch.setattr(repl_mod.sys, "stdin", MagicMock(isatty=lambda: False))
+        monkeypatch.setattr(repl_mod.sys, "stdout", open(os.devnull, "w"))
+        with patch("builtins.input", return_value="2"):
+            assert repl_mod.select_model_interactive(models, "a:1b") == "b:3b"
+        with patch("builtins.input", return_value="custom:9b"):
+            assert repl_mod.select_model_interactive(models, "a:1b") == "custom:9b"
+        with patch("builtins.input", return_value=""):
+            assert repl_mod.select_model_interactive(models, "a:1b") is None
+
+    def test_model_direct_argument_updates_config_and_session(self, repl):
+        assert repl.handle_command("/model qwen2.5-coder:7b") is True
+        assert repl.config.ollama_model == "qwen2.5-coder:7b"
+        assert repl.session_mgr.get_session(repl.session_id)["model_name"] == "qwen2.5-coder:7b"
+        repl.config.save.assert_called()
+
+    def test_model_picker_selection_updates_session(self, repl):
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"models": [{"name": "old-model:1b"}, {"name": "new-model:3b"}]}
+        client = MagicMock()
+        client.__enter__.return_value.get.return_value = resp
+        with patch("httpx.Client", return_value=client), patch(
+            "zelyr.cli.repl.select_model_interactive", return_value="new-model:3b"
+        ) as picker:
+            assert repl.handle_command("/model") is True
+        picker.assert_called_once_with(["old-model:1b", "new-model:3b"], "old-model:1b")
+        assert repl.config.ollama_model == "new-model:3b"
+        assert repl.session_mgr.get_session(repl.session_id)["model_name"] == "new-model:3b"
+
+    def test_model_picker_cancel_leaves_model_unchanged(self, repl):
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"models": [{"name": "old-model:1b"}, {"name": "new-model:3b"}]}
+        client = MagicMock()
+        client.__enter__.return_value.get.return_value = resp
+        with patch("httpx.Client", return_value=client), patch(
+            "zelyr.cli.repl.select_model_interactive", return_value=None
+        ):
+            assert repl.handle_command("/model") is True
+        assert repl.config.ollama_model == "old-model:1b"
+        assert repl.session_mgr.get_session(repl.session_id)["model_name"] == "old-model:1b"
+
+
 class TestChatStreamingAndInterruption:
     """Tests for streaming token generation, interruption handling, and error containment."""
 

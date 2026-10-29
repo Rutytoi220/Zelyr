@@ -124,14 +124,14 @@ PROMPT_STYLE = Style.from_dict({
 BANNER = (
     r"[#7aa2f7 bold]"
     r"""
-     _   __  _____ ___  __  __ 
-    / \  \ \/ /_ _/ _ \|  \/  |
-   / _ \  \  / | | | | | |\/| |
-  / ___ \ /  \ | | |_| | |  | |
- /_/   \_\_/\_\___\___/|_|  |_|
+ _____  _____  _     __   __ ____
+|__  / | ____|| |    \ \ / /|  _ \
+  / /  |  _|  | |     \ V / | |_) |
+ / /_  | |___ | |___   | |  |  _ <
+/____| |_____||_____|  |_|  |_| \_\
 """
     r"[/#7aa2f7 bold]"
-    "\n[#a9b1d6]Local-First AI Orchestrator  ·  Three-Tier Semantic Automation  ·  Tokyo Night[/#a9b1d6]\n"
+    "\n[#a9b1d6]Zelyr Autonomous Agent Orchestrator[/#a9b1d6]\n"
 )
 
 
@@ -172,60 +172,79 @@ def ensure_ollama_running(base_url: str = "http://127.0.0.1:11434") -> bool:
 
 
 def select_model_interactive(models: List[str], active_model: str) -> Optional[str]:
-    """Interactive inline model selector using Tokyo Night palette and ANSI cursor keys."""
+    """Select a model using terminal arrow keys or a numbered text prompt."""
+    import os
     import select
     import termios
     import tty
 
-    if not models or not sys.stdin.isatty():
-        return models[0] if models else None
+    if not models:
+        return None
+    if not sys.stdin.isatty():
+        console.print("[title]Select Model[/title]")
+        for i, model in enumerate(models, 1):
+            marker = " (active)" if model == active_model else ""
+            console.print(f"  {i}. {model}{marker}")
+        try:
+            choice = input("Model number or name (Enter to cancel): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if not choice:
+            return None
+        if choice.isdigit() and 1 <= int(choice) <= len(models):
+            return models[int(choice) - 1]
+        return choice
 
-    idx = 0
-    if active_model in models:
-        idx = models.index(active_model)
-
+    idx = models.index(active_model) if active_model in models else 0
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
     num_lines = len(models)
 
     def render_list(current_idx: int) -> None:
-        for i, m in enumerate(models):
-            is_active = (m == active_model)
+        for i, model in enumerate(models):
+            is_active = model == active_model
             if i == current_idx:
                 tag = " \033[38;2;187;154;247m(active)\033[0m" if is_active else ""
-                sys.stdout.write(f"  \033[38;2;122;162;247m\033[1m▶ \033[0m\033[38;2;125;207;255m\033[1m{m}\033[0m{tag}\r\n")
+                sys.stdout.write(f"  \033[38;2;122;162;247m\033[1m▶ \033[0m\033[38;2;125;207;255m\033[1m{model}\033[0m{tag}\r\n")
             else:
                 tag = " \033[38;2;169;177;214m\033[2m(active)\033[0m" if is_active else ""
-                sys.stdout.write(f"    \033[38;2;169;177;214m{m}\033[0m{tag}\r\n")
+                sys.stdout.write(f"    \033[38;2;169;177;214m{model}\033[0m{tag}\r\n")
         sys.stdout.flush()
 
     try:
         tty.setraw(fd)
-        sys.stdout.write("\033[?25l")  # Hide cursor
+        sys.stdout.write("\033[?25l")
         sys.stdout.write("\r\n\033[38;2;122;162;247m\033[1mSelect Model\033[0m \033[38;2;169;177;214m(↑/↓: navigate, Enter: confirm, Esc: cancel)\033[0m\r\n")
         render_list(idx)
 
         while True:
-            r, _, _ = select.select([sys.stdin], [], [], None)
-            ch = sys.stdin.read(1)
-
+            select.select([fd], [], [], None)
+            ch = os.read(fd, 1).decode("utf-8", errors="ignore")
             if ch == "\x1b":
-                r2, _, _ = select.select([sys.stdin], [], [], 0.05)
-                if r2:
-                    c2 = sys.stdin.read(1)
-                    if c2 in ("[", "O"):
-                        c3 = sys.stdin.read(1)
-                        if c3 == "A":  # Up
-                            idx = (idx - 1) % num_lines
-                        elif c3 == "B":  # Down
-                            idx = (idx + 1) % num_lines
-                    sys.stdout.write(f"\033[{num_lines}A\r")
-                    render_list(idx)
-                else:
-                    return None  # Standalone Esc
+                # ESC begins a multibyte key sequence. Buffer its tail, with a
+                # short timeout reserved for a standalone Escape cancellation.
+                seq = ""
+                while len(seq) < 16:
+                    ready, _, _ = select.select([fd], [], [], 0.04)
+                    if not ready:
+                        break
+                    byte = os.read(fd, 1).decode("ascii", errors="ignore")
+                    if not byte:
+                        break
+                    seq += byte
+                    if len(seq) >= 2 and seq[0] in ("[", "O") and (byte.isalpha() or byte == "~"):
+                        break
+                if not seq:
+                    return None
+                if seq.endswith("A"):
+                    idx = (idx - 1) % num_lines
+                elif seq.endswith("B"):
+                    idx = (idx + 1) % num_lines
+                sys.stdout.write(f"\033[{num_lines}A\r")
+                render_list(idx)
             elif ch in ("\r", "\n"):
                 return models[idx]
-            elif ch == "\x03":  # Ctrl+C
+            elif ch in ("\x03",):
                 return None
             elif ch in ("k", "K"):
                 idx = (idx - 1) % num_lines
@@ -236,7 +255,6 @@ def select_model_interactive(models: List[str], active_model: str) -> Optional[s
                 sys.stdout.write(f"\033[{num_lines}A\r")
                 render_list(idx)
     finally:
-        # Erase the selection lines and restore cursor
         sys.stdout.write(f"\033[{num_lines + 2}A\r\033[J")
         sys.stdout.write("\033[?25h")
         sys.stdout.flush()
@@ -431,6 +449,7 @@ class InlineRepl:
                 target_model = parts[1].strip()
                 self.config.ollama_model = target_model
                 self.config.save()
+                self.session_mgr.update_model_name(self.session_id, target_model)
                 console.print(f"[success]✓ Switched model to: {target_model}[/success]\n")
                 return True
 
@@ -448,6 +467,7 @@ class InlineRepl:
                         if selected:
                             self.config.ollama_model = selected
                             self.config.save()
+                            self.session_mgr.update_model_name(self.session_id, selected)
                             console.print(f"[success]✓ Switched model to: {selected}[/success]\n")
                         else:
                             console.print("[dim]Model selection cancelled.[/dim]\n")

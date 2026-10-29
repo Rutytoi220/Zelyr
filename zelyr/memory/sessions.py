@@ -173,6 +173,15 @@ class SessionManager:
                 "message_count": count,
             }
 
+    def update_model_name(self, session_id: str, model_name: str) -> bool:
+        """Persist the model currently selected for a session."""
+        with self._get_conn() as conn:
+            cursor = conn.execute(
+                "UPDATE sessions SET model_name = ?, updated_at = ? WHERE session_id = ?",
+                (model_name, time.time(), session_id),
+            )
+        return cursor.rowcount > 0
+
     def list_sessions(self, limit: int = 50) -> List[Dict[str, Any]]:
         """Return a list of recent sessions ordered by latest activity."""
         with self._get_conn() as conn:
