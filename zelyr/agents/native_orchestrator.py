@@ -38,6 +38,11 @@ class NativeOrchestrator:
         self._execute_tool = execute_tool or tool_executor
         self.db_path = db_path
 
+        from zelyr.engine.budget_manager import ContextBudgetEngine
+        self.budget_engine = ContextBudgetEngine(
+            default_max_tokens=self._explicit_max_context_tokens or 8192,
+        )
+
     @property
     def max_context_tokens(self) -> int:
         from zelyr.config import get_config
@@ -169,43 +174,18 @@ class NativeOrchestrator:
         messages: list[dict],
         max_context_tokens: Optional[int] = None,
         reserve_tokens: int = 1000,
+        model_name: Optional[str] = None,
     ) -> list[dict]:
-        """Sliding window context budgeting: keeps system directives, initial turn,
-        and latest turns within (max_context_tokens - reserve_tokens).
+        """Adaptive context window budgeting: applies Stage 1 tool compaction and Stage 2
+        sliding-window turn pruning with semantic summarization.
         """
-        max_tokens = max_context_tokens or self.max_context_tokens
-        budget = max_tokens - reserve_tokens
-
-        system_messages = [m for m in messages if m.get("role") == "system"]
-        conv_messages = [m for m in messages if m.get("role") != "system"]
-
-        if not conv_messages:
-            return messages
-
-        total_conv_tokens = sum(self.count_message_tokens(m) for m in conv_messages)
-        if total_conv_tokens <= budget:
-            return messages
-
-        # Initial turn is conv_messages[0]
-        initial_turn = conv_messages[0]
-        remaining = conv_messages[1:]
-
-        initial_tokens = self.count_message_tokens(initial_turn)
-        avail_budget = max(budget - initial_tokens, 0)
-
-        # Retain as many latest turns as fit within avail_budget
-        kept_latest = []
-        current_tokens = 0
-        for msg in reversed(remaining):
-            msg_tokens = self.count_message_tokens(msg)
-            if current_tokens + msg_tokens <= avail_budget or not kept_latest:
-                kept_latest.insert(0, msg)
-                current_tokens += msg_tokens
-            else:
-                break
-
-        pruned_conv = [initial_turn] + kept_latest
-        return system_messages + pruned_conv
+        eff_max = max_context_tokens or self.max_context_tokens
+        return self.budget_engine.apply_context_budget(
+            messages,
+            model_name=model_name,
+            max_context_tokens=eff_max,
+            reserve_tokens=reserve_tokens,
+        )
 
     async def fetch_dynamic_context_length(self, model: str, base_url: str) -> Optional[int]:
         """Attempt to read context length dynamically from Ollama /api/show."""
@@ -569,11 +549,13 @@ class NativeOrchestrator:
             else:
                 payload["messages"][0]["content"] += f"\n\n{system_prompt_content}"
 
-        # Apply sliding window context budgeting on every step to prevent HTTP 400 overflows
+        # Apply adaptive context window budgeting and historical tool compaction
+        eff_model = payload.get("model") or config.ollama_model
         payload["messages"] = self.prune_messages(
             payload.get("messages", []),
             max_context_tokens=self.max_context_tokens,
             reserve_tokens=1000,
+            model_name=eff_model,
         )
         user_query_for_intent = ""
         for msg in reversed(payload.get("messages", [])):

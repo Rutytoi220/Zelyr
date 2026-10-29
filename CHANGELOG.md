@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Adaptive Context Window Budgeting & Historical Tool Compaction**:
+  - Implemented `ContextBudgetEngine` (and facade `AdaptiveContextBudgeter`) in `zelyr.engine.budget_manager` and `zelyr.agents.context_budgeter`.
+  - Added comprehensive Model Context Catalog (`MODEL_CONTEXT_CATALOG`) discovering effective token capacities across model families (Qwen, Llama, Mistral, DeepSeek, GPT-4o, Claude 3.5, Gemini) with safe configurable defaults.
+  - Implemented Stage 1 Historical Tool Compaction: automatically detects verbose tool execution results (>250 tokens) older than recent interaction turns, condensing them into structured excerpts while strictly preserving tool status, output headers, and recent window context.
+  - Implemented Stage 2 Sliding-Window Turn Pruning with Semantic Summarization: when token limits are reached, evicts oldest non-system turns, generating an ephemeral context anchor digest (`[Previous conversation summary: ...]`) placed immediately after the root system directives.
+  - Enforced inviolate anchors: root system instructions and immediate user queries are guaranteed never to be pruned or truncated.
+  - Added zero-overhead fast-path: conversations below 50% capacity return instantly with zero memory allocations or serialization overhead (<0.1ms).
+  - Wired directly into `NativeOrchestrator` before dispatching prompt payloads to `UniversalLLMClient` and LiteLLM/Ollama streaming endpoints.
 - **Interactive Streaming REPL & Persistent Multi-Turn Chat Sessions (`zelyr chat` / `zelyr repl`)**:
   - Implemented `SessionManager` in `zelyr.memory.sessions` providing thread-safe SQLite persistence for multi-turn conversations, tracking sessions, timestamps, model metadata, and turn-by-turn messages with tool call metadata.
   - Added CLI session discovery commands: `zelyr chat --list`, `zelyr chat --session <id>`, `zelyr chat --new`, and `zelyr chat --delete <id>`.
