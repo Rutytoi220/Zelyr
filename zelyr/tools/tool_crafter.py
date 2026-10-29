@@ -8,14 +8,13 @@ contract validation, and privilege escalation guards (no generated tools at Ring
 from __future__ import annotations
 
 import ast
-import json
 import logging
-import os
 import re
+import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from zelyr.core.plugins import reload_plugin, unregister_plugin
 from zelyr.db.memory import MemoryStore
@@ -24,9 +23,18 @@ from zelyr.tools.validator import ToolValidator
 
 logger = logging.getLogger(__name__)
 
+__all__ = [
+    "craft_tool",
+    "_extract_schema_metadata_from_code",
+    "reload_plugin",
+    "unregister_plugin",
+]
 
-def _extract_schema_metadata_from_code(code: str) -> Tuple[Optional[str], Optional[str]]:
-    """Statically inspect tool candidate code to extract tool name and description if possible."""
+
+def _extract_schema_metadata_from_code(
+    code: str,
+) -> Tuple[Optional[str], Optional[str], Optional[Dict[str, Any]]]:
+    """Statically inspect tool candidate code to extract tool name, description, and schema."""
     try:
         tree = ast.parse(code)
         for node in tree.body:
@@ -35,40 +43,38 @@ def _extract_schema_metadata_from_code(code: str) -> Tuple[Optional[str], Option
                     if isinstance(target, ast.Name) and target.id == "TOOL_SCHEMA":
                         if isinstance(node.value, ast.Dict):
                             for k, v in zip(node.value.keys, node.value.values):
-                                if isinstance(k, ast.Constant) and k.value == "function" and isinstance(v, ast.Dict):
+                                if (
+                                    isinstance(k, ast.Constant)
+                                    and k.value == "function"
+                                    and isinstance(v, ast.Dict)
+                                ):
                                     name_val = None
                                     desc_val = None
+                                    params_val = None
                                     for fk, fv in zip(v.keys, v.values):
                                         if isinstance(fk, ast.Constant):
                                             if fk.value == "name" and isinstance(fv, ast.Constant):
                                                 name_val = str(fv.value)
                                             elif fk.value == "description" and isinstance(fv, ast.Constant):
                                                 desc_val = str(fv.value)
-                                    return name_val, desc_val
+                                            elif fk.value == "parameters" and isinstance(fv, ast.Dict):
+                                                try:
+                                                    params_val = ast.literal_eval(fv)
+                                                except Exception:
+                                                    pass
+                                    return name_val, desc_val, params_val
     except Exception:
         pass
-    return None, None
+    return None, None, None
 
 
-async def craft_tool(
+async def _legacy_craft_tool(
     name: str,
     code: str,
     test_params: Optional[Dict[str, Any]] = None,
     db_path: Optional[str] = None,
     tools_dir: Optional[Path] = None,
 ) -> ToolResult:
-    """Synthesize, validate, test, register, and hot-reload a new tool.
-
-    Steps:
-      1. Tool name validation format (^[a-zA-Z_][a-zA-Z0-9_]*$).
-      2. Duplicate capability prevention via MemoryStore(category='capability').
-      3. Complete contract & staging validation via ToolValidator.
-      4. Privilege escalation check: candidate tools CANNOT declare REQUIRED_RING = 0.
-      5. Atomic write to tools.d/{name}.py.
-      6. Hot-reload via reload_plugin(name).
-      7. MemoryStore capability indexing verification.
-      8. Return structured ToolResult.
-    """
     clean_name = (name or "").strip()
     if not clean_name or not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", clean_name):
         return ToolResult(
@@ -79,7 +85,6 @@ async def craft_tool(
     store = MemoryStore(db_path=db_path)
 
     # 1. Duplicate Capability Prevention
-    # Check exact tool key
     key = f"tool.{clean_name}"
     existing_by_key = store.get_by_key(key)
     if existing_by_key and existing_by_key.get("is_active"):
@@ -92,7 +97,7 @@ async def craft_tool(
         )
 
     # Statically extract candidate description to check semantic duplicate
-    _, cand_desc = _extract_schema_metadata_from_code(code)
+    _, cand_desc, _ = _extract_schema_metadata_from_code(code)
     if cand_desc:
         cand_desc_clean = cand_desc.strip().lower()
         active_caps = store.search(cand_desc_clean, category="capability", limit=5)
@@ -119,7 +124,6 @@ async def craft_tool(
             error=f"Validation failed: {val_res.error}",
         )
 
-    # Tool name matching
     if val_res.tool_name and val_res.tool_name != clean_name:
         return ToolResult(
             success=False,
@@ -138,11 +142,11 @@ async def craft_tool(
 
     # 4. Atomic Installation & Hot-Reload
     from zelyr.config import get_config_dir
+
     target_dir = tools_dir or (get_config_dir() / "tools.d")
     target_dir.mkdir(parents=True, exist_ok=True)
     target_file = target_dir / f"{clean_name}.py"
 
-    # Atomic write via temporary file in target_dir
     tmp_file = target_dir / f".tmp_{clean_name}_{uuid.uuid4().hex}.py"
     try:
         tmp_file.write_text(code, encoding="utf-8")
@@ -159,24 +163,23 @@ async def craft_tool(
         )
 
     # Hot reload with Rollback
+    this_mod = sys.modules.get(__name__)
+    active_reload = getattr(this_mod, "reload_plugin", reload_plugin)
     try:
-        reload_plugin(target_file)
+        active_reload(target_file)
     except Exception as err:
         logger.warning("reload_plugin failed for %s: %s. Rolling back installation.", target_file, err)
-        # Rollback: remove target_file immediately
         if target_file.exists():
             try:
                 target_file.unlink()
             except OSError:
                 pass
 
-        # Clean up any partial schemas or cached modules
         try:
             unregister_plugin(clean_name)
         except Exception:
             pass
 
-        # Soft-delete capability record if created in MemoryStore
         try:
             cap_record = store.get_by_key(f"tool.{clean_name}")
             if cap_record:
@@ -193,6 +196,7 @@ async def craft_tool(
 
         try:
             from zelyr.memory.capability_indexer import reconcile_tool_capabilities
+
             reconcile_tool_capabilities(store=store, tools_dir=target_dir)
         except Exception:
             pass
@@ -202,9 +206,9 @@ async def craft_tool(
             error=f"Installation failed during reload: {err}. File and runtime state rolled back.",
         )
 
-    # Confirm capability indexed into MemoryStore
     try:
         from zelyr.memory.capability_indexer import index_tool_capabilities
+
         index_tool_capabilities(store=store, tools_dir=target_dir)
     except Exception as e:
         logger.warning("Capability indexing failed for %s: %s", clean_name, e)
@@ -219,3 +223,55 @@ async def craft_tool(
             "ring": val_res.ring,
         },
     )
+
+
+async def craft_tool(
+    name: str,
+    code: str,
+    description: Optional[str] = None,
+    parameters: Optional[Dict[str, Any]] = None,
+    test_code: Optional[str] = None,
+    persist: bool = False,
+    registry: Optional[Any] = None,
+    test_params: Optional[Dict[str, Any]] = None,
+    db_path: Optional[str] = None,
+    tools_dir: Optional[Path] = None,
+    **kwargs: Any,
+) -> ToolResult:
+    """Synthesize, validate against Ring-0 AST rules, test in an isolated sandbox, and register a new tool."""
+    # Check if legacy plugin format with TOOL_SCHEMA and no test_code
+    if test_code is None and "TOOL_SCHEMA" in code:
+        return await _legacy_craft_tool(
+            name=name,
+            code=code,
+            test_params=test_params,
+            db_path=db_path,
+            tools_dir=tools_dir,
+        )
+
+    from zelyr.engine.tool_crafter import ToolCrafterEngine
+
+    engine = ToolCrafterEngine(registry=registry, tools_dir=tools_dir)
+    return await engine.craft_tool(
+        name=name,
+        code=code,
+        description=description,
+        parameters=parameters,
+        test_code=test_code,
+        persist=persist,
+        registry=registry,
+        tools_dir=tools_dir,
+        test_params=test_params,
+        db_path=db_path,
+        **kwargs,
+    )
+
+
+def __getattr__(attr_name: str) -> Any:
+    if attr_name in ("DynamicSynthesizedTool", "ToolCrafterEngine", "ToolCrafterTool"):
+        import zelyr.engine.tool_crafter as etc_mod
+
+        val = getattr(etc_mod, attr_name)
+        globals()[attr_name] = val
+        return val
+    raise AttributeError(f"module {__name__!r} has no attribute {attr_name!r}")

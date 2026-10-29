@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Autonomous Tool Crafting & Runtime Skill Compilation (`craft_tool`)**:
+  - Implemented `ToolCrafterEngine`, `DynamicSynthesizedTool`, and `ToolCrafterTool` in `zelyr.engine.tool_crafter` and unified `craft_tool` in `zelyr.tools.tool_crafter`.
+  - Added two-phase gatekeeper architecture:
+    - **Static Gate**: Ring-0 AST analysis enforcing strict prohibition of dangerous module imports (`os`, `subprocess`, `sys`, `shutil`, `ctypes`, `socket`, `importlib`), reflection escapes (`__subclasses__`, `__globals__`, `__code__`, `__class__`), and Ring 0 privilege escalation before dynamic execution.
+    - **Dynamic Gate**: Companion test code and candidate logic execute inside an isolated child worker process via `SandboxedPluginRunner` under POSIX virtual memory ceilings (512 MB default) and bounded timeouts, containing crashes, assertions, and infinite loops.
+  - Implemented `DynamicSynthesizedTool` conforming to `BaseTool` and `ZelyrTool` protocols, providing both synchronous and non-blocking asynchronous execution via process-isolated workers.
+  - Added session hot-loading: newly crafted tools are dynamically registered into `ToolRegistry` and exposed via `get_tool_schemas()` for immediate discovery and invocation within the active session.
+  - Supported ephemeral in-memory lifecycles (`persist=False`) as well as atomic disk persistence (`persist=True`) to `tools.d/` with synthesized `TOOL_SCHEMA` headers and automatic rollback containment.
+  - Integrated `craft_tool` into `SWARM_TOOLS` in `ToolRegistry`, exposed to `CoderAgent` in `SUBAGENT_PROFILES`, and updated Tier 1 system prompt directives.
+  - Added `get_tool_schemas()` alias on `ToolRegistry` and `validate_code` alias on `SecurityASTValidator` / `ASTValidator`.
+  - Authored comprehensive test suite in `tests/test_tool_crafter.py` (18/18 passed).
 - **Hierarchical Multi-Agent Subagent Delegation & Transactional Blackboard Coordination (`delegate_subtask`)**:
   - Implemented `SubagentDelegationTool` and `DelegatedSubagent` in `zelyr.agents.swarm.delegation` and facade `zelyr.tools.subagent_tool`.
   - Added specialized worker role profiles (`coder`, `tester`, `researcher`, `reviewer`, `general`) with curated allowed tool allocations, system prompt rails, and capability ring gating.

@@ -123,10 +123,9 @@ class NativeOrchestrator:
             pass
         return None
 
-    @classmethod
-    async def get_active_window_context(cls) -> Optional[str]:
+    async def get_active_window_context(self) -> Optional[str]:
         """Query hyprctl activewindow -j non-blockingly and format telemetry header."""
-        data = await cls.get_active_window()
+        data = await self.get_active_window()
         if not data:
             return None
         title = data.get("title", "")
@@ -566,7 +565,14 @@ class NativeOrchestrator:
                 elif isinstance(c, list):
                     user_query_for_intent = " ".join(part.get("text", "") for part in c if isinstance(part, dict))
                 break
-        user_query_for_intent = re.sub(r"^\[Active Window:[^\]]*\]\s*", "", user_query_for_intent)
+        if user_query_for_intent.startswith("[Active Window:"):
+            parts = user_query_for_intent.split("\n", 1)
+            if len(parts) > 1:
+                user_query_for_intent = parts[1]
+            else:
+                user_query_for_intent = re.sub(r"^\[Active Window:.*?\]\s*", "", user_query_for_intent)
+        else:
+            user_query_for_intent = re.sub(r"^\[Active Window:[^\]]*\]\s*", "", user_query_for_intent)
         is_interface_action = self.is_interface_action_query(user_query_for_intent)
 
         # Inspect query intent, active window, and bridge connectivity to filter active schemas

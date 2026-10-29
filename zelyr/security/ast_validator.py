@@ -219,6 +219,14 @@ class SecurityASTValidator(ast.NodeVisitor):
         validator = cls()
         validator.visit(tree)
 
+    @classmethod
+    def validate_code(cls, code: str) -> None:
+        """Alias for validate conforming to tool crafter and security interfaces."""
+        cls.validate(code)
+
+
+ASTValidator = SecurityASTValidator
+
 
 def validate_python_code(code: str) -> None:
     """Validate Python code against AST sandbox rules."""

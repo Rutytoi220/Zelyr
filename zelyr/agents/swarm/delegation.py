@@ -87,6 +87,7 @@ SUBAGENT_PROFILES: Dict[str, SubagentProfile] = {
             "echo",
             "blackboard_write",
             "blackboard_read",
+            "craft_tool",
         ],
         system_prompt=(
             "You are CoderAgent, a specialist subagent in software development and refactoring. "

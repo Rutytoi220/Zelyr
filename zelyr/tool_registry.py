@@ -131,6 +131,12 @@ SWARM_TOOLS: Dict[str, BuiltinToolDef] = {
         module_path="zelyr.tools.subagent_tool",
         class_name="SubagentDelegationTool",
     ),
+    "craft_tool": BuiltinToolDef(
+        tool_id="craft_tool",
+        description="Synthesize, validate against Ring-0 AST rules, test in an isolated sandbox, and dynamically register a new Python tool.",
+        module_path="zelyr.engine.tool_crafter",
+        class_name="ToolCrafterTool",
+    ),
 }
 
 class ToolRegistryError(Exception):
@@ -238,6 +244,10 @@ Returns:
         with self._lock:
             if not self._core_registry.has_tool(tool_id):
                 instance = defn.instantiate()
+                if hasattr(instance, "set_registry"):
+                    instance.set_registry(self)
+                elif hasattr(instance, "tool_registry") and instance.tool_registry is None:
+                    instance.tool_registry = self
                 self._core_registry.register_tool(tool_id, instance)
                 return instance
             return self._core_registry.get_tool(tool_id)
@@ -290,6 +300,10 @@ Returns:
                 continue
             schemas.append({'type': 'function', 'function': {'name': tool_id, 'description': tool.description or tool_id, 'parameters': tool.schema or {'type': 'object', 'properties': {}}}})
         return schemas
+
+    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+        """Return OpenAI-compatible function-calling schemas for all active tools."""
+        return self.get_schemas()
 
     def _pre_validate_path(self, tool_id: str, arguments: Dict[str, Any]) -> Optional[ToolResult]:
         """Intercept slang or hallucinatory file paths before execution."""

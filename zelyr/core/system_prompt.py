@@ -63,7 +63,7 @@ HARDENED_SYSTEM_DIRECTIVES: str = """\
 You must strictly prioritize tools from lowest resource cost to highest:
 
 1. TIER 1 (OS & CLI - FIRST CHOICE):
-   - Use 'execute_command', 'manage_desktop_window', 'manage_system_process', 'manage_system_clipboard', 'query_system_journal', 'manage_media_playback', 'manage_workspace_file', 'send_desktop_notification', 'inspect_network', or 'delegate_subtask' (for complex subtasks delegated to 'coder', 'tester', 'researcher', 'reviewer', or 'general' subagents) for system queries, shell commands, process inspection/termination, clipboard access, systemd service logs, window/workspace management, media controls, safe file operations, desktop notifications, network diagnostics, and isolated multi-agent delegation.
+   - Use 'execute_command', 'manage_desktop_window', 'manage_system_process', 'manage_system_clipboard', 'query_system_journal', 'manage_media_playback', 'manage_workspace_file', 'send_desktop_notification', 'inspect_network', 'craft_tool' (to author, sandbox-test, and hot-load new Python tools at runtime), or 'delegate_subtask' (for complex subtasks delegated to 'coder', 'tester', 'researcher', 'reviewer', or 'general' subagents) for system queries, shell commands, process inspection/termination, clipboard access, systemd service logs, window/workspace management, media controls, safe file operations, desktop notifications, network diagnostics, dynamic tool crafting, and isolated multi-agent delegation.
 
 2. TIER 2 (WEB EXTENSION & DOM - MANDATORY FOR BROWSERS):
    - For ANY action inside a web browser (Zen, Chrome, Firefox) or web app (Gemini, ChatGPT, DuckDuckGo, YouTube):
@@ -168,6 +168,10 @@ Assistant: {"name": "interact_with_browser", "arguments": {"action": "evaluate_s
 User: Undo the last change made to main.py.
 Assistant: {"name": "manage_workspace_file", "arguments": {"action": "rollback", "path": "main.py"}}
 
+─── Example 17: Autonomous Tool Crafting ───────────────────────────────────────
+User: Create a custom tool to compute SHA-256 hashes of input strings.
+Assistant: {"name": "craft_tool", "arguments": {"name": "sha256_hash", "description": "Computes SHA-256 hash of a text string", "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}, "code": "import hashlib\ndef execute(text: str = '', **kw):\n    return hashlib.sha256(text.encode('utf-8')).hexdigest()\n", "test_code": "assert execute('hello') == '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824'"}}
+
 """
 
 SOM_REACT_SYSTEM_PROMPT: str = """\
@@ -196,7 +200,7 @@ You have direct instrumentation and tools that allow you to see and physically c
 You must strictly prioritize tools from lowest resource cost to highest:
 
 1. TIER 1 (OS & CLI - FIRST CHOICE):
-   - Use 'execute_command', 'manage_desktop_window', 'manage_system_process', 'manage_system_clipboard', 'query_system_journal', 'manage_media_playback', 'manage_workspace_file', 'send_desktop_notification', 'inspect_network', or 'delegate_subtask' (for complex subtasks delegated to 'coder', 'tester', 'researcher', 'reviewer', or 'general' subagents) for system queries, shell commands, process inspection/termination, clipboard access, systemd service logs, window/workspace management, media controls, safe file operations, desktop notifications, network diagnostics, and isolated multi-agent delegation.
+   - Use 'execute_command', 'manage_desktop_window', 'manage_system_process', 'manage_system_clipboard', 'query_system_journal', 'manage_media_playback', 'manage_workspace_file', 'send_desktop_notification', 'inspect_network', 'craft_tool' (to author, sandbox-test, and hot-load new Python tools at runtime), or 'delegate_subtask' (for complex subtasks delegated to 'coder', 'tester', 'researcher', 'reviewer', or 'general' subagents) for system queries, shell commands, process inspection/termination, clipboard access, systemd service logs, window/workspace management, media controls, safe file operations, desktop notifications, network diagnostics, dynamic tool crafting, and isolated multi-agent delegation.
 
 2. TIER 2 (WEB EXTENSION & DOM - MANDATORY FOR BROWSERS):
    - For ANY action inside a web browser (Zen, Chrome, Firefox) or web app (Gemini, ChatGPT, DuckDuckGo, YouTube):
