@@ -15,6 +15,32 @@ if [ ! -f "main.py" ] || [ ! -d "scripts" ]; then
     exit 1
 fi
 
+# Resolve the release version: $1, then $VERSION, then pyproject.toml.
+# A leading "v" is stripped so both "v1.2.0-rc1" and "1.2.0-rc1" are accepted.
+VERSION="${1:-${VERSION:-}}"
+if [ -z "$VERSION" ]; then
+    VERSION="$(python3 - <<'PY' 2>/dev/null || true
+import re
+try:
+    import tomllib
+    with open("pyproject.toml", "rb") as fh:
+        print(tomllib.load(fh)["project"]["version"])
+except Exception:
+    with open("pyproject.toml", encoding="utf-8") as fh:
+        match = re.search(r'^version\s*=\s*"([^"]+)"', fh.read(), re.M)
+        if match:
+            print(match.group(1))
+PY
+)"
+fi
+VERSION="${VERSION#v}"
+if [ -z "$VERSION" ]; then
+    echo -e "${RED}[ERROR]${NC} Could not determine version; pass it as \$1 or set VERSION."
+    exit 1
+fi
+APPIMAGE_NAME="Zelyr-v${VERSION}-x86_64.AppImage"
+echo -e "${BLUE}[INFO]${NC} Building ${APPIMAGE_NAME}"
+
 # 1. Setup & Compilation (PyInstaller)
 echo -e "${BLUE}[INFO]${NC} Creating venv and installing PyInstaller..."
 uv venv --python 3.11 --clear
@@ -107,9 +133,9 @@ fi
 
 echo -e "${BLUE}[INFO]${NC} Packaging AppImage..."
 # Run appimagetool silently to avoid noisy stdout, but set -e ensures we catch exit codes
-./appimagetool-x86_64.AppImage "$APPDIR" Zelyr-v1.0.0-x86_64.AppImage > /dev/null
+./appimagetool-x86_64.AppImage "$APPDIR" "$APPIMAGE_NAME" > /dev/null
 
 echo -e "${BLUE}[INFO]${NC} Cleaning up temporary AppDir..."
 rm -rf "$APPDIR"
 
-echo -e "${GREEN}[SUCCESS]${NC} Build complete! Distributable AppImage has been generated."
+echo -e "${GREEN}[SUCCESS]${NC} Build complete! Generated ${APPIMAGE_NAME}"
