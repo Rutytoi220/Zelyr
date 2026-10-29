@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Remote Model Context Protocol (MCP) Server-Sent Events (SSE) Client Transport**:
+  - Implemented asynchronous `MCPSSEClient` in `zelyr.mcp.sse_client` using `httpx.AsyncClient` with streaming response ingestion for remote tool federation.
+  - Added protocol handshake and dynamic endpoint negotiation listening for initial SSE `endpoint` events to resolve HTTP POST target URLs.
+  - Implemented robust request-response correlation over HTTP POST and incoming SSE `message` events using JSON-RPC 2.0 message IDs and `asyncio.Future`s.
+  - Integrated resilient background read loop with exponential reconnection backoff (1s up to 15s max) and keepalive ping handling.
+  - Implemented tool federation via `tools/list` schema extraction, prefix namespacing `mcp__<server_name>__<tool_name>`, and integration into `ToolRegistry`.
+  - Added dynamic SSE configuration support in `MCPManager` (`transport: "sse"`, `url: ...`, `headers: ...`) and re-exported client in `zelyr.server.mcp_sse`.
 
 ### Changed
 
