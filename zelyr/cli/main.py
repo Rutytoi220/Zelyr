@@ -433,6 +433,258 @@ def cmd_mcp(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def _notify_daemon_reload_routines() -> None:
+    """Best-effort notification to running daemon to reload routines."""
+    async def _notify() -> None:
+        try:
+            import websockets
+            from zelyr.config import data_dir
+            token_file = data_dir() / "daemon.token"
+            headers = {}
+            if token_file.is_file():
+                tok = token_file.read_text(encoding="utf-8").strip()
+                if tok:
+                    headers["Authorization"] = f"Bearer {tok}"
+            async with websockets.connect("ws://127.0.0.1:8000", additional_headers=headers) as ws:
+                await ws.send(json.dumps({"action": "reload_routines"}))
+        except Exception:
+            pass
+
+    try:
+        asyncio.run(_notify())
+    except Exception:
+        pass
+
+
+def cmd_routine(args: argparse.Namespace) -> None:
+    """Dispatch routine subcommand."""
+    cmd = getattr(args, "routine_cmd", None)
+    if cmd in ("list", "ls") or not cmd:
+        cmd_routine_list(args)
+    elif cmd == "add":
+        cmd_routine_add(args)
+    elif cmd == "run":
+        cmd_routine_run(args)
+    elif cmd in ("remove", "delete", "rm"):
+        cmd_routine_remove(args)
+    elif cmd == "history":
+        cmd_routine_history(args)
+    else:
+        _build_parser().parse_args(["routine", "--help"])
+
+
+def cmd_routine_list(args: argparse.Namespace) -> None:
+    """List scheduled routines in a formatted table."""
+    from datetime import datetime
+    from zelyr.core.routine import RoutineDatabase
+
+    db = RoutineDatabase()
+    include_disabled = getattr(args, "all", False)
+    routines = db.sync_list_routines(include_disabled=True)
+
+    if not include_disabled:
+        routines = [r for r in routines if r.get("enabled", 1)]
+
+    if not routines:
+        _print("[dim]No routines configured. Use 'zelyr routine add' to schedule one.[/dim]")
+        return
+
+    history = {h.get("routine_id"): h.get("status") for h in db.sync_get_history(limit=100)}
+
+    if _RICH and _console:
+        from rich.table import Table
+
+        table = Table(title="Autonomous Background Routines", box=box.ROUNDED)
+        table.add_column("Name", style="bold cyan", no_wrap=True)
+        table.add_column("Schedule", style="yellow")
+        table.add_column("Action", style="magenta")
+        table.add_column("Status", justify="center")
+        table.add_column("Last Run", style="dim")
+        table.add_column("Next Run", style="bold green")
+        table.add_column("Last Result", justify="center")
+
+        for r in routines:
+            sched = f"{r['schedule_type']} ({r['schedule_expr']})"
+            act_type = r.get("action_type", "prompt")
+            payload = r.get("action_payload", "")
+            if isinstance(payload, dict):
+                act_str = f"{act_type}: {payload.get('tool', payload.get('hook', str(payload)))[:24]}"
+            else:
+                act_str = f"{act_type}: {str(payload)[:24]}"
+
+            status_str = "[green]ENABLED[/green]" if r.get("enabled", 1) else "[yellow]DISABLED[/yellow]"
+
+            last_run = r.get("last_run_at")
+            last_run_str = datetime.fromtimestamp(last_run).strftime("%Y-%m-%d %H:%M:%S") if last_run else "Never"
+
+            next_run = r.get("next_run_at")
+            if not r.get("enabled", 1):
+                next_run_str = "[yellow]Paused[/yellow]"
+            elif next_run:
+                next_run_str = datetime.fromtimestamp(next_run).strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                next_run_str = "[dim]Pending[/dim]"
+
+            last_st = history.get(r["id"], "-")
+            if last_st == "success":
+                res_str = "[green]SUCCESS[/green]"
+            elif last_st == "failure":
+                res_str = "[red]FAILURE[/red]"
+            elif last_st == "timeout":
+                res_str = "[yellow]TIMEOUT[/yellow]"
+            else:
+                res_str = "[dim]-[/dim]"
+
+            table.add_row(r["name"], sched, act_str, status_str, last_run_str, next_run_str, res_str)
+
+        _console.print(table)
+    else:
+        print(f"{'NAME':<20} {'SCHEDULE':<18} {'ACTION':<24} {'STATUS':<10} {'NEXT RUN':<20}")
+        print("-" * 92)
+        for r in routines:
+            sched = f"{r['schedule_type']} ({r['schedule_expr']})"
+            act = f"{r.get('action_type', '')}: {str(r.get('action_payload', ''))[:16]}"
+            stat = "ENABLED" if r.get("enabled", 1) else "DISABLED"
+            nxt = datetime.fromtimestamp(r["next_run_at"]).strftime("%Y-%m-%d %H:%M:%S") if r.get("next_run_at") else "Paused"
+            print(f"{r['name']:<20} {sched:<18} {act:<24} {stat:<10} {nxt:<20}")
+
+
+def cmd_routine_add(args: argparse.Namespace) -> None:
+    """Add a new background routine."""
+    from datetime import datetime
+    from zelyr.core.routine import RoutineEngine
+
+    engine = RoutineEngine()
+    enabled = not getattr(args, "disabled", False)
+
+    try:
+        routine = asyncio.run(
+            engine.add_routine_async(
+                name=args.name,
+                schedule_expr=args.schedule,
+                schedule_type=getattr(args, "type", None),
+                action_type=getattr(args, "action", "prompt"),
+                action_payload=args.target,
+                timeout_seconds=getattr(args, "timeout", 120.0),
+                description=getattr(args, "description", ""),
+                enabled=enabled,
+            )
+        )
+        nxt_str = (
+            datetime.fromtimestamp(routine.next_run_at).strftime("%Y-%m-%d %H:%M:%S")
+            if routine.next_run_at
+            else "Paused"
+        )
+        _print(f"[green]✓[/green] Added routine [bold]{routine.name}[/bold] ({routine.schedule_type}: '{routine.schedule_expr}')")
+        _print(f"  ID: {routine.id} | Action: {routine.action_type} | Next Run: {nxt_str}")
+        _notify_daemon_reload_routines()
+    except Exception as exc:
+        _print(f"[bold red]Failed to add routine:[/bold red] {exc}")
+        sys.exit(1)
+
+
+def cmd_routine_run(args: argparse.Namespace) -> None:
+    """Manually trigger immediate execution of a routine."""
+    from zelyr.core.routine import RoutineDatabase, RoutineEngine
+
+    db = RoutineDatabase()
+    routine = asyncio.run(db.get_routine(args.name_or_id))
+    if not routine:
+        _print(f"[bold red]Error:[/bold red] Routine '{args.name_or_id}' not found.")
+        sys.exit(1)
+
+    _print(f"[cyan]▶[/cyan] Executing routine [bold]{routine.name}[/bold] ({routine.action_type})...")
+    engine = RoutineEngine()
+    run = asyncio.run(engine.execute_routine_once(routine))
+
+    if run.status == "success":
+        _print(f"[bold green]✓ Execution succeeded[/bold green] ({run.duration_seconds:.2f}s)")
+        if run.output:
+            _print(f"[bold]Output:[/bold]\n{run.output}")
+    elif run.status == "timeout":
+        _print(f"[bold yellow]⚠ Execution timed out[/bold yellow] after {run.duration_seconds:.2f}s")
+        if run.error:
+            _print(f"[yellow]{run.error}[/yellow]")
+        sys.exit(1)
+    else:
+        _print(f"[bold red]✗ Execution failed[/bold red] ({run.duration_seconds:.2f}s)")
+        if run.error:
+            _print(f"[red]{run.error}[/red]")
+        sys.exit(1)
+
+
+def cmd_routine_remove(args: argparse.Namespace) -> None:
+    """Remove a routine by name or ID prefix."""
+    from zelyr.core.routine import RoutineDatabase
+
+    db = RoutineDatabase()
+    target = args.name_or_id
+    success = asyncio.run(db.delete_routine(target))
+    if success:
+        _print(f"[green]✓[/green] Routine [bold]{target}[/bold] removed successfully.")
+        _notify_daemon_reload_routines()
+    else:
+        _print(f"[bold red]Error:[/bold red] Routine '{target}' not found.")
+        sys.exit(1)
+
+
+def cmd_routine_history(args: argparse.Namespace) -> None:
+    """Show execution history of routines."""
+    from datetime import datetime
+    from zelyr.core.routine import RoutineDatabase
+
+    db = RoutineDatabase()
+    limit = getattr(args, "limit", 20) or 20
+    target = getattr(args, "name_or_id", None)
+    runs = db.sync_get_history(name_or_id=target, limit=limit)
+
+    if not runs:
+        _print("[dim]No routine execution history recorded.[/dim]")
+        return
+
+    if _RICH and _console:
+        from rich.table import Table
+
+        table = Table(title="Routine Execution History", box=box.ROUNDED)
+        table.add_column("Run ID", style="dim")
+        table.add_column("Routine Name", style="bold cyan")
+        table.add_column("Started At", style="dim")
+        table.add_column("Duration", justify="right")
+        table.add_column("Status", justify="center")
+        table.add_column("Summary / Error", style="italic")
+
+        for r in runs:
+            st = r.get("status", "unknown")
+            if st == "success":
+                status_str = "[green]SUCCESS[/green]"
+                msg = str(r.get("output", "") or "")[:40]
+            elif st == "timeout":
+                status_str = "[yellow]TIMEOUT[/yellow]"
+                msg = str(r.get("error", "") or "")[:40]
+            else:
+                status_str = "[red]FAILURE[/red]"
+                msg = str(r.get("error", "") or "")[:40]
+
+            started_str = (
+                datetime.fromtimestamp(r["started_at"]).strftime("%Y-%m-%d %H:%M:%S")
+                if r.get("started_at")
+                else "-"
+            )
+            dur_str = f"{r.get('duration_seconds', 0.0):.2f}s"
+            table.add_row(r["id"][:8], r["routine_name"], started_str, dur_str, status_str, msg)
+
+        _console.print(table)
+    else:
+        print(f"{'RUN ID':<10} {'ROUTINE':<20} {'STARTED':<20} {'DURATION':<10} {'STATUS':<10} {'SUMMARY'}")
+        print("-" * 85)
+        for r in runs:
+            st = r.get("status", "unknown").upper()
+            started_str = datetime.fromtimestamp(r["started_at"]).strftime("%Y-%m-%d %H:%M:%S") if r.get("started_at") else "-"
+            dur_str = f"{r.get('duration_seconds', 0.0):.2f}s"
+            msg = (r.get("output") or r.get("error") or "")[:30]
+            print(f"{r['id'][:8]:<10} {r['routine_name']:<20} {started_str:<20} {dur_str:<10} {st:<10} {msg}")
+
+
 # ===========================================================================
 # Argument parser
 # ===========================================================================
@@ -526,6 +778,73 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Disable read-only memory resource endpoints",
     )
 
+    # ── Routine management ───────────────────────────────────────────────────
+    p_routine = sub.add_parser("routine", help="Manage autonomous background routines and schedules")
+    routine_sub = p_routine.add_subparsers(dest="routine_cmd")
+
+    p_rt_list = routine_sub.add_parser("list", aliases=["ls"], help="List all scheduled routines")
+    p_rt_list.add_argument("--all", "-a", action="store_true", help="Include disabled routines")
+
+    p_rt_add = routine_sub.add_parser("add", help="Add a new background routine")
+    p_rt_add.add_argument("name", help="Unique identifier/name for the routine")
+    p_rt_add.add_argument(
+        "--schedule",
+        "-s",
+        required=True,
+        help="Cron expression (e.g. '0 8 * * *') or interval seconds (e.g. '300')",
+    )
+    p_rt_add.add_argument(
+        "--type",
+        choices=["cron", "interval"],
+        default=None,
+        help="Schedule type (auto-detected if omitted)",
+    )
+    p_rt_add.add_argument(
+        "--action",
+        choices=["prompt", "tool", "maintenance"],
+        default="prompt",
+        help="Action type to execute (default: prompt)",
+    )
+    p_rt_add.add_argument(
+        "--target",
+        required=True,
+        help="Target prompt, tool payload, or maintenance hook",
+    )
+    p_rt_add.add_argument(
+        "--timeout",
+        type=float,
+        default=120.0,
+        help="Execution timeout in seconds (default: 120.0)",
+    )
+    p_rt_add.add_argument(
+        "--description",
+        "-d",
+        default="",
+        help="Optional description of the routine",
+    )
+    p_rt_add.add_argument(
+        "--disabled",
+        action="store_true",
+        default=False,
+        help="Create routine in disabled state",
+    )
+
+    p_rt_run = routine_sub.add_parser("run", help="Trigger immediate execution of a routine")
+    p_rt_run.add_argument("name_or_id", help="Routine name or ID prefix")
+
+    p_rt_del = routine_sub.add_parser("remove", aliases=["delete", "rm"], help="Remove a scheduled routine")
+    p_rt_del.add_argument("name_or_id", help="Routine name or ID prefix to delete")
+
+    p_rt_hist = routine_sub.add_parser("history", help="Show execution history of routines")
+    p_rt_hist.add_argument("name_or_id", nargs="?", default=None, help="Optional routine name or ID to filter")
+    p_rt_hist.add_argument(
+        "--limit",
+        "-n",
+        type=int,
+        default=20,
+        help="Maximum number of history records to show (default: 20)",
+    )
+
     return parser
 
 
@@ -571,6 +890,8 @@ def main() -> None:
         cmd_memory(args)
     elif args.command == "mcp":
         cmd_mcp(args)
+    elif args.command == "routine":
+        cmd_routine(args)
     elif args.command in dispatch:
         if args.command == "eval":
             cmd_eval(args, extra)

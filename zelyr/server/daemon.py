@@ -347,6 +347,8 @@ class ZelyrDaemonServer:
             from zelyr.services.scheduler_service import BackgroundSchedulerService
             self.scheduler_service = BackgroundSchedulerService(event_bus=self.event_bus)
             self.scheduler_service.start()
+            if self.cli and hasattr(self.scheduler_service, "routine_engine"):
+                self.scheduler_service.routine_engine.orchestrator = getattr(self.cli, "orchestrator", None)
             _emit_status("scheduler", AppLifecycleState.READY)
         except Exception as e:
             logger.error("Failed to start scheduler: %s", e)
@@ -541,6 +543,16 @@ class ZelyrDaemonServer:
                             await websocket.send(json.dumps(make_success_response(req_id, tools_list)))
                         elif method == "ping":
                             await websocket.send(json.dumps(make_success_response(req_id, "pong")))
+                        elif method == "list_routines":
+                            routines = []
+                            if self.scheduler_service and hasattr(self.scheduler_service, "routine_engine"):
+                                r_list = await self.scheduler_service.routine_engine.list_routines_async()
+                                routines = [r.to_dict() for r in r_list]
+                            await websocket.send(json.dumps(make_success_response(req_id, routines)))
+                        elif method == "reload_routines":
+                            if self.scheduler_service and hasattr(self.scheduler_service, "routine_engine"):
+                                await self.scheduler_service.routine_engine.reload()
+                            await websocket.send(json.dumps(make_success_response(req_id, {"reloaded": True})))
                         else:
                             await websocket.send(json.dumps(make_error_response(req_id, METHOD_NOT_FOUND, f"Method '{method}' not found")))
                         continue
@@ -629,6 +641,17 @@ class ZelyrDaemonServer:
                             "action": "toggle_tool",
                             "success": True
                         }))
+                    elif action == "reload_routines":
+                        logger.info("Routines reload triggered via IPC...")
+                        if self.scheduler_service and hasattr(self.scheduler_service, "routine_engine"):
+                            await self.scheduler_service.routine_engine.reload()
+                        await websocket.send(json.dumps({"type": "response", "action": "reload_routines", "success": True}))
+                    elif action == "list_routines":
+                        routines = []
+                        if self.scheduler_service and hasattr(self.scheduler_service, "routine_engine"):
+                            r_list = await self.scheduler_service.routine_engine.list_routines_async()
+                            routines = [r.to_dict() for r in r_list]
+                        await websocket.send(json.dumps({"type": "response", "action": "list_routines", "data": routines}))
                     elif action == "add_mcp_server":
                         name = data.get("name")
                         cmd = data.get("command")
@@ -666,6 +689,11 @@ class ZelyrDaemonServer:
         if hasattr(self, "token_file") and self.token_file and self.token_file.exists():
             try:
                 self.token_file.unlink()
+            except Exception:
+                pass
+        if hasattr(self, "scheduler_service") and self.scheduler_service:
+            try:
+                await self.scheduler_service.stop_async()
             except Exception:
                 pass
         if hasattr(self, "supervisor") and self.supervisor:

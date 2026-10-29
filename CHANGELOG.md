@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Autonomous Routine Scheduler & Proactive Daemon Execution**:
+  - Implemented persistent SQLite-backed routine engine in `zelyr.core.routine` supporting both cron expressions (`0 8 * * *`, `*/15 * * * *`) and interval schedules (`300s`, `60s`).
+  - Added clean routine data models (`Routine`, `RoutineRun`) and `RoutineDatabase` with WAL journaling, schema migrations, and full execution history tracking.
+  - Implemented asynchronous execution supervisor with execution timeout containment, exception isolation, and concurrency guards preventing duplicate concurrent executions.
+  - Re-implemented `BackgroundSchedulerService` in `zelyr.services.scheduler_service` wrapping `RoutineEngine`, eliminating the missing `apscheduler` dependency and restoring healthy daemon lifecycle readiness.
+  - Integrated dynamic routine reloading and IPC synchronization into `zelyr.server.daemon`.
+  - Added comprehensive CLI interface `zelyr routine` with subcommands `list`, `add`, `run`, `remove` (alias `delete`), and `history`, maintaining pure lazy-loading startup invariance (<100ms startup).
+  - Authored isolated test battery in `tests/test_routine_scheduler.py` (16/16 passed).
 - **Model Context Protocol (MCP) Server Gateway**:
   - Implemented `ZelyrMCPServerGateway` in `zelyr.mcp.server`, exposing Zelyr's native tool registry and read-only memory resources to external AI harnesses and agents.
   - Implemented full MCP protocol lifecycle support: `initialize` (with capability negotiation), `notifications/initialized`, `ping`, `tools/list`, `tools/call`, `resources/list`, and `resources/read`.
