@@ -47,12 +47,19 @@ def _sandbox_worker(
     kwargs: dict,
     max_memory_bytes: Optional[int],
     conn: Any,
+    parent_conn: Optional[Any] = None,
 ) -> None:
     """Pre-exec child worker entrypoint running in an isolated process.
 
     Enforces POSIX resource limits and executes the plugin target, transmitting
     the structured result or failure envelope across the IPC pipe before exiting.
     """
+    if parent_conn is not None:
+        try:
+            parent_conn.close()
+        except Exception:
+            pass
+
     try:
         # Disable faulthandler in the isolated child to prevent stderr noise on deliberate crashes
         try:
@@ -247,7 +254,7 @@ class SandboxedPluginRunner(BaseTool):
         parent_conn, child_conn = ctx.Pipe(duplex=False)
         proc = ctx.Process(
             target=_sandbox_worker,
-            args=(self._target, args, kwargs, self.max_memory_bytes, child_conn),
+            args=(self._target, args, kwargs, self.max_memory_bytes, child_conn, parent_conn),
             daemon=True,
         )
 
@@ -255,8 +262,18 @@ class SandboxedPluginRunner(BaseTool):
             proc.start()
             child_conn.close()
 
-            # Poll for worker response up to timeout threshold
-            has_data = parent_conn.poll(self.timeout)
+            # Poll for worker response up to timeout threshold with process liveness checks
+            import time
+            deadline = time.monotonic() + self.timeout
+            has_data = False
+            while time.monotonic() < deadline:
+                if parent_conn.poll(0.02):
+                    has_data = True
+                    break
+                if not proc.is_alive():
+                    # Process exited or was killed by signal
+                    has_data = parent_conn.poll(0.0)
+                    break
 
             if not has_data:
                 # Execution timed out: escalate termination gracefully then forcefully
