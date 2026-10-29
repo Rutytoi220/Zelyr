@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 from zelyr.compat import sync_legacy_env
 sync_legacy_env()
 
-__version__ = "1.1.0rc1"
+__version__ = "1.1.0"
 __author__ = "Zelyr Team"
 __description__ = "Local-first AI orchestration framework"
 

@@ -7,38 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.1.0-rc.1] - 2026-10-28
+## [1.1.0] - 2026-10-29
 
-Release Candidate 1 for Zelyr v1.1.0, delivering end-to-end security hardening, resilient OTA updates, authenticated IPC, autonomous multi-turn evaluation benchmarks, and distribution builds.
+General Availability (GA) official production release of Zelyr v1.1.0, delivering comprehensive execution security hardening, sub-100ms CLI startup latency, modular optional dependency boundaries, resilient atomic OTA updates, authenticated WebSocket IPC, Swarm consensus quorum resilience, REM sleep memory consolidation, and full 24/24 autonomous multi-turn evaluation benchmarks.
 
 ### Highlights & Architecture Pillars
 
-- **Pillar 1: Ring-0 AST Validation & Transport-Level SSRF Protection**
+- **Pillar 1: Sub-100ms CLI Startup & Non-Blocking Telemetry**
+  - Implemented PEP 562 package-level lazy exports across `zelyr/__init__.py`, `axiom/__init__.py`, and `zelyr/main.py`, reducing root import module count from 4,322 to 77 and cutting cold-start latency from ~2.7s to ~67ms (32x faster).
+  - Converted `zelyr status` to non-blocking kernel load sampling and a 20ms bounded socket probe (~83ms runtime).
+  - Deferred `PluginManager` initialization and filesystem discovery in `zelyr tool list` behind `--all`/`--plugins` flags.
+- **Pillar 2: Modular Dependency Boundaries & Structured Degradation**
+  - Standardized `OptionalDependencyError`, zero-import `is_extra_available`, and `require_extra` helpers in `zelyr.utils.optional_deps` for robust degradation when optional extras are missing.
+  - Decoupled optional extras (`gui`, `server`, `vision`, `audio`, `dev`) with actionable remediation instructions (`pip install 'zelyr-core[gui]'`).
+  - Integrated structured `ToolResult` failure envelopment into `ToolRegistry` to safely report missing optional dependencies and prevent agent ReAct loops from crashing.
+- **Pillar 3: Ring-0 AST Validation & Transport-Level SSRF Defense**
   - Integrated `SecurityASTValidator` inspecting dynamic Python code for dangerous AST nodes, forbidden imports (`os`, `subprocess`, `sys`), and dynamic code execution (`eval`, `exec`).
   - Added strict Ring-0 authorization enforcement in `ToolRegistry` preventing dynamic tools from claiming Ring 0 or mutating core tools.
   - Implemented transport-level SSRF defense with strict IP pinning, defeating DNS rebinding attacks and validating against loopback, private, link-local, multicast, and cloud metadata endpoints.
-- **Pillar 2: Resilient OTA Auto-Updater & Daemon Self-Healing Supervisor**
+- **Pillar 4: Resilient Atomic OTA Updates & Daemon Worker Circuit Breaking**
   - Implemented atomic staging pipeline (`staging_<version>`) with SHA256 verification, pre-flight dry-run health checks, and automated directory rollback on failure.
   - Built `DaemonWorkerSupervisor` featuring exponential backoff (1s -> 30s) and a 5-crash circuit breaker to contain repeated process or task crashes.
   - Hardened daemon shutdown sequence with SIGTERM, bounded 5s wait, and SIGKILL escalation.
-- **Pillar 3: Authenticated IPC Protocol, Rate Limiting & Frame Ceilings**
+- **Pillar 5: Authenticated WebSocket IPC with Pydantic Contracts and Rate Limiting**
   - Enforced POSIX 0600 cryptographic token authentication (`daemon.token`) across WebSocket connections via bearer headers or query tokens.
   - Established strict JSON-RPC 2.0 Pydantic schema validation with standard error codes (-32700, -32600, -32601, -32029).
   - Implemented 1MB payload ceilings (`PayloadTooLargeError`, code 4409) and sliding window rate limiting (50 req/s).
-- **Pillar 4: Autonomous Multi-Turn Benchmark Expansion (24/24 Tasks)**
-  - Expanded benchmark evaluation suite from 18 to 24 tasks with the introduction of Level 4 autonomous self-repair and resilient subsystems.
-  - Tasks include runtime bug patching, Swarm blackboard coordination, corrupted state rollback, ETL pipelines, sandbox containment, and proactive memory decay.
-  - Achieved a 100.0% offline pass rate across all 24 tasks in ~1.16s execution time.
-- **Pillar 5: Multi-Platform Distribution Build Verification**
-  - Verified wheel and sdist package builds from clean isolated source trees with `scripts/build_dist.py`.
-  - Version alignment synchronized to `1.1.0rc1` across Python packages, Web UI (`1.1.0-rc.1`), and browser extension manifest (`1.1.0.1`).
+- **Pillar 6: Swarm Quorum Hardening & Ephemeral Blackboard Rollback**
+  - Hardened $\ge 2/3$ quorum evaluation against voter timeouts and exceptions with fail-safe diagnostic logging for split-decision ties.
+  - Added automatic ephemeral Blackboard point-in-time snapshot rollback upon rejected proposals.
+- **Pillar 7: REM Sleep Memory Compaction, Temporal Decay & FTS5 Concurrency**
+  - Verified and hardened SQLite WAL concurrency under simultaneous read/write multi-agent operations.
+  - Integrated exponential temporal decay scoring and semantic deduplication during sleep cycles.
+  - Enforced FTS5 full-text index synchronization and consistency during memory pruning and archival.
+- **Pillar 8: Autonomous Multi-Turn Benchmark Expansion (24/24 Tasks, Levels 1-4)**
+  - Expanded benchmark evaluation suite from 18 to 24 deterministic offline tasks covering Levels 1 through 4.
+  - Validated Level 4 self-repair, Swarm coordination, atomic state rollback, ETL pipelines, tool sandboxing, and memory decay with 100.0% pass rate in ~1.18s.
 
 ### Distribution Release Assets
 
 | Artifact Name | Platform / Type | SHA256 Checksum | Size |
 | :--- | :--- | :--- | :--- |
-| `zelyr_core-1.1.0rc1-py3-none-any.whl` | Python Wheel (`any`) | `ac470442195d1e2a8499b79570486c99ed6f4486a23096fd6ae77133397b2d0e` | 2.1 MiB |
-| `zelyr_core-1.1.0rc1.tar.gz` | Source Distribution (`sdist`) | `39468d09336782edb3ff951f28aba409bcc9efc6b1c5482967a454f2c97f3851` | 2.0 MiB |
+| `zelyr_core-1.1.0-py3-none-any.whl` | Python Wheel (`any`) | `adf27e0648d9d7d9ab1a99d93b88293d993ce14932812efd07e37871ffe5de33` | 2.1 MiB |
+| `zelyr_core-1.1.0.tar.gz` | Source Distribution (`sdist`) | `cfc7ee71e5582dc3344a88738e728a94e4c8b362093abb2f0f9b528faedde5a6` | 2.0 MiB |
 
 ### Added
 - **Deterministic Offline Evaluation Benchmarks:** Full 24/24 offline benchmark execution via deterministic ReAct mock queues for Levels 1, 2, 3, and 4.

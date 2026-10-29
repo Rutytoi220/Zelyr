@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Zelyr Browser Bridge",
-  "version": "1.1.0.1",
+  "version": "1.1.0.0",
   "description": "Local WebSocket automation bridge for Zelyr",
   "permissions": [
     "tabs",
