@@ -96,6 +96,16 @@ def _infer_task_level(task_id: str, metadata: Optional[Dict[str, Any]] = None) -
     }
     if tid in LEVEL_4_TASK_IDS or tid.startswith("p4_") or tid.startswith("l4_") or "level4" in tid or "level_4" in tid:
         return 4
+    LEVEL_5_TASK_IDS = {
+        "task_mcp_server_gateway_federation",
+        "task_autonomous_routine_lifecycle",
+        "task_adaptive_context_budget_compaction",
+        "task_hierarchical_subagent_delegation",
+        "task_autonomous_tool_crafting_and_hotload",
+        "task_multi_turn_session_continuity",
+    }
+    if tid in LEVEL_5_TASK_IDS or tid.startswith("p5_") or tid.startswith("l5_") or "level5" in tid or "level_5" in tid:
+        return 5
     return 1
 
 
@@ -347,6 +357,7 @@ def render_markdown_scorecard(scorecard: Union[BenchmarkScorecard, Dict[str, Any
         2: "Synthetic Multi-Step Workflows",
         3: "Autonomous Dynamic Self-Repair",
         4: "Level 4 Multi-Turn Self-Repair & System Resilience",
+        5: "Autonomous Federation, Tool Synthesis & Multi-Agent Swarm Workflows",
     }
 
     for lvl in sorted(int(k) for k in levels.keys()):

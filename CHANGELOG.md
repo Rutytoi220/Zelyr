@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Level 5 Autonomous Federation, Tool Synthesis & Multi-Agent Swarm Evaluation Benchmark**:
+  - Expanded Zelyr's deterministic offline evaluation harness (`zelyr/eval/`) from 24 tasks (Levels 1–4) to 30 tasks with Level 5:
+    - `task_mcp_server_gateway_federation`: Handshake negotiation, tool discovery, tool invocation, and memory resource query via Model Context Protocol gateway.
+    - `task_autonomous_routine_lifecycle`: Autonomous background routine scheduling, interval evaluation, execution triggering, and SQLite history persistence.
+    - `task_adaptive_context_budget_compaction`: Adaptive context window budgeting and historical tool compaction under pressure while preserving inviolate anchors.
+    - `task_hierarchical_subagent_delegation`: Multi-agent delegation via `SubagentDelegationTool` and `SwarmBlackboard` with context bubble isolation.
+    - `task_autonomous_tool_crafting_and_hotload`: Autonomous tool crafting via `craft_tool`: AST security gate, `SandboxedPluginRunner` test gate, dynamic registry hotload, and invocation.
+    - `task_multi_turn_session_continuity`: Multi-turn chat session persistence via `SessionManager`: durable SQLite storage, tool-call tracking, and restart continuity.
+  - Added `LEVEL_5 = "level_5"` to `EvalLevel` enum in `zelyr.eval.types`.
+  - Updated CLI runner in `zelyr.eval.cli` to support `--level 5`, task listing, and filtering.
+  - Updated scorecard generator and markdown renderer in `zelyr.eval.scorecard` with Level 5 tier categorization.
+  - Authored dedicated unit test suite in `tests/test_eval_level5.py` (11/11 passed).
 - **Autonomous Tool Crafting & Runtime Skill Compilation (`craft_tool`)**:
   - Implemented `ToolCrafterEngine`, `DynamicSynthesizedTool`, and `ToolCrafterTool` in `zelyr.engine.tool_crafter` and unified `craft_tool` in `zelyr.tools.tool_crafter`.
   - Added two-phase gatekeeper architecture:

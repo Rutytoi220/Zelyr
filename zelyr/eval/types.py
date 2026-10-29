@@ -23,6 +23,7 @@ class EvalLevel(str, enum.Enum):
     LEVEL_2 = "level_2"
     LEVEL_3 = "level_3"
     LEVEL_4 = "level_4"
+    LEVEL_5 = "level_5"
     ALL = "all"
 
 

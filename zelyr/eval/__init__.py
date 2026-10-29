@@ -28,6 +28,15 @@ from zelyr.eval.tasks.model_tasks_p4 import (
     build_task_proactive_memory_decay_audit,
     get_model_tasks_p4,
 )
+from zelyr.eval.tasks.model_tasks_p5 import (
+    build_task_adaptive_context_budget_compaction,
+    build_task_autonomous_routine_lifecycle,
+    build_task_autonomous_tool_crafting_and_hotload,
+    build_task_hierarchical_subagent_delegation,
+    build_task_mcp_server_gateway_federation,
+    build_task_multi_turn_session_continuity,
+    get_model_tasks_p5,
+)
 from zelyr.eval.tasks.self_repair_l3 import get_self_repair_l3_tasks
 from zelyr.eval.tasks.synthetic_workflows_p2 import get_synthetic_workflows_p2_tasks
 from zelyr.eval.types import EvalLevel, EvaluationResult, ResultStatus, ValidationResult
@@ -64,12 +73,19 @@ __all__ = [
     "get_self_repair_l3_tasks",
     "get_model_tasks_p3",
     "get_model_tasks_p4",
+    "get_model_tasks_p5",
     "build_task_autonomous_runtime_bug_patching",
     "build_task_multi_agent_blackboard_coordination",
     "build_task_corrupted_state_recovery_and_rollback",
     "build_task_complex_data_pipeline_etl",
     "build_task_dynamic_tool_sandbox_containment",
     "build_task_proactive_memory_decay_audit",
+    "build_task_mcp_server_gateway_federation",
+    "build_task_autonomous_routine_lifecycle",
+    "build_task_adaptive_context_budget_compaction",
+    "build_task_hierarchical_subagent_delegation",
+    "build_task_autonomous_tool_crafting_and_hotload",
+    "build_task_multi_turn_session_continuity",
     "task_live_web_research_synthesis",
     "check_ollama_status",
     "check_ollama_status_async",
