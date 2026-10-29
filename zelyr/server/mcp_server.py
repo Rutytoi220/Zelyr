@@ -66,10 +66,26 @@ def inspect_security_audit(limit: int = 10) -> str:
         # Fallback if AuditLedger isn't perfectly matched to the above signature
         return f"Could not retrieve audit logs. Error: {str(e)}"
 
-def run_mcp_server():
-    """Start the MCP server using stdio."""
-    logger.info("Starting Zelyr MCP Server over stdio...")
-    mcp.run()
+def run_mcp_server(transport: str = "stdio", **kwargs):
+    """Start the MCP server using stdio or specified transport."""
+    logger.info("Starting Zelyr MCP Server over %s...", transport)
+    try:
+        import anyio
+        from zelyr.mcp.server import ZelyrMCPServerGateway
+
+        gateway = ZelyrMCPServerGateway(**kwargs)
+        if transport == "stdio":
+            anyio.run(gateway.run_stdio_async)
+        else:
+            anyio.run(
+                gateway.run_http_async,
+                kwargs.get("host", "127.0.0.1"),
+                kwargs.get("port", 8000),
+                transport,
+            )
+    except Exception as exc:
+        logger.warning("Falling back to legacy FastMCP runner: %s", exc)
+        mcp.run()
 
 if __name__ == "__main__":
     run_mcp_server()

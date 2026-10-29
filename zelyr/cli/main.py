@@ -396,6 +396,43 @@ def cmd_memory(args: argparse.Namespace) -> None:
         _print("[yellow]Usage: zelyr memory compact [--days N][/yellow]")
 
 
+def cmd_mcp(args: argparse.Namespace) -> None:
+    """Handle MCP (Model Context Protocol) gateway subcommands."""
+    mcp_cmd = getattr(args, "mcp_cmd", None)
+    if mcp_cmd != "serve":
+        _print("[yellow]Usage: zelyr mcp serve [--transport stdio|http|sse] [--host HOST] [--port PORT][/yellow]")
+        return
+
+    transport = getattr(args, "transport", "stdio")
+    host = getattr(args, "host", "127.0.0.1")
+    port = getattr(args, "port", 8000)
+    allowed_tools_raw = getattr(args, "allowed_tools", None)
+    allowed_tools = [t.strip() for t in allowed_tools_raw.split(",")] if allowed_tools_raw else None
+    caller_ring = getattr(args, "caller_ring", 1)
+    expose_memory = not getattr(args, "no_memory", False)
+
+    try:
+        import anyio
+        from zelyr.mcp.server import ZelyrMCPServerGateway
+
+        gateway = ZelyrMCPServerGateway(
+            caller_ring=caller_ring,
+            allowed_tools=allowed_tools,
+            expose_memory=expose_memory,
+        )
+
+        if transport == "stdio":
+            anyio.run(gateway.run_stdio_async)
+        else:
+            _print(f"[bold cyan]Starting Zelyr MCP Gateway on {transport}://{host}:{port}[/bold cyan]")
+            anyio.run(gateway.run_http_async, host, port, transport)
+    except KeyboardInterrupt:
+        pass
+    except Exception as exc:
+        _print(f"[bold red]Error running MCP server:[/bold red] {exc}")
+        sys.exit(1)
+
+
 # ===========================================================================
 # Argument parser
 # ===========================================================================
@@ -464,6 +501,31 @@ def _build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--host", default="0.0.0.0")
     p_serve.add_argument("--port", type=int, default=9412)
 
+    p_mcp = sub.add_parser("mcp", help="Model Context Protocol (MCP) server gateway")
+    mcp_sub = p_mcp.add_subparsers(dest="mcp_cmd")
+    p_mcp_serve = mcp_sub.add_parser("serve", help="Start the MCP server gateway")
+    p_mcp_serve.add_argument(
+        "--transport",
+        choices=["stdio", "http", "sse"],
+        default="stdio",
+        help="Transport type (stdio, http, or sse, default: stdio)",
+    )
+    p_mcp_serve.add_argument("--host", default="127.0.0.1", help="Host interface to bind (default: 127.0.0.1)")
+    p_mcp_serve.add_argument("--port", type=int, default=8000, help="Port to bind (default: 8000)")
+    p_mcp_serve.add_argument("--allowed-tools", default=None, help="Comma-separated list of allowed tool IDs")
+    p_mcp_serve.add_argument(
+        "--caller-ring",
+        type=int,
+        default=1,
+        help="Caller security ring (0=root, 1=user, default: 1)",
+    )
+    p_mcp_serve.add_argument(
+        "--no-memory",
+        action="store_true",
+        default=False,
+        help="Disable read-only memory resource endpoints",
+    )
+
     return parser
 
 
@@ -507,6 +569,8 @@ def main() -> None:
             parser.parse_args(["tool", "--help"])
     elif args.command == "memory":
         cmd_memory(args)
+    elif args.command == "mcp":
+        cmd_mcp(args)
     elif args.command in dispatch:
         if args.command == "eval":
             cmd_eval(args, extra)

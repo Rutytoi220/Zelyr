@@ -17,6 +17,8 @@ def pytest_configure(config):
 @pytest.fixture(autouse=True)
 def mock_home_directory(monkeypatch):
     """Ensure tests never write to actual ~/.local or ~/.config by mocking Path.home()"""
+    import logging
+    existing_handlers = logging.root.handlers[:]
     with tempfile.TemporaryDirectory() as temp_home:
         # We must mock it where it's used, but setting HOME env var often helps too
         monkeypatch.setenv("HOME", temp_home)
@@ -27,6 +29,21 @@ def mock_home_directory(monkeypatch):
         
         with patch("pathlib.Path.home", return_value=Path(temp_home)):
             yield temp_home
+
+        # Clean up any logging handlers attached to deleted temporary directories
+        for h in logging.root.handlers[:]:
+            if h not in existing_handlers:
+                try:
+                    h.close()
+                except Exception:
+                    pass
+                logging.root.removeHandler(h)
+            elif isinstance(h, logging.FileHandler) and h.baseFilename.startswith(temp_home):
+                try:
+                    h.close()
+                except Exception:
+                    pass
+                logging.root.removeHandler(h)
 
 @pytest.fixture
 def mock_orchestrator():

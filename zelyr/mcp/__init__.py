@@ -4,6 +4,7 @@ from zelyr.mcp.adapter import MCPBridgedToolAsync
 from zelyr.mcp.bridge import MCPBridgeManager, MCPBridgedTool
 from zelyr.mcp.client import MCPStdioClient
 from zelyr.mcp.manager import MCPManager
+from zelyr.mcp.server import ZelyrMCPServerGateway, create_mcp_server
 from zelyr.mcp.sse_client import MCPSSEBridgedTool, MCPSSEClient
 from zelyr.mcp.stdio_client import MCPStdioClientAsync
 
@@ -16,4 +17,6 @@ __all__ = [
     "MCPManager",
     "MCPSSEClient",
     "MCPSSEBridgedTool",
+    "ZelyrMCPServerGateway",
+    "create_mcp_server",
 ]
