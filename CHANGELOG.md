@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Hierarchical Multi-Agent Subagent Delegation & Transactional Blackboard Coordination (`delegate_subtask`)**:
+  - Implemented `SubagentDelegationTool` and `DelegatedSubagent` in `zelyr.agents.swarm.delegation` and facade `zelyr.tools.subagent_tool`.
+  - Added specialized worker role profiles (`coder`, `tester`, `researcher`, `reviewer`, `general`) with curated allowed tool allocations, system prompt rails, and capability ring gating.
+  - Implemented isolated context execution bubbles: subagents execute their own multi-turn ReAct loops in private message histories, preventing intermediate scratchpad traces, raw command outputs, or failed attempts from bloating the parent orchestrator's conversation window.
+  - Enforced transactional blackboard integrity on `SwarmBlackboard`: wrapped subtask execution in point-in-time snapshot boundaries, committing artifacts on success and executing automatic rollback upon error, timeout, or failure with zero orphaned artifacts.
+  - Implemented recursion depth ceiling (`max_depth = 2` by default) tracked via context variables, preventing runaway recursive agent trees.
+  - Enforced execution timeouts (`asyncio.wait_for`, default 60s, max 300s) and capability ring invariance (subagents cannot escalate permissions beyond caller ring).
+  - Registered `delegate_subtask` as a standard Tier 1 built-in tool in `ToolRegistry.BUILTIN_TOOLS`, `zelyr.core.plugins`, and hardened system directives.
 - **Adaptive Context Window Budgeting & Historical Tool Compaction**:
   - Implemented `ContextBudgetEngine` (and facade `AdaptiveContextBudgeter`) in `zelyr.engine.budget_manager` and `zelyr.agents.context_budgeter`.
   - Added comprehensive Model Context Catalog (`MODEL_CONTEXT_CATALOG`) discovering effective token capacities across model families (Qwen, Llama, Mistral, DeepSeek, GPT-4o, Claude 3.5, Gemini) with safe configurable defaults.

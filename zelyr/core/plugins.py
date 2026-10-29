@@ -354,6 +354,28 @@ def load_plugins() -> None:
                 "    return json.dumps(res.to_dict(tool=_tool.name, arguments=params))\n"
             ),
         ),
+        (
+            TOOLS_DIR / "delegate_subtask.py",
+            (
+                "import json\n"
+                "from zelyr.tools.subagent_tool import SubagentDelegationTool\n\n"
+                "_tool = SubagentDelegationTool()\n\n"
+                "TOOL_SCHEMA = {\n"
+                '    "type": "function",\n'
+                '    "function": {\n'
+                '        "name": _tool.name,\n'
+                '        "description": _tool.description,\n'
+                '        "parameters": _tool.schema,\n'
+                "    }\n"
+                "}\n"
+                'TUI_HINT = "🤖 Delegating subtask to specialized worker agent..."\n'
+                "REQUIRED_RING = 1\n\n"
+                "async def execute(role: str = '', task: str = '', context: dict = None, timeout_seconds: int = 60, **kwargs) -> str:\n"
+                '    params = {"role": role, "task": task, "context": context or {}, "timeout_seconds": timeout_seconds, **kwargs}\n'
+                "    res = await _tool.execute(params)\n"
+                "    return json.dumps(res.to_dict(tool=_tool.name, arguments=params))\n"
+            ),
+        ),
     ]
     for target_file, code_content in provisions:
         if not target_file.exists():
@@ -697,6 +719,7 @@ PROVISIONED_TOOLS = {
     "manage_tools",
     "execute_command",
     "manage_desktop_window",
+    "delegate_subtask",
 }
 
 TIER_TIMEOUTS: Dict[str, float] = {

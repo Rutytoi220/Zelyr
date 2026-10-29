@@ -124,6 +124,15 @@ BUILTIN_TOOLS: Dict[str, BuiltinToolDef] = {
     ),
 }
 
+SWARM_TOOLS: Dict[str, BuiltinToolDef] = {
+    "delegate_subtask": BuiltinToolDef(
+        tool_id="delegate_subtask",
+        description="Delegate a focused subtask to a specialized worker subagent (coder, tester, researcher, reviewer, general) in an isolated context bubble.",
+        module_path="zelyr.tools.subagent_tool",
+        class_name="SubagentDelegationTool",
+    ),
+}
+
 class ToolRegistryError(Exception):
     """Raised when a tool registry operation is invalid."""
 
@@ -201,6 +210,10 @@ Returns:
                     tool = self._load_builtin_tool(resolved_id)
                 elif tool_id in BUILTIN_TOOLS:
                     tool = self._load_builtin_tool(tool_id)
+                elif resolved_id in SWARM_TOOLS:
+                    tool = self._load_swarm_tool(resolved_id)
+                elif tool_id in SWARM_TOOLS:
+                    tool = self._load_swarm_tool(tool_id)
         return tool
 
     def get_builtin_tools(self) -> Dict[str, BuiltinToolDef]:
@@ -209,6 +222,17 @@ Returns:
 
     def _load_builtin_tool(self, tool_id: str) -> Optional[BaseTool]:
         defn = BUILTIN_TOOLS.get(tool_id)
+        if defn is None:
+            return None
+        with self._lock:
+            if not self._core_registry.has_tool(tool_id):
+                instance = defn.instantiate()
+                self._core_registry.register_tool(tool_id, instance)
+                return instance
+            return self._core_registry.get_tool(tool_id)
+
+    def _load_swarm_tool(self, tool_id: str) -> Optional[BaseTool]:
+        defn = SWARM_TOOLS.get(tool_id)
         if defn is None:
             return None
         with self._lock:
@@ -327,6 +351,8 @@ Returns:
 
         if tool_id in BUILTIN_TOOLS:
             return 0
+        if tool_id in SWARM_TOOLS:
+            return 1
         return 1
 
     def _authorize_execution(

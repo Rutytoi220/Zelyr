@@ -55,6 +55,7 @@ __all__ = [
     'SomKeyTool',
     'FileTeleportTool',
     'TaskSchedulerTool',
+    'SubagentDelegationTool',
     'ToolManager',
     'PROTECTED_TOOLS',
     'list_dynamic_tools',
@@ -1249,6 +1250,7 @@ _EXTRA_TOOL_EXPORTS = {
     "SomClickTool": ("zelyr.tools.som_tools", "SomClickTool"),
     "SomTypeTool": ("zelyr.tools.som_tools", "SomTypeTool"),
     "SomKeyTool": ("zelyr.tools.som_tools", "SomKeyTool"),
+    "SubagentDelegationTool": ("zelyr.tools.subagent_tool", "SubagentDelegationTool"),
 }
 
 

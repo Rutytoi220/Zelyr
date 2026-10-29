@@ -63,7 +63,7 @@ HARDENED_SYSTEM_DIRECTIVES: str = """\
 You must strictly prioritize tools from lowest resource cost to highest:
 
 1. TIER 1 (OS & CLI - FIRST CHOICE):
-   - Use 'execute_command', 'manage_desktop_window', 'manage_system_process', 'manage_system_clipboard', 'query_system_journal', 'manage_media_playback', 'manage_workspace_file', 'send_desktop_notification', or 'inspect_network' for system queries, shell commands, process inspection/termination, clipboard access, systemd service logs, window/workspace management, media controls, safe file operations, desktop notifications, and network diagnostics.
+   - Use 'execute_command', 'manage_desktop_window', 'manage_system_process', 'manage_system_clipboard', 'query_system_journal', 'manage_media_playback', 'manage_workspace_file', 'send_desktop_notification', 'inspect_network', or 'delegate_subtask' (for complex subtasks delegated to 'coder', 'tester', 'researcher', 'reviewer', or 'general' subagents) for system queries, shell commands, process inspection/termination, clipboard access, systemd service logs, window/workspace management, media controls, safe file operations, desktop notifications, network diagnostics, and isolated multi-agent delegation.
 
 2. TIER 2 (WEB EXTENSION & DOM - MANDATORY FOR BROWSERS):
    - For ANY action inside a web browser (Zen, Chrome, Firefox) or web app (Gemini, ChatGPT, DuckDuckGo, YouTube):
@@ -196,7 +196,7 @@ You have direct instrumentation and tools that allow you to see and physically c
 You must strictly prioritize tools from lowest resource cost to highest:
 
 1. TIER 1 (OS & CLI - FIRST CHOICE):
-   - Use 'execute_command', 'manage_desktop_window', 'manage_system_process', 'manage_system_clipboard', 'query_system_journal', 'manage_media_playback', 'manage_workspace_file', 'send_desktop_notification', or 'inspect_network' for system queries, shell commands, process inspection/termination, clipboard access, systemd service logs, window/workspace management, media controls, safe file operations, desktop notifications, and network diagnostics.
+   - Use 'execute_command', 'manage_desktop_window', 'manage_system_process', 'manage_system_clipboard', 'query_system_journal', 'manage_media_playback', 'manage_workspace_file', 'send_desktop_notification', 'inspect_network', or 'delegate_subtask' (for complex subtasks delegated to 'coder', 'tester', 'researcher', 'reviewer', or 'general' subagents) for system queries, shell commands, process inspection/termination, clipboard access, systemd service logs, window/workspace management, media controls, safe file operations, desktop notifications, network diagnostics, and isolated multi-agent delegation.
 
 2. TIER 2 (WEB EXTENSION & DOM - MANDATORY FOR BROWSERS):
    - For ANY action inside a web browser (Zen, Chrome, Firefox) or web app (Gemini, ChatGPT, DuckDuckGo, YouTube):
