@@ -146,7 +146,7 @@ class TestPluginProcessIsolation:
 
     def test_crash_containment_sigsegv(self):
         """Phase 3.2: Verify SIGSEGV is intercepted into structured failure envelope."""
-        runner = SandboxedPluginRunner(crashing_segfault_plugin, name="segfault_tool", timeout=5.0)
+        runner = SandboxedPluginRunner(crashing_segfault_plugin, name="segfault_tool", timeout=10.0)
 
         res = runner.run()
 
@@ -158,7 +158,7 @@ class TestPluginProcessIsolation:
 
     def test_crash_containment_exit_code_139(self):
         """Phase 3.2: Verify os._exit(139) is intercepted without crashing the test process."""
-        runner = SandboxedPluginRunner(crashing_exit139_plugin, name="exit139_tool", timeout=5.0)
+        runner = SandboxedPluginRunner(crashing_exit139_plugin, name="exit139_tool", timeout=10.0)
 
         res = runner.run()
 
@@ -170,7 +170,7 @@ class TestPluginProcessIsolation:
 
     def test_crash_containment_sigabrt(self):
         """Phase 3.2: Verify SIGABRT crash does not bring down the host process."""
-        runner = SandboxedPluginRunner(crashing_sigabrt_plugin, name="sigabrt_tool", timeout=5.0)
+        runner = SandboxedPluginRunner(crashing_sigabrt_plugin, name="sigabrt_tool", timeout=10.0)
 
         res = runner.run()
 

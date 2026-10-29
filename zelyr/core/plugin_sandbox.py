@@ -69,6 +69,15 @@ def _sandbox_worker(
         except Exception:
             pass
 
+        # Disable core dumps in isolated child to prevent OS core-collection pauses
+        try:
+            import resource
+
+            if hasattr(resource, "RLIMIT_CORE"):
+                resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        except Exception:
+            pass
+
         # 1. Enforce POSIX virtual memory limits (RLIMIT_AS)
         if max_memory_bytes is not None and max_memory_bytes > 0:
             try:
@@ -275,23 +284,25 @@ class SandboxedPluginRunner(BaseTool):
                     has_data = parent_conn.poll(0.0)
                     break
 
-            if not has_data and proc.is_alive():
-                # Execution timed out: escalate termination gracefully then forcefully
-                logger.warning(
-                    "Plugin '%s' exceeded timeout %.1fs. Escalating termination...",
-                    self.name,
-                    self.timeout,
-                )
-                proc.terminate()
-                proc.join(timeout=SIGTERM_GRACE_PERIOD_SECONDS)
+            if not has_data:
+                proc.join(timeout=0.05)
                 if proc.is_alive():
-                    proc.kill()
-                    proc.join(timeout=1.0)
-                return ToolResult(
-                    success=False,
-                    output="",
-                    error=f"PluginExecutionError: Plugin execution timed out after {self.timeout}s.",
-                )
+                    # Execution timed out: escalate termination gracefully then forcefully
+                    logger.warning(
+                        "Plugin '%s' exceeded timeout %.1fs. Escalating termination...",
+                        self.name,
+                        self.timeout,
+                    )
+                    proc.terminate()
+                    proc.join(timeout=SIGTERM_GRACE_PERIOD_SECONDS)
+                    if proc.is_alive():
+                        proc.kill()
+                        proc.join(timeout=1.0)
+                    return ToolResult(
+                        success=False,
+                        output="",
+                        error=f"PluginExecutionError: Plugin execution timed out after {self.timeout}s.",
+                    )
 
             # Read response envelope from child worker
             msg = None
