@@ -212,7 +212,7 @@ def select_model_interactive(models: List[str], active_model: str) -> Optional[s
         sys.stdout.flush()
 
     try:
-        tty.setraw(fd)
+        tty.setraw(fd, termios.TCSANOW)
         sys.stdout.write("\033[?25l")
         sys.stdout.write("\r\n\033[38;2;122;162;247m\033[1mSelect Model\033[0m \033[38;2;169;177;214m(↑/↓: navigate, Enter: confirm, Esc: cancel)\033[0m\r\n")
         render_list(idx)
@@ -1002,6 +1002,7 @@ class InlineRepl:
             if in_think:
                 end_thought()
 
+            name = NativeOrchestrator.normalize_tool_name(name)
             # Automatic guardrail: prevent Tier 3 regression on browser elements
             if name == "interact_with_ui" and ("element_id" in kwargs or kwargs.get("action") in ("click_element", "fill_element")):
                 console.print(f"\n  [dim yellow]⚡ Tier Route Correction:[/dim yellow] Redirecting 'interact_with_ui' with element_id to Tier 2 'interact_with_browser'")
@@ -1104,7 +1105,8 @@ class InlineRepl:
             sys.stdout.flush()
             full_content.append(text)
 
-        try:
+        async def _consume_stream_pass() -> List[Dict[str, Any]]:
+            pass_tool_calls: List[Dict[str, Any]] = []
             async for chunk in self.orchestrator.generate_stream(payload):
                 choices = chunk.get("choices", [])
                 if not choices:
@@ -1119,7 +1121,10 @@ class InlineRepl:
                     for tc in delta["tool_calls"]:
                         fn = tc.get("function", {})
                         if fn.get("name"):
-                            tool_calls_emitted.append(fn)
+                            norm_fn = dict(fn)
+                            norm_fn["name"] = NativeOrchestrator.normalize_tool_name(fn["name"])
+                            pass_tool_calls.append(norm_fn)
+                            tool_calls_emitted.append(norm_fn)
 
                 # Reasoning delta capture (field-based)
                 reasoning = delta.get("reasoning_content") or delta.get("reasoning")
@@ -1159,6 +1164,44 @@ class InlineRepl:
                             else:
                                 append_thought(raw_content[cursor:])
                                 break
+            return pass_tool_calls
+
+        try:
+            max_fallback_steps = getattr(self.orchestrator, "max_steps", 5)
+            for step_idx in range(max_fallback_steps):
+                pass_tcs = await _consume_stream_pass()
+                if pass_tcs or not full_content:
+                    break
+                accumulated_text = "".join(full_content).strip()
+                known_tools = self.orchestrator.get_known_tool_names(payload.get("tools"))
+                fallback_tc = self.orchestrator.extract_first_tool_call(accumulated_text, known_tools)
+                if not fallback_tc:
+                    break
+                fn_name = NativeOrchestrator.normalize_tool_name(
+                    fallback_tc.get("function", {}).get("name") or fallback_tc.get("name")
+                )
+                fn_args = fallback_tc.get("function", {}).get("arguments") or fallback_tc.get("arguments", {})
+                if not isinstance(fn_args, dict):
+                    fn_args = {}
+                tool_calls_emitted.append({"name": fn_name, "arguments": fn_args})
+                full_content.clear()
+                obs = await inline_execute_tool(fn_name, **fn_args)
+                call_id = f"call_repl_fallback_{step_idx}"
+                payload["messages"].append({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": fn_name, "arguments": fn_args},
+                    }],
+                })
+                payload["messages"].append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "name": fn_name,
+                    "content": str(obs),
+                })
 
         except Exception as e:
             err_str = str(e)

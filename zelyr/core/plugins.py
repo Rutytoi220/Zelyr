@@ -742,6 +742,16 @@ async def execute_tool(name: str, **kwargs) -> str:
     if not _executors:
         load_plugins()
     if name not in _executors:
+        try:
+            from zelyr.tool_registry import ToolRegistry
+            registry = ToolRegistry()
+            if registry.get_tool(name) is not None:
+                res = await registry.execute_async(name, **kwargs)
+                if hasattr(res, "to_dict"):
+                    return json.dumps(res.to_dict(tool=name, arguments=kwargs))
+                return str(res)
+        except Exception:
+            pass
         return f"Tool execution failed: Tool {name} not found in dynamic plugins."
     
     import asyncio

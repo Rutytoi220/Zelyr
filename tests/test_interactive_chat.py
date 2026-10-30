@@ -634,3 +634,163 @@ class TestStartupInvarianceAndPerformance:
         )
         res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
         assert res.returncode == 0, f"Premature import detected: {res.stderr}"
+
+
+class TestHeadlessRunAndToolInterception:
+    """Tests for headless `zelyr run "<prompt>"` and text-leaked JSON tool call fallback interception."""
+
+    def test_zelyr_run_ping_headless(self, capsys, monkeypatch):
+        """zelyr run 'ping' executes headlessly, prints assistant answer to stdout, and exits with code 0."""
+        from zelyr.cli.main import cmd_run
+
+        async def mock_generate_stream(self, payload, **kwargs):
+            assert payload["messages"][-1] == {"role": "user", "content": "ping"}
+            yield {"choices": [{"delta": {"content": "pong"}}]}
+
+        monkeypatch.setattr(
+            "zelyr.agents.native_orchestrator.NativeOrchestrator.generate_stream",
+            mock_generate_stream,
+        )
+
+        args = argparse.Namespace(prompt="ping", model="qwen2.5:7b", json=False)
+        cmd_run(args)
+
+        captured = capsys.readouterr()
+        assert captured.out.strip() == "pong"
+        assert "_____  _____" not in captured.out
+
+    def test_zelyr_run_json_output(self, capsys, monkeypatch):
+        """zelyr run --json 'ping' outputs valid JSON structure to stdout."""
+        import json as _json
+        from zelyr.cli.main import cmd_run
+
+        async def mock_generate_stream(self, payload, **kwargs):
+            yield {"choices": [{"delta": {"content": "pong"}}]}
+
+        monkeypatch.setattr(
+            "zelyr.agents.native_orchestrator.NativeOrchestrator.generate_stream",
+            mock_generate_stream,
+        )
+
+        args = argparse.Namespace(prompt="ping", model="qwen2.5:7b", json=True)
+        cmd_run(args)
+
+        captured = capsys.readouterr()
+        data = _json.loads(captured.out.strip())
+        assert data["prompt"] == "ping"
+        assert data["model"] == "qwen2.5:7b"
+        assert data["response"] == "pong"
+
+    def test_extract_first_tool_call_strips_tool_and_functions_prefixes(self):
+        """extract_first_tool_call strips 'tool.' and 'functions.' prefixes and validates tool registry."""
+        from zelyr.agents.native_orchestrator import NativeOrchestrator
+
+        raw_tool_prefix = '{"name": "tool.execute_command", "arguments": {"command": "uptime"}}'
+        parsed = NativeOrchestrator.extract_first_tool_call(raw_tool_prefix)
+        assert parsed is not None
+        assert parsed["name"] == "execute_command"
+        assert parsed["function"]["name"] == "execute_command"
+        assert parsed["arguments"] == {"command": "uptime"}
+
+        fenced_func_prefix = '```json\n{"name": "functions.execute_command", "arguments": {"command": "whoami"}}\n```'
+        parsed_fn = NativeOrchestrator.extract_first_tool_call(fenced_func_prefix)
+        assert parsed_fn is not None
+        assert parsed_fn["name"] == "execute_command"
+        assert parsed_fn["arguments"] == {"command": "whoami"}
+
+        unknown_tool = '{"name": "tool.nonexistent_fake_tool_xyz", "arguments": {}}'
+        assert NativeOrchestrator.extract_first_tool_call(unknown_tool) is None
+
+    @pytest.mark.asyncio
+    async def test_native_orchestrator_fallback_tool_interception(self, monkeypatch):
+        """NativeOrchestrator intercepts raw JSON 'tool.execute_command' in content, strips prefix, executes tool, and returns final response."""
+        from zelyr.agents.native_orchestrator import NativeOrchestrator
+
+        turn = 0
+        executed_calls = []
+
+        async def fake_stream_provider(payload):
+            nonlocal turn
+            turn += 1
+            if turn == 1:
+                yield {
+                    "choices": [
+                        {
+                            "delta": {
+                                "content": '{"name": "tool.execute_command", "arguments": {"command": "uptime"}}'
+                            }
+                        }
+                    ]
+                }
+            else:
+                tool_msgs = [m for m in payload["messages"] if m.get("role") == "tool"]
+                assert len(tool_msgs) == 1
+                assert tool_msgs[0]["name"] == "execute_command"
+                assert "up 10 days" in tool_msgs[0]["content"]
+                yield {"choices": [{"delta": {"content": "System has been up 10 days."}}]}
+
+        async def fake_execute_tool(name, **kwargs):
+            executed_calls.append((name, kwargs))
+            return "Exit code 0\nup 10 days"
+
+        monkeypatch.setattr("zelyr.agents.native_orchestrator.execute_tool", fake_execute_tool)
+
+        orch = NativeOrchestrator(stream_provider=fake_stream_provider)
+        monkeypatch.setattr(orch, "get_active_window_context", AsyncMock(return_value=None))
+
+        payload = {"messages": [{"role": "user", "content": "What is the uptime?"}]}
+        content_chunks = []
+        tool_call_chunks = []
+
+        async for chunk in orch.generate_stream(payload):
+            delta = chunk.get("choices", [{}])[0].get("delta", {})
+            if delta.get("content"):
+                content_chunks.append(delta["content"])
+            if delta.get("tool_calls"):
+                tool_call_chunks.extend(delta["tool_calls"])
+
+        assert executed_calls == [("execute_command", {"command": "uptime"})]
+        assert len(tool_call_chunks) == 1
+        assert tool_call_chunks[0]["function"]["name"] == "execute_command"
+        assert "".join(content_chunks).strip() == "System has been up 10 days."
+
+    def test_zelyr_run_with_leaked_tool_call_e2e(self, capsys, monkeypatch):
+        """zelyr run intercepts a text-leaked 'tool.execute_command' response, executes it, and prints the final answer."""
+        from zelyr.cli.main import cmd_run
+
+        turn = 0
+        executed = []
+
+        async def mock_generate_stream(self, payload, **kwargs):
+            nonlocal turn
+            turn += 1
+            if turn == 1:
+                yield {
+                    "choices": [
+                        {
+                            "delta": {
+                                "content": '```json\n{"name": "tool.execute_command", "arguments": {"command": "echo smoke"}}\n```'
+                            }
+                        }
+                    ]
+                }
+            else:
+                yield {"choices": [{"delta": {"content": "Smoke test succeeded."}}]}
+
+        async def mock_exec(name, **kwargs):
+            executed.append((name, kwargs))
+            return "smoke"
+
+        monkeypatch.setattr(
+            "zelyr.agents.native_orchestrator.NativeOrchestrator.generate_stream",
+            mock_generate_stream,
+        )
+        monkeypatch.setattr("zelyr.agents.native_orchestrator.execute_tool", mock_exec)
+
+        args = argparse.Namespace(prompt="run smoke test", model=None, json=False)
+        cmd_run(args)
+
+        captured = capsys.readouterr()
+        assert executed == [("execute_command", {"command": "echo smoke"})]
+        assert captured.out.strip() == "Smoke test succeeded."
+

@@ -54,9 +54,9 @@ if TYPE_CHECKING:
 
 def main():
     """Run Zelyr CLI."""
-    from zelyr.api.cli import run_cli
+    from zelyr.cli.main import main as cli_main
 
-    run_cli()
+    cli_main()
 
 
 if __name__ == "__main__":

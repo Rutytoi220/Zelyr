@@ -238,25 +238,163 @@ def cmd_server(_args: argparse.Namespace) -> None:
 
 
 
+async def _execute_headless_run(
+    prompt: str,
+    model_override: Optional[str] = None,
+    output_json: bool = False,
+    orchestrator: Optional[Any] = None,
+) -> int:
+    """Execute a one-shot prompt headlessly via NativeOrchestrator."""
+    import re
+    import zelyr.agents.native_orchestrator as nat_orch
+    from zelyr.agents.native_orchestrator import NativeOrchestrator
+    from zelyr.config import get_config
+    from zelyr.core.plugins import filter_tool_schemas_by_tier, get_tool_schemas, load_plugins
+
+    clean_prompt = (prompt or "").strip()
+    if not clean_prompt:
+        sys.stderr.write("Error: prompt cannot be empty.\n")
+        sys.stderr.flush()
+        return 1
+
+    cfg = get_config()
+    if model_override:
+        cfg.ollama_model = model_override
+    active_model = model_override or getattr(cfg, "ollama_model", "qwen2.5-coder:7b")
+
+    load_plugins()
+    orch = orchestrator or NativeOrchestrator()
+    tier = orch.route_tier(clean_prompt)
+    dynamic_tools = filter_tool_schemas_by_tier(get_tool_schemas(0), tier)
+
+    payload: Dict[str, Any] = {
+        "model": active_model,
+        "stream": True,
+        "tools": dynamic_tools,
+        "messages": [{"role": "user", "content": clean_prompt}],
+    }
+
+    original_execute = nat_orch.execute_tool
+    tool_calls_emitted: List[Dict[str, Any]] = []
+
+    async def headless_execute_tool(name: str, **kwargs: Any) -> str:
+        clean_name = NativeOrchestrator.normalize_tool_name(name)
+        if clean_name == "interact_with_ui" and (
+            "element_id" in kwargs or kwargs.get("action") in ("click_element", "fill_element")
+        ):
+            clean_name = "interact_with_browser"
+        if not output_json:
+            sys.stderr.write(f"[tool] {clean_name} {json.dumps(kwargs)}\n")
+            sys.stderr.flush()
+        res = await original_execute(clean_name, **kwargs)
+        return str(res)
+
+    nat_orch.execute_tool = headless_execute_tool
+    final_answer = ""
+
+    try:
+        max_steps = getattr(orch, "max_steps", 5)
+        for step_idx in range(max_steps):
+            step_content: List[str] = []
+            step_tcs: List[Dict[str, Any]] = []
+
+            async for chunk in orch.generate_stream(payload):
+                choices = chunk.get("choices", [])
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {})
+                if "tool_calls" in delta:
+                    for tc in delta["tool_calls"]:
+                        fn = tc.get("function", {})
+                        if fn.get("name"):
+                            norm_fn = {
+                                "name": NativeOrchestrator.normalize_tool_name(fn["name"]),
+                                "arguments": fn.get("arguments", {}),
+                            }
+                            step_tcs.append(norm_fn)
+                            tool_calls_emitted.append(norm_fn)
+                raw_text = delta.get("content", "")
+                if raw_text:
+                    step_content.append(raw_text)
+
+            raw_joined = "".join(step_content)
+            clean_step = re.sub(r"<think>.*?</think>", "", raw_joined, flags=re.DOTALL).strip()
+
+            if not step_tcs and clean_step:
+                known_tools = orch.get_known_tool_names(payload.get("tools"))
+                fallback_tc = orch.extract_first_tool_call(clean_step, known_tools)
+                if fallback_tc:
+                    fn_name = NativeOrchestrator.normalize_tool_name(
+                        fallback_tc.get("function", {}).get("name") or fallback_tc.get("name")
+                    )
+                    fn_args = fallback_tc.get("function", {}).get("arguments") or fallback_tc.get("arguments", {})
+                    if not isinstance(fn_args, dict):
+                        fn_args = {}
+                    tool_calls_emitted.append({"name": fn_name, "arguments": fn_args})
+                    obs = await headless_execute_tool(fn_name, **fn_args)
+                    call_id = f"call_headless_fallback_{step_idx}"
+                    payload["messages"].append({
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": fn_name, "arguments": fn_args},
+                        }],
+                    })
+                    payload["messages"].append({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "name": fn_name,
+                        "content": str(obs),
+                    })
+                    continue
+
+            final_answer = clean_step
+            break
+    except Exception as exc:
+        sys.stderr.write(f"Error executing headless run: {exc}\n")
+        sys.stderr.flush()
+        return 1
+    finally:
+        nat_orch.execute_tool = original_execute
+
+    if final_answer.startswith("⚠️ [Connection Error]") or final_answer.startswith("⚠️ [API Error]") or final_answer.startswith("⚠️ [Request Error]"):
+        sys.stderr.write(f"{final_answer}\n")
+        sys.stderr.flush()
+        return 1
+
+    if output_json:
+        print(
+            json.dumps({
+                "prompt": clean_prompt,
+                "model": active_model,
+                "response": final_answer,
+                "tool_calls": tool_calls_emitted,
+            }),
+            flush=True,
+        )
+    else:
+        print(final_answer, flush=True)
+
+    return 0
+
+
 def cmd_run(args: argparse.Namespace) -> None:
-    """Autonomous agent entry point — rich spinner stub."""
-    prompt: str = args.prompt
+    """Execute a one-shot prompt headlessly via NativeOrchestrator and exit."""
+    prompt: str = getattr(args, "prompt", "")
+    model_override: Optional[str] = getattr(args, "model", None)
+    output_json: bool = bool(getattr(args, "json", False))
 
-    _panel(
-        "Zelyr Autonomous Agent",
-        f"[bold]Prompt:[/bold] {prompt}\n\n"
-        "[dim]Planner, Memory, and Tool-Registry integration is on the roadmap.[/dim]",
-        style="bold green",
+    exit_code = asyncio.run(
+        _execute_headless_run(
+            prompt=prompt,
+            model_override=model_override,
+            output_json=output_json,
+        )
     )
-
-    with _spinner_context(f"Reasoning over: \"{prompt[:60]}{'…' if len(prompt) > 60 else ''}\""):
-        if _RICH:
-            _time.sleep(1.5)  # Simulate async planner startup
-
-    _print(
-        "[bold green]✓[/bold green] Agent stub complete.  "
-        "Wire [cyan]zelyr.core.planner[/cyan] here when ready."
-    )
+    if exit_code != 0:
+        sys.exit(exit_code)
 
 
 # ---------------------------------------------------------------------------
@@ -800,8 +938,10 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("ui",     aliases=["gui"], help="Launch the PySide6 desktop UI")
     sub.add_parser("server", help="Print Zelyr Distributed Server panel (stub)")
 
-    p_run = sub.add_parser("run", help="Autonomous agent entry point")
+    p_run = sub.add_parser("run", help="Execute a one-shot prompt headlessly via NativeOrchestrator")
     p_run.add_argument("prompt", type=str, help="Natural-language task prompt")
+    p_run.add_argument("--model", "-m", type=str, default=None, help="Override model for this execution")
+    p_run.add_argument("--json", action="store_true", default=False, help="Output structured JSON response")
 
     # ── Legacy commands (backwards-compatible) ──────────────────────────────
     p_send = sub.add_parser("send", help="Send a prompt to the daemon")
