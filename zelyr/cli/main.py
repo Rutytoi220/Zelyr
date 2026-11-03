@@ -354,7 +354,7 @@ async def _execute_headless_run(
                         "role": "tool",
                         "tool_call_id": call_id,
                         "name": fn_name,
-                        "content": str(obs),
+                        "content": NativeOrchestrator.format_tool_observation(fn_name, obs),
                     })
                     continue
 

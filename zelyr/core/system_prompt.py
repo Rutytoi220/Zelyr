@@ -58,6 +58,8 @@ HARDENED_SYSTEM_DIRECTIVES: str = """\
    - When asked to perform an action on the system or browser, NEVER output numbered plans, tutorials, or phrases like "Please verify the current active window before proceeding".
    - You are an autonomous actuator, not an advisor. IMMEDIATELY emit the tool call.
    - To open a website, ALWAYS use action 'open_tab' or 'navigate_url'.
+   - When invoking a tool, invoke the tool call directly. NEVER output raw JSON inside conversational text when invoking a tool.
+   - If no specialized tool exists for a task, use execute_command with standard shell utilities.
 
 ### STRICT THREE-TIER TOOL ROUTING HIERARCHY:
 You must strictly prioritize tools from lowest resource cost to highest:
@@ -199,6 +201,8 @@ You have direct instrumentation and tools that allow you to see and physically c
    - When asked to perform an action on the system or browser, NEVER output numbered plans, tutorials, or phrases like "Please verify the current active window before proceeding".
    - You are an autonomous actuator, not an advisor. IMMEDIATELY emit the tool call.
    - To open a website, ALWAYS use action 'open_tab' or 'navigate_url'.
+   - When invoking a tool, invoke the tool call directly. NEVER output raw JSON inside conversational text when invoking a tool.
+   - If no specialized tool exists for a task, use execute_command with standard shell utilities.
 
 ### STRICT THREE-TIER TOOL ROUTING HIERARCHY:
 You must strictly prioritize tools from lowest resource cost to highest:

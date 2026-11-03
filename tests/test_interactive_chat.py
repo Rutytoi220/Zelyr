@@ -328,6 +328,8 @@ class TestModelSelection:
         from zelyr.cli import repl as repl_mod
 
         master, slave = pty.openpty()
+        import termios, tty
+        tty.setraw(slave, termios.TCSANOW)
         stdin = os.fdopen(slave, "r", closefd=True)
         monkeypatch.setattr(sys, "stdin", stdin)
         monkeypatch.setattr(sys, "stdout", open(os.devnull, "w"))
@@ -886,5 +888,169 @@ class TestHeadlessRunAndToolInterception:
 
         assert executed_calls == [("execute_command", {"command": "uptime -p"})]
         assert "".join(content_chunks).strip() == "up 2 hours, 15 minutes"
+
+    def test_system_prompt_streamlined_directives_no_forbidden_strings(self):
+        """System prompt contains no contradictory directives or non-existent tools, and contains streamlined directives."""
+        from zelyr.agents.native_orchestrator import NativeOrchestrator
+
+        orch = NativeOrchestrator()
+        prompt = orch._build_system_prompt()
+
+        # Forbidden contradictory directives and non-existent tools
+        assert "ALWAYS prefer dedicated API tools over raw shell commands" not in prompt
+        assert "shell_exec" not in prompt
+        assert "Distrobox" not in prompt
+        assert "ask_human" not in prompt
+
+        # Required concise directives
+        assert "If no specialized tool exists for a task, use execute_command with standard shell utilities." in prompt
+        assert "NEVER output raw JSON inside conversational text when invoking a tool." in prompt
+
+    @pytest.mark.asyncio
+    async def test_tool_observation_structured_exit_code_and_status(self):
+        """Tool execution results fed back to the agent contain structured exit_code and status fields."""
+        import json
+        from zelyr.agents.native_orchestrator import NativeOrchestrator
+
+        # 1. Successful shell command execution
+        succ_res = NativeOrchestrator.format_tool_observation("execute_command", "Exit code 0\nAll tests passed")
+        succ_dict = json.loads(succ_res)
+        assert succ_dict["tool"] == "execute_command"
+        assert succ_dict["status"] == "success"
+        assert succ_dict["exit_code"] == 0
+        assert succ_dict["output"] == "All tests passed"
+        assert succ_dict["error"] == ""
+
+        # 2. Failed shell command execution with remediation hint
+        fail_res = NativeOrchestrator.format_tool_observation("execute_command", "Exit code 1\ncat: /tmp/none: No such file")
+        fail_dict = json.loads(fail_res)
+        assert fail_dict["tool"] == "execute_command"
+        assert fail_dict["status"] == "error"
+        assert fail_dict["exit_code"] == 1
+        assert "Command failed with non-zero exit code. Inspect stderr and adjust arguments." in fail_dict["error"]
+
+        # 3. Structured observation injected into orchestrator message history
+        async def mock_stream(payload):
+            msgs = payload.get("messages", [])
+            if msgs and msgs[-1].get("role") == "tool":
+                yield {"choices": [{"delta": {"content": "Task completed successfully."}}]}
+            else:
+                yield {
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_stat_1",
+                                "function": {
+                                    "name": "execute_command",
+                                    "arguments": json.dumps({"command": "echo 'grounded test'"}),
+                                },
+                            }]
+                        }
+                    }]
+                }
+
+        async def mock_exec(name, **kwargs):
+            return "Exit code 0\ngrounded test"
+
+        orch = NativeOrchestrator(stream_provider=mock_stream, tool_executor=mock_exec)
+        payload = {"messages": [{"role": "user", "content": "Run grounded test"}]}
+
+        async for _ in orch.generate_stream(payload):
+            pass
+
+        tool_msgs = [m for m in payload["messages"] if m.get("role") == "tool"]
+        assert len(tool_msgs) == 1
+        parsed_obs = json.loads(tool_msgs[0]["content"])
+        assert parsed_obs["tool"] == "execute_command"
+        assert parsed_obs["status"] == "success"
+        assert parsed_obs["exit_code"] == 0
+        assert parsed_obs["output"] == "grounded test"
+        assert parsed_obs["error"] == ""
+
+    @pytest.mark.asyncio
+    async def test_canary_multi_step_create_and_read_file(self, monkeypatch):
+        """A multi-step canary prompt executes both tool calls sequentially and completes."""
+        import json
+        from zelyr.agents.native_orchestrator import NativeOrchestrator
+
+        turn = 0
+        executed_calls = []
+
+        async def canary_stream_provider(payload):
+            nonlocal turn
+            turn += 1
+            if turn == 1:
+                # Step 1: Model invokes tool to create the file
+                yield {
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_canary_create",
+                                "function": {
+                                    "name": "execute_command",
+                                    "arguments": json.dumps({"command": "echo 'OK' > /tmp/canary_test.txt"}),
+                                },
+                            }]
+                        }
+                    }]
+                }
+            elif turn == 2:
+                # Step 2: Model verifies observation and invokes tool to read the file
+                last_tool_msg = payload["messages"][-1]
+                assert last_tool_msg.get("role") == "tool"
+                obs = json.loads(last_tool_msg["content"])
+                assert obs["status"] == "success"
+                assert obs["exit_code"] == 0
+
+                yield {
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_canary_read",
+                                "function": {
+                                    "name": "execute_command",
+                                    "arguments": json.dumps({"command": "cat /tmp/canary_test.txt"}),
+                                },
+                            }]
+                        }
+                    }]
+                }
+            else:
+                # Step 3: Model receives file content observation and generates final response
+                last_tool_msg = payload["messages"][-1]
+                assert last_tool_msg.get("role") == "tool"
+                obs = json.loads(last_tool_msg["content"])
+                assert obs["status"] == "success"
+                assert obs["output"] == "OK"
+
+                yield {"choices": [{"delta": {"content": "The file /tmp/canary_test.txt was created and verified to contain 'OK'."}}]}
+
+        async def canary_execute_tool(name, **kwargs):
+            executed_calls.append((name, kwargs))
+            cmd = kwargs.get("command", "")
+            if "cat" in cmd:
+                return "Exit code 0\nOK"
+            return "Exit code 0\n"
+
+        orch = NativeOrchestrator(stream_provider=canary_stream_provider, tool_executor=canary_execute_tool)
+        monkeypatch.setattr(orch, "get_active_window_context", AsyncMock(return_value=None))
+
+        payload = {"messages": [{"role": "user", "content": "Create /tmp/canary_test.txt containing 'OK', then read it"}]}
+        response_chunks = []
+
+        async for chunk in orch.generate_stream(payload):
+            delta = chunk.get("choices", [{}])[0].get("delta", {})
+            if delta.get("content"):
+                response_chunks.append(delta["content"])
+
+        assert len(executed_calls) == 2
+        assert executed_calls[0] == ("execute_command", {"command": "echo 'OK' > /tmp/canary_test.txt"})
+        assert executed_calls[1] == ("execute_command", {"command": "cat /tmp/canary_test.txt"})
+        final_answer = "".join(response_chunks).strip()
+        assert "The file /tmp/canary_test.txt was created and verified to contain 'OK'." in final_answer
+
 
 

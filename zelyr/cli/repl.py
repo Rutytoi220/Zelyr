@@ -1200,7 +1200,7 @@ class InlineRepl:
                     "role": "tool",
                     "tool_call_id": call_id,
                     "name": fn_name,
-                    "content": str(obs),
+                    "content": NativeOrchestrator.format_tool_observation(fn_name, obs),
                 })
 
         except Exception as e:

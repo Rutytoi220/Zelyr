@@ -506,6 +506,146 @@ class NativeOrchestrator:
 
         return None
 
+    @classmethod
+    def format_tool_observation(cls, tool_name: str, tool_result: Any) -> str:
+        """Format tool execution observations with explicit status metadata and remediation hints."""
+        # 1. Unpack ToolResult or object with to_dict
+        if hasattr(tool_result, "to_dict"):
+            try:
+                tool_result = tool_result.to_dict(tool=tool_name)
+            except TypeError:
+                tool_result = tool_result.to_dict()
+
+        parsed: Optional[Dict[str, Any]] = None
+        raw_str = ""
+
+        if isinstance(tool_result, dict):
+            parsed = tool_result
+            raw_str = json.dumps(tool_result)
+        elif isinstance(tool_result, str):
+            raw_str = tool_result.strip()
+            try:
+                data = json.loads(raw_str)
+                if isinstance(data, dict):
+                    parsed = data
+            except Exception:
+                pass
+        else:
+            raw_str = str(tool_result)
+
+        exit_code = 0
+        status = "success"
+        output = ""
+        error = ""
+        remedy_hint = ""
+
+        if parsed is not None:
+            # Check success / error flags
+            is_error = False
+            if parsed.get("success") is False:
+                is_error = True
+            elif parsed.get("status") in ("error", "failed", "tool_execution_failed"):
+                is_error = True
+            elif parsed.get("error"):
+                is_error = True
+            elif isinstance(parsed.get("result"), dict) and parsed["result"].get("error"):
+                is_error = True
+
+            # Extract exit_code
+            if "exit_code" in parsed:
+                try:
+                    exit_code = int(parsed["exit_code"])
+                except Exception:
+                    exit_code = 1 if is_error else 0
+            elif "returncode" in parsed:
+                try:
+                    exit_code = int(parsed["returncode"])
+                except Exception:
+                    exit_code = 1 if is_error else 0
+            else:
+                exit_code = 1 if is_error else 0
+
+            status = "error" if (is_error or exit_code != 0) else "success"
+
+            # Extract output
+            if "output" in parsed:
+                out_val = parsed["output"]
+            elif "stdout" in parsed:
+                out_val = parsed["stdout"]
+            elif "result" in parsed:
+                res_val = parsed["result"]
+                if isinstance(res_val, dict) and "output" in res_val:
+                    out_val = res_val["output"]
+                elif isinstance(res_val, dict) and "error" in res_val and is_error:
+                    out_val = ""
+                else:
+                    out_val = res_val
+            else:
+                out_val = raw_str if status == "success" else ""
+
+            output = json.dumps(out_val) if isinstance(out_val, dict) else str(out_val if out_val is not None else "")
+
+            # Extract error
+            if is_error or exit_code != 0:
+                err_val = (
+                    parsed.get("error")
+                    or parsed.get("stderr")
+                    or (parsed.get("result", {}).get("error") if isinstance(parsed.get("result"), dict) else None)
+                    or "Tool execution failed"
+                )
+                error = str(err_val)
+                remedy_hint = (
+                    parsed.get("remedy_hint")
+                    or (parsed.get("result", {}).get("remedy_hint") if isinstance(parsed.get("result"), dict) else None)
+                    or (parsed.get("result", {}).get("metadata", {}).get("remedy_hint") if isinstance(parsed.get("result"), dict) else None)
+                    or ""
+                )
+        else:
+            # Parse raw text (e.g. "Exit code 0\n...", "Exit code 1\n...", "Error executing command: ...")
+            exit_code_match = re.match(r"^Exit code\s+(\d+)(?:\n([\s\S]*))?$", raw_str, re.IGNORECASE)
+            if exit_code_match:
+                exit_code = int(exit_code_match.group(1))
+                body = (exit_code_match.group(2) or "").strip()
+                if exit_code == 0:
+                    status = "success"
+                    output = body
+                    error = ""
+                else:
+                    status = "error"
+                    output = ""
+                    error = body or f"Command exited with code {exit_code}"
+            elif raw_str.startswith(("Error executing command:", "Tool execution failed:", "Error:")):
+                status = "error"
+                exit_code = 1
+                output = ""
+                error = raw_str
+            else:
+                status = "success"
+                exit_code = 0
+                output = raw_str
+                error = ""
+
+        # Remediation hint handling on failure
+        if status == "error" or exit_code != 0:
+            if not remedy_hint:
+                remedy_hint = "Command failed with non-zero exit code. Inspect stderr and adjust arguments."
+
+            err_clean = error.rstrip(".")
+            if "[Tool Error]:" not in err_clean:
+                err_clean = f"[Tool Error]: {err_clean}" if err_clean else "[Tool Error]: Command failed"
+            if "Recovery Hint:" not in err_clean:
+                err_clean = f"{err_clean}. Recovery Hint: {remedy_hint}"
+            error = err_clean
+
+        structured = {
+            "tool": tool_name,
+            "status": status,
+            "exit_code": exit_code,
+            "output": output,
+            "error": error,
+        }
+        return json.dumps(structured, indent=2)
+
     async def _stream_model_events(self, payload: dict, base_url: str, stream_provider: Optional[Any] = None) -> AsyncGenerator[dict, None]:
         active_provider = stream_provider or getattr(self, "stream_provider", None) or getattr(self, "model_provider", None)
         if active_provider is not None:
@@ -1159,51 +1299,36 @@ class NativeOrchestrator:
                         "allowed_actions": [],
                     })
 
-                # Format tool output: if tool execution failed, format as structured recovery observation
+                # Format tool output with structured status metadata and remediation hints
+                content_for_msg = self.format_tool_observation(func_name, res_str)
+
                 is_failed = False
-                err_text = ""
                 remedy_hint_out = ""
                 allowed_actions_out = []
 
                 try:
-                    parsed_res = json.loads(res_str) if isinstance(res_str, str) else res_str
-                    if isinstance(parsed_res, dict):
-                        if parsed_res.get("success") is False:
+                    obs_dict = json.loads(content_for_msg) if isinstance(content_for_msg, str) else content_for_msg
+                    if isinstance(obs_dict, dict):
+                        if obs_dict.get("status") == "error" or obs_dict.get("exit_code", 0) != 0:
                             is_failed = True
-                        elif "error" in parsed_res and parsed_res["error"]:
-                            is_failed = True
-                        elif isinstance(parsed_res.get("result"), dict) and parsed_res["result"].get("error"):
-                            is_failed = True
-
-                        if is_failed:
-                            err_text = (
-                                parsed_res.get("error")
-                                or (parsed_res.get("result", {}).get("error") if isinstance(parsed_res.get("result"), dict) else None)
-                                or "Tool execution failed"
-                            )
-                            remedy_hint_out = (
-                                parsed_res.get("remedy_hint")
-                                or (parsed_res.get("result", {}).get("remedy_hint") if isinstance(parsed_res.get("result"), dict) else None)
-                                or (parsed_res.get("result", {}).get("metadata", {}).get("remedy_hint") if isinstance(parsed_res.get("result"), dict) else None)
-                                or ""
-                            )
-                            allowed_actions_out = (
-                                parsed_res.get("allowed_actions")
-                                or (parsed_res.get("result", {}).get("allowed_actions") if isinstance(parsed_res.get("result"), dict) else None)
-                                or (parsed_res.get("result", {}).get("metadata", {}).get("allowed_actions") if isinstance(parsed_res.get("result"), dict) else None)
-                                or []
-                            )
+                        err_str = str(obs_dict.get("error") or "")
+                        if "Recovery Hint:" in err_str:
+                            remedy_hint_out = err_str.split("Recovery Hint:", 1)[1].strip()
+                        elif is_failed:
+                            remedy_hint_out = "Command failed with non-zero exit code. Inspect stderr and adjust arguments."
                 except Exception:
                     pass
 
-                if is_failed and err_text:
-                    err_clean = str(err_text).rstrip(".")
-                    if remedy_hint_out:
-                        content_for_msg = f"[Tool Error]: {err_clean}. Recovery Hint: {remedy_hint_out}"
-                    else:
-                        content_for_msg = f"[Tool Error]: {err_clean}"
-                else:
-                    content_for_msg = res_str
+                try:
+                    parsed_raw = json.loads(res_str) if isinstance(res_str, str) else res_str
+                    if isinstance(parsed_raw, dict):
+                        allowed_actions_out = (
+                            parsed_raw.get("allowed_actions")
+                            or (parsed_raw.get("result", {}).get("allowed_actions") if isinstance(parsed_raw.get("result"), dict) else None)
+                            or []
+                        )
+                except Exception:
+                    pass
 
                 tool_msg = {
                     "role": "tool",
