@@ -422,9 +422,15 @@ class ContextBudgetEngine:
         if len(conv_messages) == 1:
             return system_messages + [latest_turn], 0
 
-        # Initial turn is preserved as context anchor if possible
+        #Initial turn is preserved as context anchor if possible
         initial_turn = conv_messages[0]
         middle_turns = conv_messages[1:-1]
+
+        # If the latest turn is a tool result, protect its immediately preceding
+        # assistant tool_call message so an active ReAct step is never severed.
+        protected_tail: List[Dict[str, Any]] = [latest_turn]
+        if latest_turn.get("role") == "tool" and middle_turns and middle_turns[-1].get("role") == "assistant":
+            protected_tail.insert(0, middle_turns.pop())
 
         evicted: List[Dict[str, Any]] = []
         kept_middle: List[Dict[str, Any]] = []
@@ -432,13 +438,13 @@ class ContextBudgetEngine:
         # If there are middle turns, evict oldest middle turns first
         if middle_turns:
             # We want to keep as many recent middle turns as fit within budget
-            # Available budget for middle turns after reserving system, initial turn, latest turn, and summary (~150 tokens)
+            # Available budget for middle turns after reserving system, initial turn, protected tail, and summary (~150 tokens)
             sys_tokens = sum(count_message_tokens(m) for m in system_messages)
             init_tokens = count_message_tokens(initial_turn)
-            latest_tokens = count_message_tokens(latest_turn)
+            tail_tokens = sum(count_message_tokens(m) for m in protected_tail)
             summary_reserve = 150
 
-            avail_for_middle = target_budget - sys_tokens - init_tokens - latest_tokens - summary_reserve
+            avail_for_middle = target_budget - sys_tokens - init_tokens - tail_tokens - summary_reserve
 
             # Select recent middle turns from back to front
             accum_tokens = 0
@@ -450,12 +456,12 @@ class ContextBudgetEngine:
                 else:
                     evicted.insert(0, msg)
         else:
-            # Only initial_turn and latest_turn exist.
-            # If initial_turn + latest_turn > target_budget, evict initial_turn into summary
+            # Only initial_turn and protected_tail exist.
+            # If initial_turn + protected_tail > target_budget, evict initial_turn into summary
             sys_tokens = sum(count_message_tokens(m) for m in system_messages)
             init_tokens = count_message_tokens(initial_turn)
-            latest_tokens = count_message_tokens(latest_turn)
-            if sys_tokens + init_tokens + latest_tokens > target_budget:
+            tail_tokens = sum(count_message_tokens(m) for m in protected_tail)
+            if sys_tokens + init_tokens + tail_tokens > target_budget:
                 evicted.append(initial_turn)
                 initial_turn = None
 
@@ -463,7 +469,7 @@ class ContextBudgetEngine:
         if initial_turn is not None:
             pruned_conv.append(initial_turn)
         pruned_conv.extend(kept_middle)
-        pruned_conv.append(latest_turn)
+        pruned_conv.extend(protected_tail)
 
         # Inject semantic summary anchor if any turns were evicted
         if evicted:

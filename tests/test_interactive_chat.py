@@ -352,9 +352,12 @@ class TestModelSelection:
         models = ["a:1b", "b:3b"]
         assert self._pty_pick(monkeypatch, b"\x1b[1;5B\r", models, "a:1b") == "b:3b"
 
-    def test_standalone_escape_and_ctrl_c_cancel(self, monkeypatch):
+    def test_standalone_escape_cancel(self, monkeypatch):
         models = ["a:1b", "b:3b"]
         assert self._pty_pick(monkeypatch, b"\x1b", models, "a:1b") is None
+
+    def test_ctrl_c_cancel(self, monkeypatch):
+        models = ["a:1b", "b:3b"]
         assert self._pty_pick(monkeypatch, b"\x03", models, "a:1b") is None
 
     def test_non_tty_fallback_numbered_prompt(self, monkeypatch):
@@ -792,5 +795,96 @@ class TestHeadlessRunAndToolInterception:
 
         captured = capsys.readouterr()
         assert executed == [("execute_command", {"command": "echo smoke"})]
-        assert captured.out.strip() == "Smoke test succeeded."
+        assert captured.out == "Smoke test succeeded.\n"
+
+    def test_normalize_tool_name_aliases_and_arguments(self):
+        """normalize_tool_name maps common shell and file aliases to canonical tools and normalizes arguments."""
+        from zelyr.agents.native_orchestrator import NativeOrchestrator
+
+        for alias in (
+            "shell_exec",
+            "bash",
+            "sh",
+            "terminal",
+            "run_command",
+            "run_shell",
+            "cmd",
+            "exec_command",
+            "shell_command",
+            "shell",
+            "tool.shell_exec",
+            "functions.bash",
+        ):
+            assert NativeOrchestrator.normalize_tool_name(alias) == "execute_command"
+
+        for file_alias in ("read_file", "view_file", "tool.read_file", "functions.view_file"):
+            assert NativeOrchestrator.normalize_tool_name(file_alias) == "manage_workspace_file"
+
+        # Verify argument mapping for shell_exec / bash with "command" and "cmd"
+        parsed_cmd = NativeOrchestrator.extract_first_tool_call(
+            '{"name": "shell_exec", "arguments": {"command": "uptime -p"}}'
+        )
+        assert parsed_cmd is not None
+        assert parsed_cmd["name"] == "execute_command"
+        assert parsed_cmd["arguments"] == {"command": "uptime -p"}
+
+        parsed_alt_cmd = NativeOrchestrator.extract_first_tool_call(
+            '{"name": "bash", "arguments": {"cmd": "uptime -p"}}'
+        )
+        assert parsed_alt_cmd is not None
+        assert parsed_alt_cmd["name"] == "execute_command"
+        assert parsed_alt_cmd["arguments"] == {"command": "uptime -p"}
+
+        # Verify argument mapping for file aliases
+        parsed_file = NativeOrchestrator.extract_first_tool_call(
+            '{"name": "read_file", "arguments": {"file_path": "/etc/hostname"}}'
+        )
+        assert parsed_file is not None
+        assert parsed_file["name"] == "manage_workspace_file"
+        assert parsed_file["arguments"] == {"action": "read", "path": "/etc/hostname"}
+
+    @pytest.mark.asyncio
+    async def test_leaked_shell_exec_dispatches_execute_command(self, monkeypatch):
+        """A leaked JSON payload {'name': 'shell_exec', 'arguments': {'command': 'uptime -p'}} dispatches execute_command."""
+        from zelyr.agents.native_orchestrator import NativeOrchestrator
+
+        turn = 0
+        executed_calls = []
+
+        async def fake_stream_provider(payload):
+            nonlocal turn
+            turn += 1
+            if turn == 1:
+                yield {
+                    "choices": [
+                        {
+                            "delta": {
+                                "content": '{"name": "shell_exec", "arguments": {"command": "uptime -p"}}'
+                            }
+                        }
+                    ]
+                }
+            else:
+                yield {"choices": [{"delta": {"content": "up 2 hours, 15 minutes"}}]}
+
+        async def fake_execute_tool(name, **kwargs):
+            executed_calls.append((name, kwargs))
+            return "up 2 hours, 15 minutes"
+
+        monkeypatch.setattr("zelyr.agents.native_orchestrator.execute_tool", fake_execute_tool)
+
+        orch = NativeOrchestrator(stream_provider=fake_stream_provider)
+        monkeypatch.setattr(orch, "get_active_window_context", AsyncMock(return_value=None))
+
+        payload = {"messages": [{"role": "user", "content": "What is my system uptime?"}]}
+        content_chunks = []
+
+        async for chunk in orch.generate_stream(payload):
+            delta = chunk.get("choices", [{}])[0].get("delta", {})
+            if delta.get("content"):
+                content_chunks.append(delta["content"])
+
+        assert executed_calls == [("execute_command", {"command": "uptime -p"})]
+        assert "".join(content_chunks).strip() == "up 2 hours, 15 minutes"
+
 

@@ -199,9 +199,32 @@ class NativeOrchestrator:
                             return v
         except Exception:
             pass
-    @classmethod
-    def normalize_tool_name(cls, name: Any) -> str:
-        """Normalize a tool name by stripping common prefixes ('tool.', 'tools.', 'functions.', 'function.')."""
+    SHELL_TOOL_ALIASES = {
+        "shell_exec",
+        "bash",
+        "sh",
+        "terminal",
+        "run_command",
+        "run_shell",
+        "cmd",
+        "exec_command",
+        "shell_command",
+        "shell",
+    }
+
+    FILE_TOOL_ALIASES = {
+        "read_file",
+        "view_file",
+    }
+
+    TOOL_ALIAS_MAP = {
+        **{alias: "execute_command" for alias in SHELL_TOOL_ALIASES},
+        **{alias: "manage_workspace_file" for alias in FILE_TOOL_ALIASES},
+    }
+
+    @staticmethod
+    def _strip_tool_prefixes(name: Any) -> str:
+        """Strip common prefixes ('tool.', 'tools.', 'functions.', 'function.') without alias mapping."""
         if not name or not isinstance(name, str):
             return ""
         clean = name.strip()
@@ -215,6 +238,66 @@ class NativeOrchestrator:
         return clean
 
     @classmethod
+    def normalize_tool_name(cls, name: Any, active_schemas: Optional[list] = None) -> str:
+        """Normalize a tool name by stripping common prefixes and mapping hallucinated aliases to canonical tools."""
+        clean = cls._strip_tool_prefixes(name)
+        if not clean:
+            return ""
+        if active_schemas:
+            explicit_names = set()
+            for t in active_schemas:
+                if isinstance(t, dict):
+                    fn = t.get("function")
+                    if isinstance(fn, dict) and fn.get("name"):
+                        explicit_names.add(cls._strip_tool_prefixes(fn["name"]))
+                    elif t.get("name"):
+                        explicit_names.add(cls._strip_tool_prefixes(t["name"]))
+            if clean in explicit_names:
+                return clean
+        target = cls.TOOL_ALIAS_MAP.get(clean)
+        if target and target in cls.get_known_tool_names(active_schemas):
+            return target
+        return clean
+
+    @classmethod
+    def normalize_tool_arguments(
+        cls,
+        clean_name: str,
+        args: Any,
+        original_name: Optional[str] = None,
+    ) -> dict:
+        """Normalize tool arguments for aliased or hallucinated tool calls."""
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                pass
+        if not isinstance(args, dict):
+            args = {}
+        else:
+            args = dict(args)
+
+        raw_orig = cls._strip_tool_prefixes(original_name) if original_name else ""
+
+        if clean_name == "execute_command":
+            if "command" not in args:
+                for alt_key in ("cmd", "script", "shell_command", "command_line", "input"):
+                    if alt_key in args:
+                        args["command"] = args.pop(alt_key)
+                        break
+
+        elif clean_name == "manage_workspace_file":
+            if raw_orig in cls.FILE_TOOL_ALIASES or "action" not in args:
+                args.setdefault("action", "read")
+            if "path" not in args:
+                for alt_key in ("file_path", "filepath", "file", "filename"):
+                    if alt_key in args:
+                        args["path"] = args.pop(alt_key)
+                        break
+
+        return args
+
+    @classmethod
     def get_known_tool_names(cls, active_schemas: Optional[list] = None) -> set:
         """Return the set of valid tool names from active schemas, dynamic plugins, and ToolRegistry."""
         known: set = set()
@@ -223,9 +306,9 @@ class NativeOrchestrator:
                 if isinstance(t, dict):
                     fn = t.get("function")
                     if isinstance(fn, dict) and fn.get("name"):
-                        known.add(cls.normalize_tool_name(fn["name"]))
+                        known.add(cls._strip_tool_prefixes(fn["name"]))
                     elif t.get("name"):
-                        known.add(cls.normalize_tool_name(t["name"]))
+                        known.add(cls._strip_tool_prefixes(t["name"]))
         try:
             from zelyr.core.plugins import PROVISIONED_TOOLS, _schemas
             known.update(PROVISIONED_TOOLS)
@@ -233,9 +316,9 @@ class NativeOrchestrator:
                 if isinstance(s, dict):
                     fn = s.get("function")
                     if isinstance(fn, dict) and fn.get("name"):
-                        known.add(cls.normalize_tool_name(fn["name"]))
+                        known.add(cls._strip_tool_prefixes(fn["name"]))
                     elif s.get("name"):
-                        known.add(cls.normalize_tool_name(s["name"]))
+                        known.add(cls._strip_tool_prefixes(s["name"]))
         except Exception:
             pass
         try:
@@ -261,6 +344,7 @@ class NativeOrchestrator:
         cls,
         text: str,
         known_tools: Optional[set] = None,
+        active_schemas: Optional[list] = None,
     ) -> Optional[dict]:
         """Tolerantly extract the first valid JSON/XML tool call from model text.
 
@@ -273,22 +357,28 @@ class NativeOrchestrator:
             return None
 
         effective_known = (
-            {cls.normalize_tool_name(k) for k in known_tools if isinstance(k, str)}
+            {cls.normalize_tool_name(k, active_schemas=active_schemas) for k in known_tools if isinstance(k, str)}
             if known_tools is not None
-            else cls.get_known_tool_names()
+            else cls.get_known_tool_names(active_schemas)
         )
 
+        def _extract_raw_args(fn_obj: dict) -> Any:
+            for key in ("arguments", "parameters", "args"):
+                if key in fn_obj:
+                    return fn_obj[key]
+            # Handle flat tool call objects like {"name": "shell_exec", "command": "uptime -p"}
+            extra = {
+                k: v
+                for k, v in fn_obj.items()
+                if k not in ("name", "tool", "type", "id", "index", "function")
+            }
+            return extra if extra else {}
+
         def _format_res(name: Any, args: Any) -> Optional[dict]:
-            clean_name = cls.normalize_tool_name(name)
+            clean_name = cls.normalize_tool_name(name, active_schemas=active_schemas)
             if not clean_name:
                 return None
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except Exception:
-                    pass
-            if not isinstance(args, dict):
-                args = {}
+            args = cls.normalize_tool_arguments(clean_name, args, original_name=str(name) if name else None)
             # Guard against model confusing interact_with_ui with interact_with_browser on web elements
             if clean_name == "interact_with_ui" and ("element_id" in args or args.get("action") in ("click_element", "fill_element")):
                 clean_name = "interact_with_browser"
@@ -339,14 +429,14 @@ class NativeOrchestrator:
                         if isinstance(first_item, dict):
                             fn_obj = first_item.get("function") if isinstance(first_item.get("function"), dict) else first_item
                             name = fn_obj.get("name") or fn_obj.get("tool")
-                            args = fn_obj.get("arguments", fn_obj.get("parameters", fn_obj.get("args", {})))
+                            args = _extract_raw_args(fn_obj)
                             res = _format_res(name, args)
                             if res:
                                 return res
                     elif isinstance(obj, dict):
                         fn_obj = obj.get("function") if isinstance(obj.get("function"), dict) else obj
                         name = fn_obj.get("name") or fn_obj.get("tool")
-                        args = fn_obj.get("arguments", fn_obj.get("parameters", fn_obj.get("args", {})))
+                        args = _extract_raw_args(fn_obj)
                         res = _format_res(name, args)
                         if res:
                             return res
@@ -374,7 +464,7 @@ class NativeOrchestrator:
                     if isinstance(first_item, dict):
                         fn_obj = first_item.get("function") if isinstance(first_item.get("function"), dict) else first_item
                         name = fn_obj.get("name") or fn_obj.get("tool")
-                        args = fn_obj.get("arguments", fn_obj.get("parameters", fn_obj.get("args", {})))
+                        args = _extract_raw_args(fn_obj)
                         res = _format_res(name, args)
                         if res:
                             return res
@@ -393,7 +483,7 @@ class NativeOrchestrator:
                 if isinstance(obj, dict):
                     fn_obj = obj.get("function") if isinstance(obj.get("function"), dict) else obj
                     name = fn_obj.get("name") or fn_obj.get("tool")
-                    args = fn_obj.get("arguments", fn_obj.get("parameters", fn_obj.get("args", {})))
+                    args = _extract_raw_args(fn_obj)
                     res = _format_res(name, args)
                     if res:
                         return res
@@ -407,7 +497,7 @@ class NativeOrchestrator:
                 extracted = json.loads(match.group(0))
                 if isinstance(extracted, dict) and "name" in extracted:
                     name = extracted["name"]
-                    args = extracted.get("arguments", extracted.get("parameters", extracted.get("args", {})))
+                    args = _extract_raw_args(extracted)
                     res = _format_res(name, args)
                     if res:
                         return res
@@ -452,24 +542,55 @@ class NativeOrchestrator:
             options.get("num_ctx") or self._explicit_max_context_tokens
         )
         try:
-            async with httpx.AsyncClient(timeout=2.0) as client:
+            async with httpx.AsyncClient(timeout=15.0) as client:
                 await client.post(
                     f"{base_url}/api/generate",
                     json={
                         "model": payload["model"],
-                        "options": {"num_ctx": prewarm_ctx, "num_gpu": 99},
+                        "options": {"num_ctx": prewarm_ctx},
                         "keep_alive": "5m",
                     },
                 )
         except Exception:
             pass
 
+        # OpenAI-compatible /v1/chat/completions requires assistant tool_calls.function.arguments
+        # to be a JSON-encoded string, whereas in-memory payload["messages"] keeps native dicts.
+        wire_payload = dict(payload)
+        wire_payload["stream"] = True
+        if "messages" in wire_payload and isinstance(wire_payload["messages"], list):
+            wire_msgs = []
+            for m in wire_payload["messages"]:
+                if isinstance(m, dict) and m.get("role") == "assistant" and isinstance(m.get("tool_calls"), list):
+                    m_copy = dict(m)
+                    if isinstance(m_copy.get("content"), str) and "<think>" in m_copy["content"]:
+                        m_copy["content"] = re.sub(
+                            r"<think>.*?(?:</think>|$)", "", m_copy["content"], flags=re.DOTALL
+                        ).strip()
+                    tc_copies = []
+                    for tc in m["tool_calls"]:
+                        if isinstance(tc, dict) and isinstance(tc.get("function"), dict):
+                            tc_copy = dict(tc)
+                            fn_copy = dict(tc["function"])
+                            fn_args = fn_copy.get("arguments", {})
+                            if not isinstance(fn_args, str):
+                                fn_copy["arguments"] = json.dumps(fn_args)
+                            tc_copy["function"] = fn_copy
+                            tc_copies.append(tc_copy)
+                        else:
+                            tc_copies.append(tc)
+                    m_copy["tool_calls"] = tc_copies
+                    wire_msgs.append(m_copy)
+                else:
+                    wire_msgs.append(m)
+            wire_payload["messages"] = wire_msgs
+
         timeout_config = httpx.Timeout(connect=10.0, read=300.0, write=20.0, pool=20.0)
         async with httpx.AsyncClient(timeout=timeout_config) as client:
             async with client.stream(
                 "POST",
                 f"{base_url}/v1/chat/completions",
-                json=payload
+                json=wire_payload
             ) as resp:
                 if resp.status_code != 200:
                     await resp.aread()
@@ -695,14 +816,13 @@ class NativeOrchestrator:
         except Exception:
             pass
 
-        # Enforce 100% GPU layer offload and adequate context size in Ollama
+        # Enforce adequate context size in Ollama (allow Ollama to auto-calculate GPU/CPU layer split)
         options = payload.setdefault("options", {})
         from zelyr.config import get_config
         eff_ctx = get_config().get_effective_num_ctx(
             options.get("num_ctx") or self._explicit_max_context_tokens
         )
         options["num_ctx"] = eff_ctx
-        options.setdefault("num_gpu", 99)
 
         pending_tool_calls = []
         is_reasoning = False
@@ -719,15 +839,14 @@ class NativeOrchestrator:
 
                 delta = data.get("choices", [{}])[0].get("delta", {})
 
-                if "reasoning_content" in delta:
-                    r_content = delta.pop("reasoning_content")
+                if "reasoning_content" in delta or "reasoning" in delta:
+                    r_content = delta.pop("reasoning_content", None) or delta.pop("reasoning", "")
                     if not is_reasoning:
                         delta["content"] = "<think>" + r_content
                         is_reasoning = True
                     else:
                         delta["content"] = r_content
-
-                if "content" in delta and is_reasoning and not "reasoning_content" in data.get("choices", [{}])[0].get("delta", {}):
+                elif "content" in delta and delta["content"] and is_reasoning:
                     delta["content"] = "</think>" + delta["content"]
                     is_reasoning = False
 
@@ -745,7 +864,11 @@ class NativeOrchestrator:
                             pending_tool_calls[idx]["id"] = tc["id"]
                         if "function" in tc and isinstance(tc["function"], dict):
                             if "name" in tc["function"] and tc["function"]["name"]:
-                                pending_tool_calls[idx]["function"]["name"] = self.normalize_tool_name(tc["function"]["name"])
+                                raw_fn_name = tc["function"]["name"]
+                                pending_tool_calls[idx]["raw_name"] = raw_fn_name
+                                pending_tool_calls[idx]["function"]["name"] = self.normalize_tool_name(
+                                    raw_fn_name, active_schemas=eff_tool_schemas
+                                )
                             if "arguments" in tc["function"] and tc["function"]["arguments"] is not None:
                                 incoming_args = tc["function"]["arguments"]
                                 if isinstance(incoming_args, dict):
@@ -753,7 +876,11 @@ class NativeOrchestrator:
                                 else:
                                     pending_tool_calls[idx]["function"]["arguments"] += str(incoming_args)
                         elif "name" in tc and tc["name"]:
-                            pending_tool_calls[idx]["function"]["name"] = self.normalize_tool_name(tc["name"])
+                            raw_fn_name = tc["name"]
+                            pending_tool_calls[idx]["raw_name"] = raw_fn_name
+                            pending_tool_calls[idx]["function"]["name"] = self.normalize_tool_name(
+                                raw_fn_name, active_schemas=eff_tool_schemas
+                            )
                             if "arguments" in tc and tc["arguments"] is not None:
                                 incoming_args = tc["arguments"]
                                 if isinstance(incoming_args, dict):
@@ -774,6 +901,7 @@ class NativeOrchestrator:
                         buffered_chunks.append(data)
                         text_so_far = "".join(collected_assistant_text)
                         clean_text = re.sub(r"<think>.*?</think>", "", text_so_far, flags=re.DOTALL)
+                        clean_text = re.sub(r"<think>.*$", "", clean_text, flags=re.DOTALL)
                         stripped = clean_text.lstrip()
                         if is_interface_action and self.is_refusal(clean_text):
                             refusal_detected = True
@@ -805,6 +933,14 @@ class NativeOrchestrator:
             yield {"choices": [{"delta": {"content": f"\n⚠️ [Request Error] Communication failure with {base_url}: {exc}\n"}}]}
             return
 
+        if is_reasoning:
+            collected_assistant_text.append("</think>")
+            if buffering:
+                buffered_chunks.append({"choices": [{"delta": {"content": "</think>"}}]})
+            else:
+                yield {"choices": [{"delta": {"content": "</think>"}}]}
+            is_reasoning = False
+
         if not refusal_detected and (depth == 0 and not is_retry and is_interface_action):
             text_so_far = "".join(collected_assistant_text)
             clean_text = re.sub(r"<think>.*?</think>", "", text_so_far, flags=re.DOTALL)
@@ -834,26 +970,30 @@ class NativeOrchestrator:
 
         if not pending_tool_calls and collected_assistant_text:
             full_text = "".join(collected_assistant_text).strip()
+            non_think_text = re.sub(r"<think>.*?</think>", "", full_text, flags=re.DOTALL)
+            non_think_text = re.sub(r"<think>.*$", "", non_think_text, flags=re.DOTALL).strip()
             known_tools = self.get_known_tool_names(payload.get("tools"))
 
-            tool_call = self.extract_first_tool_call(full_text, known_tools)
+            tool_call = (
+                self.extract_first_tool_call(
+                    non_think_text, known_tools, active_schemas=payload.get("tools")
+                )
+                if non_think_text
+                else None
+            )
             if tool_call:
+                raw_name = tool_call.get("function", {}).get("name") or tool_call.get("name")
                 func_name = self.normalize_tool_name(
-                    tool_call.get("function", {}).get("name") or tool_call.get("name")
+                    raw_name, active_schemas=payload.get("tools")
                 )
                 func_args = tool_call.get("function", {}).get("arguments") or tool_call.get("arguments", {})
-                if isinstance(func_args, str):
-                    try:
-                        func_args = json.loads(func_args)
-                    except Exception:
-                        pass
-                if not isinstance(func_args, dict):
-                    func_args = {}
+                func_args = self.normalize_tool_arguments(func_name, func_args, original_name=raw_name)
                 func_args_str = json.dumps(func_args)
                 call_id = "call_native_0"
                 pending_tool_calls = [{
                     "id": call_id,
                     "type": "function",
+                    "raw_name": raw_name,
                     "function": {
                         "name": func_name,
                         "arguments": func_args_str
@@ -924,7 +1064,8 @@ class NativeOrchestrator:
             # Normalize tool calls: Ollama /api/chat requires function.arguments to be a native JSON dict
             normalized_tool_calls = []
             for tc in pending_tool_calls:
-                fn_name = self.normalize_tool_name(tc.get("function", {}).get("name") or tc.get("name") or "")
+                raw_fn_name = tc.get("raw_name") or tc.get("function", {}).get("name") or tc.get("name") or ""
+                fn_name = self.normalize_tool_name(raw_fn_name, active_schemas=eff_tool_schemas)
                 fn_args_raw = tc.get("function", {}).get("arguments") or tc.get("arguments", {})
                 tc_id = tc.get("id") or "call_native_0"
 
@@ -947,8 +1088,7 @@ class NativeOrchestrator:
                 else:
                     fn_args = {}
 
-                if not isinstance(fn_args, dict):
-                    fn_args = {}
+                fn_args = self.normalize_tool_arguments(fn_name, fn_args, original_name=raw_fn_name)
 
                 # Guard against model confusing interact_with_ui with interact_with_browser on web elements
                 if fn_name == "interact_with_ui" and ("element_id" in fn_args or fn_args.get("action") in ("click_element", "fill_element")):

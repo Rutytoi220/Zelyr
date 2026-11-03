@@ -172,6 +172,10 @@ Assistant: {"name": "manage_workspace_file", "arguments": {"action": "rollback",
 User: Create a custom tool to compute SHA-256 hashes of input strings.
 Assistant: {"name": "craft_tool", "arguments": {"name": "sha256_hash", "description": "Computes SHA-256 hash of a text string", "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}, "code": "import hashlib\ndef execute(text: str = '', **kw):\n    return hashlib.sha256(text.encode('utf-8')).hexdigest()\n", "test_code": "assert execute('hello') == '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824'"}}
 
+─── Example 18: Shell Command Execution (Uptime / System Statistics) ───────────
+User: What is my system uptime?
+Assistant: {"name": "execute_command", "arguments": {"command": "uptime -p"}}
+
 """
 
 SOM_REACT_SYSTEM_PROMPT: str = """\

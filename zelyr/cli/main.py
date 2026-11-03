@@ -279,14 +279,15 @@ async def _execute_headless_run(
 
     async def headless_execute_tool(name: str, **kwargs: Any) -> str:
         clean_name = NativeOrchestrator.normalize_tool_name(name)
+        norm_kwargs = NativeOrchestrator.normalize_tool_arguments(clean_name, kwargs, original_name=name)
         if clean_name == "interact_with_ui" and (
-            "element_id" in kwargs or kwargs.get("action") in ("click_element", "fill_element")
+            "element_id" in norm_kwargs or norm_kwargs.get("action") in ("click_element", "fill_element")
         ):
             clean_name = "interact_with_browser"
         if not output_json:
-            sys.stderr.write(f"[tool] {clean_name} {json.dumps(kwargs)}\n")
+            sys.stderr.write(f"[tool] {clean_name} {json.dumps(norm_kwargs)}\n")
             sys.stderr.flush()
-        res = await original_execute(clean_name, **kwargs)
+        res = await original_execute(clean_name, **norm_kwargs)
         return str(res)
 
     nat_orch.execute_tool = headless_execute_tool
@@ -304,12 +305,18 @@ async def _execute_headless_run(
                     continue
                 delta = choices[0].get("delta", {})
                 if "tool_calls" in delta:
+                    # Clear any pre-tool text or leaked JSON buffered in this turn
+                    step_content.clear()
                     for tc in delta["tool_calls"]:
                         fn = tc.get("function", {})
                         if fn.get("name"):
+                            clean_fn_name = NativeOrchestrator.normalize_tool_name(fn["name"])
+                            norm_fn_args = NativeOrchestrator.normalize_tool_arguments(
+                                clean_fn_name, fn.get("arguments", {}), original_name=fn["name"]
+                            )
                             norm_fn = {
-                                "name": NativeOrchestrator.normalize_tool_name(fn["name"]),
-                                "arguments": fn.get("arguments", {}),
+                                "name": clean_fn_name,
+                                "arguments": norm_fn_args,
                             }
                             step_tcs.append(norm_fn)
                             tool_calls_emitted.append(norm_fn)
@@ -318,18 +325,19 @@ async def _execute_headless_run(
                     step_content.append(raw_text)
 
             raw_joined = "".join(step_content)
-            clean_step = re.sub(r"<think>.*?</think>", "", raw_joined, flags=re.DOTALL).strip()
+            clean_step = re.sub(r"<think>.*?</think>", "", raw_joined, flags=re.DOTALL)
+            clean_step = re.sub(r"<think>.*$", "", clean_step, flags=re.DOTALL).strip()
 
             if not step_tcs and clean_step:
                 known_tools = orch.get_known_tool_names(payload.get("tools"))
                 fallback_tc = orch.extract_first_tool_call(clean_step, known_tools)
                 if fallback_tc:
-                    fn_name = NativeOrchestrator.normalize_tool_name(
-                        fallback_tc.get("function", {}).get("name") or fallback_tc.get("name")
-                    )
+                    raw_fb_name = fallback_tc.get("function", {}).get("name") or fallback_tc.get("name")
+                    fn_name = NativeOrchestrator.normalize_tool_name(raw_fb_name)
                     fn_args = fallback_tc.get("function", {}).get("arguments") or fallback_tc.get("arguments", {})
-                    if not isinstance(fn_args, dict):
-                        fn_args = {}
+                    fn_args = NativeOrchestrator.normalize_tool_arguments(
+                        fn_name, fn_args, original_name=raw_fb_name
+                    )
                     tool_calls_emitted.append({"name": fn_name, "arguments": fn_args})
                     obs = await headless_execute_tool(fn_name, **fn_args)
                     call_id = f"call_headless_fallback_{step_idx}"
@@ -365,17 +373,17 @@ async def _execute_headless_run(
         return 1
 
     if output_json:
-        print(
-            json.dumps({
-                "prompt": clean_prompt,
-                "model": active_model,
-                "response": final_answer,
-                "tool_calls": tool_calls_emitted,
-            }),
-            flush=True,
-        )
+        json_out = json.dumps({
+            "prompt": clean_prompt,
+            "model": active_model,
+            "response": final_answer,
+            "tool_calls": tool_calls_emitted,
+        })
+        sys.stdout.write(json_out.rstrip("\n") + "\n")
+        sys.stdout.flush()
     else:
-        print(final_answer, flush=True)
+        sys.stdout.write(final_answer.rstrip("\n") + "\n")
+        sys.stdout.flush()
 
     return 0
 

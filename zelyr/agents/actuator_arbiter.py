@@ -67,7 +67,7 @@ TIER_1_PATTERNS = [
     r"\b(network|gateway|ip\s+address|interfaces|tailscale|dns|ping|vpn|wifi)\b",
     r"\b(media|music|playerctl|playback|volume|track|song|mpris)\b",
     r"\b(file|files|patch|rollback|undo|backup)\b",
-    r"\b(command|bash|shell|terminal|exec|run command|cli)\b",
+    r"\b(command|bash|shell|terminal|exec|run command|cli|uptime|hostname|uname|kernel|distro|cpu|memory|disk|df|lsblk)\b",
 ]
 
 # Tier 2 Browser / Web indicators
