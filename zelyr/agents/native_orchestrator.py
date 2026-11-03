@@ -865,7 +865,7 @@ class NativeOrchestrator:
 
             if not payload.get("messages") or payload["messages"][0].get("role") != "system":
                 payload.setdefault("messages", []).insert(0, system_prompt)
-            else:
+            elif system_prompt_content not in payload["messages"][0].get("content", ""):
                 payload["messages"][0]["content"] += f"\n\n{system_prompt_content}"
 
         # Apply adaptive context window budgeting and historical tool compaction
