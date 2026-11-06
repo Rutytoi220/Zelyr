@@ -17,8 +17,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
-from zelyr.compat import get_env, repository_memory_db
+from zelyr.compat import get_env
 from zelyr.config import get_data_dir
+from zelyr.db.connection import (
+    checkpoint_and_close,
+    get_db_connection,
+    get_default_db_path,
+    managed_transaction,
+)
 
 VALID_CATEGORIES: Set[str] = {
     "preference",
@@ -81,38 +87,16 @@ def get_db_path() -> str:
 
     ``ZELYR_MEMORY_DB`` is preferred, with ``AXIOM_MEMORY_DB`` retained as a
     compatibility fallback. Existing ``axiom_memory.db`` files are reused
-    in place; they are never copied or deleted.
+    in place; they are never copied or deleted. Never defaults to repository root.
     """
-    env_path = get_env("MEMORY_DB")
-    if env_path:
-        return str(Path(env_path).expanduser().resolve())
-
-    repo_root = Path(__file__).resolve().parent.parent.parent
-    parts = repo_root.parts
-    if "site-packages" in parts or "dist-packages" in parts:
-        user_data = get_data_dir()
-        user_data.mkdir(parents=True, exist_ok=True)
-        legacy_db = user_data / "axiom_memory.db"
-        new_db = user_data / "zelyr_memory.db"
-        if not new_db.exists() and legacy_db.exists():
-            return str(legacy_db)
-        return str(new_db)
-
-    return str(repository_memory_db(repo_root))
+    return str(get_default_db_path("memory.db"))
 
 
 def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
     """Create and return a SQLite connection configured for WAL mode, high busy timeout,
-    and foreign key constraints.
+    and foreign key constraints via the centralized connection factory.
     """
-    path = db_path or get_db_path()
-    conn = sqlite3.connect(path, timeout=5.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=5000;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute("PRAGMA foreign_keys=ON;")
-    return conn
+    return get_db_connection(db_path or get_db_path())
 
 
 def init_db(db_path: Optional[str] = None) -> None:
@@ -215,28 +199,28 @@ class MemoryStore:
         now = time.time()
         with self._write_lock:
             with self._get_conn() as conn:
-                cursor = conn.execute(
-                    """
-                    INSERT INTO memories (category, key, content, confidence, is_active, superseded_by, created_at, updated_at, access_count)
-                    VALUES (?, ?, ?, ?, 1, NULL, ?, ?, 0)
-                    """,
-                    (category, key, content, float(confidence), now, now),
-                )
-                new_id = cursor.lastrowid
-                if new_id is None:
-                    raise RuntimeError("Failed to retrieve lastrowid after inserting memory.")
-
-                # If key was provided, atomically supersede any prior active memory with same key
-                if key:
-                    conn.execute(
+                with managed_transaction(conn):
+                    cursor = conn.execute(
                         """
-                        UPDATE memories
-                        SET is_active = 0, superseded_by = ?, updated_at = ?
-                        WHERE key = ? AND is_active = 1 AND id != ?
+                        INSERT INTO memories (category, key, content, confidence, is_active, superseded_by, created_at, updated_at, access_count)
+                        VALUES (?, ?, ?, ?, 1, NULL, ?, ?, 0)
                         """,
-                        (new_id, now, key, new_id),
+                        (category, key, content, float(confidence), now, now),
                     )
-                conn.commit()
+                    new_id = cursor.lastrowid
+                    if new_id is None:
+                        raise RuntimeError("Failed to retrieve lastrowid after inserting memory.")
+
+                    # If key was provided, atomically supersede any prior active memory with same key
+                    if key:
+                        conn.execute(
+                            """
+                            UPDATE memories
+                            SET is_active = 0, superseded_by = ?, updated_at = ?
+                            WHERE key = ? AND is_active = 1 AND id != ?
+                            """,
+                            (new_id, now, key, new_id),
+                        )
                 return new_id
 
     def _infer_fact_key(self, content: str, category: str) -> Optional[str]:
@@ -573,12 +557,12 @@ class MemoryStore:
 
         with self._write_lock:
             with self._get_conn() as conn:
-                cursor = conn.execute(
-                    f"UPDATE memories SET {', '.join(clauses)} WHERE id = ?",
-                    tuple(params),
-                )
-                conn.commit()
-                return cursor.rowcount > 0
+                with managed_transaction(conn):
+                    cursor = conn.execute(
+                        f"UPDATE memories SET {', '.join(clauses)} WHERE id = ?",
+                        tuple(params),
+                    )
+                    return cursor.rowcount > 0
 
     def delete(self, memory_id: int, hard_delete: bool = False) -> bool:
         """Delete or soft-delete a memory by ID.
@@ -588,18 +572,17 @@ class MemoryStore:
         """
         with self._write_lock:
             with self._get_conn() as conn:
-                if hard_delete:
-                    cursor = conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
-                    conn.commit()
-                    return cursor.rowcount > 0
-                else:
-                    # Soft delete: only succeed if it was currently active
-                    cursor = conn.execute(
-                        "UPDATE memories SET is_active = 0, updated_at = ? WHERE id = ? AND is_active = 1",
-                        (time.time(), memory_id),
-                    )
-                    conn.commit()
-                    return cursor.rowcount > 0
+                with managed_transaction(conn):
+                    if hard_delete:
+                        cursor = conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+                        return cursor.rowcount > 0
+                    else:
+                        # Soft delete: only succeed if it was currently active
+                        cursor = conn.execute(
+                            "UPDATE memories SET is_active = 0, updated_at = ? WHERE id = ? AND is_active = 1",
+                            (time.time(), memory_id),
+                        )
+                        return cursor.rowcount > 0
 
     def purge_inactive(self, older_than_seconds: Optional[float] = None) -> int:
         """Permanently delete inactive (soft-deleted) memories.
@@ -610,16 +593,16 @@ class MemoryStore:
         now = time.time()
         with self._write_lock:
             with self._get_conn() as conn:
-                if older_than_seconds is not None:
-                    cutoff = now - float(older_than_seconds)
-                    cursor = conn.execute(
-                        "DELETE FROM memories WHERE is_active = 0 AND updated_at < ?",
-                        (cutoff,),
-                    )
-                else:
-                    cursor = conn.execute("DELETE FROM memories WHERE is_active = 0")
-                conn.commit()
-                return cursor.rowcount
+                with managed_transaction(conn):
+                    if older_than_seconds is not None:
+                        cutoff = now - float(older_than_seconds)
+                        cursor = conn.execute(
+                            "DELETE FROM memories WHERE is_active = 0 AND updated_at < ?",
+                            (cutoff,),
+                        )
+                    else:
+                        cursor = conn.execute("DELETE FROM memories WHERE is_active = 0")
+                    return cursor.rowcount
 
     def compact(
         self,
@@ -656,78 +639,77 @@ class MemoryStore:
 
         with self._write_lock:
             with self._get_conn() as conn:
-                # 1. Scan all active memories
-                cursor = conn.execute(
-                    """
-                    SELECT id, category, key, content, confidence, created_at, updated_at, access_count
-                    FROM memories
-                    WHERE is_active = 1
-                    ORDER BY id ASC
-                    """
-                )
-                rows = [dict(r) for r in cursor.fetchall()]
-                total_scanned = len(rows)
-
-                # 2. Identify decayed ephemeral memories
-                surviving_rows = []
-                for row in rows:
-                    cat = (row.get("category") or "").lower()
-                    key = (row.get("key") or "").lower()
-                    content = (row.get("content") or "").lower()
-                    created = float(row.get("created_at") or now)
-
-                    is_protected = (
-                        cat in prot_cats
-                        or any(t in key for t in prot_tags)
-                        or any(t in content for t in prot_tags)
+                with managed_transaction(conn):
+                    # 1. Scan all active memories
+                    cursor = conn.execute(
+                        """
+                        SELECT id, category, key, content, confidence, created_at, updated_at, access_count
+                        FROM memories
+                        WHERE is_active = 1
+                        ORDER BY id ASC
+                        """
                     )
+                    rows = [dict(r) for r in cursor.fetchall()]
+                    total_scanned = len(rows)
 
-                    if not is_protected and created < cutoff_time:
-                        decayed_count += 1
-                        conn.execute(
-                            "UPDATE memories SET is_active = 0, updated_at = ? WHERE id = ?",
-                            (now, row["id"]),
+                    # 2. Identify decayed ephemeral memories
+                    surviving_rows = []
+                    for row in rows:
+                        cat = (row.get("category") or "").lower()
+                        key = (row.get("key") or "").lower()
+                        content = (row.get("content") or "").lower()
+                        created = float(row.get("created_at") or now)
+
+                        is_protected = (
+                            cat in prot_cats
+                            or any(t in key for t in prot_tags)
+                            or any(t in content for t in prot_tags)
                         )
+
+                        if not is_protected and created < cutoff_time:
+                            decayed_count += 1
+                            conn.execute(
+                                "UPDATE memories SET is_active = 0, updated_at = ? WHERE id = ?",
+                                (now, row["id"]),
+                            )
+                        else:
+                            surviving_rows.append(row)
+
+                    # 3. Semantic Deduplication among surviving rows
+                    seen_normalized: Dict[str, Dict[str, Any]] = {}
+                    for row in surviving_rows:
+                        content_norm = " ".join(re.findall(r"\w+", (row.get("content") or "").lower()))
+                        if not content_norm:
+                            continue
+
+                        norm_key = f"{row.get('category')}:{content_norm}"
+                        if norm_key in seen_normalized:
+                            primary = seen_normalized[norm_key]
+                            merged_count += 1
+
+                            new_access = max(int(primary.get("access_count", 0)), int(row.get("access_count", 0))) + 1
+                            new_conf = min(1.0, max(float(primary.get("confidence", 1.0)), float(row.get("confidence", 1.0))) + 0.1)
+
+                            conn.execute(
+                                "UPDATE memories SET access_count = ?, confidence = ?, updated_at = ? WHERE id = ?",
+                                (new_access, new_conf, now, primary["id"]),
+                            )
+                            primary["access_count"] = new_access
+                            primary["confidence"] = new_conf
+
+                            conn.execute(
+                                "UPDATE memories SET is_active = 0, superseded_by = ?, updated_at = ? WHERE id = ?",
+                                (primary["id"], now, row["id"]),
+                            )
+                        else:
+                            seen_normalized[norm_key] = row
+
+                    # 4. If purge_decayed is True, hard-delete inactive rows
+                    if purge_decayed:
+                        c_del = conn.execute("DELETE FROM memories WHERE is_active = 0")
+                        purged_count = c_del.rowcount
                     else:
-                        surviving_rows.append(row)
-
-                # 3. Semantic Deduplication among surviving rows
-                seen_normalized: Dict[str, Dict[str, Any]] = {}
-                for row in surviving_rows:
-                    content_norm = " ".join(re.findall(r"\w+", (row.get("content") or "").lower()))
-                    if not content_norm:
-                        continue
-
-                    norm_key = f"{row.get('category')}:{content_norm}"
-                    if norm_key in seen_normalized:
-                        primary = seen_normalized[norm_key]
-                        merged_count += 1
-
-                        new_access = max(int(primary.get("access_count", 0)), int(row.get("access_count", 0))) + 1
-                        new_conf = min(1.0, max(float(primary.get("confidence", 1.0)), float(row.get("confidence", 1.0))) + 0.1)
-
-                        conn.execute(
-                            "UPDATE memories SET access_count = ?, confidence = ?, updated_at = ? WHERE id = ?",
-                            (new_access, new_conf, now, primary["id"]),
-                        )
-                        primary["access_count"] = new_access
-                        primary["confidence"] = new_conf
-
-                        conn.execute(
-                            "UPDATE memories SET is_active = 0, superseded_by = ?, updated_at = ? WHERE id = ?",
-                            (primary["id"], now, row["id"]),
-                        )
-                    else:
-                        seen_normalized[norm_key] = row
-
-                # 4. If purge_decayed is True, hard-delete inactive rows
-                if purge_decayed:
-                    c_del = conn.execute("DELETE FROM memories WHERE is_active = 0")
-                    purged_count = c_del.rowcount
-                else:
-                    purged_count = decayed_count + merged_count
-
-                conn.commit()
+                        purged_count = decayed_count + merged_count
 
         duration = time.perf_counter() - start_time
         return {
@@ -770,14 +752,15 @@ def create_session(
     """Insert a new session record into the database."""
     init_db(db_path)
     with get_connection(db_path) as conn:
-        now = datetime.now(timezone.utc).isoformat()
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO sessions (id, title, created_at)
-            VALUES (?, ?, ?)
-            """,
-            (session_id, title, now),
-        )
+        with managed_transaction(conn):
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO sessions (id, title, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (session_id, title, now),
+            )
 
 
 def get_latest_session_id(db_path: Optional[str] = None) -> Optional[str]:
@@ -801,21 +784,22 @@ def add_message(
     init_db(db_path)
     create_session(session_id, db_path=db_path)
     with get_connection(db_path) as conn:
-        now = datetime.now(timezone.utc).isoformat()
-        conn.execute(
-            """
-            INSERT INTO messages (session_id, role, content, timestamp)
-            VALUES (?, ?, ?, ?)
-            """,
-            (session_id, role, content, now),
-        )
-        conn.execute(
-            """
-            INSERT INTO messages_fts (content, session_id, role)
-            VALUES (?, ?, ?)
-            """,
-            (content, session_id, role),
-        )
+        with managed_transaction(conn):
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                """
+                INSERT INTO messages (session_id, role, content, timestamp)
+                VALUES (?, ?, ?, ?)
+                """,
+                (session_id, role, content, now),
+            )
+            conn.execute(
+                """
+                INSERT INTO messages_fts (content, session_id, role)
+                VALUES (?, ?, ?)
+                """,
+                (content, session_id, role),
+            )
 
 
 def get_session_messages(
