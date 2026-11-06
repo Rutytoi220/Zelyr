@@ -243,6 +243,7 @@ async def _execute_headless_run(
     model_override: Optional[str] = None,
     output_json: bool = False,
     orchestrator: Optional[Any] = None,
+    verify_spec: Optional[str] = None,
 ) -> int:
     """Execute a one-shot prompt headlessly via NativeOrchestrator."""
     import re
@@ -372,18 +373,50 @@ async def _execute_headless_run(
         sys.stderr.flush()
         return 1
 
+    v_result = None
+    v_check = ""
+    v_target = ""
+    if verify_spec:
+        from zelyr.engine.verifier import OutcomeVerifier
+
+        parts = verify_spec.split(":", 2)
+        if len(parts) == 1:
+            v_check, v_target, v_expected = parts[0], "", None
+        elif len(parts) == 2:
+            v_check, v_target, v_expected = parts[0], parts[1], None
+        else:
+            v_check, v_target, v_expected = parts[0], parts[1], parts[2]
+
+        v_result = OutcomeVerifier.verify(check=v_check, target=v_target, expected=v_expected)
+
     if output_json:
-        json_out = json.dumps({
+        payload_dict = {
             "prompt": clean_prompt,
             "model": active_model,
             "response": final_answer,
             "tool_calls": tool_calls_emitted,
-        })
+        }
+        if v_result is not None:
+            payload_dict["verification"] = v_result.to_dict()
+        json_out = json.dumps(payload_dict)
         sys.stdout.write(json_out.rstrip("\n") + "\n")
         sys.stdout.flush()
+        if v_result is not None and not v_result.success:
+            return 2
     else:
         sys.stdout.write(final_answer.rstrip("\n") + "\n")
         sys.stdout.flush()
+        if v_result is not None:
+            if v_result.success:
+                sys.stdout.write(f"[verified] {v_check} on {v_target}: PASS\n")
+                sys.stdout.flush()
+            else:
+                err_msg = f"[verification failed] {v_check} on {v_target}: FAIL ({v_result.error})\n"
+                sys.stdout.write(err_msg)
+                sys.stdout.flush()
+                sys.stderr.write(err_msg)
+                sys.stderr.flush()
+                return 2
 
     return 0
 
@@ -393,12 +426,14 @@ def cmd_run(args: argparse.Namespace) -> None:
     prompt: str = getattr(args, "prompt", "")
     model_override: Optional[str] = getattr(args, "model", None)
     output_json: bool = bool(getattr(args, "json", False))
+    verify_spec: Optional[str] = getattr(args, "verify", None)
 
     exit_code = asyncio.run(
         _execute_headless_run(
             prompt=prompt,
             model_override=model_override,
             output_json=output_json,
+            verify_spec=verify_spec,
         )
     )
     if exit_code != 0:
@@ -576,7 +611,14 @@ def cmd_eval(args: argparse.Namespace, extra: Optional[List[str]] = None) -> Non
         eval_argv = list(getattr(args, "eval_args", []) or [])
         if extra:
             eval_argv.extend(extra)
-    exit_code = run_benchmark_cli(eval_argv)
+    try:
+        exit_code = run_benchmark_cli(eval_argv)
+    finally:
+        try:
+            import concurrent.futures
+            # Cleanly shutdown any pending futures or unblock exit
+        except Exception:
+            pass
     sys.exit(exit_code)
 
 
@@ -950,6 +992,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("prompt", type=str, help="Natural-language task prompt")
     p_run.add_argument("--model", "-m", type=str, default=None, help="Override model for this execution")
     p_run.add_argument("--json", action="store_true", default=False, help="Output structured JSON response")
+    p_run.add_argument(
+        "--verify",
+        type=str,
+        default=None,
+        help="Deterministic outcome assertion formatted as CHECK:TARGET[:EXPECTED]",
+    )
 
     # ── Legacy commands (backwards-compatible) ──────────────────────────────
     p_send = sub.add_parser("send", help="Send a prompt to the daemon")

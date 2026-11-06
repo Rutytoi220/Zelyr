@@ -927,7 +927,9 @@ class TestHeadlessRunAndToolInterception:
         assert fail_dict["tool"] == "execute_command"
         assert fail_dict["status"] == "error"
         assert fail_dict["exit_code"] == 1
-        assert "Command failed with non-zero exit code. Inspect stderr and adjust arguments." in fail_dict["error"]
+        assert "Recovery Hint:" in fail_dict["error"]
+        assert fail_dict["error_type"] == "PATH_NOT_FOUND"
+        assert "Target file or directory does not exist" in fail_dict["remedy_hint"]
 
         # 3. Structured observation injected into orchestrator message history
         async def mock_stream(payload):

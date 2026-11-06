@@ -122,6 +122,36 @@ BUILTIN_TOOLS: Dict[str, BuiltinToolDef] = {
         module_path="zelyr.tools.task_scheduler",
         class_name="TaskSchedulerTool",
     ),
+    "verify_outcome": BuiltinToolDef(
+        tool_id="verify_outcome",
+        description="Verify system state outcomes deterministically (files, contents, checksums, json, processes, ports, commands).",
+        module_path="zelyr.tools.verify_outcome",
+        class_name="VerifyOutcomeTool",
+    ),
+    "manage_desktop_window": BuiltinToolDef(
+        tool_id="manage_desktop_window",
+        description="Tier 1 Hyprland System IPC: Deterministically manage desktop windows, workspaces, and focus via direct UNIX socket or hyprctl.",
+        module_path="zelyr.tools.hyprland_ipc",
+        class_name="ManageDesktopWindowTool",
+    ),
+    "interact_with_browser": BuiltinToolDef(
+        tool_id="interact_with_browser",
+        description="Tier 2 Semantic UI Automation: Direct Chrome DevTools Protocol (CDP) browser automation and accessibility tree extraction.",
+        module_path="zelyr.tools.browser_cdp",
+        class_name="InteractWithBrowserTool",
+    ),
+    "manage_memory": BuiltinToolDef(
+        tool_id="manage_memory",
+        description="Tier 1 Persistent Memory: Store, search, retrieve, and delete persistent facts, user preferences, and environment configurations.",
+        module_path="zelyr.tools.manage_memory",
+        class_name="ManageMemoryTool",
+    ),
+    "manage_routine": BuiltinToolDef(
+        tool_id="manage_routine",
+        description="Autonomous background routine scheduling, temporal task management, and execution lifecycle actuator.",
+        module_path="zelyr.tools.manage_routine",
+        class_name="ManageRoutineTool",
+    ),
 }
 
 SWARM_TOOLS: Dict[str, BuiltinToolDef] = {
@@ -133,8 +163,8 @@ SWARM_TOOLS: Dict[str, BuiltinToolDef] = {
     ),
     "craft_tool": BuiltinToolDef(
         tool_id="craft_tool",
-        description="Synthesize, validate against Ring-0 AST rules, test in an isolated sandbox, and dynamically register a new Python tool.",
-        module_path="zelyr.engine.tool_crafter",
+        description="Synthesizes, AST validates, sandboxes, and hotloads a new dynamic Python tool.",
+        module_path="zelyr.tools.tool_crafter",
         class_name="ToolCrafterTool",
     ),
 }
@@ -208,6 +238,8 @@ Returns:
                 "write_file": "file_write",
                 "shell_command": "shell",
                 "run_command": "shell",
+                "execute_command": "shell",
+                "bash": "shell",
             }
             resolved_id = aliases.get(tool_id, tool_id)
             tool = self._core_registry.get_tool(resolved_id)
@@ -431,7 +463,10 @@ Returns:
             return val_error
             
         try:
-            return tool(**arguments)
+            res = tool(**arguments)
+            if isinstance(res, ToolResult):
+                return res
+            return ToolResult(success=True, output=res)
         except Exception as exc:
             import traceback
             import logging

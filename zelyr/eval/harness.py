@@ -427,6 +427,7 @@ class EvalHarness:
                 tool_schemas=task.tool_schemas,
                 tool_executor=scoped_tool_executor,
                 db_path=str(db_path),
+                enable_cycle_detection=getattr(task, "enable_cycle_detection", True),
             )
 
             payload = {

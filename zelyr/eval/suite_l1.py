@@ -161,6 +161,7 @@ def build_eval_l1_step_limit() -> EvaluationTask:
         max_steps=3,
         validator=None,
         expected_status=ResultStatus.STEP_LIMIT_EXCEEDED,
+        enable_cycle_detection=False,
     )
 
 

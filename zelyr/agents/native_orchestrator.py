@@ -3,6 +3,7 @@ import inspect
 import json
 import re
 import shutil
+import uuid
 import httpx
 from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optional
 from zelyr.core.plugins import get_tool_schemas, execute_tool, get_tier_timeout
@@ -27,10 +28,12 @@ class NativeOrchestrator:
         tool_executor: Optional[Callable[[str, dict], Awaitable[Any]]] = None,
         db_path: Optional[str] = None,
         max_depth: Optional[int] = None,
+        enable_cycle_detection: bool = True,
     ):
         self._explicit_max_context_tokens = max_context_tokens
         self.max_steps = max_depth if max_depth is not None else max_steps
         self.max_depth = self.max_steps
+        self.enable_cycle_detection = enable_cycle_detection
         self.stream_provider = stream_provider or model_provider
         self.model_provider = self.stream_provider
         self.tool_schemas = tool_schemas
@@ -217,9 +220,61 @@ class NativeOrchestrator:
         "view_file",
     }
 
+    VERIFY_TOOL_ALIASES = {
+        "assert_outcome",
+        "check_state",
+        "verify_state",
+        "verify",
+    }
+
+    DESKTOP_TOOL_ALIASES = {
+        "switch_workspace",
+        "focus_window",
+        "desktop_window",
+        "hyprland_ipc",
+        "hyprland",
+        "window_manager",
+    }
+
+    BROWSER_TOOL_ALIASES = {
+        "browser",
+        "cdp",
+        "web_browser",
+        "chrome",
+        "chromium",
+    }
+
+    MEMORY_TOOL_ALIASES = {
+        "remember",
+        "remember_fact",
+        "search_memory",
+        "save_memory",
+        "recall_memory",
+    }
+
+    CRAFT_TOOL_ALIASES = {
+        "create_tool",
+        "write_tool",
+        "hotload_tool",
+    }
+
+    ROUTINE_TOOL_ALIASES = {
+        "schedule_task",
+        "create_routine",
+        "schedule_routine",
+        "cron",
+        "cron_job",
+    }
+
     TOOL_ALIAS_MAP = {
         **{alias: "execute_command" for alias in SHELL_TOOL_ALIASES},
         **{alias: "manage_workspace_file" for alias in FILE_TOOL_ALIASES},
+        **{alias: "verify_outcome" for alias in VERIFY_TOOL_ALIASES},
+        **{alias: "manage_desktop_window" for alias in DESKTOP_TOOL_ALIASES},
+        **{alias: "interact_with_browser" for alias in BROWSER_TOOL_ALIASES},
+        **{alias: "manage_memory" for alias in MEMORY_TOOL_ALIASES},
+        **{alias: "craft_tool" for alias in CRAFT_TOOL_ALIASES},
+        **{alias: "manage_routine" for alias in ROUTINE_TOOL_ALIASES},
     }
 
     @staticmethod
@@ -294,6 +349,112 @@ class NativeOrchestrator:
                     if alt_key in args:
                         args["path"] = args.pop(alt_key)
                         break
+
+        elif clean_name == "verify_outcome":
+            if "check" not in args:
+                for alt_key in ("assertion", "type", "check_type", "action"):
+                    if alt_key in args:
+                        args["check"] = args.pop(alt_key)
+                        break
+            if "target" not in args:
+                for alt_key in ("path", "file", "file_path", "filepath", "cmd", "command", "process", "port", "name"):
+                    if alt_key in args:
+                        args["target"] = args.pop(alt_key)
+                        break
+            if "expected" not in args:
+                for alt_key in ("pattern", "content", "value", "hash", "sha256", "regex"):
+                    if alt_key in args:
+                        args["expected"] = args.pop(alt_key)
+                        break
+
+        elif clean_name == "manage_desktop_window":
+            if raw_orig == "switch_workspace":
+                args.setdefault("action", "workspace")
+                if "target" not in args:
+                    for alt_key in ("workspace", "workspace_id", "ws", "name", "id"):
+                        if alt_key in args:
+                            args["target"] = args.pop(alt_key)
+                            break
+            elif raw_orig == "focus_window":
+                args.setdefault("action", "focus")
+                if "target" not in args:
+                    for alt_key in ("window", "address", "title", "class_name", "app", "name"):
+                        if alt_key in args:
+                            args["target"] = args.pop(alt_key)
+                            break
+            elif "action" not in args:
+                args.setdefault("action", "get_active")
+
+        elif clean_name == "interact_with_browser":
+            act = args.get("action")
+            if not act:
+                if "url" in args:
+                    args["action"] = "navigate_url"
+                elif "element_id" in args:
+                    args["action"] = "click_element"
+                else:
+                    args["action"] = "get_page_snapshot"
+            else:
+                act_str = str(act).strip().lower()
+                if act_str in ("snapshot", "page_snapshot"):
+                    args["action"] = "get_page_snapshot"
+                elif act_str in ("navigate", "goto"):
+                    args["action"] = "navigate_url"
+                elif act_str == "click" and "element_id" in args:
+                    args["action"] = "click_element"
+                elif act_str == "type" and "element_id" in args:
+                    args["action"] = "fill_element"
+                elif act_str in ("tabs",):
+                    args["action"] = "list_tabs"
+            if "url" not in args:
+                for alt_key in ("link", "target_url", "uri", "site"):
+                    if alt_key in args:
+                        args["url"] = args.pop(alt_key)
+                        break
+
+        elif clean_name == "manage_memory":
+            if "content" not in args and "fact" in args:
+                args["content"] = args.pop("fact")
+            if "action" not in args:
+                if "content" in args:
+                    args["action"] = "store"
+                elif "query" in args:
+                    args["action"] = "search"
+                elif "memory_id" in args:
+                    args["action"] = "get"
+                else:
+                    args["action"] = "store"
+
+        elif clean_name == "craft_tool":
+            if "code" not in args:
+                for alt_key in ("source", "source_code", "tool_code", "implementation"):
+                    if alt_key in args:
+                        args["code"] = args.pop(alt_key)
+                        break
+            if "name" not in args:
+                for alt_key in ("tool_name", "id", "tool_id"):
+                    if alt_key in args:
+                        args["name"] = args.pop(alt_key)
+                        break
+
+        elif clean_name == "manage_routine":
+            if "schedule" not in args:
+                for alt_key in ("cron_expression", "interval", "cron", "schedule_expr", "time"):
+                    if alt_key in args:
+                        args["schedule"] = args.pop(alt_key)
+                        break
+            if "action_payload" not in args:
+                for alt_key in ("payload", "command", "instruction", "prompt", "task"):
+                    if alt_key in args:
+                        args["action_payload"] = args.pop(alt_key)
+                        break
+            if "action" not in args:
+                if "schedule" in args:
+                    args["action"] = "create"
+                elif "name" in args:
+                    args["action"] = "run"
+                else:
+                    args["action"] = "list"
 
         return args
 
@@ -538,8 +699,16 @@ class NativeOrchestrator:
         output = ""
         error = ""
         remedy_hint = ""
+        allowed_actions: List[str] = []
 
         if parsed is not None:
+            if "allowed_actions" in parsed and isinstance(parsed["allowed_actions"], list):
+                allowed_actions = list(parsed["allowed_actions"])
+            elif isinstance(parsed.get("result"), dict) and "allowed_actions" in parsed["result"]:
+                allowed_actions = list(parsed["result"]["allowed_actions"] or [])
+            elif isinstance(parsed.get("result"), dict) and isinstance(parsed["result"].get("metadata"), dict) and "allowed_actions" in parsed["result"]["metadata"]:
+                allowed_actions = list(parsed["result"]["metadata"]["allowed_actions"] or [])
+
             # Check success / error flags
             is_error = False
             if parsed.get("success") is False:
@@ -627,8 +796,14 @@ class NativeOrchestrator:
 
         # Remediation hint handling on failure
         if status == "error" or exit_code != 0:
+            from zelyr.engine.error_classifier import classify_tool_error
+
+            classification = classify_tool_error(tool_name, exit_code, output, error)
+            error_type = classification.error_type
             if not remedy_hint:
-                remedy_hint = "Command failed with non-zero exit code. Inspect stderr and adjust arguments."
+                remedy_hint = classification.remedy_hint
+            if not allowed_actions:
+                allowed_actions = classification.allowed_actions
 
             err_clean = error.rstrip(".")
             if "[Tool Error]:" not in err_clean:
@@ -637,13 +812,25 @@ class NativeOrchestrator:
                 err_clean = f"{err_clean}. Recovery Hint: {remedy_hint}"
             error = err_clean
 
-        structured = {
-            "tool": tool_name,
-            "status": status,
-            "exit_code": exit_code,
-            "output": output,
-            "error": error,
-        }
+            structured = {
+                "tool": tool_name,
+                "status": "error",
+                "error_type": error_type,
+                "exit_code": exit_code,
+                "output": output,
+                "error": error,
+                "remedy_hint": remedy_hint,
+                "allowed_actions": allowed_actions,
+            }
+        else:
+            structured = {
+                "tool": tool_name,
+                "status": "success",
+                "exit_code": exit_code,
+                "output": output,
+                "error": error,
+            }
+
         return json.dumps(structured, indent=2)
 
     async def _stream_model_events(self, payload: dict, base_url: str, stream_provider: Optional[Any] = None) -> AsyncGenerator[dict, None]:
@@ -749,6 +936,43 @@ class NativeOrchestrator:
                         except json.JSONDecodeError:
                             pass
 
+    @staticmethod
+    def _canonicalize_tool_args(args: Any) -> str:
+        """Canonicalize tool arguments into a deterministic JSON string.
+
+        Handles JSON strings, dicts, key ordering, and int-equivalent floats (1.0 -> 1).
+        """
+        if args is None:
+            return "{}"
+
+        raw = args
+        if isinstance(raw, str):
+            trimmed = raw.strip()
+            if not trimmed:
+                return "{}"
+            if trimmed.startswith(("{", "[")):
+                try:
+                    raw = json.loads(trimmed)
+                except Exception:
+                    pass
+
+        def _normalize(obj: Any) -> Any:
+            if isinstance(obj, bool):
+                return obj
+            if isinstance(obj, float) and obj.is_integer():
+                return int(obj)
+            if isinstance(obj, dict):
+                return {str(k): _normalize(v) for k, v in sorted(obj.items(), key=lambda item: str(item[0]))}
+            if isinstance(obj, list):
+                return [_normalize(item) for item in obj]
+            return obj
+
+        try:
+            norm = _normalize(raw)
+            return json.dumps(norm, sort_keys=True, separators=(",", ":"))
+        except Exception:
+            return "{}" if not raw else str(raw)
+
     async def generate_stream(
         self,
         payload: dict,
@@ -759,12 +983,18 @@ class NativeOrchestrator:
         tool_executor: Optional[Callable[[str, dict], Awaitable[Any]]] = None,
         db_path: Optional[str] = None,
         max_depth: Optional[int] = None,
+        turn_tool_history: Optional[List[tuple]] = None,
+        actual_step_count: int = 0,
+        disable_tools: bool = False,
+        enable_cycle_detection: Optional[bool] = None,
     ) -> AsyncGenerator[dict, None]:
         eff_max_depth = max_depth if max_depth is not None else getattr(self, "max_depth", self.max_steps)
         eff_stream_provider = stream_provider or getattr(self, "stream_provider", None) or getattr(self, "model_provider", None)
         eff_tool_schemas = tool_schemas if tool_schemas is not None else getattr(self, "tool_schemas", None)
         eff_tool_executor = tool_executor or getattr(self, "tool_executor", None)
         eff_db_path = db_path or getattr(self, "db_path", None)
+        curr_tool_history = turn_tool_history if turn_tool_history is not None else []
+        eff_cycle_detection = self.enable_cycle_detection if enable_cycle_detection is None else enable_cycle_detection
 
         if depth >= eff_max_depth:
             yield {"choices": [{"delta": {"content": f"\n[Notice: Reached maximum autonomous ReAct steps ({eff_max_depth}).]\n"}}]}
@@ -778,6 +1008,7 @@ class NativeOrchestrator:
         is_recovery_turn = False
         recovery_hint = ""
         allowed_recovery_actions = []
+        recovery_error_type = ""
 
         messages = payload.get("messages", [])
         if messages:
@@ -786,12 +1017,45 @@ class NativeOrchestrator:
                     continue
                 if m.get("role") == "tool":
                     c = str(m.get("content", ""))
+                    m_status = m.get("status")
+                    m_remedy = m.get("remedy_hint")
+                    m_actions = m.get("allowed_actions")
+                    m_error_type = m.get("error_type")
+
+                    parsed_c = None
+                    try:
+                        c_stripped = c.strip()
+                        if c_stripped.startswith("{") and c_stripped.endswith("}"):
+                            parsed_c = json.loads(c_stripped)
+                    except Exception:
+                        pass
+
+                    if isinstance(parsed_c, dict):
+                        if parsed_c.get("status") == "error" or parsed_c.get("exit_code", 0) != 0:
+                            is_recovery_turn = True
+                        if parsed_c.get("remedy_hint"):
+                            is_recovery_turn = True
+                            recovery_hint = str(parsed_c.get("remedy_hint") or "")
+                        if parsed_c.get("allowed_actions"):
+                            allowed_recovery_actions = list(parsed_c.get("allowed_actions") or [])
+                        if parsed_c.get("error_type"):
+                            recovery_error_type = str(parsed_c.get("error_type") or "")
+
+                    if m_status == "error":
+                        is_recovery_turn = True
+                    if m_remedy:
+                        is_recovery_turn = True
+                        recovery_hint = str(m_remedy)
+                    if m_actions:
+                        allowed_recovery_actions = list(m_actions)
+                    if m_error_type:
+                        recovery_error_type = str(m_error_type)
+
                     if "[Tool Error]:" in c:
                         is_recovery_turn = True
-                        recovery_hint = m.get("remedy_hint") or ""
                         if not recovery_hint and "Recovery Hint:" in c:
                             recovery_hint = c.split("Recovery Hint:", 1)[1].strip()
-                        allowed_recovery_actions = m.get("allowed_actions") or []
+
                     break
                 elif m.get("role") == "assistant" and m.get("tool_calls"):
                     break
@@ -839,9 +1103,11 @@ class NativeOrchestrator:
 
             if user_prompt and not is_retry and not is_recovery_turn:
                 try:
-                    from zelyr.memory.hydration import hydrate_context_memory
+                    from zelyr.engine.memory_hydration import MemoryHydrator
                     clean_search = re.sub(r"\[Active Window:.*?\]\n?", "", user_prompt).strip()
-                    mem_block = hydrate_context_memory(clean_search, db_path=eff_db_path, max_tokens=350)
+                    hydrator = MemoryHydrator(db_path=eff_db_path, max_tokens=350)
+                    recalled_mems = hydrator.get_relevant_memories(clean_search)
+                    mem_block = hydrator.format_recalled_memory_block(recalled_mems)
                     if mem_block:
                         system_prompt_content += f"\n\n{mem_block}"
                     elif eff_stream_provider is None:
@@ -918,7 +1184,9 @@ class NativeOrchestrator:
         from zelyr.agents.actuator_arbiter import is_browser_window
         browser_active = is_browser_window(active_window)
 
-        if eff_tool_schemas is not None:
+        if disable_tools:
+            payload["tools"] = []
+        elif eff_tool_schemas is not None:
             payload["tools"] = list(eff_tool_schemas)
         else:
             active_tools = payload.get("tools") or get_tool_schemas(0)
@@ -1161,21 +1429,24 @@ class NativeOrchestrator:
 
         # Closed-loop error recovery enforcement (Anti-consultant rule):
         # If the model responds to a recovery hint with conversational text instead of
-        # an actuator tool call, and depth < 4, do not terminate the loop.
+        # an actuator tool call, and depth < min(4, eff_max_depth - 1), do not terminate the loop.
         # Reject conversational prose, clear buffers, and trigger a fast retry directing
         # the model to invoke the recovery tool immediately.
-        if is_recovery_turn and not pending_tool_calls and depth < (eff_max_depth - 1):
+        if is_recovery_turn and not pending_tool_calls and depth < min(4, eff_max_depth - 1):
             buffered_chunks.clear()
             collected_assistant_text.clear()
 
-            hint_text = recovery_hint or "Execute the recovery tool immediately."
-            allowed_clause = f" Allowed recovery actions: {', '.join(allowed_recovery_actions)}." if allowed_recovery_actions else ""
+            err_type_str = f" ({recovery_error_type})" if recovery_error_type else ""
+            tools_list = ", ".join(allowed_recovery_actions) if allowed_recovery_actions else "execute_command, manage_workspace_file, verify_outcome"
+            allowed_clause = f" Allowed tools: {tools_list}."
+            hint_clause = f" Recovery hint: '{recovery_hint}'." if recovery_hint else ""
+
             override_msg = {
                 "role": "user",
                 "content": (
-                    f"[ACTUATOR RECOVERY REQUIRED]: A previous action failed with recovery hint: '{hint_text}'.{allowed_clause} "
-                    f"You must NOT output conversational apologies, explanations, or tutorials. "
-                    f"Call the appropriate actuator recovery tool immediately."
+                    f"[ACTUATOR RECOVERY REQUIRED] Your previous tool action failed{err_type_str}. "
+                    f"You MUST attempt a corrective tool call to diagnose or resolve the issue.{allowed_clause}{hint_clause} "
+                    f"Do not output conversational apologies without calling a tool."
                 ),
             }
             payload.setdefault("messages", []).append(override_msg)
@@ -1250,11 +1521,74 @@ class NativeOrchestrator:
             }
             payload["messages"].append(assistant_msg)
 
+            force_disable_next = False
             for tc in normalized_tool_calls:
                 func_name = tc["function"]["name"]
                 func_args = tc["function"]["arguments"]
                 tool_call_id = tc["id"]
 
+                # Fingerprint tool invocation: canonical JSON args
+                canonical_args = self._canonicalize_tool_args(func_args)
+                fingerprint = (func_name, canonical_args)
+
+                # ReAct step limit and cycle detection rules
+                rejection_reason = None
+                rejection_detail = None
+
+                eff_step_limit = getattr(self, "max_steps", 5)
+                if actual_step_count >= eff_step_limit:
+                    rejection_reason = "step_limit_reached"
+                    rejection_detail = f"Maximum execution step limit ({eff_step_limit}) reached for current turn. Explain the limitation and synthesize the answer."
+                    force_disable_next = True
+                elif eff_cycle_detection:
+                    if curr_tool_history and curr_tool_history[-1][0] == fingerprint and curr_tool_history[-1][1] == "error":
+                        # Identical Retry After Error: immediate preceding had same fingerprint and ended in error
+                        rejection_reason = "cycle_detected"
+                        rejection_detail = "Identical tool call retry after immediate failure is blocked. Alter parameters or explain the limitation."
+                    elif sum(1 for prior_fp, _ in curr_tool_history if prior_fp == fingerprint) >= 2:
+                        # Identical Call Ceiling: attempted for the 3rd time
+                        rejection_reason = "cycle_detected"
+                        rejection_detail = "Identical tool call ceiling reached (attempted 3 or more times). Alter parameters or explain the limitation."
+                    elif len(curr_tool_history) >= 3:
+                        # Alternating Failure Loop: A -> B -> A -> B where both A and B returned error
+                        A_prev = curr_tool_history[-1][0]
+                        B_prev = curr_tool_history[-2][0]
+                        A_init = curr_tool_history[-3][0]
+                        if (
+                            fingerprint == B_prev
+                            and A_prev == A_init
+                            and A_prev != B_prev
+                            and curr_tool_history[-1][1] == "error"
+                            and curr_tool_history[-2][1] == "error"
+                            and curr_tool_history[-3][1] == "error"
+                        ):
+                            rejection_reason = "cycle_detected"
+                            rejection_detail = "Alternating failure cycle detected (A -> B -> A -> B). Alter approach or explain limitation."
+
+                if rejection_reason is not None:
+                    actual_step_count += 1
+                    if actual_step_count >= eff_step_limit:
+                        force_disable_next = True
+                    synth_call_id = tool_call_id or f"call_synth_{uuid.uuid4().hex[:8]}"
+                    synth_content = json.dumps({
+                        "tool": func_name,
+                        "status": "rejected",
+                        "reason": rejection_reason,
+                        "detail": rejection_detail,
+                    })
+                    tool_msg = {
+                        "role": "tool",
+                        "tool_call_id": synth_call_id,
+                        "name": func_name,
+                        "content": synth_content,
+                    }
+                    payload["messages"].append(tool_msg)
+                    curr_tool_history.append((fingerprint, "rejected"))
+                    continue
+
+                actual_step_count += 1
+                if actual_step_count >= eff_step_limit:
+                    force_disable_next = True
                 timeout = get_tier_timeout(func_name)
                 timeout_int = int(timeout)
                 try:
@@ -1305,28 +1639,36 @@ class NativeOrchestrator:
                 is_failed = False
                 remedy_hint_out = ""
                 allowed_actions_out = []
+                error_type_out = ""
 
                 try:
                     obs_dict = json.loads(content_for_msg) if isinstance(content_for_msg, str) else content_for_msg
                     if isinstance(obs_dict, dict):
                         if obs_dict.get("status") == "error" or obs_dict.get("exit_code", 0) != 0:
                             is_failed = True
-                        err_str = str(obs_dict.get("error") or "")
-                        if "Recovery Hint:" in err_str:
-                            remedy_hint_out = err_str.split("Recovery Hint:", 1)[1].strip()
+                        if obs_dict.get("remedy_hint"):
+                            remedy_hint_out = str(obs_dict.get("remedy_hint") or "")
+                        elif "Recovery Hint:" in str(obs_dict.get("error") or ""):
+                            remedy_hint_out = str(obs_dict.get("error") or "").split("Recovery Hint:", 1)[1].strip()
                         elif is_failed:
                             remedy_hint_out = "Command failed with non-zero exit code. Inspect stderr and adjust arguments."
+
+                        if obs_dict.get("allowed_actions"):
+                            allowed_actions_out = list(obs_dict.get("allowed_actions") or [])
+                        if obs_dict.get("error_type"):
+                            error_type_out = str(obs_dict.get("error_type") or "")
                 except Exception:
                     pass
 
                 try:
-                    parsed_raw = json.loads(res_str) if isinstance(res_str, str) else res_str
-                    if isinstance(parsed_raw, dict):
-                        allowed_actions_out = (
-                            parsed_raw.get("allowed_actions")
-                            or (parsed_raw.get("result", {}).get("allowed_actions") if isinstance(parsed_raw.get("result"), dict) else None)
-                            or []
-                        )
+                    if not allowed_actions_out:
+                        parsed_raw = json.loads(res_str) if isinstance(res_str, str) else res_str
+                        if isinstance(parsed_raw, dict):
+                            allowed_actions_out = (
+                                parsed_raw.get("allowed_actions")
+                                or (parsed_raw.get("result", {}).get("allowed_actions") if isinstance(parsed_raw.get("result"), dict) else None)
+                                or []
+                            )
                 except Exception:
                     pass
 
@@ -1335,11 +1677,17 @@ class NativeOrchestrator:
                     "tool_call_id": tool_call_id,
                     "name": func_name,
                     "content": content_for_msg,
+                    "status": "error" if is_failed else "success",
                 }
-                if is_failed and remedy_hint_out:
-                    tool_msg["remedy_hint"] = remedy_hint_out
-                    tool_msg["allowed_actions"] = allowed_actions_out
+                if is_failed:
+                    if remedy_hint_out:
+                        tool_msg["remedy_hint"] = remedy_hint_out
+                    if allowed_actions_out:
+                        tool_msg["allowed_actions"] = allowed_actions_out
+                    if error_type_out:
+                        tool_msg["error_type"] = error_type_out
                 payload["messages"].append(tool_msg)
+                curr_tool_history.append((fingerprint, "error" if is_failed else "success"))
 
                 session_id = payload.get("session_id")
                 if session_id:
@@ -1358,6 +1706,10 @@ class NativeOrchestrator:
                     tool_executor=eff_tool_executor,
                     db_path=eff_db_path,
                     max_depth=eff_max_depth,
+                    turn_tool_history=curr_tool_history,
+                    actual_step_count=actual_step_count,
+                    disable_tools=force_disable_next,
+                    enable_cycle_detection=eff_cycle_detection,
                 ):
                     yield chunk
 

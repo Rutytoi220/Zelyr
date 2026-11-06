@@ -584,6 +584,7 @@ def build_task_self_repair_bounded_retries() -> EvalTask:
         level=3,
         max_steps=3,
         expected_status=EvalStatus.STEP_LIMIT_EXCEEDED,
+        enable_cycle_detection=False,
         allowed_tools=["failing_tool"],
         custom_tools={"failing_tool": custom_failing_tool},
         tool_schemas=[

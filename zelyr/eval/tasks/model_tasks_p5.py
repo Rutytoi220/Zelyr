@@ -260,6 +260,9 @@ def build_task_autonomous_routine_lifecycle() -> EvalTask:
         out_file = context.resolve_path("routine_lifecycle_report.json")
         out_file.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
+        await engine.stop()
+        await engine.checkpoint()
+
         return {
             "success": run.status == "success",
             "routine_id": routine.id,
@@ -312,6 +315,8 @@ def build_task_autonomous_routine_lifecycle() -> EvalTask:
             return False, "routines.db SQLite database file missing"
 
         db = RoutineDatabase(db_file)
+        await db.initialize()
+        await db.checkpoint()
         routines = await db.list_routines(include_disabled=True)
         matching = [r for r in routines if r.name == "routine_telemetry_probe"]
         if not matching:

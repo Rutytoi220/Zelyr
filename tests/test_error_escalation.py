@@ -312,6 +312,184 @@ class TestErrorEscalation(unittest.IsolatedAsyncioTestCase):
             self.assertGreaterEqual(len(tool_messages), 1)
             self.assertIn("Recovery Hint: Call list_tabs to see valid targets", tool_messages[0]["content"])
 
+    async def test_shell_command_failure_anti_consultant_recovery(self):
+        """Test orchestrator handles shell command failure (exit 127), rejects advisory tutorial,
+        and forces an autonomous corrective tool execution.
+        """
+        orch = NativeOrchestrator()
+        executed_tools = []
+
+        async def mock_execute(name, **kwargs):
+            executed_tools.append((name, kwargs))
+            cmd = kwargs.get("command", "")
+            if "jq" in cmd:
+                return "Exit code 127\nbash: jq: command not found"
+            return "Exit code 0\n{\n  \"status\": \"formatted\"\n}"
+
+        turn_counter = 0
+
+        @contextlib.asynccontextmanager
+        async def mock_stream_client(method, url, **kwargs):
+            nonlocal turn_counter
+            turn_counter += 1
+            resp = AsyncMock()
+            resp.status_code = 200
+
+            if turn_counter == 1:
+                lines = [
+                    'data: {"choices": [{"delta": {"content": "{\\"name\\": \\"execute_command\\", \\"arguments\\": {\\"command\\": \\"jq . input.json\\"}}"}}]}',
+                    "data: [DONE]",
+                ]
+            elif turn_counter == 2:
+                lines = [
+                    'data: {"choices": [{"delta": {"content": "You should install jq using sudo apt-get install jq to parse JSON."}}]}',
+                    "data: [DONE]",
+                ]
+            elif turn_counter == 3:
+                lines = [
+                    'data: {"choices": [{"delta": {"content": "{\\"name\\": \\"execute_command\\", \\"arguments\\": {\\"command\\": \\"python3 -m json.tool input.json\\"}}"}}]}',
+                    "data: [DONE]",
+                ]
+            else:
+                lines = [
+                    'data: {"choices": [{"delta": {"content": "Formatted JSON using python3 -m json.tool successfully."}}]}',
+                    "data: [DONE]",
+                ]
+
+            async def aiter_lines():
+                for l in lines:
+                    yield l
+
+            resp.aiter_lines = aiter_lines
+            yield resp
+
+        payload = {
+            "messages": [{"role": "user", "content": "Format input.json"}],
+        }
+
+        with patch("zelyr.agents.native_orchestrator.execute_tool", side_effect=mock_execute), \
+             patch.object(orch, "get_active_window_context", return_value=None), \
+             patch("httpx.AsyncClient") as mock_client:
+
+            mock_client.return_value.__aenter__.return_value.stream = mock_stream_client
+            mock_client.return_value.__aenter__.return_value.post = AsyncMock()
+
+            streamed_content = []
+            async for chunk in orch.generate_stream(payload):
+                choices = chunk.get("choices", [])
+                if choices:
+                    delta = choices[0].get("delta", {})
+                    if "content" in delta and delta["content"]:
+                        streamed_content.append(delta["content"])
+
+            final_text = "".join(streamed_content)
+
+            self.assertEqual(len(executed_tools), 2)
+            self.assertEqual(executed_tools[0][1]["command"], "jq . input.json")
+            self.assertEqual(executed_tools[1][1]["command"], "python3 -m json.tool input.json")
+
+            # Conversational advice is rejected and suppressed
+            self.assertNotIn("You should install jq using sudo apt-get install jq", final_text)
+            self.assertIn("Formatted JSON using python3 -m json.tool successfully.", final_text)
+
+            # Assert override message was injected
+            override_messages = [
+                m for m in payload["messages"]
+                if m.get("role") == "user" and "[ACTUATOR RECOVERY REQUIRED]" in str(m.get("content", ""))
+            ]
+            self.assertEqual(len(override_messages), 1)
+            self.assertIn("COMMAND_NOT_FOUND", override_messages[0]["content"])
+
+    async def test_verification_failure_anti_consultant_recovery(self):
+        """Test orchestrator handles verify_outcome failure, rejects conversational apology,
+        and triggers recovery tool turn.
+        """
+        orch = NativeOrchestrator()
+        executed_tools = []
+
+        async def mock_execute(name, **kwargs):
+            executed_tools.append((name, kwargs))
+            if name == "verify_outcome":
+                return ToolResult(
+                    success=False,
+                    error="File not found: /tmp/build.log",
+                    metadata={"verification": {"success": False, "check": "file_exists"}},
+                )
+            return "Exit code 0\nbuild.log located in /var/log/build.log"
+
+        turn_counter = 0
+
+        @contextlib.asynccontextmanager
+        async def mock_stream_client(method, url, **kwargs):
+            nonlocal turn_counter
+            turn_counter += 1
+            resp = AsyncMock()
+            resp.status_code = 200
+
+            if turn_counter == 1:
+                lines = [
+                    'data: {"choices": [{"delta": {"content": "{\\"name\\": \\"verify_outcome\\", \\"arguments\\": {\\"check\\": \\"file_exists\\", \\"target\\": \\"/tmp/build.log\\"}}"}}]}',
+                    "data: [DONE]",
+                ]
+            elif turn_counter == 2:
+                lines = [
+                    'data: {"choices": [{"delta": {"content": "I apologize, the build log was not found. Please verify the build step."}}]}',
+                    "data: [DONE]",
+                ]
+            elif turn_counter == 3:
+                lines = [
+                    'data: {"choices": [{"delta": {"content": "{\\"name\\": \\"execute_command\\", \\"arguments\\": {\\"command\\": \\"find / -name build.log 2>/dev/null\\"}}"}}]}',
+                    "data: [DONE]",
+                ]
+            else:
+                lines = [
+                    'data: {"choices": [{"delta": {"content": "Located build log in /var/log/build.log."}}]}',
+                    "data: [DONE]",
+                ]
+
+            async def aiter_lines():
+                for l in lines:
+                    yield l
+
+            resp.aiter_lines = aiter_lines
+            yield resp
+
+        payload = {
+            "messages": [{"role": "user", "content": "Verify build log exists"}],
+        }
+
+        with patch("zelyr.agents.native_orchestrator.execute_tool", side_effect=mock_execute), \
+             patch.object(orch, "get_active_window_context", return_value=None), \
+             patch("httpx.AsyncClient") as mock_client:
+
+            mock_client.return_value.__aenter__.return_value.stream = mock_stream_client
+            mock_client.return_value.__aenter__.return_value.post = AsyncMock()
+
+            streamed_content = []
+            async for chunk in orch.generate_stream(payload):
+                choices = chunk.get("choices", [])
+                if choices:
+                    delta = choices[0].get("delta", {})
+                    if "content" in delta and delta["content"]:
+                        streamed_content.append(delta["content"])
+
+            final_text = "".join(streamed_content)
+
+            self.assertEqual(len(executed_tools), 2)
+            self.assertEqual(executed_tools[0][0], "verify_outcome")
+            self.assertEqual(executed_tools[1][0], "execute_command")
+
+            # Conversational apology suppressed
+            self.assertNotIn("I apologize, the build log was not found", final_text)
+            self.assertIn("Located build log in /var/log/build.log.", final_text)
+
+            override_messages = [
+                m for m in payload["messages"]
+                if m.get("role") == "user" and "[ACTUATOR RECOVERY REQUIRED]" in str(m.get("content", ""))
+            ]
+            self.assertEqual(len(override_messages), 1)
+            self.assertIn("VERIFICATION_FAILED", override_messages[0]["content"])
+
 
 if __name__ == "__main__":
     unittest.main()

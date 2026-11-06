@@ -130,10 +130,13 @@ async def run_benchmark_async(
         results.append(res)
 
         if not quiet:
-            status_disp = res.status.value if isinstance(res.status, EvalStatus) else str(res.status)
+            exp = res.artifacts.get("expected_status") if isinstance(res.artifacts, dict) else None
+            status_val = res.status.value if isinstance(res.status, EvalStatus) else str(res.status)
+            is_passed = (status_val in ("PASS", "PASSED")) or (exp is not None and status_val == str(exp))
+            status_disp = "PASS" if is_passed else status_val
             dur_disp = f"{res.duration_seconds:.2f}s"
             sys.stdout.write(f"{status_disp} ({dur_disp})\n")
-            if res.status != EvalStatus.PASS and res.message:
+            if not is_passed and res.message:
                 sys.stdout.write(f"    Notice: {res.message}\n")
             sys.stdout.flush()
 
