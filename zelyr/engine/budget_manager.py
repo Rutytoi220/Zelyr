@@ -174,6 +174,160 @@ def is_tool_result_message(msg: Dict[str, Any]) -> bool:
     return False
 
 
+def _group_into_atomic_turns(messages: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+    """Group messages into atomic ReAct turn blocks.
+
+    An atomic turn block is an indivisible unit for context pruning:
+    - System message: [sys]
+    - User message with immediate non-tool assistant response: [user, assistant]
+    - User message alone: [user]
+    - Assistant message with tool_calls + all corresponding tool responses:
+      [assistant, tool_1, tool_2, ...]
+    - Standalone assistant response: [assistant]
+    - Standalone tool message: [tool]
+    """
+    if not messages:
+        return []
+
+    blocks: List[List[Dict[str, Any]]] = []
+    i = 0
+    n = len(messages)
+    while i < n:
+        msg = messages[i]
+        role = msg.get("role")
+        if role == "assistant":
+            block = [msg]
+            j = i + 1
+            while j < n and messages[j].get("role") == "tool":
+                block.append(messages[j])
+                j += 1
+            blocks.append(block)
+            i = j
+        elif role == "user":
+            # If immediately followed by an assistant message that has NO tool calls
+            # and is NOT followed by tool messages, pair them into an atomic turn block
+            if (
+                i + 1 < n
+                and messages[i + 1].get("role") == "assistant"
+                and not messages[i + 1].get("tool_calls")
+                and not (i + 2 < n and messages[i + 2].get("role") == "tool")
+            ):
+                blocks.append([msg, messages[i + 1]])
+                i += 2
+            else:
+                blocks.append([msg])
+                i += 1
+        else:
+            blocks.append([msg])
+            i += 1
+
+    return blocks
+
+
+group_into_atomic_turns = _group_into_atomic_turns
+
+
+def _sanitize_wire_invariants(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Sanitize message sequence to guarantee strict ReAct wire-format compliance.
+
+    Invariants enforced:
+    1. Every 'tool' message must be preceded by an 'assistant' message
+       (or another 'tool' message in the same multi-tool response batch) that initiated tool calls.
+       Orphaned 'tool' messages without an assistant caller are discarded.
+    2. Any 'assistant' message with 'tool_calls' followed by non-tool messages must have
+       matching tool responses for each declared tool_call_id; missing responses are synthesized.
+    3. Tool messages have valid tool_call_id alignment with their caller.
+    """
+    if not messages:
+        return []
+
+    sanitized: List[Dict[str, Any]] = []
+    i = 0
+    n = len(messages)
+
+    while i < n:
+        msg = messages[i]
+        role = msg.get("role")
+
+        if role == "tool":
+            # Check if immediately preceded by assistant with tool_calls, or valid tool sequence
+            if not sanitized:
+                logger.warning("Dropping orphaned tool message at index 0: %s", msg.get("name"))
+                i += 1
+                continue
+
+            prev = sanitized[-1]
+            prev_role = prev.get("role")
+            if prev_role not in ("assistant", "tool"):
+                logger.warning("Dropping orphaned tool message preceded by %s: %s", prev_role, msg.get("name"))
+                i += 1
+                continue
+
+            sanitized.append(msg)
+            i += 1
+
+        elif role == "assistant":
+            tool_calls = msg.get("tool_calls")
+            if not tool_calls:
+                sanitized.append(msg)
+                i += 1
+                continue
+
+            # Assistant has tool_calls
+            sanitized.append(msg)
+            i += 1
+
+            # If this is the last message in the sequence, it's an in-flight tool call
+            if i >= n:
+                break
+
+            # Collect subsequent tool messages
+            tool_msgs: List[Dict[str, Any]] = []
+            while i < n and messages[i].get("role") == "tool":
+                tool_msgs.append(messages[i])
+                i += 1
+
+            declared_call_ids = [tc.get("id") for tc in tool_calls if isinstance(tc, dict) and tc.get("id")]
+            present_call_ids = {tm.get("tool_call_id") for tm in tool_msgs if tm.get("tool_call_id")}
+
+            # Align IDs if tool messages exist but are missing IDs
+            if declared_call_ids and tool_msgs:
+                for idx, tm in enumerate(tool_msgs):
+                    if not tm.get("tool_call_id") and idx < len(declared_call_ids):
+                        tm_copy = dict(tm)
+                        tm_copy["tool_call_id"] = declared_call_ids[idx]
+                        tool_msgs[idx] = tm_copy
+                        present_call_ids.add(declared_call_ids[idx])
+
+            # If there are declared call IDs that were not answered, and we have non-tool messages following:
+            missing_ids = [cid for cid in declared_call_ids if cid not in present_call_ids]
+            if missing_ids and (i < n or tool_msgs):
+                for cid in missing_ids:
+                    matching_tc = next((tc for tc in tool_calls if tc.get("id") == cid), {})
+                    fn_name = (
+                        matching_tc.get("function", {}).get("name")
+                        if isinstance(matching_tc.get("function"), dict)
+                        else matching_tc.get("name", "tool")
+                    )
+                    tool_msgs.append({
+                        "role": "tool",
+                        "tool_call_id": cid,
+                        "name": fn_name,
+                        "content": json.dumps({"status": "evicted", "output": "[Observation omitted for context budgeting]"}),
+                    })
+
+            sanitized.extend(tool_msgs)
+
+        else:
+            sanitized.append(msg)
+            i += 1
+
+    return sanitized
+
+
+sanitize_wire_invariants = _sanitize_wire_invariants
+
+
 # ---------------------------------------------------------------------------
 # Context Budget Engine
 # ---------------------------------------------------------------------------
@@ -187,6 +341,9 @@ class ContextBudgetEngine:
     3. Stage 2: sliding-window turn eviction with concise semantic summary anchor.
     4. Guarantees root system directives and immediate user query remain inviolate.
     """
+
+    _group_into_atomic_turns = staticmethod(_group_into_atomic_turns)
+    _sanitize_wire_invariants = staticmethod(_sanitize_wire_invariants)
 
     def __init__(
         self,
@@ -256,41 +413,66 @@ class ContextBudgetEngine:
         self,
         text: str,
         token_limit: int = 250,
-        keep_head_chars: int = 400,
-        keep_tail_chars: int = 150,
+        keep_head_chars: Optional[int] = None,
+        keep_tail_chars: Optional[int] = None,
     ) -> str:
         """Compact a verbose tool output into a structured excerpt with truncation indicator."""
-        if estimate_tokens(text) <= token_limit:
+        if len(text) <= 1500 and estimate_tokens(text) <= token_limit:
             return text
+
+        if keep_head_chars is None:
+            keep_head_chars = 400 if token_limit <= 200 else 500
+        if keep_tail_chars is None:
+            keep_tail_chars = 150 if token_limit <= 200 else 500
 
         # Check if text is JSON string with status/result structure
         try:
             parsed = json.loads(text)
             if isinstance(parsed, dict):
                 modified = False
-                for key in ("output", "stdout", "content", "result", "data"):
+                for key in ("output", "stdout", "content", "result", "data", "error", "stderr"):
                     if key in parsed and isinstance(parsed[key], str):
                         val = parsed[key]
-                        if estimate_tokens(val) > token_limit:
+                        if len(val) > 1500 or estimate_tokens(val) > token_limit:
                             head = val[:keep_head_chars]
-                            tail = val[-keep_tail_chars:]
+                            tail = val[-keep_tail_chars:] if keep_tail_chars > 0 else ""
                             omitted = len(val) - len(head) - len(tail)
                             if omitted > 0:
-                                parsed[key] = f"{head}\n\n[... output truncated: {omitted} chars omitted ...]\n\n{tail}"
+                                parsed[key] = (
+                                    f"{head}\n\n[... output truncated: {omitted} chars omitted ...]\n"
+                                    f"... [TRUNCATED FOR CONTEXT BUDGET] ...\n\n{tail}"
+                                )
                                 modified = True
                 if modified:
-                    return json.dumps(parsed)
+                    return json.dumps(parsed, indent=2)
+
+                str_keys = [k for k, v in parsed.items() if isinstance(v, str) and len(v) > 200]
+                if str_keys:
+                    longest_k = max(str_keys, key=lambda k: len(parsed[k]))
+                    val = parsed[longest_k]
+                    head = val[:keep_head_chars]
+                    tail = val[-keep_tail_chars:] if keep_tail_chars > 0 else ""
+                    omitted = len(val) - len(head) - len(tail)
+                    if omitted > 0:
+                        parsed[longest_k] = (
+                            f"{head}\n\n[... output truncated: {omitted} chars omitted ...]\n"
+                            f"... [TRUNCATED FOR CONTEXT BUDGET] ...\n\n{tail}"
+                        )
+                    return json.dumps(parsed, indent=2)
         except Exception:
             pass
 
         # Text excerpting
         head = text[:keep_head_chars]
-        tail = text[-keep_tail_chars:]
+        tail = text[-keep_tail_chars:] if keep_tail_chars > 0 else ""
         omitted = len(text) - len(head) - len(tail)
         if omitted <= 0:
             return text
 
-        return f"{head}\n\n[... output truncated: {omitted} chars omitted ...]\n\n{tail}"
+        return (
+            f"{head}\n\n[... output truncated: {omitted} chars omitted ...]\n"
+            f"... [TRUNCATED FOR CONTEXT BUDGET] ...\n\n{tail}"
+        )
 
     def stage1_compact_tool_results(
         self,
@@ -332,7 +514,7 @@ class ContextBudgetEngine:
             is_eligible = is_tool and is_historical
 
             content = msg.get("content", "")
-            if is_eligible and isinstance(content, str) and estimate_tokens(content) > tool_output_token_limit:
+            if is_eligible and isinstance(content, str) and (len(content) > 1500 or estimate_tokens(content) > tool_output_token_limit):
                 new_content = self.compact_tool_output(content, token_limit=tool_output_token_limit)
                 new_msg = dict(msg)
                 new_msg["content"] = new_content
@@ -396,20 +578,15 @@ class ContextBudgetEngine:
         messages: List[Dict[str, Any]],
         target_budget: int,
     ) -> Tuple[List[Dict[str, Any]], int]:
-        """Stage 2: Sliding-window turn eviction with semantic summarization.
+        """Stage 2: Sliding-window turn eviction with atomic ReAct block preservation and semantic summarization.
 
         Inviolate Anchors:
-        - System directives (messages at start with role=='system').
-        - Initial user turn (conv_messages[0]) preserved as the initial task anchor when possible.
-        - Latest user turn (conv_messages[-1]) strictly preserved as the immediate user query.
+        - System directives (leading messages with role=='system').
+        - Root user goal (first user message) is strictly preserved as the task foundation.
+        - Active user turn (from the latest user message to the end of the conversation) is strictly preserved.
+        - ReAct step blocks (assistant with tool_calls + matching tool outputs) are indivisible.
         """
         if not messages:
-            return messages, 0
-
-        system_messages = [m for m in messages if m.get("role") == "system"]
-        conv_messages = [m for m in messages if m.get("role") != "system"]
-
-        if not conv_messages:
             return messages, 0
 
         # Current total token check
@@ -417,71 +594,119 @@ class ContextBudgetEngine:
         if total_tokens <= target_budget:
             return messages, 0
 
-        # Latest turn is inviolate anchor
-        latest_turn = conv_messages[-1]
-        if len(conv_messages) == 1:
-            return system_messages + [latest_turn], 0
+        # Separate leading system messages from conversation messages
+        sys_idx = 0
+        while sys_idx < len(messages) and messages[sys_idx].get("role") == "system":
+            sys_idx += 1
 
-        #Initial turn is preserved as context anchor if possible
-        initial_turn = conv_messages[0]
-        middle_turns = conv_messages[1:-1]
+        system_messages = messages[:sys_idx]
+        conv_messages = messages[sys_idx:]
 
-        # If the latest turn is a tool result, protect its immediately preceding
-        # assistant tool_call message so an active ReAct step is never severed.
-        protected_tail: List[Dict[str, Any]] = [latest_turn]
-        if latest_turn.get("role") == "tool" and middle_turns and middle_turns[-1].get("role") == "assistant":
-            protected_tail.insert(0, middle_turns.pop())
+        if not conv_messages:
+            return system_messages, 0
 
-        evicted: List[Dict[str, Any]] = []
-        kept_middle: List[Dict[str, Any]] = []
+        user_indices = [i for i, m in enumerate(conv_messages) if m.get("role") == "user"]
 
-        # If there are middle turns, evict oldest middle turns first
-        if middle_turns:
-            # We want to keep as many recent middle turns as fit within budget
-            # Available budget for middle turns after reserving system, initial turn, protected tail, and summary (~150 tokens)
+        if not user_indices:
+            if len(conv_messages) == 1:
+                return system_messages + conv_messages, 0
+            root_user_msg = conv_messages[0]
+            active_turn_msgs = [conv_messages[-1]]
+            middle_msgs = conv_messages[1:-1]
+        elif len(user_indices) == 1:
+            first_idx = user_indices[0]
+            root_user_msg = conv_messages[first_idx]
+            subsequent_msgs = conv_messages[first_idx + 1:]
+
+            if not subsequent_msgs:
+                return system_messages + [root_user_msg], 0
+
+            react_blocks = self._group_into_atomic_turns(subsequent_msgs)
+            active_block = react_blocks[-1]
+            middle_blocks = react_blocks[:-1]
+
+            if not middle_blocks:
+                return system_messages + [root_user_msg] + active_block, 0
+
             sys_tokens = sum(count_message_tokens(m) for m in system_messages)
-            init_tokens = count_message_tokens(initial_turn)
-            tail_tokens = sum(count_message_tokens(m) for m in protected_tail)
+            root_tokens = count_message_tokens(root_user_msg)
+            active_tokens = sum(count_message_tokens(m) for m in active_block)
             summary_reserve = 150
+            avail_for_middle = target_budget - sys_tokens - root_tokens - active_tokens - summary_reserve
 
-            avail_for_middle = target_budget - sys_tokens - init_tokens - tail_tokens - summary_reserve
-
-            # Select recent middle turns from back to front
+            kept_middle_blocks: List[List[Dict[str, Any]]] = []
+            evicted_middle_blocks: List[List[Dict[str, Any]]] = []
             accum_tokens = 0
-            for msg in reversed(middle_turns):
-                t_count = count_message_tokens(msg)
-                if accum_tokens + t_count <= avail_for_middle:
-                    kept_middle.insert(0, msg)
-                    accum_tokens += t_count
+
+            for b in reversed(middle_blocks):
+                b_tokens = sum(count_message_tokens(m) for m in b)
+                if accum_tokens + b_tokens <= avail_for_middle:
+                    kept_middle_blocks.insert(0, b)
+                    accum_tokens += b_tokens
                 else:
-                    evicted.insert(0, msg)
+                    evicted_middle_blocks.insert(0, b)
+
+            evicted_msgs = [m for b in evicted_middle_blocks for m in b]
+            pruned_conv = [root_user_msg]
+            for b in kept_middle_blocks:
+                pruned_conv.extend(b)
+            pruned_conv.extend(active_block)
+
+            if evicted_msgs:
+                summary_text = self.summarize_turns(evicted_msgs, max_summary_tokens=250)
+                summary_msg = {
+                    "role": "system",
+                    "content": f"[Previous conversation summary: {summary_text}]",
+                }
+                assembled = system_messages + [summary_msg] + pruned_conv
+                return self._sanitize_wire_invariants(assembled), len(evicted_msgs)
+
+            return self._sanitize_wire_invariants(system_messages + pruned_conv), 0
         else:
-            # Only initial_turn and protected_tail exist.
-            # If initial_turn + protected_tail > target_budget, evict initial_turn into summary
-            sys_tokens = sum(count_message_tokens(m) for m in system_messages)
-            init_tokens = count_message_tokens(initial_turn)
-            tail_tokens = sum(count_message_tokens(m) for m in protected_tail)
-            if sys_tokens + init_tokens + tail_tokens > target_budget:
-                evicted.append(initial_turn)
-                initial_turn = None
+            first_user_idx = user_indices[0]
+            last_user_idx = user_indices[-1]
 
-        pruned_conv: List[Dict[str, Any]] = []
-        if initial_turn is not None:
-            pruned_conv.append(initial_turn)
-        pruned_conv.extend(kept_middle)
-        pruned_conv.extend(protected_tail)
+            root_user_msg = conv_messages[first_user_idx]
+            active_turn_msgs = conv_messages[last_user_idx:]
+            middle_msgs = conv_messages[first_user_idx + 1 : last_user_idx]
 
-        # Inject semantic summary anchor if any turns were evicted
-        if evicted:
-            summary_text = self.summarize_turns(evicted, max_summary_tokens=250)
+        middle_blocks = self._group_into_atomic_turns(middle_msgs)
+
+        sys_tokens = sum(count_message_tokens(m) for m in system_messages)
+        root_tokens = count_message_tokens(root_user_msg)
+        active_tokens = sum(count_message_tokens(m) for m in active_turn_msgs)
+        summary_reserve = 150
+        avail_for_middle = target_budget - sys_tokens - root_tokens - active_tokens - summary_reserve
+
+        kept_middle_blocks = []
+        evicted_middle_blocks = []
+        accum_tokens = 0
+
+        for b in reversed(middle_blocks):
+            b_tokens = sum(count_message_tokens(m) for m in b)
+            if accum_tokens + b_tokens <= avail_for_middle:
+                kept_middle_blocks.insert(0, b)
+                accum_tokens += b_tokens
+            else:
+                evicted_middle_blocks.insert(0, b)
+
+        evicted_msgs = [m for b in evicted_middle_blocks for m in b]
+
+        pruned_conv = [root_user_msg]
+        for b in kept_middle_blocks:
+            pruned_conv.extend(b)
+        pruned_conv.extend(active_turn_msgs)
+
+        if evicted_msgs:
+            summary_text = self.summarize_turns(evicted_msgs, max_summary_tokens=250)
             summary_msg = {
                 "role": "system",
                 "content": f"[Previous conversation summary: {summary_text}]",
             }
-            # Place immediately after the root system prompt(s)
-            return system_messages + [summary_msg] + pruned_conv, len(evicted)
+            assembled = system_messages + [summary_msg] + pruned_conv
+            return self._sanitize_wire_invariants(assembled), len(evicted_msgs)
 
-        return system_messages + pruned_conv, 0
+        return self._sanitize_wire_invariants(system_messages + pruned_conv), 0
 
     def apply_context_budget(
         self,
@@ -550,16 +775,22 @@ class ContextBudgetEngine:
         return final_msgs
 
 
-# Facade alias
+# Facade aliases
 AdaptiveContextBudgeter = ContextBudgetEngine
+BudgetEngine = ContextBudgetEngine
 
 __all__ = [
     "ContextBudgetEngine",
     "AdaptiveContextBudgeter",
+    "BudgetEngine",
     "MODEL_CONTEXT_CATALOG",
     "get_model_context_limit",
     "estimate_tokens",
     "count_message_tokens",
     "estimate_messages_tokens",
     "is_tool_result_message",
+    "group_into_atomic_turns",
+    "_group_into_atomic_turns",
+    "sanitize_wire_invariants",
+    "_sanitize_wire_invariants",
 ]

@@ -1,9 +1,368 @@
+import hashlib
+import logging
 import os
+import re
+import shutil
 import sys
+import tempfile
+import time
 import json
 import importlib.util
 from pathlib import Path
-from typing import Any, Dict, List, Callable, Awaitable, Optional
+from typing import Any, Dict, List, Callable, Awaitable, Optional, Set
+
+logger = logging.getLogger(__name__)
+
+_ANSI_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
+
+def _strip_ansi_codes(text: str) -> str:
+    """Strip ANSI escape sequences from text while preserving formatting."""
+    if not text:
+        return ""
+    return _ANSI_RE.sub("", text)
+
+
+strip_ansi_codes = _strip_ansi_codes
+
+HISTORICAL_TEMPLATE_HASHES: Dict[str, Set[str]] = {
+    "execute_command": {
+        "2a13ac516ff055002b3ca71b13398ee39185d38c155f051c85f77c8c7034bbdf",  # v1 (subprocess.run baseline, escaped)
+        "015fc4c94b4085015605b9f04f33ade5ead868b928d1879e2ead3d41f1ebe7ac",  # v1 (subprocess.run baseline, unescaped)
+        "ead3aa6b79254f2a587b991c314262683641b3f39a18a6ce3ae25d9476d62627",  # v2 (asyncio.create_subprocess_exec Day 2)
+        "f06413f020b18cd892ea1c3e692f48d1527ee1691419963bee230f3aa04a263c",  # v3 (PTY and non-interactive isolation)
+    },
+}
+
+_EXECUTE_COMMAND_TEMPLATE = (
+    "import asyncio\n"
+    "import os\n"
+    "import re\n"
+    "import signal\n"
+    "try:\n"
+    "    import pty as _pty_mod\n"
+    "except ImportError:\n"
+    "    _pty_mod = None\n\n"
+    "IS_CORE = True\n"
+    "TIER = 0\n"
+    "TOOL_SCHEMA = {\n"
+    '    "type": "function",\n'
+    '    "function": {\n'
+    '        "name": "execute_command",\n'
+    '        "description": "Executes a shell command via bash and returns stdout and stderr.",\n'
+    '        "parameters": {\n'
+    '            "type": "object",\n'
+    '            "properties": {\n'
+    '                "command": {"type": "string", "description": "Command to execute"},\n'
+    '                "cwd": {"type": "string", "description": "Optional working directory for execution"},\n'
+    '                "pty": {\n'
+    '                    "type": "boolean",\n'
+    '                    "description": "Execute inside a pseudo-terminal (TTY). Enable for commands requiring a controlling terminal or checking isatty().",\n'
+    '                    "default": False,\n'
+    '                },\n'
+    '            },\n'
+    '            "required": ["command"],\n'
+    '        },\n'
+    '    },\n'
+    "}\n"
+    'TUI_HINT = "⚙️ Executing system command..."\n'
+    "REQUIRED_RING = 0\n\n"
+    '_ANSI_RE = re.compile(r"\\x1b(?:[@-Z\\\\-_]|\\[[0-?]*[ -/]*[@-~])")\n\n'
+    "def _strip_ansi_codes(text: str) -> str:\n"
+    '    """Strip ANSI escape sequences from text while preserving formatting."""\n'
+    "    if not text:\n"
+    '        return ""\n'
+    '    return _ANSI_RE.sub("", text)\n\n'
+    "async def execute(command: str = '', timeout: float = 60.0, pty: bool = False, cwd: str = None, **kwargs) -> str:\n"
+    "    if cwd is None:\n"
+    '        cwd = kwargs.get("cwd")\n'
+    "    env = os.environ.copy()\n"
+    '    env.setdefault("PAGER", "cat")\n'
+    '    env.setdefault("TERM", "dumb")\n'
+    '    env.setdefault("DEBIAN_FRONTEND", "noninteractive")\n'
+    '    env.setdefault("CI", "1")\n'
+    '    env.setdefault("PYTHONUNBUFFERED", "1")\n\n'
+    "    max_bytes = 2 * 1024 * 1024\n"
+    "    use_pty = bool(pty and _pty_mod is not None and hasattr(_pty_mod, 'openpty'))\n\n"
+    "    if use_pty and _pty_mod is not None:\n"
+    "        master_fd, slave_fd = _pty_mod.openpty()\n"
+    "        try:\n"
+    "            proc = await asyncio.create_subprocess_exec(\n"
+    "                'bash', '-c', command,\n"
+    "                stdin=slave_fd,\n"
+    "                stdout=slave_fd,\n"
+    "                stderr=slave_fd,\n"
+    "                start_new_session=True,\n"
+    "                env=env,\n"
+    "                cwd=cwd,\n"
+    "            )\n"
+    "        except Exception as e:\n"
+    "            try:\n"
+    "                os.close(slave_fd)\n"
+    "            except OSError:\n"
+    "                pass\n"
+    "            try:\n"
+    "                os.close(master_fd)\n"
+    "            except OSError:\n"
+    "                pass\n"
+    '            return f"Error executing command: {e}"\n'
+    "        finally:\n"
+    "            try:\n"
+    "                os.close(slave_fd)\n"
+    "            except OSError:\n"
+    "                pass\n\n"
+    "        async def _cleanup_pty_proc():\n"
+    "            has_pg = hasattr(os, 'killpg') and hasattr(os, 'getpgid')\n"
+    "            try:\n"
+    "                if has_pg:\n"
+    "                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)\n"
+    "                else:\n"
+    "                    proc.terminate()\n"
+    "            except (ProcessLookupError, OSError):\n"
+    "                pass\n\n"
+    "            try:\n"
+    "                await asyncio.wait_for(proc.wait(), timeout=1.5)\n"
+    "            except (asyncio.TimeoutError, TimeoutError):\n"
+    "                try:\n"
+    "                    if has_pg:\n"
+    "                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)\n"
+    "                    else:\n"
+    "                        proc.kill()\n"
+    "                except (ProcessLookupError, OSError):\n"
+    "                    pass\n"
+    "                try:\n"
+    "                    await proc.wait()\n"
+    "                except Exception:\n"
+    "                    pass\n\n"
+    "        buf = bytearray()\n"
+    "        loop = asyncio.get_running_loop()\n"
+    "        reader_future = loop.create_future()\n"
+    "        os.set_blocking(master_fd, False)\n\n"
+    "        def _on_pty_readable():\n"
+    "            try:\n"
+    "                chunk = os.read(master_fd, 65536)\n"
+    "                if chunk:\n"
+    "                    if len(buf) < max_bytes:\n"
+    "                        buf.extend(chunk[:max_bytes - len(buf)])\n"
+    "                else:\n"
+    "                    loop.remove_reader(master_fd)\n"
+    "                    if not reader_future.done():\n"
+    "                        reader_future.set_result(None)\n"
+    "            except (BlockingIOError, InterruptedError):\n"
+    "                pass\n"
+    "            except (OSError, Exception):\n"
+    "                loop.remove_reader(master_fd)\n"
+    "                if not reader_future.done():\n"
+    "                    reader_future.set_result(None)\n\n"
+    "        loop.add_reader(master_fd, _on_pty_readable)\n"
+    "        try:\n"
+    "            try:\n"
+    "                await asyncio.wait_for(\n"
+    "                    asyncio.gather(reader_future, proc.wait()),\n"
+    "                    timeout=timeout,\n"
+    "                )\n"
+    "            except (asyncio.TimeoutError, TimeoutError):\n"
+    "                await _cleanup_pty_proc()\n"
+    '                return f"Exit code 124\\nError executing command: Command \'{command}\' timed out after {timeout} seconds"\n'
+    "            except (asyncio.CancelledError, BaseException):\n"
+    "                await _cleanup_pty_proc()\n"
+    "                raise\n"
+    "        finally:\n"
+    "            try:\n"
+    "                loop.remove_reader(master_fd)\n"
+    "            except Exception:\n"
+    "                pass\n"
+    "            try:\n"
+    "                os.close(master_fd)\n"
+    "            except OSError:\n"
+    "                pass\n\n"
+    "        raw_out = bytes(buf).decode('utf-8', errors='replace')\n"
+    "        body = _strip_ansi_codes(raw_out)\n"
+    '        return f"Exit code {proc.returncode}\\n{body}".strip() if body else f"Exit code {proc.returncode}"\n\n'
+    "    start_new_session = hasattr(os, 'setsid')\n"
+    "    try:\n"
+    "        proc = await asyncio.create_subprocess_exec(\n"
+    "            'bash', '-c', command,\n"
+    "            stdin=asyncio.subprocess.DEVNULL,\n"
+    "            stdout=asyncio.subprocess.PIPE,\n"
+    "            stderr=asyncio.subprocess.PIPE,\n"
+    "            start_new_session=start_new_session,\n"
+    "            env=env,\n"
+    "            cwd=cwd,\n"
+    "        )\n"
+    "    except Exception as e:\n"
+    '        return f"Error executing command: {e}"\n\n'
+    "    async def _read_stream(stream):\n"
+    "        buf = bytearray()\n"
+    "        try:\n"
+    "            while True:\n"
+    "                chunk = await stream.read(65536)\n"
+    "                if not chunk:\n"
+    "                    break\n"
+    "                if len(buf) < max_bytes:\n"
+    "                    buf.extend(chunk[:max_bytes - len(buf)])\n"
+    "        except (asyncio.CancelledError, Exception):\n"
+    "            pass\n"
+    "        return bytes(buf)\n\n"
+    "    async def _cleanup_proc():\n"
+    "        has_pg = hasattr(os, 'killpg') and hasattr(os, 'getpgid')\n"
+    "        try:\n"
+    "            if has_pg:\n"
+    "                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)\n"
+    "            else:\n"
+    "                proc.terminate()\n"
+    "        except (ProcessLookupError, OSError):\n"
+    "            pass\n\n"
+    "        try:\n"
+    "            await asyncio.wait_for(proc.wait(), timeout=1.5)\n"
+    "        except (asyncio.TimeoutError, TimeoutError):\n"
+    "            try:\n"
+    "                if has_pg:\n"
+    "                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)\n"
+    "                else:\n"
+    "                    proc.kill()\n"
+    "            except (ProcessLookupError, OSError):\n"
+    "                pass\n"
+    "            try:\n"
+    "                await proc.wait()\n"
+    "            except Exception:\n"
+    "                pass\n\n"
+    "    try:\n"
+    "        stdout_bytes, stderr_bytes = await asyncio.wait_for(\n"
+    "            asyncio.gather(_read_stream(proc.stdout), _read_stream(proc.stderr)),\n"
+    "            timeout=timeout,\n"
+    "        )\n"
+    "        await proc.wait()\n"
+    "        out = _strip_ansi_codes(stdout_bytes.decode('utf-8', errors='replace'))\n"
+    "        err = _strip_ansi_codes(stderr_bytes.decode('utf-8', errors='replace'))\n"
+    "        body = (out or '') + (err or '')\n"
+    '        return f"Exit code {proc.returncode}\\n{body}".strip() if body else f"Exit code {proc.returncode}"\n'
+    "    except (asyncio.TimeoutError, TimeoutError):\n"
+    "        await _cleanup_proc()\n"
+    '        return f"Exit code 124\\nError executing command: Command \'{command}\' timed out after {timeout} seconds"\n'
+    "    except (asyncio.CancelledError, BaseException):\n"
+    "        await _cleanup_proc()\n"
+    "        raise\n"
+)
+
+def safe_provision_tool(
+    target_path: Path,
+    canonical_code: str,
+    historical_hashes: Optional[Set[str]] = None,
+) -> bool:
+    """Safely provision or upgrade a tool template in TOOLS_DIR with strict hash provenance.
+
+    Rules:
+    - If target_path does not exist: write canonical template atomically.
+    - If target_path is a symlink or not a regular file: log warning, DO NOT modify/overwrite, treat as user-managed.
+    - If target_path exists: compute complete SHA-256 hash.
+      * If hash matches canonical: no action needed.
+      * If hash matches an explicitly recognized historical generated template hash:
+        a. Create timestamped backup: <filename>.py.bak.<timestamp>
+        b. Preserve original POSIX file permissions (os.stat(target_path).st_mode).
+        c. Atomically write new template using tempfile in same dir + os.replace.
+        d. Wrap in try...except: if atomic replacement fails, ensure backup is retained, attempt rollback, raise clear error.
+      * If hash is unknown, missing, or user-modified: NEVER overwrite or replace. Treat as user-managed code.
+    """
+    if target_path.is_symlink() or (target_path.exists() and not target_path.is_file()):
+        logger.warning(
+            f"Tool path {target_path} is a symlink or non-regular file; skipping provisioning to protect user configuration."
+        )
+        return False
+
+    if not target_path.exists():
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_file = tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target_path.parent,
+            delete=False,
+        )
+        temp_path = Path(temp_file.name)
+        try:
+            temp_file.write(canonical_code)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+            temp_file.close()
+            os.replace(temp_path, target_path)
+            return True
+        except Exception as exc:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except Exception:
+                    pass
+            logger.error(f"Failed to provision tool {target_path}: {exc}")
+            return False
+
+    # Target path exists and is a regular file
+    try:
+        file_bytes = target_path.read_bytes()
+        file_hash = hashlib.sha256(file_bytes).hexdigest()
+    except Exception as e:
+        logger.warning(f"Could not read tool file {target_path} for hash calculation: {e}")
+        return False
+
+    canonical_bytes = canonical_code.encode("utf-8")
+    canonical_hash = hashlib.sha256(canonical_bytes).hexdigest()
+
+    if file_hash == canonical_hash:
+        return True
+
+    tool_name = target_path.stem
+    allowed_hashes: Set[str] = set(historical_hashes) if historical_hashes is not None else set()
+    allowed_hashes.update(HISTORICAL_TEMPLATE_HASHES.get(tool_name, set()))
+    allowed_hashes.add(canonical_hash)
+
+    if file_hash not in allowed_hashes:
+        logger.info(
+            f"Tool {target_path.name} (hash: {file_hash[:12]}...) does not match any recognized historical template. Treating as user-managed."
+        )
+        return False
+
+    # Recognized historical hash! Perform safe upgrade.
+    timestamp = int(time.time() * 1000)
+    backup_path = target_path.with_name(f"{target_path.name}.bak.{timestamp}")
+    orig_mode = os.stat(target_path).st_mode
+
+    try:
+        shutil.copy2(target_path, backup_path)
+    except Exception as exc:
+        logger.error(f"Failed to create backup for {target_path}: {exc}")
+        raise RuntimeError(f"Backup creation failed for {target_path} before upgrade: {exc}") from exc
+
+    temp_file = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=target_path.parent,
+        delete=False,
+    )
+    temp_path = Path(temp_file.name)
+    try:
+        temp_file.write(canonical_code)
+        temp_file.flush()
+        os.fsync(temp_file.fileno())
+        temp_file.close()
+        os.chmod(temp_path, orig_mode)
+        os.replace(temp_path, target_path)
+        logger.info(f"Safely upgraded {target_path.name} to current template (backup saved to {backup_path.name}).")
+        return True
+    except Exception as exc:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except Exception:
+                pass
+        # Rollback from backup if target_path was damaged
+        if not target_path.exists() and backup_path.exists():
+            try:
+                shutil.copy2(backup_path, target_path)
+            except Exception:
+                pass
+        logger.error(f"Atomic replacement failed for {target_path}: {exc}; backup retained at {backup_path}")
+        raise RuntimeError(
+            f"Atomic replacement failed for {target_path}; rollback attempted. Backup retained at {backup_path}"
+        ) from exc
 
 def get_tools_dir() -> Path:
     """Return the active tools.d directory respecting ZELYR_CONFIG_DIR."""
@@ -215,34 +574,7 @@ def load_plugins() -> None:
         ),
         (
             TOOLS_DIR / "execute_command.py",
-            (
-                "import subprocess\n\n"
-                "IS_CORE = True\n"
-                "TIER = 0\n"
-                "TOOL_SCHEMA = {\n"
-                '    "type": "function",\n'
-                '    "function": {\n'
-                '        "name": "execute_command",\n'
-                '        "description": "Executes a shell command via bash and returns stdout and stderr.",\n'
-                '        "parameters": {\n'
-                '            "type": "object",\n'
-                '            "properties": {\n'
-                '                "command": {"type": "string", "description": "Command to execute"}\n'
-                '            },\n'
-                '            "required": ["command"]\n'
-                '        }\n'
-                '    }\n'
-                "}\n"
-                'TUI_HINT = "⚙️ Executing system command..."\n'
-                "REQUIRED_RING = 0\n\n"
-                "async def execute(command: str = '', **kwargs) -> str:\n"
-                "    try:\n"
-                "        proc = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=60)\n"
-                "        body = (proc.stdout or '') + (proc.stderr or '')\n"
-                '        return f"Exit code {proc.returncode}\\n{body}".strip() if body else f"Exit code {proc.returncode}"\n'
-                "    except Exception as e:\n"
-                '        return f"Error executing command: {e}"\n'
-            ),
+            _EXECUTE_COMMAND_TEMPLATE,
         ),
         (
             TOOLS_DIR / "manage_desktop_window.py",
@@ -378,11 +710,10 @@ def load_plugins() -> None:
         ),
     ]
     for target_file, code_content in provisions:
-        if not target_file.exists():
-            try:
-                target_file.write_text(code_content, encoding="utf-8")
-            except Exception:
-                pass
+        try:
+            safe_provision_tool(target_file, code_content)
+        except Exception as exc:
+            logger.warning(f"Error provisioning tool {target_file}: {exc}")
 
     for path in TOOLS_DIR.glob("*.py"):
         if path.name.startswith("__"):
