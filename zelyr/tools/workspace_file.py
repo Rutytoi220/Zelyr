@@ -12,13 +12,16 @@ from __future__ import annotations
 import fnmatch
 import os
 import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from zelyr.tools.core import BaseTool, ToolParameter, ToolResult
 
-BACKUP_DIR = Path("/tmp/zelyr_backups")
+PRIMARY_BACKUP_DIR = Path(tempfile.gettempdir()) / "zelyr_backups"
+LEGACY_BACKUP_DIR = Path(tempfile.gettempdir()) / "axiom_backups"
+BACKUP_DIR = PRIMARY_BACKUP_DIR
 DEFAULT_IGNORES = {
     ".git",
     "__pycache__",
@@ -98,20 +101,21 @@ class ManageWorkspaceFileTool(BaseTool):
             ),
         ]
 
-    def _resolve_path(self, path_str: str) -> Path:
+    def _resolve_path(self, path_str: str, cwd: Optional[Path] = None) -> Path:
+        base_dir = cwd if cwd is not None else Path.cwd()
         if not path_str or path_str.strip() == "":
-            return Path.cwd()
+            return base_dir
         p = Path(path_str.strip())
         if p.is_absolute():
             return p.resolve()
-        return (Path.cwd() / p).resolve()
+        return (base_dir / p).resolve()
 
     def _create_backup(self, file_path: Path) -> Optional[str]:
         if not file_path.is_file():
             return None
-        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        PRIMARY_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
         timestamp = int(time.time() * 1000)
-        backup_file = BACKUP_DIR / f"{file_path.name}.{timestamp}.bak"
+        backup_file = PRIMARY_BACKUP_DIR / f"{file_path.name}.{timestamp}.bak"
         shutil.copy2(file_path, backup_file)
         return str(backup_file)
 
@@ -170,7 +174,9 @@ class ManageWorkspaceFileTool(BaseTool):
 
         action = str(merged.get("action") or "read").strip().lower()
         path_str = str(merged.get("path") or "").strip()
-        target_path = self._resolve_path(path_str)
+        cwd_param = merged.get("cwd")
+        cwd_dir = Path(cwd_param).resolve() if cwd_param else None
+        target_path = self._resolve_path(path_str, cwd=cwd_dir)
 
         if action == "read":
             if not target_path.exists():
@@ -272,22 +278,23 @@ class ManageWorkspaceFileTool(BaseTool):
             if not path_str:
                 return ToolResult(False, error="Target path must be provided for rollback action.")
 
-            if not BACKUP_DIR.exists():
-                return ToolResult(False, error=f"No backup found in {BACKUP_DIR} for this file.")
-
-            filename = target_path.name
+            candidate_dirs = [PRIMARY_BACKUP_DIR, LEGACY_BACKUP_DIR]
             matching_backups = []
-            for bak in BACKUP_DIR.glob(f"{filename}.*.bak"):
-                parts = bak.name.rsplit(".", 2)
-                if len(parts) >= 3 and parts[-1] == "bak" and parts[-2].isdigit():
-                    try:
-                        ts = int(parts[-2])
-                        matching_backups.append((ts, bak))
-                    except ValueError:
-                        pass
+            filename = target_path.name
+            for b_dir in candidate_dirs:
+                if not b_dir.exists():
+                    continue
+                for bak in b_dir.glob(f"{filename}.*.bak"):
+                    parts = bak.name.rsplit(".", 2)
+                    if len(parts) >= 3 and parts[-1] == "bak" and parts[-2].isdigit():
+                        try:
+                            ts = int(parts[-2])
+                            matching_backups.append((ts, bak))
+                        except ValueError:
+                            pass
 
             if not matching_backups:
-                return ToolResult(False, error=f"No backup found in {BACKUP_DIR} for this file.")
+                return ToolResult(False, error=f"No backup found in {PRIMARY_BACKUP_DIR} for this file.")
 
             matching_backups.sort(key=lambda x: x[0], reverse=True)
             latest_ts, latest_bak = matching_backups[0]
@@ -296,8 +303,17 @@ class ManageWorkspaceFileTool(BaseTool):
                 content = latest_bak.read_text(encoding="utf-8")
                 target_path.parent.mkdir(parents=True, exist_ok=True)
                 target_path.write_text(content, encoding="utf-8")
+                try:
+                    shutil.copymode(latest_bak, target_path)
+                except Exception:
+                    pass
                 _last_modified_file = target_path
                 restored_size = len(content.encode("utf-8"))
+
+                try:
+                    latest_bak.unlink()
+                except Exception:
+                    pass
 
                 return ToolResult(
                     True,
