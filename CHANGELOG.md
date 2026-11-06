@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-06
+
+Production release v1.3.0 of Zelyr, delivering end-to-end autonomous systems integration: deterministic outcome verification, closed-loop error classification and recovery, direct Hyprland Wayland IPC and standalone Chrome DevTools Protocol (CDP) browser automation, token-budgeted proactive FTS5 memory hydration, hardened runtime tool crafting and hotloading, background routine actuators, and grounded multi-step developer self-repair workflows.
+
+### Added
+- **Deterministic State Outcome Verifier (`verify_outcome`)**:
+  - Implemented `OutcomeVerifierEngine` in `zelyr.engine.verifier` and canonical `VerifyOutcomeTool` in `zelyr.tools.verify_outcome`.
+  - Supports deterministic verification across 7 operational predicates: file existence, literal/regex content matching, SHA256 checksums, JSON schema key validation, process lifecycle states, TCP port binding, and command output evaluation.
+  - Added CLI verification mode: `zelyr run --verify "<goal>"` with exit code 0 on verified success, exit code 2 on verification failure.
+- **Closed-Loop Error Classification & Recovery (`ErrorClassifier`)**:
+  - Built unified error taxonomy in `zelyr.engine.error_classifier` categorizing runtime errors into `command_not_found`, `permission_denied`, `timeout`, `path_not_found`, `port_in_use`, `schema_mismatch`, `syntax_error`, and unrecoverable hardware/display limits.
+  - Injected actionable recovery hints into orchestrator ReAct feedback loops with anti-consultant gates to prevent premature surrender.
+- **Direct Hyprland UNIX Domain Socket IPC Actuator (`manage_desktop_window`)**:
+  - Standalone asynchronous `HyprlandIPCClient` communicating directly over `$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket.sock` with graceful degradation in non-Wayland/headless environments.
+  - Deterministic post-dispatch state verification inspecting active window addresses, workspace IDs, and focus changes.
+- **Standalone Chrome DevTools Protocol (CDP) Browser Engine (`interact_with_browser`)**:
+  - Direct WebSocket client (`CDPBrowserClient`) automating Chromium instances over remote debugging ports with zero unpacked extension requirements.
+  - Interactive accessibility DOM extraction generating indexed semantic element trees with tab switching, navigation, and input execution.
+- **Proactive FTS5 Memory Retrieval & Actuator (`manage_memory`)**:
+  - Token-budgeted composite retrieval engine (`MemoryHydrator`) with BM25 SQLite FTS5 search, recency decay, and access frequency ranking adhering to strict <=350 token injection ceilings.
+  - Canonical `manage_memory` tool supporting `store`, `retrieve`, `search`, and `delete` actions.
+- **Hardened Autonomous Tool Crafter Pipeline (`craft_tool`)**:
+  - Static Ring-0 AST analyzer (`validator.py`) strictly rejecting reflection escapes (`__subclasses__`, `__globals__`, `__code__`), unsafe imports, and privilege escalation.
+  - Dynamic companion test execution inside sterile POSIX sandboxes (`SandboxedPluginRunner`) with atomic userland promotion to `tools.d/` and session hotloading into `ToolRegistry`.
+- **Autonomous Routine Actuator (`manage_routine`)**:
+  - Canonical tool managing cron and interval schedules, routine lifecycles, and asynchronous temporal task execution supervised by `RoutineEngine`.
+- **Grounded Multi-Step Developer Workflows**:
+  - Comprehensive integration test battery (`tests/workflows/test_developer_workflows.py`) validating autonomous merge conflict resolution, test failure diagnostics with self-repair, and atomic patch rollback in `ManageWorkspaceFileTool`.
+- **Centralized SQLite Connection Hygiene**:
+  - Centralized connection factory in `zelyr.db.connection` enforcing WAL mode, busy timeouts, foreign key checks, and eliminating root repository database leaks.
+
 ## [1.2.0-rc.1] - 2026-10-29
 
 Release Candidate 1 for Zelyr v1.2.0, establishing production-grade Model Context Protocol (MCP) server federation, autonomous background routine scheduling, interactive streaming terminal chat with durable SQLite session persistence, adaptive context window budgeting and historical tool compaction, hierarchical multi-agent subagent delegation with transactional blackboard rollback, autonomous runtime tool crafting with AST and sandbox gatekeepers, and the full 30-task Level 5 evaluation benchmark suite.
@@ -214,7 +245,8 @@ This release hardens the build system, wires in OTA capabilities, and eliminates
 - **AppImage Build Resilience:** Fortified `scripts/build_appimage.sh` with correct `usr/share/applications` AppDir directory structure and explicit `set -e` failure trapping.
 - **Circuit Breakers:** `SystemHealthWatchdog` now survives nested permission errors silently rather than stalling the central EventBus.
 
-[Unreleased]: https://github.com/Rutytoi220/Zelyr/compare/v1.2.0-rc1...HEAD
+[Unreleased]: https://github.com/Rutytoi220/Zelyr/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/Rutytoi220/Zelyr/compare/v1.2.0-rc1...v1.3.0
 [1.2.0-rc.1]: https://github.com/Rutytoi220/Zelyr/releases/tag/v1.2.0-rc1
 [1.1.0]: https://github.com/Rutytoi220/Zelyr/releases/tag/v1.1.0
 [1.0.0]: https://github.com/Rutytoi220/Zelyr/releases/tag/v1.0.0
