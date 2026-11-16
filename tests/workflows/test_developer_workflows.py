@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from zelyr.agents.native_orchestrator import NativeOrchestrator
+from zelyr.engine.observation_framing import ObservationFramingEngine
 from zelyr.engine.verifier import OutcomeVerifier, verify_outcome
 from zelyr.tools.workspace_file import PRIMARY_BACKUP_DIR, ManageWorkspaceFileTool
 
@@ -421,13 +422,15 @@ async def test_python_test_diagnostic_and_self_repair(monkeypatch):
         tool_messages = [m for m in payload["messages"] if m.get("role") == "tool"]
         assert len(tool_messages) == 5
 
+        from zelyr.engine.observation_framing import ObservationFramingEngine
+
         # Check turn 1 observed failure
-        obs1 = json.loads(tool_messages[0]["content"])
+        obs1 = ObservationFramingEngine.parse_observation(tool_messages[0]["content"])
         assert obs1.get("status") == "error"
         assert obs1.get("exit_code") != 0
 
         # Check turn 4 observed success
-        obs4 = json.loads(tool_messages[3]["content"])
+        obs4 = ObservationFramingEngine.parse_observation(tool_messages[3]["content"])
         assert obs4.get("status") == "success"
         assert obs4.get("exit_code") == 0
 
@@ -495,7 +498,7 @@ async def test_atomic_mutation_and_rollback(monkeypatch):
             elif step == 2:
                 # Step 2: Extract backup path from previous observation & verify backup exists
                 last_tool_msg = next(m for m in reversed(payload["messages"]) if m.get("role") == "tool")
-                obs = json.loads(last_tool_msg["content"])
+                obs = ObservationFramingEngine.parse_observation(last_tool_msg["content"])
                 out_field = obs.get("output", {})
                 if isinstance(out_field, str):
                     try:

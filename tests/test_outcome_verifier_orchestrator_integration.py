@@ -204,13 +204,15 @@ class TestOrchestratorErrorObservationFormatting:
     def test_format_tool_observation_includes_classification_metadata(self):
         raw_output = "Exit code 127\nbash: non_existent_tool: command not found"
         formatted = NativeOrchestrator.format_tool_observation("execute_command", raw_output)
-        data = json.loads(formatted)
+        from zelyr.engine.observation_framing import ObservationFramingEngine
+
+        data = ObservationFramingEngine.parse_observation(formatted)
         assert data["status"] == "error"
         assert data["error_type"] == "COMMAND_NOT_FOUND"
         assert data["exit_code"] == 127
         assert "Command not found in PATH" in data["remedy_hint"]
         assert "execute_command" in data["allowed_actions"]
-        assert "Recovery Hint:" in data["error"]
+        assert "Recovery Hint:" in formatted
 
 
 # ==============================================================================
@@ -470,3 +472,489 @@ async def test_native_orchestrator_proactive_hydration_depth0(isolated_db):
         break
     sys_recovery = payload_recovery["messages"][0]["content"]
     assert "[Contextual Memory]:" not in sys_recovery
+
+
+class TestMidTurnAcceptanceCriteriaFailureFeedback:
+    """Phase 1 regression tests: mid-turn acceptance-criteria failure feedback."""
+
+    @pytest.mark.asyncio
+    async def test_1_successful_write_with_incorrect_content_produces_failed_verification_observation(self, tmp_path: Path):
+        """1. A successful file write with incorrect content produces a failed-verification observation containing the actual mismatch."""
+        orch = NativeOrchestrator()
+        target_b = tmp_path / "beta.txt"
+
+        async def real_write_executor(name: str, **kwargs):
+            p = Path(kwargs["path"])
+            p.write_text(kwargs["content"], encoding="utf-8")
+            return f"Successfully wrote {len(kwargs['content'])} characters to {p}"
+
+        turn = 0
+        observed_tool_messages = []
+
+        async def mock_stream(payload: dict):
+            nonlocal turn
+            turn += 1
+            for m in payload.get("messages", []):
+                if m.get("role") == "tool" and m not in observed_tool_messages:
+                    observed_tool_messages.append(dict(m))
+            if turn == 1:
+                yield {
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_wrong_beta",
+                                "type": "function",
+                                "function": {
+                                    "name": "manage_workspace_file",
+                                    "arguments": json.dumps({
+                                        "action": "write",
+                                        "path": str(target_b),
+                                        "content": "BETA_102",
+                                    }),
+                                },
+                            }]
+                        }
+                    }]
+                }
+            else:
+                yield {"choices": [{"delta": {"content": "Stopping here."}}]}
+
+        from zelyr.engine.execution_ledger import TurnExecutionLedger
+        ledger = TurnExecutionLedger()
+        payload = {
+            "messages": [{"role": "user", "content": f"Create {target_b} containing exactly BETA_202."}],
+            "acceptance_criteria": f"file_contains:{target_b}:BETA_202",
+        }
+        async for _ in orch.generate_stream(
+            payload,
+            stream_provider=mock_stream,
+            tool_executor=real_write_executor,
+            ledger=ledger,
+            max_replanning_attempts=0,
+        ):
+            pass
+
+        assert len(observed_tool_messages) == 1
+        obs_content = observed_tool_messages[0]["content"]
+        # Tool itself executed successfully (not claimed as tool execution error)
+        assert "- Status: SUCCESS" in obs_content
+        assert observed_tool_messages[0]["status"] == "success"
+        assert "Successfully wrote 8 characters" in obs_content
+        # Outcome is explicitly reported as NOT verified with actual failed criterion and reason
+        assert "- Verified: FALSE" in obs_content
+        assert "NOT verified" in obs_content or "[Outcome Verification Failed]:" in obs_content
+        assert str(target_b) in obs_content
+        assert "file_contains" in obs_content
+        assert "BETA_202" in obs_content
+        assert f"Pattern 'BETA_202' not found in {target_b}" in obs_content
+
+    @pytest.mark.asyncio
+    async def test_2_successful_write_with_correct_content_reported_as_verified(self, tmp_path: Path):
+        """2. A successful write with correct content is reported as verified."""
+        orch = NativeOrchestrator()
+        target_a = tmp_path / "alpha.txt"
+
+        async def real_write_executor(name: str, **kwargs):
+            p = Path(kwargs["path"])
+            p.write_text(kwargs["content"], encoding="utf-8")
+            return f"Successfully wrote {len(kwargs['content'])} characters to {p}"
+
+        turn = 0
+        observed_tool_messages = []
+
+        async def mock_stream(payload: dict):
+            nonlocal turn
+            turn += 1
+            for m in payload.get("messages", []):
+                if m.get("role") == "tool" and m not in observed_tool_messages:
+                    observed_tool_messages.append(dict(m))
+            if turn == 1:
+                yield {
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_ok_alpha",
+                                "type": "function",
+                                "function": {
+                                    "name": "manage_workspace_file",
+                                    "arguments": json.dumps({
+                                        "action": "write",
+                                        "path": str(target_a),
+                                        "content": "ALPHA_101",
+                                    }),
+                                },
+                            }]
+                        }
+                    }]
+                }
+            else:
+                yield {"choices": [{"delta": {"content": "Completed."}}]}
+
+        from zelyr.engine.execution_ledger import TurnExecutionLedger
+        ledger = TurnExecutionLedger()
+        payload = {
+            "messages": [{"role": "user", "content": f"Create {target_a} containing exactly ALPHA_101."}],
+            "acceptance_criteria": f"file_contains:{target_a}:ALPHA_101",
+        }
+        async for _ in orch.generate_stream(
+            payload,
+            stream_provider=mock_stream,
+            tool_executor=real_write_executor,
+            ledger=ledger,
+        ):
+            pass
+
+        assert len(observed_tool_messages) == 1
+        obs_content = observed_tool_messages[0]["content"]
+        assert "- Status: SUCCESS" in obs_content
+        assert "- Verified: TRUE" in obs_content
+        assert "[Machine State Verified]:" in obs_content
+        assert ledger.is_target_verified(str(target_a)) is True
+        assert ledger._records["call_ok_alpha"].verified is True
+
+    @pytest.mark.asyncio
+    async def test_3_tool_execution_error_distinguished_from_acceptance_criteria_mismatch(self, tmp_path: Path):
+        """3. A tool execution error is still distinguished from an acceptance-criteria mismatch."""
+        orch = NativeOrchestrator()
+        target_err = tmp_path / "readonly.txt"
+        target_mismatch = tmp_path / "mismatch.txt"
+
+        async def executor(name: str, **kwargs):
+            p = Path(kwargs["path"])
+            if p == target_err:
+                raise PermissionError(f"Permission denied: '{p}'")
+            p.write_text(kwargs["content"], encoding="utf-8")
+            return f"Successfully wrote {len(kwargs['content'])} characters to {p}"
+
+        turn = 0
+
+        async def mock_stream(payload: dict):
+            nonlocal turn
+            turn += 1
+            if turn == 1:
+                yield {
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_exec_err",
+                                "type": "function",
+                                "function": {
+                                    "name": "manage_workspace_file",
+                                    "arguments": json.dumps({
+                                        "action": "write",
+                                        "path": str(target_err),
+                                        "content": "EXPECTED",
+                                    }),
+                                },
+                            }]
+                        }
+                    }]
+                }
+            elif turn == 2:
+                yield {
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_crit_mismatch",
+                                "type": "function",
+                                "function": {
+                                    "name": "manage_workspace_file",
+                                    "arguments": json.dumps({
+                                        "action": "write",
+                                        "path": str(target_mismatch),
+                                        "content": "WRONG_VALUE",
+                                    }),
+                                },
+                            }]
+                        }
+                    }]
+                }
+            else:
+                yield {"choices": [{"delta": {"content": "Unable to complete due to error."}}]}
+
+        from zelyr.engine.execution_ledger import ActionState, TurnExecutionLedger
+        ledger = TurnExecutionLedger()
+        payload = {
+            "messages": [{"role": "user", "content": f"Write {target_err} and {target_mismatch}."}],
+            "acceptance_criteria": f"file_contains:{target_err}:EXPECTED,file_contains:{target_mismatch}:EXPECTED",
+        }
+        async for _ in orch.generate_stream(
+            payload,
+            stream_provider=mock_stream,
+            tool_executor=executor,
+            ledger=ledger,
+            max_replanning_attempts=0,
+        ):
+            pass
+
+        tool_msgs = [m for m in payload["messages"] if m.get("role") == "tool"]
+        assert len(tool_msgs) == 2
+
+        # First tool call: actual tool execution error
+        assert tool_msgs[0]["status"] == "error"
+        assert "- Status: ERROR" in tool_msgs[0]["content"]
+        assert "[Error Diagnostic:" in tool_msgs[0]["content"]
+        assert ledger._records["call_exec_err"].state == ActionState.FAILED
+
+        # Second tool call: tool execution succeeded, acceptance criterion mismatched
+        assert tool_msgs[1]["status"] == "success"
+        assert "- Status: SUCCESS" in tool_msgs[1]["content"]
+        assert "- Verified: FALSE" in tool_msgs[1]["content"]
+        assert "[Outcome Verification Failed]:" in tool_msgs[1]["content"]
+        assert ledger._records["call_crit_mismatch"].state == ActionState.SUCCESS
+        assert ledger._records["call_crit_mismatch"].verified is False
+
+    @pytest.mark.asyncio
+    async def test_4_failed_criterion_never_marks_target_verified_and_preserves_ledger_failure_detail(self, tmp_path: Path):
+        """4. A failed criterion never marks its target verified and preserves the verification failure in the ledger."""
+        orch = NativeOrchestrator()
+        target_b = tmp_path / "beta.txt"
+
+        async def executor(name: str, **kwargs):
+            p = Path(kwargs["path"])
+            p.write_text(kwargs["content"], encoding="utf-8")
+            return f"Wrote to {p}"
+
+        turn = 0
+
+        async def mock_stream(payload: dict):
+            nonlocal turn
+            turn += 1
+            if turn == 1:
+                yield {
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_b1",
+                                "type": "function",
+                                "function": {
+                                    "name": "manage_workspace_file",
+                                    "arguments": json.dumps({
+                                        "action": "write",
+                                        "path": str(target_b),
+                                        "content": "BETA_102",
+                                    }),
+                                },
+                            }]
+                        }
+                    }]
+                }
+            else:
+                yield {"choices": [{"delta": {"content": "Stopped."}}]}
+
+        from zelyr.engine.execution_ledger import TurnExecutionLedger
+        ledger = TurnExecutionLedger()
+        payload = {
+            "messages": [{"role": "user", "content": f"Create {target_b} containing BETA_202."}],
+            "acceptance_criteria": f"file_contains:{target_b}:BETA_202",
+        }
+        async for _ in orch.generate_stream(
+            payload,
+            stream_provider=mock_stream,
+            tool_executor=executor,
+            ledger=ledger,
+            max_replanning_attempts=0,
+        ):
+            pass
+
+        assert ledger.is_target_verified(str(target_b)) is False
+        assert ledger.get_verified_targets() == []
+        rec = ledger._records["call_b1"]
+        assert rec.verified is False
+        assert rec in ledger.unverified_actions()
+        assert rec.verification_detail is not None
+        assert "Verification failed" in rec.verification_detail
+        assert "BETA_202" in rec.verification_detail
+
+    @pytest.mark.asyncio
+    async def test_5_verification_failure_does_not_trigger_automatic_repetition_and_blocks_identical_retry(self, tmp_path: Path):
+        """5. The model cannot trigger automatic repetition merely because verification failed."""
+        orch = NativeOrchestrator()
+        target_b = tmp_path / "beta.txt"
+        executed_calls = []
+
+        async def executor(name: str, **kwargs):
+            executed_calls.append(dict(kwargs))
+            p = Path(kwargs["path"])
+            p.write_text(kwargs["content"], encoding="utf-8")
+            return f"Wrote to {p}"
+
+        turn = 0
+
+        async def mock_stream(payload: dict):
+            nonlocal turn
+            turn += 1
+            if turn in (1, 2):
+                # Model tries to emit the exact same wrong content twice
+                yield {
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": f"call_dup_{turn}",
+                                "type": "function",
+                                "function": {
+                                    "name": "manage_workspace_file",
+                                    "arguments": json.dumps({
+                                        "action": "write",
+                                        "path": str(target_b),
+                                        "content": "BETA_102",
+                                    }),
+                                },
+                            }]
+                        }
+                    }]
+                }
+            else:
+                yield {"choices": [{"delta": {"content": "Stopped."}}]}
+
+        from zelyr.engine.execution_ledger import ActionState, TurnExecutionLedger
+        ledger = TurnExecutionLedger()
+        payload = {
+            "messages": [{"role": "user", "content": f"Create {target_b} containing BETA_202."}],
+            "acceptance_criteria": f"file_contains:{target_b}:BETA_202",
+        }
+        async for _ in orch.generate_stream(
+            payload,
+            stream_provider=mock_stream,
+            tool_executor=executor,
+            ledger=ledger,
+            max_replanning_attempts=0,
+        ):
+            pass
+
+        # Executor was called only ONCE; no automatic retry occurred, and identical parameters in Turn 2 were blocked
+        assert len(executed_calls) == 1
+        assert ledger._records["call_dup_2"].state == ActionState.FAILED
+        assert "redundant_action" in str(ledger._records["call_dup_2"].error)
+
+    @pytest.mark.asyncio
+    async def test_6_subsequent_corrected_tool_call_succeeds_and_verifies(self, tmp_path: Path):
+        """6. A subsequent corrected tool call can succeed through the normal validation and execution path."""
+        orch = NativeOrchestrator()
+        target_a = tmp_path / "alpha.txt"
+        target_b = tmp_path / "beta.txt"
+        executed_writes = []
+
+        async def executor(name: str, **kwargs):
+            executed_writes.append((kwargs["path"], kwargs["content"]))
+            p = Path(kwargs["path"])
+            p.write_text(kwargs["content"], encoding="utf-8")
+            return f"Successfully wrote {len(kwargs['content'])} characters to {p}"
+
+        turn = 0
+        observed_beta_failure_msg = ""
+
+        async def mock_stream(payload: dict):
+            nonlocal turn, observed_beta_failure_msg
+            turn += 1
+            if turn == 1:
+                # Proposes two writes (S2 reproduction)
+                yield {
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_a",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "manage_workspace_file",
+                                        "arguments": json.dumps({
+                                            "action": "write",
+                                            "path": str(target_a),
+                                            "content": "ALPHA_101",
+                                        }),
+                                    },
+                                },
+                                {
+                                    "index": 1,
+                                    "id": "call_b_pending",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "manage_workspace_file",
+                                        "arguments": json.dumps({
+                                            "action": "write",
+                                            "path": str(target_b),
+                                            "content": "BETA_202",
+                                        }),
+                                    },
+                                },
+                            ]
+                        }
+                    }]
+                }
+            elif turn == 2:
+                # Model emits second write with wrong content BETA_102
+                yield {
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_b_wrong",
+                                "type": "function",
+                                "function": {
+                                    "name": "manage_workspace_file",
+                                    "arguments": json.dumps({
+                                        "action": "write",
+                                        "path": str(target_b),
+                                        "content": "BETA_102",
+                                    }),
+                                },
+                            }]
+                        }
+                    }]
+                }
+            elif turn == 3:
+                # Model sees the failed-verification observation and emits corrected tool call with BETA_202
+                tool_msgs = [m for m in payload["messages"] if m.get("role") == "tool"]
+                observed_beta_failure_msg = tool_msgs[-1]["content"]
+                yield {
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_b_fixed",
+                                "type": "function",
+                                "function": {
+                                    "name": "manage_workspace_file",
+                                    "arguments": json.dumps({
+                                        "action": "write",
+                                        "path": str(target_b),
+                                        "content": "BETA_202",
+                                    }),
+                                },
+                            }]
+                        }
+                    }]
+                }
+            else:
+                yield {"choices": [{"delta": {"content": "Both files created and verified."}}]}
+
+        from zelyr.engine.execution_ledger import ActionState, TurnExecutionLedger
+        ledger = TurnExecutionLedger()
+        payload = {
+            "messages": [{"role": "user", "content": f"Create {target_a} with ALPHA_101 and {target_b} with BETA_202."}],
+            "acceptance_criteria": f"file_contains:{target_a}:ALPHA_101,file_contains:{target_b}:BETA_202",
+        }
+        async for _ in orch.generate_stream(
+            payload,
+            stream_provider=mock_stream,
+            tool_executor=executor,
+            ledger=ledger,
+        ):
+            pass
+
+        assert "- Verified: FALSE" in observed_beta_failure_msg
+        assert "BETA_202" in observed_beta_failure_msg
+        assert target_a.read_text(encoding="utf-8") == "ALPHA_101"
+        assert target_b.read_text(encoding="utf-8") == "BETA_202"
+        assert ledger.is_target_verified(str(target_a)) is True
+        assert ledger.is_target_verified(str(target_b)) is True
+        assert ledger._records["call_b_fixed"].state == ActionState.VERIFIED
+        assert ledger._records["call_b_fixed"].verified is True

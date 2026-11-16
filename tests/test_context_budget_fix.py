@@ -155,8 +155,8 @@ class TestContextBudgetFix(unittest.IsolatedAsyncioTestCase):
             # Check that streaming succeeded and emitted tool call
             self.assertGreater(len(chunks), 0)
 
-            # Find the completions request
-            comp_req = next(r for r in captured_requests if "/v1/chat/completions" in r[1])
+            # Find the chat dispatch request (uses Ollama /api/chat so options.num_ctx=8192 is honored)
+            comp_req = next(r for r in captured_requests if "/api/chat" in r[1])
             req_body = comp_req[2]["json"]
 
             # 1. num_ctx must be 8192
@@ -171,6 +171,124 @@ class TestContextBudgetFix(unittest.IsolatedAsyncioTestCase):
             tool_names = [t["function"]["name"] for t in req_body["tools"]]
             self.assertIn("send_desktop_notification", tool_names)
             self.assertNotIn("interact_with_browser", tool_names)
+
+    async def test_api_chat_endpoint_ndjson_and_dict_tool_arguments(self):
+        """Verify live Ollama path uses /api/chat (honoring num_ctx=8192), sends dict arguments, and decodes NDJSON."""
+        captured_requests = []
+
+        class MockNdjsonResponse:
+            def __init__(self, turn_idx: int):
+                self.status_code = 200
+                self.turn_idx = turn_idx
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc_val, exc_tb):
+                pass
+
+            async def aiter_lines(self):
+                if self.turn_idx == 1:
+                    yield json.dumps({
+                        "model": "qwen3:4b",
+                        "message": {"role": "assistant", "content": "", "thinking": "Checking tools."},
+                        "done": False,
+                    })
+                    yield json.dumps({
+                        "model": "qwen3:4b",
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [{
+                                "id": "call_ndjson_1",
+                                "function": {
+                                    "index": 0,
+                                    "name": "send_desktop_notification",
+                                    "arguments": {"title": "Hi", "message": "World"},
+                                },
+                            }],
+                        },
+                        "done": False,
+                    })
+                    yield json.dumps({
+                        "model": "qwen3:4b",
+                        "message": {"role": "assistant", "content": ""},
+                        "done": True,
+                        "done_reason": "stop",
+                    })
+                else:
+                    yield json.dumps({
+                        "model": "qwen3:4b",
+                        "message": {"role": "assistant", "content": "Notification sent cleanly."},
+                        "done": False,
+                    })
+                    yield json.dumps({
+                        "model": "qwen3:4b",
+                        "message": {"role": "assistant", "content": ""},
+                        "done": True,
+                        "done_reason": "stop",
+                    })
+
+            async def aread(self):
+                return b""
+
+        class MockAsyncClient:
+            turn_counter = 0
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc_val, exc_tb):
+                pass
+
+            async def post(self, url, **kwargs):
+                captured_requests.append(("POST", url, kwargs))
+                mock_resp = MagicMock()
+                mock_resp.status_code = 200
+                return mock_resp
+
+            def stream(self, method, url, **kwargs):
+                MockAsyncClient.turn_counter += 1
+                captured_requests.append((method, url, json.loads(json.dumps(kwargs))))
+                return MockNdjsonResponse(MockAsyncClient.turn_counter)
+
+        executed = []
+
+        async def mock_exec(name: str, args: dict) -> str:
+            executed.append((name, args))
+            return json.dumps({"status": "ok", "delivered": True})
+
+        self.orchestrator.tool_executor = mock_exec
+        self.orchestrator._execute_tool = mock_exec
+        self.orchestrator.max_depth = 3
+
+        payload = {
+            "messages": [{"role": "user", "content": "Send a desktop notification saying World"}],
+        }
+
+        with patch("httpx.AsyncClient", MockAsyncClient):
+            chunks = []
+            async for chunk in self.orchestrator.generate_stream(payload):
+                chunks.append(chunk)
+
+        stream_reqs = [r for r in captured_requests if r[0] == "POST" and "/api/generate" not in r[1]]
+        self.assertGreaterEqual(len(stream_reqs), 2)
+        for _, url, kw in stream_reqs:
+            self.assertIn("/api/chat", url)
+            self.assertNotIn("/v1/chat/completions", url)
+            self.assertEqual(kw["json"]["options"]["num_ctx"], 8192)
+
+        turn2_messages = stream_reqs[1][2]["json"]["messages"]
+        assistant_msg = next(m for m in turn2_messages if m.get("role") == "assistant" and m.get("tool_calls"))
+        tc_args = assistant_msg["tool_calls"][0]["function"]["arguments"]
+        self.assertIsInstance(tc_args, dict)
+        self.assertEqual(tc_args, {"title": "Hi", "message": "World"})
+        self.assertEqual(executed, [("send_desktop_notification", {"title": "Hi", "message": "World"})])
+        rendered = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks if c.get("choices"))
+        self.assertIn("Notification sent cleanly.", rendered)
 
 
 if __name__ == "__main__":

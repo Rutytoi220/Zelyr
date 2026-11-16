@@ -244,12 +244,12 @@ async def _execute_headless_run(
     output_json: bool = False,
     orchestrator: Optional[Any] = None,
     verify_spec: Optional[str] = None,
+    base_url_override: Optional[str] = None,
 ) -> int:
     """Execute a one-shot prompt headlessly via NativeOrchestrator."""
     import re
-    import zelyr.agents.native_orchestrator as nat_orch
     from zelyr.agents.native_orchestrator import NativeOrchestrator
-    from zelyr.config import get_config
+    from zelyr.config import ZelyrConfig, get_config
     from zelyr.core.plugins import filter_tool_schemas_by_tier, get_tool_schemas, load_plugins
 
     clean_prompt = (prompt or "").strip()
@@ -258,13 +258,22 @@ async def _execute_headless_run(
         sys.stderr.flush()
         return 1
 
-    cfg = get_config()
-    if model_override:
-        cfg.ollama_model = model_override
-    active_model = model_override or getattr(cfg, "ollama_model", "qwen2.5-coder:7b")
+    base_cfg = getattr(orchestrator, "config", None) or get_config()
+    active_model = model_override or getattr(base_cfg, "ollama_model", "qwen2.5-coder:7b")
 
     load_plugins()
-    orch = orchestrator or NativeOrchestrator()
+    if orchestrator is not None:
+        orch = orchestrator
+        if base_url_override and getattr(orch, "config", None) is None:
+            run_cfg = ZelyrConfig.from_dict(base_cfg.to_dict()) if hasattr(base_cfg, "to_dict") else ZelyrConfig()
+            run_cfg.ollama_base_url = base_cfg.get_effective_ollama_base_url(base_url_override) if hasattr(base_cfg, "get_effective_ollama_base_url") else base_url_override.rstrip("/")
+            orch.config = run_cfg
+    else:
+        run_cfg = None
+        if base_url_override:
+            run_cfg = ZelyrConfig.from_dict(base_cfg.to_dict()) if hasattr(base_cfg, "to_dict") else ZelyrConfig()
+            run_cfg.ollama_base_url = base_cfg.get_effective_ollama_base_url(base_url_override) if hasattr(base_cfg, "get_effective_ollama_base_url") else base_url_override.rstrip("/")
+        orch = NativeOrchestrator(config=run_cfg)
     tier = orch.route_tier(clean_prompt)
     dynamic_tools = filter_tool_schemas_by_tier(get_tool_schemas(0), tier)
 
@@ -274,13 +283,19 @@ async def _execute_headless_run(
         "tools": dynamic_tools,
         "messages": [{"role": "user", "content": clean_prompt}],
     }
+    if verify_spec:
+        payload["acceptance_criteria"] = verify_spec
+        orch.acceptance_criteria = verify_spec
 
-    original_execute = nat_orch.execute_tool
+    original_raw_execute = getattr(orch, "_execute_tool", None)
+    original_execute = orch.execute_tool
     tool_calls_emitted: List[Dict[str, Any]] = []
 
     async def headless_execute_tool(name: str, **kwargs: Any) -> str:
         clean_name = NativeOrchestrator.normalize_tool_name(name)
-        norm_kwargs = NativeOrchestrator.normalize_tool_arguments(clean_name, kwargs, original_name=name)
+        norm_kwargs = NativeOrchestrator.normalize_tool_arguments(
+            clean_name, kwargs, original_name=name, active_schemas=dynamic_tools
+        )
         if clean_name == "interact_with_ui" and (
             "element_id" in norm_kwargs or norm_kwargs.get("action") in ("click_element", "fill_element")
         ):
@@ -291,20 +306,27 @@ async def _execute_headless_run(
         res = await original_execute(clean_name, **norm_kwargs)
         return str(res)
 
-    nat_orch.execute_tool = headless_execute_tool
+    orch.execute_tool = headless_execute_tool
     final_answer = ""
 
+    is_truncated = False
     try:
         max_steps = getattr(orch, "max_steps", 5)
         for step_idx in range(max_steps):
             step_content: List[str] = []
             step_tcs: List[Dict[str, Any]] = []
+            last_finish_reason: Optional[str] = None
 
             async for chunk in orch.generate_stream(payload):
                 choices = chunk.get("choices", [])
                 if not choices:
                     continue
-                delta = choices[0].get("delta", {})
+                choice = choices[0]
+                fr = choice.get("finish_reason") or chunk.get("done_reason") or chunk.get("finish_reason")
+                if fr:
+                    last_finish_reason = fr
+
+                delta = choice.get("delta", {})
                 if "tool_calls" in delta:
                     # Clear any pre-tool text or leaked JSON buffered in this turn
                     step_content.clear()
@@ -313,7 +335,7 @@ async def _execute_headless_run(
                         if fn.get("name"):
                             clean_fn_name = NativeOrchestrator.normalize_tool_name(fn["name"])
                             norm_fn_args = NativeOrchestrator.normalize_tool_arguments(
-                                clean_fn_name, fn.get("arguments", {}), original_name=fn["name"]
+                                clean_fn_name, fn.get("arguments", {}), original_name=fn["name"], active_schemas=dynamic_tools
                             )
                             norm_fn = {
                                 "name": clean_fn_name,
@@ -329,6 +351,9 @@ async def _execute_headless_run(
             clean_step = re.sub(r"<think>.*?</think>", "", raw_joined, flags=re.DOTALL)
             clean_step = re.sub(r"<think>.*$", "", clean_step, flags=re.DOTALL).strip()
 
+            if last_finish_reason is None and hasattr(orch, "last_finish_reason"):
+                last_finish_reason = orch.last_finish_reason
+
             if not step_tcs and clean_step:
                 known_tools = orch.get_known_tool_names(payload.get("tools"))
                 fallback_tc = orch.extract_first_tool_call(clean_step, known_tools)
@@ -337,11 +362,95 @@ async def _execute_headless_run(
                     fn_name = NativeOrchestrator.normalize_tool_name(raw_fb_name)
                     fn_args = fallback_tc.get("function", {}).get("arguments") or fallback_tc.get("arguments", {})
                     fn_args = NativeOrchestrator.normalize_tool_arguments(
-                        fn_name, fn_args, original_name=raw_fb_name
+                        fn_name, fn_args, original_name=raw_fb_name, active_schemas=dynamic_tools
                     )
                     tool_calls_emitted.append({"name": fn_name, "arguments": fn_args})
                     obs = await headless_execute_tool(fn_name, **fn_args)
                     call_id = f"call_headless_fallback_{step_idx}"
+                    framed_obs = NativeOrchestrator.format_tool_observation(fn_name, obs)
+                    from zelyr.engine.observation_framing import ObservationFramingEngine
+                    fb_parsed = ObservationFramingEngine.parse_observation(framed_obs)
+                    fb_status = "error" if (
+                        fb_parsed.get("status") == "error"
+                        or (fb_parsed.get("exit_code") is not None and fb_parsed.get("exit_code") != 0)
+                    ) else "success"
+                    fb_verified = fb_parsed.get("verified") is True
+                    fb_ver_failed = bool(fb_parsed.get("verification_failed"))
+                    fb_ver_detail = fb_parsed.get("verification_detail")
+
+                    fb_failed_targets: List[str] = []
+                    fb_verified_targets: List[str] = []
+                    if verify_spec:
+                        from zelyr.engine.execution_ledger import canonicalize_target, parse_acceptance_criteria, has_remaining_explicit_steps
+                        from zelyr.engine.verifier import OutcomeVerifier
+                        parsed_c = parse_acceptance_criteria(verify_spec)
+                        if parsed_c:
+                            c_ver_results = []
+                            for c in parsed_c:
+                                vr = OutcomeVerifier.verify(check=c["check"], target=c["target"], expected=c.get("expected"))
+                                c_ver_results.append((c, vr))
+                                if vr.success and hasattr(orch, "current_ledger") and orch.current_ledger is not None:
+                                    orch.current_ledger.record_target_verified(c["target"], detail=f"{c['check']} verified")
+                                elif not vr.success and hasattr(orch, "current_ledger") and orch.current_ledger is not None:
+                                    orch.current_ledger.invalidate_target_verification(c["target"], check_type=c.get("check"))
+                            if fb_status == "success":
+                                if all(vr.success for _, vr in c_ver_results):
+                                    fb_verified = True
+                                    fb_ver_failed = False
+                                    fb_verified_targets = [
+                                        canonicalize_target(str(c["target"]), check_type=c.get("check"))
+                                        for c, _ in c_ver_results
+                                        if c.get("target")
+                                    ]
+                                else:
+                                    fb_verified = False
+                                    fb_ver_failed = True
+                                    fb_failed_targets = [
+                                        canonicalize_target(str(c["target"]), check_type=c.get("check"))
+                                        for c, vr in c_ver_results
+                                        if not vr.success and c.get("target")
+                                    ]
+                                    failed_c, failed_vr = next((c, vr) for c, vr in c_ver_results if not vr.success)
+                                    fb_ver_detail = failed_vr.error or f"Verification failed on {failed_c.get('target')}"
+                                    framed_obs = ObservationFramingEngine.frame_observation(
+                                        fn_name,
+                                        {
+                                            "output": fb_parsed.get("output") or obs,
+                                            "status": "success",
+                                            "verified": False,
+                                            "verification_failed": True,
+                                            "target": failed_c.get("target"),
+                                            "failed_criterion": f"{failed_c.get('check')} on {failed_c.get('target')}",
+                                            "verifier_reason": fb_ver_detail,
+                                        },
+                                    )
+
+                    if hasattr(orch, "current_ledger") and orch.current_ledger is not None:
+                        if orch.current_ledger.get_record(call_id) is not None:
+                            suffix = 2
+                            while orch.current_ledger.get_record(f"{call_id}_{suffix}") is not None:
+                                suffix += 1
+                            call_id = f"{call_id}_{suffix}"
+                        orch.current_ledger.record_proposed(call_id, fn_name, fn_args)
+                        orch.current_ledger.record_validated(call_id)
+                        orch.current_ledger.record_dispatched(call_id)
+                        orch.current_ledger.record_observation(
+                            call_id,
+                            status=fb_status,
+                            output=framed_obs,
+                            error=fb_parsed.get("error"),
+                            exit_code=fb_parsed.get("exit_code"),
+                            verified=fb_verified,
+                            verification_detail=fb_ver_detail,
+                            verification_failed=fb_ver_failed,
+                            failed_targets=fb_failed_targets,
+                            verified_targets=fb_verified_targets,
+                        )
+                        if verify_spec and fb_verified and not fb_ver_failed:
+                            from zelyr.engine.execution_ledger import has_remaining_explicit_steps
+                            tool_target = NativeOrchestrator._extract_target_from_args(fn_name, fn_args)
+                            if not has_remaining_explicit_steps(clean_prompt, orch.current_ledger, current_target=tool_target):
+                                payload["tools"] = []
                     payload["messages"].append({
                         "role": "assistant",
                         "content": "",
@@ -355,68 +464,164 @@ async def _execute_headless_run(
                         "role": "tool",
                         "tool_call_id": call_id,
                         "name": fn_name,
-                        "content": NativeOrchestrator.format_tool_observation(fn_name, obs),
+                        "content": framed_obs,
                     })
                     continue
+
+            # Detect truncation or exhaustion
+            if last_finish_reason in ("length", "max_tokens"):
+                is_truncated = True
+                if not clean_step and not step_tcs:
+                    final_answer = (
+                        "⚠️ [Model Error] Model generation truncated: "
+                        "token limit reached during reasoning without producing terminal response or tool call."
+                    )
+                    break
+                else:
+                    final_answer = clean_step
+                    break
+
+            if not step_tcs and not clean_step:
+                final_answer = "⚠️ [Model Error] Empty response received from model without tool execution."
+                break
 
             final_answer = clean_step
             break
     except Exception as exc:
+        if hasattr(orch, "current_ledger") and orch.current_ledger is not None and orch.current_ledger.has_pending_proposals():
+            orch.current_ledger.discard_pending_proposals(reason="headless_error")
         sys.stderr.write(f"Error executing headless run: {exc}\n")
         sys.stderr.flush()
         return 1
     finally:
-        nat_orch.execute_tool = original_execute
+        orch.execute_tool = original_raw_execute
 
-    if final_answer.startswith("⚠️ [Connection Error]") or final_answer.startswith("⚠️ [API Error]") or final_answer.startswith("⚠️ [Request Error]"):
+    if final_answer.startswith("⚠️ [Connection Error]") or final_answer.startswith("⚠️ [API Error]") or final_answer.startswith("⚠️ [Request Error]") or final_answer.startswith("⚠️ [Model Error]"):
         sys.stderr.write(f"{final_answer}\n")
         sys.stderr.flush()
+        if output_json:
+            from zelyr.engine.execution_ledger import TurnExecutionLedger
+            payload_dict = {
+                "prompt": clean_prompt,
+                "model": active_model,
+                "response": final_answer,
+                "tool_calls": tool_calls_emitted,
+                "error": final_answer,
+            }
+            if hasattr(orch, "current_ledger") and orch.current_ledger is not None:
+                payload_dict["execution_ledger"] = orch.current_ledger.to_dict()
+            else:
+                payload_dict["execution_ledger"] = TurnExecutionLedger().to_dict()
+            sys.stdout.write(json.dumps(payload_dict) + "\n")
+            sys.stdout.flush()
         return 1
 
-    v_result = None
-    v_check = ""
-    v_target = ""
-    if verify_spec:
+    if is_truncated:
+        sys.stderr.write("⚠️ [Model Truncated] Generation reached token length limit before completion.\n")
+        sys.stderr.flush()
+        if output_json:
+            from zelyr.engine.execution_ledger import TurnExecutionLedger
+            payload_dict = {
+                "prompt": clean_prompt,
+                "model": active_model,
+                "response": final_answer,
+                "tool_calls": tool_calls_emitted,
+                "truncated": True,
+            }
+            if hasattr(orch, "current_ledger") and orch.current_ledger is not None:
+                payload_dict["execution_ledger"] = orch.current_ledger.to_dict()
+            else:
+                payload_dict["execution_ledger"] = TurnExecutionLedger().to_dict()
+            sys.stdout.write(json.dumps(payload_dict) + "\n")
+            sys.stdout.flush()
+        else:
+            sys.stdout.write(final_answer.rstrip("\n") + "\n")
+            sys.stdout.flush()
+        return 1
+
+    v_results = []
+    if verify_spec is not None:
+        if not verify_spec.strip():
+            err_msg = "[verification failed] Empty verification specification provided.\n"
+            sys.stdout.write(err_msg)
+            sys.stderr.write(err_msg)
+            return 2
+        from zelyr.engine.execution_ledger import parse_acceptance_criteria
         from zelyr.engine.verifier import OutcomeVerifier
 
-        parts = verify_spec.split(":", 2)
-        if len(parts) == 1:
-            v_check, v_target, v_expected = parts[0], "", None
-        elif len(parts) == 2:
-            v_check, v_target, v_expected = parts[0], parts[1], None
+        parsed_specs = parse_acceptance_criteria(verify_spec)
+        if parsed_specs:
+            for item in parsed_specs:
+                v_res = OutcomeVerifier.verify(
+                    check=item.get("check", ""),
+                    target=item.get("target", ""),
+                    expected=item.get("expected"),
+                )
+                v_results.append((item.get("check", ""), item.get("target", ""), v_res))
         else:
-            v_check, v_target, v_expected = parts[0], parts[1], parts[2]
+            err_msg = f"[verification failed] Unable to parse verification specification: '{verify_spec}'\n"
+            sys.stdout.write(err_msg)
+            sys.stderr.write(err_msg)
+            return 2
 
-        v_result = OutcomeVerifier.verify(check=v_check, target=v_target, expected=v_expected)
+    ledger = getattr(orch, "current_ledger", None)
+    has_unresolved_ledger = False
+    if ledger is not None:
+        has_fn = getattr(ledger, "has_unresolved_failures", None)
+        if callable(has_fn):
+            has_unresolved_ledger = bool(has_fn())
+        else:
+            has_unresolved_ledger = bool(ledger.unresolved_failures())
 
     if output_json:
+        from zelyr.engine.execution_ledger import TurnExecutionLedger
+
         payload_dict = {
             "prompt": clean_prompt,
             "model": active_model,
             "response": final_answer,
             "tool_calls": tool_calls_emitted,
         }
-        if v_result is not None:
-            payload_dict["verification"] = v_result.to_dict()
+        if v_results:
+            all_success = all(res.success for _, _, res in v_results)
+            if len(v_results) == 1:
+                payload_dict["verification"] = v_results[0][2].to_dict()
+            else:
+                payload_dict["verification"] = {
+                    "success": all_success,
+                    "checks": [res.to_dict() for _, _, res in v_results],
+                }
+        if ledger is not None:
+            payload_dict["execution_ledger"] = ledger.to_dict()
+        else:
+            payload_dict["execution_ledger"] = TurnExecutionLedger().to_dict()
         json_out = json.dumps(payload_dict)
         sys.stdout.write(json_out.rstrip("\n") + "\n")
         sys.stdout.flush()
-        if v_result is not None and not v_result.success:
+        if v_results and not all(res.success for _, _, res in v_results):
+            return 2
+        if has_unresolved_ledger:
             return 2
     else:
         sys.stdout.write(final_answer.rstrip("\n") + "\n")
         sys.stdout.flush()
-        if v_result is not None:
-            if v_result.success:
-                sys.stdout.write(f"[verified] {v_check} on {v_target}: PASS\n")
-                sys.stdout.flush()
-            else:
-                err_msg = f"[verification failed] {v_check} on {v_target}: FAIL ({v_result.error})\n"
-                sys.stdout.write(err_msg)
-                sys.stdout.flush()
-                sys.stderr.write(err_msg)
-                sys.stderr.flush()
+        if v_results:
+            any_failed = False
+            for v_check, v_target, v_res in v_results:
+                if v_res.success:
+                    sys.stdout.write(f"[verified] {v_check} on {v_target}: PASS\n")
+                    sys.stdout.flush()
+                else:
+                    any_failed = True
+                    err_msg = f"[verification failed] {v_check} on {v_target}: FAIL ({v_res.error})\n"
+                    sys.stdout.write(err_msg)
+                    sys.stdout.flush()
+                    sys.stderr.write(err_msg)
+                    sys.stderr.flush()
+            if any_failed:
                 return 2
+        if has_unresolved_ledger:
+            return 2
 
     return 0
 
@@ -427,6 +632,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     model_override: Optional[str] = getattr(args, "model", None)
     output_json: bool = bool(getattr(args, "json", False))
     verify_spec: Optional[str] = getattr(args, "verify", None)
+    base_url_override: Optional[str] = getattr(args, "base_url", None)
 
     exit_code = asyncio.run(
         _execute_headless_run(
@@ -434,6 +640,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             model_override=model_override,
             output_json=output_json,
             verify_spec=verify_spec,
+            base_url_override=base_url_override,
         )
     )
     if exit_code != 0:
@@ -991,6 +1198,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run = sub.add_parser("run", help="Execute a one-shot prompt headlessly via NativeOrchestrator")
     p_run.add_argument("prompt", type=str, help="Natural-language task prompt")
     p_run.add_argument("--model", "-m", type=str, default=None, help="Override model for this execution")
+    p_run.add_argument("--base-url", type=str, default=None, help="Override Ollama base URL for this execution")
     p_run.add_argument("--json", action="store_true", default=False, help="Output structured JSON response")
     p_run.add_argument(
         "--verify",

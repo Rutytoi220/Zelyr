@@ -23,6 +23,14 @@ import pytest
 
 from zelyr.agents.native_orchestrator import NativeOrchestrator
 from zelyr.core.plugins import execute_tool, load_plugins
+from zelyr.engine.observation_framing import ObservationFramingEngine
+
+
+def _parse_msg(content: str) -> dict:
+    try:
+        return json.loads(content)
+    except Exception:
+        return ObservationFramingEngine.parse_observation(content)
 
 
 class TestWirePayloadConformance:
@@ -139,11 +147,11 @@ class TestCycleDetectionGuardrails:
         assert len(tool_messages) == 2
 
         # First call was executed and returned error
-        call_1_content = json.loads(tool_messages[0]["content"])
+        call_1_content = _parse_msg(tool_messages[0]["content"])
         assert call_1_content["status"] == "error"
 
         # Second call was blocked by cycle detection rule 1
-        call_2_content = json.loads(tool_messages[1]["content"])
+        call_2_content = _parse_msg(tool_messages[1]["content"])
         assert call_2_content["status"] == "rejected"
         assert call_2_content["reason"] == "cycle_detected"
         assert "retry after immediate failure" in call_2_content["detail"]
@@ -189,9 +197,9 @@ class TestCycleDetectionGuardrails:
         tool_messages = [m for m in payload["messages"] if m.get("role") == "tool"]
         assert len(tool_messages) == 3
 
-        call_1_content = json.loads(tool_messages[0]["content"])
-        call_2_content = json.loads(tool_messages[1]["content"])
-        call_3_content = json.loads(tool_messages[2]["content"])
+        call_1_content = _parse_msg(tool_messages[0]["content"])
+        call_2_content = _parse_msg(tool_messages[1]["content"])
+        call_3_content = _parse_msg(tool_messages[2]["content"])
 
         assert call_1_content["status"] == "success"
         assert call_2_content["status"] == "success"
@@ -246,13 +254,13 @@ class TestCycleDetectionGuardrails:
         assert len(tool_messages) == 4
 
         # 1st A: error
-        assert json.loads(tool_messages[0]["content"])["status"] == "error"
+        assert _parse_msg(tool_messages[0]["content"])["status"] == "error"
         # 1st B: error
-        assert json.loads(tool_messages[1]["content"])["status"] == "error"
+        assert _parse_msg(tool_messages[1]["content"])["status"] == "error"
         # 2nd A: error
-        assert json.loads(tool_messages[2]["content"])["status"] == "error"
+        assert _parse_msg(tool_messages[2]["content"])["status"] == "error"
         # 2nd B: rejected by Rule 3
-        call_4_content = json.loads(tool_messages[3]["content"])
+        call_4_content = _parse_msg(tool_messages[3]["content"])
         assert call_4_content["status"] == "rejected"
         assert call_4_content["reason"] == "cycle_detected"
         assert "Alternating failure cycle detected" in call_4_content["detail"]
@@ -298,9 +306,9 @@ class TestCycleDetectionGuardrails:
         assert len(tool_messages) == 2
 
         # 1st call failed
-        assert json.loads(tool_messages[0]["content"])["status"] == "error"
+        assert _parse_msg(tool_messages[0]["content"])["status"] == "error"
         # 2nd call was rejected by Rule 1 (cycle_detected), NOT deferred to step limit
-        call_2_content = json.loads(tool_messages[1]["content"])
+        call_2_content = _parse_msg(tool_messages[1]["content"])
         assert call_2_content["status"] == "rejected"
         assert call_2_content["reason"] == "cycle_detected"
         assert "retry after immediate failure" in call_2_content["detail"]
@@ -346,10 +354,10 @@ class TestCycleDetectionGuardrails:
         assert len(tool_messages) == 3
 
         # First 2 succeeded
-        assert json.loads(tool_messages[0]["content"])["status"] == "success"
-        assert json.loads(tool_messages[1]["content"])["status"] == "success"
+        assert _parse_msg(tool_messages[0]["content"])["status"] == "success"
+        assert _parse_msg(tool_messages[1]["content"])["status"] == "success"
         # 3rd was rejected by Rule 2 (ceiling reached)
-        call_3_content = json.loads(tool_messages[2]["content"])
+        call_3_content = _parse_msg(tool_messages[2]["content"])
         assert call_3_content["status"] == "rejected"
         assert call_3_content["reason"] == "cycle_detected"
         assert "ceiling reached" in call_3_content["detail"]
@@ -408,9 +416,9 @@ class TestCycleDetectionGuardrails:
         tool_messages = [m for m in payload["messages"] if m.get("role") == "tool"]
         assert len(tool_messages) == 2
 
-        assert json.loads(tool_messages[0]["content"])["status"] == "error"
+        assert _parse_msg(tool_messages[0]["content"])["status"] == "error"
         # Call 2 matched fingerprint despite 1.0 vs 1 and key reordering -> blocked by Rule 1
-        call_2_content = json.loads(tool_messages[1]["content"])
+        call_2_content = _parse_msg(tool_messages[1]["content"])
         assert call_2_content["status"] == "rejected"
         assert call_2_content["reason"] == "cycle_detected"
 
@@ -550,11 +558,11 @@ class TestStepCeilingEnforcement:
         assert len(tool_messages) == 3
 
         # First 2 succeeded
-        assert json.loads(tool_messages[0]["content"])["status"] == "success"
-        assert json.loads(tool_messages[1]["content"])["status"] == "success"
+        assert _parse_msg(tool_messages[0]["content"])["status"] == "success"
+        assert _parse_msg(tool_messages[1]["content"])["status"] == "success"
 
         # 3rd tool call rejected by step ceiling
-        call_3_content = json.loads(tool_messages[2]["content"])
+        call_3_content = _parse_msg(tool_messages[2]["content"])
         assert call_3_content["status"] == "rejected"
         assert call_3_content["reason"] == "step_limit_reached"
 
@@ -609,9 +617,9 @@ class TestStepCeilingEnforcement:
         # Step 2: rejected by cycle detection (step count = 2 -> ceiling reached)
         # Turn 3: disable_tools=True -> tools=[], model must synthesize
         assert len(tool_messages) == 2
-        assert json.loads(tool_messages[0]["content"])["status"] == "error"
-        assert json.loads(tool_messages[1]["content"])["status"] == "rejected"
-        assert json.loads(tool_messages[1]["content"])["reason"] == "cycle_detected"
+        assert _parse_msg(tool_messages[0]["content"])["status"] == "error"
+        assert _parse_msg(tool_messages[1]["content"])["status"] == "rejected"
+        assert _parse_msg(tool_messages[1]["content"])["reason"] == "cycle_detected"
 
         # Tools disabled on turn 3
         assert len(received_tools_counts) >= 3

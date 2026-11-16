@@ -911,10 +911,11 @@ class TestHeadlessRunAndToolInterception:
         """Tool execution results fed back to the agent contain structured exit_code and status fields."""
         import json
         from zelyr.agents.native_orchestrator import NativeOrchestrator
+        from zelyr.engine.observation_framing import ObservationFramingEngine
 
         # 1. Successful shell command execution
         succ_res = NativeOrchestrator.format_tool_observation("execute_command", "Exit code 0\nAll tests passed")
-        succ_dict = json.loads(succ_res)
+        succ_dict = ObservationFramingEngine.parse_observation(succ_res)
         assert succ_dict["tool"] == "execute_command"
         assert succ_dict["status"] == "success"
         assert succ_dict["exit_code"] == 0
@@ -923,11 +924,11 @@ class TestHeadlessRunAndToolInterception:
 
         # 2. Failed shell command execution with remediation hint
         fail_res = NativeOrchestrator.format_tool_observation("execute_command", "Exit code 1\ncat: /tmp/none: No such file")
-        fail_dict = json.loads(fail_res)
+        fail_dict = ObservationFramingEngine.parse_observation(fail_res)
         assert fail_dict["tool"] == "execute_command"
         assert fail_dict["status"] == "error"
         assert fail_dict["exit_code"] == 1
-        assert "Recovery Hint:" in fail_dict["error"]
+        assert "Recovery Hint:" in fail_res
         assert fail_dict["error_type"] == "PATH_NOT_FOUND"
         assert "Target file or directory does not exist" in fail_dict["remedy_hint"]
 
@@ -963,7 +964,7 @@ class TestHeadlessRunAndToolInterception:
 
         tool_msgs = [m for m in payload["messages"] if m.get("role") == "tool"]
         assert len(tool_msgs) == 1
-        parsed_obs = json.loads(tool_msgs[0]["content"])
+        parsed_obs = ObservationFramingEngine.parse_observation(tool_msgs[0]["content"])
         assert parsed_obs["tool"] == "execute_command"
         assert parsed_obs["status"] == "success"
         assert parsed_obs["exit_code"] == 0
@@ -975,6 +976,7 @@ class TestHeadlessRunAndToolInterception:
         """A multi-step canary prompt executes both tool calls sequentially and completes."""
         import json
         from zelyr.agents.native_orchestrator import NativeOrchestrator
+        from zelyr.engine.observation_framing import ObservationFramingEngine
 
         turn = 0
         executed_calls = []
@@ -1002,7 +1004,7 @@ class TestHeadlessRunAndToolInterception:
                 # Step 2: Model verifies observation and invokes tool to read the file
                 last_tool_msg = payload["messages"][-1]
                 assert last_tool_msg.get("role") == "tool"
-                obs = json.loads(last_tool_msg["content"])
+                obs = ObservationFramingEngine.parse_observation(last_tool_msg["content"])
                 assert obs["status"] == "success"
                 assert obs["exit_code"] == 0
 
@@ -1024,7 +1026,7 @@ class TestHeadlessRunAndToolInterception:
                 # Step 3: Model receives file content observation and generates final response
                 last_tool_msg = payload["messages"][-1]
                 assert last_tool_msg.get("role") == "tool"
-                obs = json.loads(last_tool_msg["content"])
+                obs = ObservationFramingEngine.parse_observation(last_tool_msg["content"])
                 assert obs["status"] == "success"
                 assert obs["output"] == "OK"
 
