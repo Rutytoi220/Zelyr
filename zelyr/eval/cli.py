@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -11,6 +12,11 @@ from typing import List, Optional
 
 from zelyr.config import get_config
 from zelyr.eval.harness import EvalHarness
+from zelyr.eval.matrix import (
+    ModelMatrixEvaluator,
+    format_matrix_table,
+    render_matrix_scorecard_markdown,
+)
 from zelyr.eval.metrics import EvalStatus, TaskResult, export_json_report, format_summary_table
 from zelyr.eval.scorecard import export_scorecard, generate_benchmark_scorecard
 from zelyr.eval.task import EvalTask
@@ -95,10 +101,46 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Per-task timeout in seconds for live model evaluation (defaults to 60.0s).",
     )
     parser.add_argument(
+        "--matrix",
+        action="store_true",
+        default=False,
+        help="Run the model matrix evaluation battery across archetypes or live models.",
+    )
+    parser.add_argument(
+        "--mock",
+        action="store_true",
+        default=False,
+        help="Force simulated mock archetype evaluation (default in non-interactive/CI).",
+    )
+    parser.add_argument(
+        "--matrix-models",
+        type=str,
+        default=None,
+        help="Comma-separated list of model names to evaluate under --live (e.g. 'qwen2.5:latest,llama3.2:latest').",
+    )
+    parser.add_argument(
         "-q", "--quiet",
         action="store_true",
         default=False,
         help="Suppress intermediate execution progress logs.",
+    )
+    parser.add_argument(
+        "--distributed",
+        action="store_true",
+        default=False,
+        help="Discover configured distributed workers and output/run multi-worker evaluation.",
+    )
+    parser.add_argument(
+        "--workers-config",
+        type=str,
+        default=None,
+        help="Path to JSON worker configuration file for distributed evaluation.",
+    )
+    parser.add_argument(
+        "--out-dir",
+        type=str,
+        default=None,
+        help="Output directory for distributed evaluation reports and transcripts.",
     )
     return parser
 
@@ -147,6 +189,19 @@ def run_benchmark_cli(args_list: Optional[List[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(args_list)
 
+    if args.live and args.mock:
+        print("Error: --live and --mock cannot be used together.", file=sys.stderr)
+        return 2
+    if args.live_timeout <= 0:
+        print("Error: --live-timeout must be greater than 0.", file=sys.stderr)
+        return 2
+    if args.matrix_models and not args.matrix:
+        print("Error: --matrix-models requires --matrix.", file=sys.stderr)
+        return 2
+    if args.matrix and args.mock and args.matrix_models:
+        print("Error: --matrix-models requires --live and cannot be used with --mock.", file=sys.stderr)
+        return 2
+
     cfg = get_config()
     model = args.model or getattr(cfg, "ollama_model", "qwen3:8b")
     base_url = args.base_url or getattr(cfg, "ollama_base_url", "http://127.0.0.1:11434")
@@ -161,6 +216,159 @@ def run_benchmark_cli(args_list: Optional[List[str]] = None) -> int:
             for t in lvl_tasks:
                 print(f"    - {t.task_id:<45} {t.description}")
         return 0
+
+    if args.distributed:
+        from zelyr.eval.distributed import (
+            DistributedEvalRunner,
+            ModelMetadata,
+            TaskAssignment,
+            WorkerSnapshot,
+            build_compatibility_suite,
+            build_standard_s_suite,
+            load_worker_configs,
+        )
+        from zelyr.eval.distributed_report import generate_distributed_reports
+
+        workers_cfg_path: Optional[Path] = None
+        if args.workers_config:
+            workers_cfg_path = Path(args.workers_config)
+            if not workers_cfg_path.is_file():
+                print(f"Error: Workers config file not found: {args.workers_config}", file=sys.stderr)
+                return 2
+
+        try:
+            workers = load_worker_configs(config_path=workers_cfg_path)
+        except Exception as exc:
+            print(f"Error: Invalid workers config: {exc}", file=sys.stderr)
+            return 2
+
+        if not workers:
+            print("Error: No workers configured for distributed evaluation.", file=sys.stderr)
+            return 2
+
+        if args.base_url and not args.workers_config and workers:
+            workers[0].endpoint = args.base_url.rstrip("/")
+
+        tasks = build_standard_s_suite() + build_compatibility_suite()
+        if args.task:
+            target_filter = args.task.strip()
+            tasks = [t for t in tasks if target_filter == t.task_id or target_filter in t.task_id]
+            if not tasks:
+                print(f"Error: No distributed tasks matched identifier '{args.task}'.", file=sys.stderr)
+                return 1
+
+        offline_mock = bool(args.mock or not args.live)
+
+        async def _mock_prober(w):
+            installed = {
+                m: ModelMetadata(
+                    name=m,
+                    digest="mock-digest",
+                    size_bytes=1_000_000_000,
+                    capabilities=["completion", "tools"],
+                )
+                for m in (w.model_allowlist or [model])
+            }
+            return WorkerSnapshot(
+                worker_id=w.worker_id,
+                endpoint=w.endpoint,
+                healthy=True,
+                version="mock",
+                installed_models=installed,
+            )
+
+        async def _mock_executor(w, m, task, ws, case):
+            return {
+                "exit_code": task.expected_exit_code if isinstance(task.expected_exit_code, int) else 0,
+                "cli_json_valid": True,
+                "cli_json": {"response": "Mock evaluation completed."},
+                "execution_ledger": {
+                    "has_unresolved_failures": False,
+                    "records": [
+                        {
+                            "call_id": "mock_1",
+                            "tool_name": "verify_outcome",
+                            "arguments": {"target": task.task_id},
+                            "state": "verified",
+                            "verified": True,
+                        }
+                    ],
+                },
+                "verifier_checks": [{"check": "mock", "target": task.task_id, "success": True}],
+                "telemetry": {"turn_metrics": []},
+            }
+
+        runner = DistributedEvalRunner(
+            workers=workers,
+            output_dir=Path(args.out_dir) if args.out_dir else None,
+            task_executor=_mock_executor if offline_mock else None,
+            worker_prober=_mock_prober if offline_mock else None,
+            ps_fetcher=(lambda _w: asyncio.sleep(0, result=[])) if offline_mock else None,
+            model_unloader=(
+                (lambda w, _pre, _m: asyncio.sleep(0, result={"worker_id": w.worker_id, "unloaded": [], "errors": []}))
+                if offline_mock
+                else None
+            ),
+        )
+        snaps = asyncio.run(runner.discover_workers())
+
+        assignments: List[TaskAssignment] = []
+        for w in workers:
+            snap = snaps.get(w.worker_id)
+            target_models = (
+                list(w.model_allowlist)
+                if w.model_allowlist
+                else (list(snap.installed_models.keys()) if snap and snap.healthy else [model])
+            )
+            for m in target_models:
+                for t in tasks:
+                    assignments.append(TaskAssignment(worker_id=w.worker_id, model=m, task=t))
+
+        run_out = asyncio.run(runner.execute_assignments(assignments, concurrent=True, unload_after=True))
+        paths = generate_distributed_reports(run_out, runner.output_dir)
+        if not args.quiet:
+            print(paths["distributed_summary_md"].read_text(encoding="utf-8"))
+        return 0
+
+    if args.matrix:
+        evaluator = ModelMatrixEvaluator()
+        use_live = bool(args.live and not args.mock)
+        if not args.quiet:
+            target_mode = "live Ollama models" if use_live else "simulated mock archetypes"
+            print(f"\nExecuting Model Matrix Evaluation ({target_mode})...\n")
+
+        if use_live:
+            custom_models = [m.strip() for m in args.matrix_models.split(",")] if args.matrix_models else None
+            matrix_results = asyncio.run(evaluator.evaluate_live_matrix(models=custom_models, base_url=base_url))
+        else:
+            matrix_results = asyncio.run(evaluator.evaluate_mock_matrix())
+
+        table_str = format_matrix_table(matrix_results)
+        print("\n" + table_str + "\n")
+
+        if args.json:
+            out_path = Path(args.json).resolve()
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(json.dumps(matrix_results, indent=2), encoding="utf-8")
+            if not args.quiet:
+                print(f"Matrix report exported to: {out_path}\n")
+
+        if args.scorecard:
+            sc_path = Path(args.scorecard).resolve()
+            sc_path.parent.mkdir(parents=True, exist_ok=True)
+            sc_md = render_matrix_scorecard_markdown(matrix_results)
+            sc_path.write_text(sc_md, encoding="utf-8")
+            if not args.quiet:
+                print(f"Matrix Scorecard exported to: {sc_path}\n")
+
+        if not use_live:
+            summary = matrix_results.get("summary", {})
+            return 0 if summary.get("all_passed") else 1
+        else:
+            if not matrix_results.get("live_eval", True):
+                if not args.quiet:
+                    print(f"Notice: {matrix_results.get('reason')}\n")
+            return 0
 
     # Filter tasks
     selected_tasks = all_tasks

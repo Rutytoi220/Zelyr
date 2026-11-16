@@ -180,6 +180,48 @@ class TestCLIMatrixRunner(unittest.TestCase):
                 sc_text = f.read()
             self.assertIn("Model Independence Empirical Matrix Scorecard", sc_text)
 
+    def test_cli_rejects_conflicting_live_and_mock_flags(self):
+        """Conflicting --live/--mock or --matrix-models with --mock must exit 2."""
+        self.assertEqual(run_benchmark_cli(["--matrix", "--live", "--mock"]), 2)
+        self.assertEqual(run_benchmark_cli(["--matrix", "--mock", "--matrix-models", "qwen:7b"]), 2)
+
+
+class TestMatrixHardeningAndMetadata(unittest.IsolatedAsyncioTestCase):
+    """Tests for stable combination IDs and unavailable-model separation."""
+
+    async def test_matrix_combination_ids_and_version_metadata(self):
+        evaluator = ModelMatrixEvaluator()
+        results = await evaluator.evaluate_mock_matrix()
+        self.assertEqual(results.get("matrix_version"), "1.4")
+        for arch_name, arch_data in results["archetypes"].items():
+            seen_ids = set()
+            for outcome in arch_data["task_outcomes"]:
+                expected_id = f"{arch_name}::{outcome['task_id']}"
+                self.assertEqual(outcome["combination_id"], expected_id)
+                self.assertNotIn(expected_id, seen_ids)
+                seen_ids.add(expected_id)
+
+    async def test_live_matrix_distinguishes_unavailable_models_without_network(self):
+        evaluator = ModelMatrixEvaluator()
+        with patch.object(
+            ModelMatrixEvaluator,
+            "probe_ollama",
+            new=AsyncMock(return_value=(True, ["installed:7b"])),
+        ), patch.object(
+            ModelMatrixEvaluator,
+            "probe_ollama_with_metadata",
+            new=AsyncMock(return_value=(True, {"installed:7b": {"name": "installed:7b", "digest": "sha256:abc", "size": 123, "details": {}}})),
+        ):
+            res = await evaluator.evaluate_live_matrix(
+                models=["missing:99b"],
+                base_url="http://127.0.0.1:11434",
+            )
+        self.assertTrue(res["live_eval"])
+        missing_entry = res["models"]["missing:99b"]
+        self.assertFalse(missing_entry["available"])
+        self.assertEqual(missing_entry["status"], "UNAVAILABLE")
+        self.assertEqual(missing_entry["tasks_passed"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

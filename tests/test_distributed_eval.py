@@ -1420,3 +1420,156 @@ class TestProhibitionAuditMatrix:
             {"exit_code": 1, "worker_error": "CancelledError: cancelled during run", "execution_ledger": {"records": []}},
         )
         assert (st, ec) == (DistributedTaskStatus.ERROR, "COMMUNICATION_OR_WORKER_ERROR")
+
+
+class TestCommit8HardenedDistributedContracts:
+    """Focused tests for deduplication, UNVERIFIED status, token separation, secrets, and CLI offline guarantees."""
+
+    @pytest.mark.asyncio
+    async def test_duplicate_assignment_deduplication_and_trial_correlation(self, tmp_path: Path):
+        from zelyr.eval.distributed import ModelMetadata, WorkerSnapshot
+
+        w = WorkerConfig(worker_id="victus", endpoint="http://127.0.0.1:11434")
+
+        async def prober(_w):
+            return WorkerSnapshot(
+                worker_id="victus",
+                endpoint=w.endpoint,
+                healthy=True,
+                installed_models={"m1": ModelMetadata("m1", "d_m1", 1_000_000, ["completion", "tools"])},
+            )
+
+        exec_count = 0
+
+        async def executor(_w, _m, _task, _ws, _case):
+            nonlocal exec_count
+            exec_count += 1
+            return {
+                "exit_code": 0,
+                "cli_json_valid": True,
+                "cli_json": {"response": "ok"},
+                "execution_ledger": {"has_unresolved_failures": False, "records": [{"call_id": "c1", "state": "verified", "verified": True}]},
+                "verifier_checks": [{"check": "mock", "target": "t", "success": True}],
+                "messages_transcript": [{"role": "user", "content": "create file alpha"}],
+                "telemetry": {"turn_metrics": [{"prompt_eval_count": 50, "eval_count": 10}]},
+            }
+
+        spec = DistributedTaskSpec(
+            task_id="T_DEDUP",
+            category="unit",
+            title="Dedup",
+            build_case=lambda ws: {"prompt": f"Create {ws / 'a.txt'}", "verify": None},
+        )
+        runner = DistributedEvalRunner(
+            workers=[w],
+            output_dir=tmp_path / "dedup_out",
+            task_executor=executor,
+            worker_prober=prober,
+            ps_fetcher=lambda _w: asyncio.sleep(0, result=[]),
+            model_unloader=lambda wk, _p, _m: asyncio.sleep(0, result={"worker_id": wk.worker_id, "unloaded": [], "errors": []}),
+        )
+        out = await runner.execute_assignments(
+            [
+                TaskAssignment("victus", "m1", spec, trial_index=0),
+                TaskAssignment("victus", "m1", spec, trial_index=0),
+                TaskAssignment("victus", "m1", spec, trial_index=1),
+            ],
+            concurrent=False,
+        )
+        assert exec_count == 2
+        assert out["scheduler_stats"]["duplicate_assignments_skipped"] == 1
+        assert len(out["results"]) == 2
+        assert [r.trial_index for r in out["results"]] == [0, 1]
+        assert all(r.matrix_entry_id == "victus::m1::T_DEDUP" for r in out["results"])
+        assert out["results"][0].measured_token_usage == {"prompt_eval_count_max": 50, "eval_count_sum": 10}
+        assert out["results"][0].estimated_token_usage is not None
+        assert out["results"][0].estimated_token_usage["source"] == "character_heuristic"
+
+    def test_unverified_classification_without_evidence(self, tmp_path: Path):
+        from zelyr.eval.distributed import _classify_task_outcome
+
+        spec = DistributedTaskSpec(
+            task_id="T_NO_EV",
+            category="unit",
+            title="No verification",
+            build_case=lambda ws: {"prompt": "Run check"},
+        )
+        case = spec.build_case(tmp_path)
+        st, ec, _ = _classify_task_outcome(
+            TaskAssignment("victus", "m1", spec),
+            case,
+            {
+                "exit_code": 0,
+                "cli_json_valid": True,
+                "cli_json": {"response": "All done!"},
+                "execution_ledger": {"has_unresolved_failures": False, "records": [{"call_id": "c1", "state": "success", "verified": False}]},
+                "verifier_checks": [],
+                "telemetry": {},
+            },
+        )
+        assert st == DistributedTaskStatus.UNVERIFIED
+        assert ec == "NO_VERIFICATION_EVIDENCE"
+
+    def test_report_version_token_separation_and_secret_scrubbing(self, tmp_path: Path):
+        from zelyr.eval.distributed import DistributedTaskResult
+
+        res = DistributedTaskResult(
+            model="m1",
+            model_digest="dig1",
+            worker_id="victus",
+            endpoint="https://user:superpass@ollama.internal:11434",
+            task_id="S1",
+            category="core",
+            status=DistributedTaskStatus.ERROR,
+            start_timestamp=1.0,
+            end_timestamp=2.0,
+            duration_seconds=1.0,
+            error_classification="AuthError",
+            error_detail="Bearer topsecret_tok_12345 sk-secretkey99999 failed",
+            resource_measurements={"prompt_eval_count_max": 120, "eval_count_sum": 30},
+            measured_token_usage={"prompt_eval_count_max": 120, "eval_count_sum": 30},
+            estimated_token_usage={"estimated_tokens_approx": 42, "source": "character_heuristic"},
+        )
+        paths = generate_distributed_reports({"results": [res], "cleanup": []}, tmp_path / "rep")
+        report_text = paths["distributed_report_json"].read_text(encoding="utf-8")
+        report_doc = json.loads(report_text)
+        assert report_doc["report_version"] == "1.4"
+        assert report_doc["benchmark_version"] == "1.4"
+        assert "superpass" not in report_text
+        assert "topsecret_tok_12345" not in report_text
+        assert "sk-secretkey99999" not in report_text
+        assert report_doc["overall"]["measured_token_usage"] == {"prompt_eval_count_max": 120, "eval_count_sum": 30}
+        assert report_doc["overall"]["estimated_token_usage"] == {"estimated_tokens_sum": 42, "source": "character_heuristic"}
+
+    def test_distributed_cli_validation_and_offline_mock_execution(self, tmp_path: Path):
+        from zelyr.eval.cli import run_benchmark_cli
+
+        assert run_benchmark_cli(["--distributed", "--workers-config", str(tmp_path / "missing.json")]) == 2
+        assert run_benchmark_cli(["--distributed", "--mock", "--task", "NONEXISTENT_TASK_999"]) == 1
+
+        out_dir = tmp_path / "dist_cli_mock"
+        with patch("httpx.AsyncClient", side_effect=AssertionError("Offline mock must not use network")):
+            rc = run_benchmark_cli(["--distributed", "--mock", "--task", "S1", "--out-dir", str(out_dir), "--quiet"])
+        assert rc == 0
+        assert (out_dir / "distributed_report.json").is_file()
+
+    @pytest.mark.asyncio
+    async def test_worker_spec_validation_and_cwd_restoration(self, tmp_path: Path):
+        from zelyr.eval.distributed_worker import _run_worker
+
+        bad = await _run_worker({"endpoint": "", "model": "m1", "workspace_dir": str(tmp_path), "prompt": "hi"})
+        assert bad["malformed_worker_output"] is True
+        assert "endpoint" in str(bad["worker_error"])
+
+        orig_cwd = Path.cwd()
+        ws = tmp_path / "isolated_ws"
+        with patch("zelyr.eval.distributed_worker._execute_headless_run", return_value=0):
+            ok = await _run_worker({
+                "endpoint": "http://127.0.0.1:11434",
+                "model": "m1",
+                "workspace_dir": str(ws),
+                "prompt": "Create test",
+                "allowed_tools": ["manage_workspace_file"],
+            })
+        assert ok["exit_code"] == 0
+        assert Path.cwd() == orig_cwd
