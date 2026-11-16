@@ -11,7 +11,7 @@ from zelyr.compat import config_dir, config_file
 
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 DEFAULT_GLOBAL_INSTRUCTIONS_TEMPLATE = """\
 # Zelyr Global Custom Instructions
@@ -20,6 +20,13 @@ DEFAULT_GLOBAL_INSTRUCTIONS_TEMPLATE = """\
 """
 
 from zelyr.core.system_prompt import HARDENED_SYSTEM_DIRECTIVES
+
+MANIFEST_AUTHORITY_DIRECTIVES = """\
+[RUNTIME AUTHORITY & CAPABILITY BOUNDARIES]
+- Roles: You propose actions and interpret observations. The Zelyr runtime deterministically controls tool availability, permission checks, validation, execution, and verification.
+- Manifest Truthfulness: Do not invent tools or claim filesystem, desktop, browser, shell, or network access that the manifest and active schemas do not substantiate.
+- Locality Separation: Inference locality (local or remote endpoint) is separate from tool execution on the target host.
+- Honest Outcomes: Never represent an unavailable or unauthorized tool call as successfully executed; rely strictly on returned observations and structured errors rather than inventing results."""
 
 SYSTEM_CORE_DIRECTIVES = f"""\
 [SYSTEM CORE DIRECTIVES]
@@ -82,13 +89,28 @@ class InstructionManager:
                 return ""
         return ""
 
-    def get_compiled_instructions(self, base_directives: Optional[str] = None) -> str:
-        """Compiles system directives, global user instructions, and local project rules."""
+    def get_compiled_instructions(
+        self,
+        base_directives: Optional[str] = None,
+        config: Optional[Any] = None,
+        tool_registry: Optional[Any] = None,
+        caller_ring: Optional[int] = None,
+        allowed_tools: Optional[Any] = None,
+    ) -> str:
+        """Compiles runtime manifest, system directives, global user instructions, and local project rules."""
+        from zelyr.engine.environment import RuntimeEnvironmentManifest
+
+        manifest = RuntimeEnvironmentManifest.build_manifest_block(
+            config=config,
+            tool_registry=tool_registry,
+            caller_ring=caller_ring,
+            allowed_tools=allowed_tools,
+        )
         core = (base_directives or SYSTEM_CORE_DIRECTIVES).strip()
         global_rules = self.get_global_instructions()
         project_rules = self.get_project_instructions()
 
-        parts = [core]
+        parts = [manifest, MANIFEST_AUTHORITY_DIRECTIVES, core]
         parts.append(f"[USER CUSTOM INSTRUCTIONS]\n{global_rules if global_rules else '(No global instructions configured)'}")
         parts.append(f"[PROJECT WORKSPACE RULES]\n{project_rules if project_rules else '(No project workspace rules found)'}")
 
