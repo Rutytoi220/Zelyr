@@ -139,8 +139,50 @@ def count_message_tokens(msg: Dict[str, Any]) -> int:
 
 
 def estimate_messages_tokens(messages: List[Dict[str, Any]]) -> int:
-    """Estimate total tokens across a list of chat messages."""
+    """Estimate total tokens across a list of chat messages using word/char heuristic."""
     return sum(count_message_tokens(m) for m in messages)
+
+
+def estimate_tools_tokens(tools: Optional[List[Dict[str, Any]]]) -> int:
+    """Estimate token footprint of serialized tool schema definitions."""
+    if not tools:
+        return 0
+    return estimate_tokens(json.dumps(tools, default=str)) + (8 * len(tools))
+
+
+class ContextBudgetLimitError(ValueError):
+    """Structured error raised when required context exceeds the effective token budget."""
+
+    def __init__(
+        self,
+        required_tokens: int,
+        target_budget: int,
+        max_context_tokens: int,
+        reserve_tokens: int,
+        message: Optional[str] = None,
+    ) -> None:
+        self.error_type = "CONTEXT_BUDGET_EXCEEDED"
+        self.required_tokens = required_tokens
+        self.target_budget = target_budget
+        self.max_context_tokens = max_context_tokens
+        self.reserve_tokens = reserve_tokens
+        msg = message or (
+            f"Required prompt context (~{required_tokens} estimated tokens) exceeds effective budget "
+            f"({target_budget} tokens; max={max_context_tokens}, reserve={reserve_tokens})."
+        )
+        super().__init__(msg)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return structured limit error dictionary."""
+        return {
+            "error_type": self.error_type,
+            "error": str(self),
+            "required_tokens": self.required_tokens,
+            "target_budget": self.target_budget,
+            "max_context_tokens": self.max_context_tokens,
+            "reserve_tokens": self.reserve_tokens,
+            "token_counting_mode": "heuristic_estimate",
+        }
 
 
 def _truncate_to_tokens(text: str, max_tokens: int) -> str:
@@ -363,18 +405,59 @@ class ContextBudgetEngine:
         self.tool_output_token_limit = tool_output_token_limit
         self.recent_turns_to_preserve = recent_turns_to_preserve
 
-    def get_model_limit(self, model_name: Optional[str]) -> int:
-        """Query catalog for model context limit or use default."""
-        return get_model_context_limit(model_name or self.default_model, default_limit=self.default_max_tokens)
+    def _resolve_config_default_limit(self, config: Optional[Any] = None) -> Optional[int]:
+        """Resolve explicit context limit from configuration when supplied."""
+        if config is None:
+            return None
+        if isinstance(config, dict):
+            raw = config.get("ollama_num_ctx") or config.get("num_ctx")
+        elif hasattr(config, "get_effective_num_ctx"):
+            try:
+                raw = config.get_effective_num_ctx()
+            except Exception:
+                raw = getattr(config, "ollama_num_ctx", None)
+        else:
+            raw = getattr(config, "ollama_num_ctx", None)
+        if raw is None or isinstance(raw, bool):
+            return None
+        try:
+            from zelyr.config import validate_and_clamp_num_ctx
+
+            return validate_and_clamp_num_ctx(raw)
+        except Exception:
+            try:
+                return int(raw)
+            except Exception:
+                return None
+
+    def get_model_limit(self, model_name: Optional[str], config: Optional[Any] = None) -> int:
+        """Query explicit config limit, model catalog, or global config fallback."""
+        cfg_limit = self._resolve_config_default_limit(config)
+        if cfg_limit is not None:
+            return cfg_limit
+
+        fallback_default = self.default_max_tokens
+        try:
+            from zelyr.config import get_config
+
+            global_cfg = get_config()
+            raw_global = getattr(global_cfg, "ollama_num_ctx", None)
+            if isinstance(raw_global, int) and raw_global > 0:
+                fallback_default = raw_global
+        except Exception:
+            pass
+
+        return get_model_context_limit(model_name or self.default_model, default_limit=fallback_default)
 
     def calculate_budget(
         self,
         model_name: Optional[str] = None,
         max_context_tokens: Optional[int] = None,
         reserve_tokens: Optional[int] = None,
+        config: Optional[Any] = None,
     ) -> Tuple[int, int]:
         """Compute effective context limit and response generation reserve."""
-        limit = max_context_tokens or self.get_model_limit(model_name)
+        limit = max_context_tokens if (max_context_tokens is not None and max_context_tokens > 0) else self.get_model_limit(model_name, config=config)
         if reserve_tokens is not None:
             reserve = reserve_tokens
         else:
@@ -391,23 +474,60 @@ class ContextBudgetEngine:
         model_name: Optional[str] = None,
         max_context_tokens: Optional[int] = None,
         reserve_tokens: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        config: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        """Calculate token usage, limit, reserve, and available headroom."""
-        limit, reserve = self.calculate_budget(model_name, max_context_tokens, reserve_tokens)
-        target_budget = limit - reserve
+        """Calculate estimated token usage, tool overhead, reserve, and available headroom."""
+        limit, reserve = self.calculate_budget(model_name, max_context_tokens, reserve_tokens, config=config)
+        tools_tokens = estimate_tools_tokens(tools)
+        target_budget = max(0, limit - reserve - tools_tokens)
         current_tokens = estimate_messages_tokens(messages)
         headroom = max(0, target_budget - current_tokens)
         utilization = (current_tokens / target_budget) if target_budget > 0 else 1.0
+        over = current_tokens > target_budget
 
-        return {
+        status: Dict[str, Any] = {
             "max_context_tokens": limit,
             "reserve_tokens": reserve,
             "target_budget": target_budget,
             "current_tokens": current_tokens,
             "headroom_tokens": headroom,
             "utilization": utilization,
-            "is_over_budget": current_tokens > target_budget,
+            "is_over_budget": over,
+            "token_counting_mode": "heuristic_estimate",
+            "estimated_current_tokens": current_tokens,
+            "estimated_tools_tokens": tools_tokens,
+            "estimated_headroom_tokens": headroom,
         }
+        if over:
+            status["limit_error"] = ContextBudgetLimitError(
+                required_tokens=current_tokens,
+                target_budget=target_budget,
+                max_context_tokens=limit,
+                reserve_tokens=reserve,
+            ).to_dict()
+        return status
+
+    def calculate_budget_status(
+        self,
+        messages: List[Dict[str, Any]],
+        model_name: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+        max_context_tokens: Optional[int] = None,
+        reserve_tokens: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        config: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Alias for get_context_headroom to compute utilization and token budget metrics."""
+        limit = max_tokens or max_context_tokens
+        return self.get_context_headroom(
+            messages,
+            model_name=model_name,
+            max_context_tokens=limit,
+            reserve_tokens=reserve_tokens,
+            tools=tools,
+            config=config,
+        )
 
     def compact_tool_output(
         self,
@@ -424,6 +544,48 @@ class ContextBudgetEngine:
             keep_head_chars = 400 if token_limit <= 200 else 500
         if keep_tail_chars is None:
             keep_tail_chars = 150 if token_limit <= 200 else 500
+
+        # Check if text is framed tool observation
+        if text.startswith("[TOOL OBSERVATION:"):
+            # 1. Check for [Output]: section
+            out_section = re.search(
+                r"(\[Output\]:\n)([\s\S]*?)(\n\n\[(?:Informational Diagnostic Stream|Machine State Verified|Error Diagnostic|Error Output|Output Trace|Tool Error)|$)",
+                text,
+            )
+            if out_section:
+                body = out_section.group(2)
+                start_idx = out_section.start(2)
+                end_idx = out_section.end(2)
+                if len(body) > 1000 or estimate_tokens(body) > token_limit:
+                    head = body[:keep_head_chars]
+                    tail = body[-keep_tail_chars:] if keep_tail_chars > 0 else ""
+                    omitted = len(body) - len(head) - len(tail)
+                    if omitted > 0:
+                        compacted_body = (
+                            f"{head}\n\n[... output truncated: {omitted} chars omitted ...]\n"
+                            f"... [OUTPUT TRUNCATED FOR CONTEXT BUDGET] ...\n\n{tail}"
+                        )
+                        return text[:start_idx] + compacted_body + text[end_idx:]
+
+            # 2. Check for [Output Trace]: section
+            trace_section = re.search(
+                r"(\[Output Trace\]:\n)([\s\S]*?)(\n\n\[(?:Tool Error)|$)",
+                text,
+            )
+            if trace_section:
+                body = trace_section.group(2)
+                start_idx = trace_section.start(2)
+                end_idx = trace_section.end(2)
+                if len(body) > 1000 or estimate_tokens(body) > token_limit:
+                    head = body[:keep_head_chars]
+                    tail = body[-keep_tail_chars:] if keep_tail_chars > 0 else ""
+                    omitted = len(body) - len(head) - len(tail)
+                    if omitted > 0:
+                        compacted_body = (
+                            f"{head}\n\n[... output truncated: {omitted} chars omitted ...]\n"
+                            f"... [OUTPUT TRUNCATED FOR CONTEXT BUDGET] ...\n\n{tail}"
+                        )
+                        return text[:start_idx] + compacted_body + text[end_idx:]
 
         # Check if text is JSON string with status/result structure
         try:
@@ -525,6 +687,54 @@ class ContextBudgetEngine:
 
         return compacted, compacted_count
 
+    @staticmethod
+    def _strip_thinking_tags(text: str) -> str:
+        """Strip closed or truncated <think>...</think> blocks from historical messages."""
+        stripped = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+        stripped = re.sub(r"<think>.*$", "", stripped, flags=re.DOTALL)
+        return stripped.strip()
+
+    def stage1_5_compact_thinking(
+        self,
+        messages: List[Dict[str, Any]],
+        target_budget: int,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Stage 1.5: Compact bulky <think> blocks before Stage 2 evicts whole turns.
+
+        Compacts oldest assistant messages first so recent reasoning stays intact when
+        sufficient, and strips the remaining <think> block if doing so keeps the
+        historical tool observations inside target_budget.
+        """
+        if not messages:
+            return messages, 0
+
+        assistant_indices = [
+            i for i, m in enumerate(messages)
+            if m.get("role") == "assistant"
+            and isinstance(m.get("content"), str)
+            and "<think>" in m["content"]
+        ]
+        if not assistant_indices:
+            return messages, 0
+
+        compacted = [dict(m) for m in messages]
+        stripped_count = 0
+
+        strip_order = assistant_indices[:-1] + assistant_indices[-1:]
+        for idx in strip_order:
+            msg = compacted[idx]
+            orig_content = msg.get("content", "")
+            cleaned = self._strip_thinking_tags(orig_content)
+            if cleaned != orig_content.strip():
+                if not cleaned and not msg.get("tool_calls"):
+                    cleaned = "[Reasoning compacted]"
+                msg["content"] = cleaned
+                stripped_count += 1
+                if estimate_messages_tokens(compacted) <= target_budget:
+                    break
+
+        return compacted, stripped_count
+
     def summarize_turns(self, turns: List[Dict[str, Any]], max_summary_tokens: int = 300) -> str:
         """Extract key intents, tool actions, and outcomes from evicted turns."""
         if not turns:
@@ -533,6 +743,7 @@ class ContextBudgetEngine:
         user_queries: List[str] = []
         tool_actions: List[str] = []
         assistant_notes: List[str] = []
+        failure_evidence: List[str] = []
 
         for msg in turns:
             role = msg.get("role", "")
@@ -557,9 +768,38 @@ class ContextBudgetEngine:
                         snip = clean_c[:100] + ("..." if len(clean_c) > 100 else "")
                         assistant_notes.append(snip)
             elif role == "tool":
-                fn = msg.get("name")
-                if fn:
+                fn = msg.get("name") or "tool"
+                if msg.get("name"):
                     tool_actions.append(fn)
+                # Preserve critical failure / verification-failure evidence instead of silently losing it
+                if any(
+                    marker in content_str
+                    for marker in (
+                        "[Error Diagnostic:",
+                        "[Outcome Verification Failed]:",
+                        "VERIFICATION_FAILED",
+                        "\"status\": \"error\"",
+                        "\"verification_failed\": true",
+                    )
+                ):
+                    err_lines = [
+                        ln.strip()
+                        for ln in content_str.splitlines()
+                        if any(
+                            k in ln
+                            for k in (
+                                "[Error Diagnostic:",
+                                "- Failure Reason:",
+                                "[Outcome Verification Failed]:",
+                                "- Failed Criterion:",
+                                "- Verifier Reason:",
+                            )
+                        )
+                    ]
+                    if err_lines:
+                        failure_evidence.append(f"{fn}: {' / '.join(err_lines[:3])[:160]}")
+                    else:
+                        failure_evidence.append(f"{fn}: {content_str[:120]}")
 
         parts: List[str] = []
         if user_queries:
@@ -567,6 +807,8 @@ class ContextBudgetEngine:
         if tool_actions:
             deduped = list(dict.fromkeys(tool_actions))
             parts.append(f"Tools executed: {', '.join(deduped[:6])}")
+        if failure_evidence:
+            parts.append(f"Preserved failures/verification errors: {'; '.join(failure_evidence[-3:])}")
         if assistant_notes:
             parts.append(f"Key outcomes: {'; '.join(assistant_notes[-2:])}")
 
@@ -581,7 +823,7 @@ class ContextBudgetEngine:
         """Stage 2: Sliding-window turn eviction with atomic ReAct block preservation and semantic summarization.
 
         Inviolate Anchors:
-        - System directives (leading messages with role=='system').
+        - System directives and Runtime Environment Manifest (leading messages with role=='system' containing [RUNTIME ENVIRONMENT & CAPABILITY MANIFEST]).
         - Root user goal (first user message) is strictly preserved as the task foundation.
         - Active user turn (from the latest user message to the end of the conversation) is strictly preserved.
         - ReAct step blocks (assistant with tool_calls + matching tool outputs) are indivisible.
@@ -714,6 +956,9 @@ class ContextBudgetEngine:
         model_name: Optional[str] = None,
         max_context_tokens: Optional[int] = None,
         reserve_tokens: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        config: Optional[Any] = None,
+        raise_on_overflow: bool = False,
     ) -> List[Dict[str, Any]]:
         """Apply hierarchical adaptive context budgeting across stages."""
         if not messages:
@@ -723,8 +968,15 @@ class ContextBudgetEngine:
             model_name=model_name,
             max_context_tokens=max_context_tokens,
             reserve_tokens=reserve_tokens,
+            config=config,
         )
-        target_budget = effective_max - effective_reserve
+        tools_tokens = estimate_tools_tokens(tools)
+        target_budget = effective_max - effective_reserve - tools_tokens
+        if target_budget <= 0:
+            required = estimate_messages_tokens(messages)
+            if raise_on_overflow:
+                raise ContextBudgetLimitError(required, max(0, target_budget), effective_max, effective_reserve)
+            return messages
 
         # 0. Zero-Overhead Fast Path:
         # If conversation is small (< 6 messages) and characters are well under 50% of budget capacity,
@@ -756,12 +1008,44 @@ class ContextBudgetEngine:
             )
             return stage1_msgs
 
-        # 2. Stage 2 — Sliding-Window Turn Pruning with Semantic Summarization
-        final_msgs, pruned_turns = self.stage2_prune_turns(
+        # 1.5. Stage 1.5 — Historical <think> Reasoning Compaction before evicting whole turns
+        stage1_5_msgs, compacted_thinks = self.stage1_5_compact_thinking(
             stage1_msgs,
             target_budget=target_budget,
         )
+        post_s1_5_tokens = estimate_messages_tokens(stage1_5_msgs)
+        if post_s1_5_tokens <= target_budget:
+            logger.debug(
+                "Context budget: Stage 1.5 sufficient. initial=%d, final=%d, compacted_tools=%d, compacted_thinks=%d, pruned_turns=0, max=%d",
+                initial_tokens,
+                post_s1_5_tokens,
+                compacted_tools,
+                compacted_thinks,
+                effective_max,
+            )
+            return stage1_5_msgs
+
+        # 2. Stage 2 — Sliding-Window Turn Pruning with Semantic Summarization
+        final_msgs, pruned_turns = self.stage2_prune_turns(
+            stage1_5_msgs,
+            target_budget=target_budget,
+        )
         final_tokens = estimate_messages_tokens(final_msgs)
+
+        if final_tokens > target_budget:
+            if raise_on_overflow:
+                raise ContextBudgetLimitError(
+                    required_tokens=final_tokens,
+                    target_budget=target_budget,
+                    max_context_tokens=effective_max,
+                    reserve_tokens=effective_reserve,
+                )
+            logger.warning(
+                "Context budget overflow after Stage 2 (%d > %d estimated tokens; tools=%d).",
+                final_tokens,
+                target_budget,
+                tools_tokens,
+            )
 
         logger.debug(
             "Context budget: Stage 2 applied. initial=%d, post_s1=%d, final=%d, compacted_tools=%d, pruned_turns=%d, max=%d",
@@ -774,6 +1058,26 @@ class ContextBudgetEngine:
         )
         return final_msgs
 
+    def enforce_context_budget(
+        self,
+        messages: List[Dict[str, Any]],
+        model_name: Optional[str] = None,
+        max_context_tokens: Optional[int] = None,
+        reserve_tokens: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        config: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
+        """Apply context budgeting and fail explicitly with ContextBudgetLimitError if required anchors still exceed budget."""
+        return self.apply_context_budget(
+            messages,
+            model_name=model_name,
+            max_context_tokens=max_context_tokens,
+            reserve_tokens=reserve_tokens,
+            tools=tools,
+            config=config,
+            raise_on_overflow=True,
+        )
+
 
 # Facade aliases
 AdaptiveContextBudgeter = ContextBudgetEngine
@@ -781,6 +1085,7 @@ BudgetEngine = ContextBudgetEngine
 
 __all__ = [
     "ContextBudgetEngine",
+    "ContextBudgetLimitError",
     "AdaptiveContextBudgeter",
     "BudgetEngine",
     "MODEL_CONTEXT_CATALOG",
@@ -788,6 +1093,7 @@ __all__ = [
     "estimate_tokens",
     "count_message_tokens",
     "estimate_messages_tokens",
+    "estimate_tools_tokens",
     "is_tool_result_message",
     "group_into_atomic_turns",
     "_group_into_atomic_turns",
