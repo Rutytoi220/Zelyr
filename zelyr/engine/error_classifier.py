@@ -1,14 +1,66 @@
 """System-wide Error Classification and Actionable Remedy Engine.
 
-Classifies tool execution failures into domain-specific error types,
-extracts concise summaries, and provides deterministic remediation hints
-with permitted recovery tool actions.
+Classifies tool execution failures into domain-specific error types using
+structured error envelopes first and deterministic fallbacks second, without
+exposing credentials or claiming unsafe retries are safe.
 """
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import json
+import re
 from typing import Any, Dict, List, Optional
+
+_NON_RECOVERABLE_ERROR_TYPES = frozenset(
+    {
+        "TOOL_NOT_FOUND",
+        "AUTHORIZATION_DENIED",
+        "CANCELLED",
+        "TOOL_UNAVAILABLE",
+        "DESKTOP_UNAVAILABLE",
+        "BROWSER_UNAVAILABLE",
+    }
+)
+
+
+def _redact_secrets(text: str) -> str:
+    """Scrub common credentials/tokens before surfacing error diagnostics."""
+    if not text:
+        return ""
+    scrubbed = re.sub(r"(?i)(https?://)([^:/@\s]+):([^/@\s]+)@", r"\1\2:[REDACTED]@", text)
+    scrubbed = re.sub(r"(?i)\b(bearer\s+)[a-z0-9._\-+=]+", r"\1[REDACTED]", scrubbed)
+    scrubbed = re.sub(r"\bsk-[A-Za-z0-9_\-]{8,}", "[REDACTED]", scrubbed)
+    scrubbed = re.sub(
+        r"(?i)\b(api[_-]?key|token|secret|password)\s*([=:])\s*['\"]?([^\s,'\"&;]+)['\"]?",
+        r"\1\2[REDACTED]",
+        scrubbed,
+    )
+    return scrubbed
+
+
+def _extract_structured_envelope(
+    error_envelope: Optional[Dict[str, Any]],
+    error_type: Optional[str],
+    err_str: str,
+    out_str: str,
+) -> Dict[str, Any]:
+    """Extract structured error metadata from explicit dicts or JSON payloads."""
+    merged: Dict[str, Any] = {}
+    for candidate in (out_str, err_str):
+        stripped = candidate.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                parsed = json.loads(stripped)
+                if isinstance(parsed, dict):
+                    merged.update(parsed)
+            except Exception:
+                pass
+    if isinstance(error_envelope, dict):
+        merged.update(error_envelope)
+    if error_type and not merged.get("error_type"):
+        merged["error_type"] = error_type
+    return merged
 
 
 @dataclass(frozen=True)
@@ -20,6 +72,11 @@ class ErrorClassification:
     remedy_hint: str
     allowed_actions: List[str]
 
+    @property
+    def is_recoverable(self) -> bool:
+        """Return False when automatic retry of the failed action is unsafe or futile."""
+        return self.error_type not in _NON_RECOVERABLE_ERROR_TYPES
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert error classification to dictionary representation."""
         return asdict(self)
@@ -30,26 +87,85 @@ def classify_tool_error(
     exit_code: Optional[int] = None,
     output: str = "",
     error: str = "",
+    *,
+    error_type: Optional[str] = None,
+    error_envelope: Optional[Dict[str, Any]] = None,
 ) -> ErrorClassification:
-    """Classify tool execution error into canonical domain error types.
+    """Classify tool execution error into canonical domain error types."""
+    raw_err = (error or "").strip()
+    raw_out = (output or "").strip()
+    envelope = _extract_structured_envelope(error_envelope, error_type, raw_err, raw_out)
 
-    Categories:
-    - VERIFICATION_FAILED: verify_outcome failure or criteria mismatch.
-    - TIMEOUT: exit code 124 or execution timed out.
-    - PERMISSION_DENIED: exit code 126 or access permission rejected.
-    - PORT_IN_USE: exit code 98 or TCP/UDP socket address already bound.
-    - PATH_NOT_FOUND: exit code 1/2 or file/directory does not exist.
-    - COMMAND_NOT_FOUND: exit code 127 or command/executable missing.
-    - GENERAL_ERROR: fallback failure category.
-    """
-    err_str = (error or "").strip()
-    out_str = (output or "").strip()
+    err_str = _redact_secrets(raw_err)
+    out_str = _redact_secrets(raw_out)
     tname = (tool_name or "").lower().strip()
-    combined = f"{tname}\n{err_str}\n{out_str}".lower()
 
-    # 1. Desktop window manager unavailable
+    structured_type = str(envelope.get("error_type") or "").upper().strip()
+    structured_reason = str(envelope.get("reason") or "").lower().strip()
+    structured_msg = _redact_secrets(
+        str(envelope.get("error") or envelope.get("message") or envelope.get("detail") or "").strip()
+    )
+    combined = f"{tname}\n{err_str}\n{out_str}\n{structured_msg}".lower()
+
+    # 1. Invalid tool name (must run before COMMAND_NOT_FOUND so "Tool not found" is distinct)
+    if structured_type in ("TOOL_NOT_FOUND", "INVALID_TOOL_NAME", "UNKNOWN_TOOL") or (
+        "tool not found:" in combined or "unknown tool" in combined
+    ):
+        return ErrorClassification(
+            error_type="TOOL_NOT_FOUND",
+            summary=f"Requested tool '{tool_name}' is not registered" if tool_name else "Requested tool is not registered",
+            remedy_hint="The requested tool does not exist in the active registry. Use only registered tool names from active schemas.",
+            allowed_actions=[],
+        )
+
+    # 2. Schema validation / malformed argument errors
     if (
-        "desktop_unavailable" in combined
+        structured_type == "SCHEMA_VALIDATION_ERROR"
+        or "schema_validation_error" in combined
+        or "failed schema validation" in combined
+        or "invalid_parameter" in combined
+        or "missing required parameter" in combined
+        or "arguments could not be parsed" in combined
+    ):
+        return ErrorClassification(
+            error_type="SCHEMA_VALIDATION_ERROR",
+            summary="Tool call arguments failed schema validation",
+            remedy_hint="Tool call arguments failed schema validation. Inspect 'invalid_parameter' and 'expected_type', adjust arguments, and retry.",
+            allowed_actions=[tool_name] if tool_name else ["execute_command"],
+        )
+
+    # 3. Runtime authorization / policy denial (distinct from OS file permission denied)
+    if (
+        structured_type in ("AUTHORIZATION_DENIED", "AUTHORIZATION_ERROR", "PROHIBITED_BY_USER")
+        or structured_reason == "prohibited_by_user"
+        or "authorizationerror:" in combined
+        or "prohibited_by_user" in combined
+        or "not in allowed tools list" in combined
+        or "requires higher permissions" in combined
+        or "user denied execution via the governor" in combined
+    ):
+        return ErrorClassification(
+            error_type="AUTHORIZATION_DENIED",
+            summary="Action blocked by runtime authorization or user policy",
+            remedy_hint="Authorization or user policy rejected this tool call. Do not retry this blocked action; explain the restriction.",
+            allowed_actions=[],
+        )
+
+    # 4. Cancellation (distinct from timeout; non-recoverable)
+    if structured_type in ("CANCELLED", "TASK_CANCELLED") or any(
+        k in combined for k in ("task_cancelled", "cancellederror", "execution cancelled", "operation was cancelled")
+    ):
+        return ErrorClassification(
+            error_type="CANCELLED",
+            summary="Tool execution was cancelled",
+            remedy_hint="Execution was cancelled before completion. Do not retry automatically; surface the partial/cancelled state.",
+            allowed_actions=[],
+        )
+
+    # 5. Desktop window manager unavailable
+    if (
+        structured_type == "DESKTOP_UNAVAILABLE"
+        or "desktop_unavailable" in combined
         or "hyprland session not detected" in combined
         or ("hyprland" in combined and any(k in combined for k in ("not detected", "not running", "not found", "unavailable", "unreachable")))
     ):
@@ -60,9 +176,10 @@ def classify_tool_error(
             allowed_actions=["execute_command"],
         )
 
-    # 2. Window not found
+    # 6. Window not found
     if (
-        "window_not_found" in combined
+        structured_type == "WINDOW_NOT_FOUND"
+        or "window_not_found" in combined
         or "target window was not found" in combined
         or "target window not found" in combined
         or "window not found" in combined
@@ -76,9 +193,10 @@ def classify_tool_error(
             allowed_actions=["manage_desktop_window", "execute_command"],
         )
 
-    # 3. Browser unavailable
+    # 7. Browser unavailable
     if (
-        "browser_unavailable" in combined
+        structured_type == "BROWSER_UNAVAILABLE"
+        or "browser_unavailable" in combined
         or "browser remote debugging port" in combined
         or "remote debugging port (9222) unreachable" in combined
         or "cdp connection failed" in combined
@@ -92,9 +210,10 @@ def classify_tool_error(
             allowed_actions=["interact_with_browser", "execute_command"],
         )
 
-    # 4. Element not found
+    # 8. Element not found
     if (
-        "element_not_found" in combined
+        structured_type == "ELEMENT_NOT_FOUND"
+        or "element_not_found" in combined
         or "target element id was not found" in combined
         or ("element id" in combined and "not found" in combined)
         or ("element not found for id" in combined)
@@ -106,9 +225,21 @@ def classify_tool_error(
             allowed_actions=["interact_with_browser"],
         )
 
-    # 5. State verification failure
+    # 9. General tool unavailable / missing optional dependency / disabled plugin
+    if structured_type == "TOOL_UNAVAILABLE" or any(
+        k in combined for k in ("requires optional dependency", "optionaldependencyerror", "tool unavailable", "plugin disabled")
+    ):
+        return ErrorClassification(
+            error_type="TOOL_UNAVAILABLE",
+            summary="Requested tool or dependency is unavailable in this runtime",
+            remedy_hint="Tool capability is unavailable in the current environment. Do not retry this tool; report the missing capability.",
+            allowed_actions=[],
+        )
+
+    # 10. State verification failure
     if (
-        tname in ("verify_outcome", "verify_state", "check_state", "assert_outcome")
+        structured_type == "VERIFICATION_FAILED"
+        or tname in ("verify_outcome", "verify_state", "check_state", "assert_outcome")
         or "verification failed" in combined
         or "checksum mismatch" in combined
         or "not verified" in combined
@@ -120,9 +251,10 @@ def classify_tool_error(
             allowed_actions=["execute_command", "manage_workspace_file", "verify_outcome"],
         )
 
-    # 4. Timeout
+    # 11. Timeout
     if (
-        exit_code == 124
+        structured_type == "TIMEOUT"
+        or exit_code == 124
         or "timed out" in combined
         or "timeout" in combined
     ):
@@ -133,9 +265,10 @@ def classify_tool_error(
             allowed_actions=["execute_command"],
         )
 
-    # 3. Permission Denied
+    # 12. OS Permission Denied
     if (
-        exit_code == 126
+        structured_type == "PERMISSION_DENIED"
+        or exit_code == 126
         or "permission denied" in combined
         or "operation not permitted" in combined
     ):
@@ -146,9 +279,10 @@ def classify_tool_error(
             allowed_actions=["execute_command", "manage_workspace_file"],
         )
 
-    # 4. Port in use
+    # 13. Port in use
     if (
-        exit_code == 98
+        structured_type == "PORT_IN_USE"
+        or exit_code == 98
         or "address already in use" in combined
         or "port already in use" in combined
         or "address in use" in combined
@@ -161,7 +295,7 @@ def classify_tool_error(
             allowed_actions=["execute_command", "inspect_network", "verify_outcome"],
         )
 
-    # 5. Path / File / Directory not found
+    # 14. Path / File / Directory not found
     path_keywords = (
         "no such file",
         "file not found",
@@ -170,8 +304,9 @@ def classify_tool_error(
         "file does not exist",
         "path is not a regular file",
         "path is not a directory",
+        "does not exist",
     )
-    if any(k in combined for k in path_keywords):
+    if structured_type == "PATH_NOT_FOUND" or any(k in combined for k in path_keywords):
         return ErrorClassification(
             error_type="PATH_NOT_FOUND",
             summary="Target file or directory does not exist",
@@ -179,9 +314,10 @@ def classify_tool_error(
             allowed_actions=["execute_command", "manage_workspace_file", "verify_outcome"],
         )
 
-    # 6. Command not found
+    # 15. Command not found
     if (
-        exit_code == 127
+        structured_type == "COMMAND_NOT_FOUND"
+        or exit_code == 127
         or "command not found" in combined
         or ("not found" in combined and not any(k in combined for k in ("element", "tab", "process", "key")))
     ):
@@ -192,9 +328,10 @@ def classify_tool_error(
             allowed_actions=["execute_command", "manage_workspace_file"],
         )
 
-    # 7. Tool crafting failure
+    # 16. Tool crafting failure
     if (
-        tname in ("craft_tool", "create_tool", "write_tool", "hotload_tool")
+        structured_type == "TOOL_CRAFT_FAILED"
+        or tname in ("craft_tool", "create_tool", "write_tool", "hotload_tool")
         or "tool_craft_failed" in combined
         or "tool crafting failed" in combined
         or "sandbox test verification failed" in combined
@@ -209,9 +346,10 @@ def classify_tool_error(
             allowed_actions=["craft_tool", "execute_command"],
         )
 
-    # 8. Routine operation failure
+    # 17. Routine operation failure
     if (
-        tname in ("manage_routine", "schedule_task", "create_routine", "schedule_routine", "cron", "cron_job")
+        structured_type == "ROUTINE_ERROR"
+        or tname in ("manage_routine", "schedule_task", "create_routine", "schedule_routine", "cron", "cron_job")
         or "routine_error" in combined
         or "routine operation failed" in combined
         or "invalid cron expression" in combined
@@ -226,11 +364,20 @@ def classify_tool_error(
             allowed_actions=["manage_routine", "execute_command"],
         )
 
-    # 9. Fallback General Error
+    # 18. Explicit structured execution failure
+    if structured_type == "EXECUTION_FAILURE":
+        return ErrorClassification(
+            error_type="EXECUTION_FAILURE",
+            summary="Tool execution failed",
+            remedy_hint="Tool execution failed. Inspect the structured error and exit code before taking corrective action.",
+            allowed_actions=[tool_name] if tool_name else ["execute_command", "manage_workspace_file"],
+        )
+
+    # 19. Fallback General / Unstructured Error
     return ErrorClassification(
         error_type="GENERAL_ERROR",
         summary="Action execution failed",
-        remedy_hint="Action failed. Inspect error details and adjust arguments or try an alternative approach.",
+        remedy_hint="Action failed. Inspect error details before retrying blindly or choose an alternative approach.",
         allowed_actions=["execute_command", "manage_workspace_file", "verify_outcome"],
     )
 
@@ -244,6 +391,16 @@ class ErrorClassifier:
         exit_code: Optional[int] = None,
         output: str = "",
         error: str = "",
+        *,
+        error_type: Optional[str] = None,
+        error_envelope: Optional[Dict[str, Any]] = None,
     ) -> ErrorClassification:
         """Classify tool error into canonical category."""
-        return classify_tool_error(tool_name, exit_code, output, error)
+        return classify_tool_error(
+            tool_name,
+            exit_code,
+            output,
+            error,
+            error_type=error_type,
+            error_envelope=error_envelope,
+        )

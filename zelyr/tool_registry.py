@@ -324,18 +324,24 @@ Returns:
 """
         return len(self._core_registry.list_tools())
 
-    def get_schemas(self) -> List[Dict[str, Any]]:
+    def get_schemas(self, compact: bool = False) -> List[Dict[str, Any]]:
         """Return OpenAI-compatible function-calling schemas for every tool."""
+        if not self._core_registry.list_tools():
+            for tid in BUILTIN_TOOLS:
+                self.get_tool(tid)
         schemas: List[Dict[str, Any]] = []
         for tool_id, tool in self.list_tools().items():
             if not hasattr(tool, 'description') or not hasattr(tool, 'schema'):
                 continue
             schemas.append({'type': 'function', 'function': {'name': tool_id, 'description': tool.description or tool_id, 'parameters': tool.schema or {'type': 'object', 'properties': {}}}})
+        if compact:
+            from zelyr.engine.schema_compact import CompactSchemaGenerator
+            return CompactSchemaGenerator.compact_schemas(schemas)
         return schemas
 
-    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+    def get_tool_schemas(self, compact: bool = False) -> List[Dict[str, Any]]:
         """Return OpenAI-compatible function-calling schemas for all active tools."""
-        return self.get_schemas()
+        return self.get_schemas(compact=compact)
 
     def _pre_validate_path(self, tool_id: str, arguments: Dict[str, Any]) -> Optional[ToolResult]:
         """Intercept slang or hallucinatory file paths before execution."""
@@ -414,6 +420,7 @@ Returns:
                 success=False,
                 output="",
                 error=f"AuthorizationError: Tool '{tool_id}' is not in allowed tools list.",
+                error_type="AUTHORIZATION_DENIED",
             )
 
         if caller_ring is not None:
@@ -426,8 +433,48 @@ Returns:
                         f"AuthorizationError: Tool '{tool_id}' requires higher permissions "
                         f"(requires ring {required_ring}, caller ring is {caller_ring})."
                     ),
+                    error_type="AUTHORIZATION_DENIED",
                 )
         return None
+
+    def _normalize_and_validate(
+        self,
+        tool_id: str,
+        tool: BaseTool,
+        arguments: Dict[str, Any],
+    ) -> tuple[Optional[Dict[str, Any]], Optional[ToolResult]]:
+        """Normalize unambiguous types and validate arguments via one shared authoritative path."""
+        from zelyr.engine.normalizer import SafeArgumentNormalizer, validate_arguments
+
+        tool_schema = getattr(tool, "schema", None) or getattr(tool, "tool_schema", None)
+        normalized_args, norm_warnings = SafeArgumentNormalizer.normalize(
+            tool_schema,
+            arguments,
+            tool_name=tool_id,
+        )
+        if not isinstance(arguments, dict) or (
+            norm_warnings and "Arguments could not be parsed as a dictionary." in norm_warnings
+        ):
+            val_envelope = validate_arguments(tool_id, tool_schema, arguments)
+            return None, ToolResult(
+                success=False,
+                error=val_envelope["error"] if val_envelope else "Invalid non-object tool arguments.",
+                output=val_envelope,
+                error_type="SCHEMA_VALIDATION_ERROR",
+                remedy_hint=val_envelope.get("remedy_hint") if val_envelope else None,
+                allowed_actions=[tool_id],
+            )
+        val_envelope = validate_arguments(tool_id, tool_schema, normalized_args)
+        if val_envelope is not None:
+            return None, ToolResult(
+                success=False,
+                error=val_envelope["error"],
+                output=val_envelope,
+                error_type="SCHEMA_VALIDATION_ERROR",
+                remedy_hint=val_envelope.get("remedy_hint"),
+                allowed_actions=[tool_id],
+            )
+        return normalized_args, None
 
     def execute(
         self,
@@ -444,12 +491,12 @@ Returns:
 
         tool = self.get_tool(tool_id)
         if tool is None:
-            return ToolResult(success=False, error=f'Tool not found: {tool_id}')
+            return ToolResult(success=False, error=f"Tool not found: {tool_id}", error_type="TOOL_NOT_FOUND")
 
         auth_error = self._authorize_execution(tool_id, tool, caller_ring, allowed_tools)
         if auth_error:
             return auth_error
-        
+
         if getattr(tool, 'requires_approval', False):
             try:
                 from zelyr.services.governor import GovernorService
@@ -461,7 +508,12 @@ Returns:
         val_error = self._pre_validate_path(tool.tool_id, arguments)
         if val_error:
             return val_error
-            
+
+        normalized_args, schema_error = self._normalize_and_validate(tool_id, tool, arguments)
+        if schema_error is not None or normalized_args is None:
+            return schema_error  # type: ignore[return-value]
+        arguments = normalized_args
+
         try:
             res = tool(**arguments)
             if isinstance(res, ToolResult):
@@ -479,6 +531,7 @@ Returns:
                     success=False,
                     output="",
                     error=f"Tool requires optional dependency: {exc}",
+                    error_type="TOOL_UNAVAILABLE",
                 )
             return ToolResult(success=False, error=str(exc))
 
@@ -505,12 +558,12 @@ Returns:
 
         tool = self.get_tool(tool_id)
         if tool is None:
-            return ToolResult(success=False, error=f'Tool not found: {tool_id}')
+            return ToolResult(success=False, error=f"Tool not found: {tool_id}", error_type="TOOL_NOT_FOUND")
 
         auth_error = self._authorize_execution(tool_id, tool, caller_ring, allowed_tools)
         if auth_error:
             return auth_error
-            
+
         if getattr(tool, 'requires_approval', False):
             try:
                 from zelyr.services.governor import GovernorService
@@ -518,13 +571,22 @@ Returns:
                 if governor and governor.is_strict_mode():
                     approved = await governor.request_approval(tool.name, arguments)
                     if not approved:
-                        return ToolResult(success=False, error="User denied execution via The Governor.")
+                        return ToolResult(
+                            success=False,
+                            error="User denied execution via The Governor.",
+                            error_type="AUTHORIZATION_DENIED",
+                        )
             except Exception as e:
                 return ToolResult(success=False, error=f"Governor failed: {e}")
         val_error = self._pre_validate_path(tool.tool_id, arguments)
         if val_error:
             return val_error
-            
+
+        normalized_args, schema_error = self._normalize_and_validate(tool_id, tool, arguments)
+        if schema_error is not None or normalized_args is None:
+            return schema_error  # type: ignore[return-value]
+        arguments = normalized_args
+
         try:
             sig = inspect.signature(tool.execute)
             params_list = list(sig.parameters.values())
@@ -548,5 +610,6 @@ Returns:
                     success=False,
                     output="",
                     error=f"Tool requires optional dependency: {exc}",
+                    error_type="TOOL_UNAVAILABLE",
                 )
             return ToolResult(success=False, error=str(exc))

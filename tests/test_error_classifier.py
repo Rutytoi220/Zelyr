@@ -87,6 +87,18 @@ class TestErrorClassifier:
         assert "Action failed" in res.remedy_hint
         assert "execute_command" in res.allowed_actions
 
+    def test_classify_schema_validation_error(self):
+        res = classify_tool_error(
+            "manage_workspace_file",
+            exit_code=1,
+            output="",
+            error="Parameter 'path' must be of type string, received int. Failed schema validation.",
+        )
+        assert res.error_type == "SCHEMA_VALIDATION_ERROR"
+        assert "invalid_parameter" in res.remedy_hint
+        assert "expected_type" in res.remedy_hint
+        assert "manage_workspace_file" in res.allowed_actions
+
     def test_classification_to_dict_and_facade(self):
         res = ErrorClassifier.classify("execute_command", exit_code=127, output="", error="not found")
         assert isinstance(res, ErrorClassification)
@@ -94,3 +106,62 @@ class TestErrorClassifier:
         assert d["error_type"] == "COMMAND_NOT_FOUND"
         assert "remedy_hint" in d
         assert "allowed_actions" in d
+
+    def test_classify_invalid_tool_name_and_non_recoverable(self):
+        res = classify_tool_error("bogus_tool", error="Tool not found: bogus_tool")
+        assert res.error_type == "TOOL_NOT_FOUND"
+        assert res.allowed_actions == []
+        assert res.is_recoverable is False
+        assert "Command not found in PATH" not in res.remedy_hint
+
+    def test_classify_authorization_denial_and_prohibition(self):
+        res = classify_tool_error(
+            "execute_command",
+            error="AuthorizationError: Tool 'execute_command' requires higher permissions (requires ring 0, caller ring is 1).",
+        )
+        assert res.error_type == "AUTHORIZATION_DENIED"
+        assert res.allowed_actions == []
+        assert res.is_recoverable is False
+        assert "Do not retry" in res.remedy_hint
+
+        prohibited = classify_tool_error(
+            "manage_workspace_file",
+            error=json.dumps({"status": "rejected", "reason": "prohibited_by_user", "detail": "Blocked"}),
+        )
+        assert prohibited.error_type == "AUTHORIZATION_DENIED"
+        assert prohibited.is_recoverable is False
+
+    def test_classify_cancellation_vs_timeout(self):
+        cancelled = classify_tool_error("execute_command", error="Task execution failed: task_cancelled")
+        assert cancelled.error_type == "CANCELLED"
+        assert cancelled.allowed_actions == []
+        assert cancelled.is_recoverable is False
+
+        timed_out = classify_tool_error("execute_command", exit_code=124, error="timed out")
+        assert timed_out.error_type == "TIMEOUT"
+        assert timed_out.is_recoverable is True
+
+    def test_classify_tool_unavailable(self):
+        res = classify_tool_error("custom_tool", error="Tool requires optional dependency: playwright")
+        assert res.error_type == "TOOL_UNAVAILABLE"
+        assert res.allowed_actions == []
+        assert res.is_recoverable is False
+
+    def test_structured_envelope_takes_precedence_and_redacts_secrets(self):
+        # Even if message text mentions 'not found', structured error_type='AUTHORIZATION_DENIED' wins.
+        res = classify_tool_error(
+            "custom_tool",
+            error="https://alice:topsecret123@host.internal/api token=secret_xyz",
+            error_envelope={"error_type": "EXECUTION_FAILURE", "error": "Execution failed with exit code 2"},
+        )
+        assert res.error_type == "EXECUTION_FAILURE"
+        assert "topsecret123" not in res.summary
+        assert "secret_xyz" not in res.remedy_hint
+
+        # Summary redacts secret credentials if referenced in tool error message
+        tool_nf = classify_tool_error(
+            "bad_tool",
+            error=json.dumps({"error_type": "TOOL_NOT_FOUND", "error": "api_key=sk-abc12345678"}),
+        )
+        assert tool_nf.error_type == "TOOL_NOT_FOUND"
+        assert "sk-abc12345678" not in tool_nf.summary
