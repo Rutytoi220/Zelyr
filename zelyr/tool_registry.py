@@ -26,10 +26,389 @@ vice-versa.  When no ``core_registry`` is provided, an isolated instance
 is created for backwards compatibility.
 """
 from __future__ import annotations
+from dataclasses import dataclass
 from zelyr.compat import config_dir
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from zelyr.tools.core import BaseTool, ToolResult
+
+
+@dataclass(frozen=True)
+class ToolAuthorizationDecision:
+    """Authoritative pre-execution decision returned by shared tool authorization."""
+
+    allowed: bool
+    tool_name: str
+    normalized_arguments: Dict[str, Any]
+    reason: Optional[str] = None
+    error_type: Optional[str] = None
+    detail: Optional[str] = None
+    required_ring: Optional[int] = None
+
+
+def _is_valid_ring_value(val: Any) -> bool:
+    """Return True only for integer security rings in [0, 3] (excluding booleans)."""
+    return isinstance(val, int) and not isinstance(val, bool) and 0 <= val <= 3
+
+
+_TOOL_REGISTRY_ALIASES: Dict[str, str] = {
+    "safe_file_search": "file_search",
+    "file_opener": "file_read",
+    "read_file": "file_read",
+    "write_file": "file_write",
+    "shell_command": "shell",
+    "run_command": "shell",
+    "execute_command": "shell",
+    "bash": "shell",
+}
+
+
+def canonicalize_tool_invocation(
+    tool_name: str,
+    arguments: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, Dict[str, Any]]:
+    """Resolve canonical tool target before allowlist, ring, and schema checks.
+
+    Prevents alias smuggling such as invoking ``interact_with_ui`` with browser DOM
+    parameters (``element_id`` or ``click_element``/``fill_element``) to bypass
+    allowlist or ring restrictions on ``interact_with_browser``.
+    """
+    clean_name = str(tool_name or "").strip()
+    args = dict(arguments) if isinstance(arguments, dict) else {}
+    if clean_name == "interact_with_ui" and (
+        "element_id" in args or args.get("action") in ("click_element", "fill_element")
+    ):
+        clean_name = "interact_with_browser"
+    return clean_name, args
+
+
+def _find_schema_for_tool(
+    tool_id: str,
+    tool: Optional[Any] = None,
+    tool_registry: Optional[Any] = None,
+    active_schemas: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Locate function schema from active_schemas, tool object, registry, or plugins."""
+    if active_schemas:
+        for s in active_schemas:
+            if isinstance(s, dict):
+                fn = s.get("function")
+                s_name = fn.get("name") if isinstance(fn, dict) else s.get("name")
+                if s_name == tool_id:
+                    return s
+    if tool is not None:
+        s_obj = getattr(tool, "schema", None) or getattr(tool, "tool_schema", None)
+        if isinstance(s_obj, dict):
+            return s_obj
+    if tool_registry is not None and hasattr(tool_registry, "get_tool"):
+        t_obj = tool_registry.get_tool(tool_id)
+        if t_obj is not None:
+            s_obj = getattr(t_obj, "schema", None) or getattr(t_obj, "tool_schema", None)
+            if isinstance(s_obj, dict):
+                return s_obj
+    try:
+        from zelyr.core.plugins import get_tool_schemas
+
+        for s in get_tool_schemas(0):
+            if isinstance(s, dict):
+                fn = s.get("function")
+                s_name = fn.get("name") if isinstance(fn, dict) else s.get("name")
+                if s_name == tool_id:
+                    return s
+    except Exception:
+        pass
+    return None
+
+
+def resolve_tool_ring(
+    tool_id: str,
+    *,
+    tool: Optional[Any] = None,
+    tool_registry: Optional[Any] = None,
+    active_schemas: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[int]:
+    """Resolve explicit integer security ring [0, 3], or return None on unknown/invalid ring.
+
+    Does NOT swallow exceptions raised by registry ring lookup so restricted callers
+    fail closed on lookup failures.
+    """
+    import sys
+
+    reg = tool_registry
+    if reg is None:
+        reg = ToolRegistry()
+
+    eff_tool = tool
+    if eff_tool is None and hasattr(reg, "get_tool"):
+        eff_tool = reg.get_tool(tool_id)
+
+    # Check explicit ring attributes on the tool/class/module first so invalid values
+    # always fail closed rather than falling back to permissive defaults.
+    if eff_tool is not None:
+        for attr_owner in (eff_tool, type(eff_tool)):
+            for attr_name in ("required_ring", "REQUIRED_RING"):
+                if hasattr(attr_owner, attr_name):
+                    raw_ring = getattr(attr_owner, attr_name)
+                    if raw_ring is not None:
+                        return raw_ring if _is_valid_ring_value(raw_ring) else None
+        mod_name = type(eff_tool).__module__
+        if mod_name in sys.modules:
+            mod = sys.modules[mod_name]
+            if hasattr(mod, "REQUIRED_RING"):
+                raw_ring = getattr(mod, "REQUIRED_RING")
+                if raw_ring is not None:
+                    return raw_ring if _is_valid_ring_value(raw_ring) else None
+
+    # Honor registry _get_tool_ring (including mocked/overridden implementations)
+    if reg is not None and hasattr(reg, "_get_tool_ring"):
+        if eff_tool is not None or type(reg)._get_tool_ring is not ToolRegistry._get_tool_ring:
+            ring_val = reg._get_tool_ring(tool_id, eff_tool)
+            return ring_val if _is_valid_ring_value(ring_val) else None
+
+    from zelyr.core.plugins import _executors, _rings, _schemas, load_plugins
+
+    if not _rings and not _executors and not _schemas:
+        load_plugins()
+
+    if tool_id in _rings:
+        raw_ring = _rings[tool_id]
+        return raw_ring if _is_valid_ring_value(raw_ring) else None
+
+    canonical_alias = _TOOL_REGISTRY_ALIASES.get(tool_id, tool_id)
+    eff_tool_id = getattr(eff_tool, "tool_id", None) if eff_tool is not None else None
+    if tool_id in BUILTIN_TOOLS or canonical_alias in BUILTIN_TOOLS or eff_tool_id in BUILTIN_TOOLS:
+        return 0
+    if tool_id in SWARM_TOOLS or eff_tool_id in SWARM_TOOLS:
+        return 1
+
+    if active_schemas:
+        for s in active_schemas:
+            if not isinstance(s, dict):
+                continue
+            fn = s.get("function") if isinstance(s.get("function"), dict) else {}
+            s_name = fn.get("name") or s.get("name")
+            if s_name == tool_id:
+                for src in (fn, s):
+                    for key in ("required_ring", "ring"):
+                        if key in src and src[key] is not None:
+                            return src[key] if _is_valid_ring_value(src[key]) else None
+
+    if eff_tool is not None:
+        return 1
+
+    return None
+
+
+def authorize_and_validate_tool_call(
+    tool_name: str,
+    arguments: Any,
+    *,
+    caller_ring: Optional[int] = None,
+    allowed_tools: Optional[Iterable[str]] = None,
+    active_schemas: Optional[List[Dict[str, Any]]] = None,
+    tool_registry: Optional[Any] = None,
+    tool: Optional[Any] = None,
+    known_tools: Optional[Iterable[str]] = None,
+    require_registered: bool = True,
+    normalize_args: bool = True,
+    validate_schema: bool = True,
+) -> ToolAuthorizationDecision:
+    """Single authoritative permission, canonicalization, and schema validation gate."""
+    from zelyr.engine.normalizer import SafeArgumentNormalizer, validate_arguments
+
+    args_is_dict = isinstance(arguments, dict)
+    raw_args_dict = dict(arguments) if args_is_dict else {}
+
+    canonical_name, canonical_args = canonicalize_tool_invocation(tool_name, raw_args_dict)
+    if not canonical_name:
+        return ToolAuthorizationDecision(
+            allowed=False,
+            tool_name="",
+            normalized_arguments=canonical_args,
+            reason="tool_unavailable",
+            error_type="TOOL_NOT_FOUND",
+            detail="Empty tool name rejected.",
+        )
+
+    # 1. Explicit tool allowlist enforcement (evaluated on canonical target name).
+    if allowed_tools is not None:
+        allowed_set = {str(t) for t in allowed_tools if isinstance(t, str)}
+        if canonical_name not in allowed_set:
+            return ToolAuthorizationDecision(
+                allowed=False,
+                tool_name=canonical_name,
+                normalized_arguments=canonical_args,
+                reason="authorization_denied",
+                error_type="AUTHORIZATION_DENIED",
+                detail=f"AuthorizationError: Tool '{canonical_name}' is not in allowed tools list.",
+            )
+
+    # 2. Known/registered tool check (registration != permission, but unknown tools cannot run).
+    reg = tool_registry if tool_registry is not None else ToolRegistry()
+    eff_tool = tool
+    if (
+        eff_tool is None
+        and (tool_registry is not None or require_registered)
+        and hasattr(reg, "get_tool")
+    ):
+        eff_tool = reg.get_tool(canonical_name)
+
+    from zelyr.core.plugins import _executors, _rings, _schemas, load_plugins
+
+    if not _executors and not _schemas and not _rings:
+        load_plugins()
+
+    schema_names: set[str] = set()
+    if active_schemas:
+        for s in active_schemas:
+            if isinstance(s, dict):
+                fn = s.get("function")
+                s_name = fn.get("name") if isinstance(fn, dict) else s.get("name")
+                if isinstance(s_name, str) and s_name:
+                    schema_names.add(s_name)
+
+    plugin_names = set(_executors.keys()) | {
+        (s.get("function", {}).get("name") or s.get("name"))
+        for s in _schemas
+        if isinstance(s, dict)
+    }
+
+    if known_tools is not None:
+        known_set = {str(k) for k in known_tools if isinstance(k, str)}
+        if canonical_name not in known_set:
+            return ToolAuthorizationDecision(
+                allowed=False,
+                tool_name=canonical_name,
+                normalized_arguments=canonical_args,
+                reason="tool_unavailable",
+                error_type="TOOL_NOT_FOUND",
+                detail=f"Tool '{canonical_name}' is not available in the active runtime manifest.",
+            )
+
+    is_registered_or_schema_known = bool(
+        eff_tool is not None
+        or canonical_name in plugin_names
+        or canonical_name in BUILTIN_TOOLS
+        or canonical_name in SWARM_TOOLS
+        or canonical_name in schema_names
+    )
+    if require_registered and not is_registered_or_schema_known:
+        return ToolAuthorizationDecision(
+            allowed=False,
+            tool_name=canonical_name,
+            normalized_arguments=canonical_args,
+            reason="tool_unavailable",
+            error_type="TOOL_NOT_FOUND",
+            detail=f"Tool '{canonical_name}' is not registered in the active runtime.",
+        )
+
+    # 3. Caller security-ring enforcement (fail-closed on invalid/unknown ring or lookup error).
+    resolved_ring: Optional[int] = None
+    if caller_ring is not None:
+        if not _is_valid_ring_value(caller_ring):
+            return ToolAuthorizationDecision(
+                allowed=False,
+                tool_name=canonical_name,
+                normalized_arguments=canonical_args,
+                reason="authorization_denied",
+                error_type="AUTHORIZATION_DENIED",
+                detail=f"AuthorizationError: Invalid caller_ring {caller_ring!r}.",
+            )
+        try:
+            resolved_ring = resolve_tool_ring(
+                canonical_name,
+                tool=eff_tool,
+                tool_registry=reg,
+                active_schemas=active_schemas,
+            )
+        except Exception as exc:
+            return ToolAuthorizationDecision(
+                allowed=False,
+                tool_name=canonical_name,
+                normalized_arguments=canonical_args,
+                reason="authorization_denied",
+                error_type="AUTHORIZATION_DENIED",
+                detail=f"AuthorizationError: Ring lookup failed for '{canonical_name}': {exc}",
+            )
+        if resolved_ring is None:
+            return ToolAuthorizationDecision(
+                allowed=False,
+                tool_name=canonical_name,
+                normalized_arguments=canonical_args,
+                reason="authorization_denied",
+                error_type="AUTHORIZATION_DENIED",
+                detail=f"AuthorizationError: Unknown or invalid security ring for tool '{canonical_name}'.",
+            )
+        if caller_ring > resolved_ring:
+            return ToolAuthorizationDecision(
+                allowed=False,
+                tool_name=canonical_name,
+                normalized_arguments=canonical_args,
+                reason="authorization_denied",
+                error_type="AUTHORIZATION_DENIED",
+                detail=(
+                    f"AuthorizationError: Tool '{canonical_name}' requires higher permissions "
+                    f"(requires ring {resolved_ring}, caller ring is {caller_ring})."
+                ),
+                required_ring=resolved_ring,
+            )
+
+    # 4. Schema-backed normalization and argument validation.
+    tool_schema = _find_schema_for_tool(
+        canonical_name,
+        tool=eff_tool,
+        tool_registry=reg if (tool_registry is not None or require_registered) else None,
+        active_schemas=active_schemas,
+    )
+    if not args_is_dict:
+        val_err = validate_arguments(canonical_name, tool_schema, arguments)
+        return ToolAuthorizationDecision(
+            allowed=False,
+            tool_name=canonical_name,
+            normalized_arguments={},
+            reason="schema_validation_error",
+            error_type="SCHEMA_VALIDATION_ERROR",
+            detail=val_err.get("error") if isinstance(val_err, dict) else "Invalid non-object tool arguments.",
+            required_ring=resolved_ring,
+        )
+
+    eff_args = dict(canonical_args)
+    if normalize_args and tool_schema is not None:
+        eff_args, norm_warnings = SafeArgumentNormalizer.normalize(
+            tool_schema,
+            eff_args,
+            tool_name=canonical_name,
+        )
+        if norm_warnings and "Arguments could not be parsed as a dictionary." in norm_warnings:
+            return ToolAuthorizationDecision(
+                allowed=False,
+                tool_name=canonical_name,
+                normalized_arguments={},
+                reason="schema_validation_error",
+                error_type="SCHEMA_VALIDATION_ERROR",
+                detail="Invalid non-object tool arguments.",
+                required_ring=resolved_ring,
+            )
+
+    if validate_schema and tool_schema is not None:
+        val_err = validate_arguments(canonical_name, tool_schema, eff_args)
+        if val_err is not None:
+            return ToolAuthorizationDecision(
+                allowed=False,
+                tool_name=canonical_name,
+                normalized_arguments=eff_args,
+                reason="schema_validation_error",
+                error_type="SCHEMA_VALIDATION_ERROR",
+                detail=val_err.get("error", "Schema validation failed."),
+                required_ring=resolved_ring,
+            )
+
+    return ToolAuthorizationDecision(
+        allowed=True,
+        tool_name=canonical_name,
+        normalized_arguments=eff_args,
+        required_ring=resolved_ring,
+    )
 
 class BuiltinToolDef:
     """Lightweight metadata descriptor for a built-in tool."""
@@ -231,17 +610,7 @@ Returns:
         """Return the tool registered under ``tool_id``, or ``None``."""
         tool = self._core_registry.get_tool(tool_id)
         if tool is None:
-            aliases = {
-                "safe_file_search": "file_search",
-                "file_opener": "file_read",
-                "read_file": "file_read",
-                "write_file": "file_write",
-                "shell_command": "shell",
-                "run_command": "shell",
-                "execute_command": "shell",
-                "bash": "shell",
-            }
-            resolved_id = aliases.get(tool_id, tool_id)
+            resolved_id = _TOOL_REGISTRY_ALIASES.get(tool_id, tool_id)
             tool = self._core_registry.get_tool(resolved_id)
             if tool is None:
                 if resolved_id in BUILTIN_TOOLS:
@@ -376,36 +745,45 @@ Returns:
                 pass
         return None
 
-    def _get_tool_ring(self, tool_id: str, tool: Optional[BaseTool] = None) -> int:
-        """Resolve the required security ring for a tool [0, 3]. Ring 0 is highest privilege."""
+    def _get_tool_ring(self, tool_id: str, tool: Optional[BaseTool] = None) -> Optional[int]:
+        """Resolve the required security ring for a tool [0, 3]. Ring 0 is highest privilege.
+
+        Returns None when explicit ring metadata is invalid or when no ring is defined
+        for an unregistered tool identifier.
+        """
         import sys
 
         if tool is not None:
-            if hasattr(tool, "required_ring") and isinstance(tool.required_ring, int):
-                return tool.required_ring
-            if hasattr(tool, "REQUIRED_RING") and isinstance(tool.REQUIRED_RING, int):
-                return tool.REQUIRED_RING
+            for attr_owner in (tool, type(tool)):
+                for attr_name in ("required_ring", "REQUIRED_RING"):
+                    if hasattr(attr_owner, attr_name):
+                        raw_ring = getattr(attr_owner, attr_name)
+                        if raw_ring is not None:
+                            return raw_ring if _is_valid_ring_value(raw_ring) else None
             cls = type(tool)
-            if hasattr(cls, "REQUIRED_RING") and isinstance(cls.REQUIRED_RING, int):
-                return cls.REQUIRED_RING
             mod_name = cls.__module__
             if mod_name in sys.modules:
                 mod = sys.modules[mod_name]
-                if hasattr(mod, "REQUIRED_RING") and isinstance(mod.REQUIRED_RING, int):
-                    return mod.REQUIRED_RING
+                if hasattr(mod, "REQUIRED_RING"):
+                    raw_ring = getattr(mod, "REQUIRED_RING")
+                    if raw_ring is not None:
+                        return raw_ring if _is_valid_ring_value(raw_ring) else None
 
-        try:
-            from zelyr.core.plugins import _rings
-            if tool_id in _rings:
-                return _rings[tool_id]
-        except Exception:
-            pass
+        from zelyr.core.plugins import _rings
 
-        if tool_id in BUILTIN_TOOLS:
+        if tool_id in _rings:
+            raw_ring = _rings[tool_id]
+            return raw_ring if _is_valid_ring_value(raw_ring) else None
+
+        canonical_alias = _TOOL_REGISTRY_ALIASES.get(tool_id, tool_id)
+        tool_attr_id = getattr(tool, "tool_id", None) if tool is not None else None
+        if tool_id in BUILTIN_TOOLS or canonical_alias in BUILTIN_TOOLS or tool_attr_id in BUILTIN_TOOLS:
             return 0
-        if tool_id in SWARM_TOOLS:
+        if tool_id in SWARM_TOOLS or tool_attr_id in SWARM_TOOLS:
             return 1
-        return 1
+        if tool is not None:
+            return 1
+        return None
 
     def _authorize_execution(
         self,
@@ -415,26 +793,23 @@ Returns:
         allowed_tools: Optional[Any] = None,
     ) -> Optional[ToolResult]:
         """Verify that caller has permission to execute the specified tool."""
-        if allowed_tools is not None and tool_id not in allowed_tools:
+        decision = authorize_and_validate_tool_call(
+            tool_id,
+            {},
+            caller_ring=caller_ring,
+            allowed_tools=allowed_tools,
+            tool_registry=self,
+            tool=tool,
+            normalize_args=False,
+            validate_schema=False,
+        )
+        if not decision.allowed:
             return ToolResult(
                 success=False,
                 output="",
-                error=f"AuthorizationError: Tool '{tool_id}' is not in allowed tools list.",
-                error_type="AUTHORIZATION_DENIED",
+                error=decision.detail or "AuthorizationError: Tool execution denied.",
+                error_type=decision.error_type or "AUTHORIZATION_DENIED",
             )
-
-        if caller_ring is not None:
-            required_ring = self._get_tool_ring(tool_id, tool)
-            if caller_ring > required_ring:
-                return ToolResult(
-                    success=False,
-                    output="",
-                    error=(
-                        f"AuthorizationError: Tool '{tool_id}' requires higher permissions "
-                        f"(requires ring {required_ring}, caller ring is {caller_ring})."
-                    ),
-                    error_type="AUTHORIZATION_DENIED",
-                )
         return None
 
     def _normalize_and_validate(
@@ -489,6 +864,7 @@ Returns:
         if allowed_tools is None and "allowed_tools" in arguments:
             allowed_tools = arguments.pop("allowed_tools")
 
+        tool_id, arguments = canonicalize_tool_invocation(tool_id, arguments)
         tool = self.get_tool(tool_id)
         if tool is None:
             return ToolResult(success=False, error=f"Tool not found: {tool_id}", error_type="TOOL_NOT_FOUND")
@@ -556,6 +932,7 @@ Returns:
         if allowed_tools is None and "allowed_tools" in arguments:
             allowed_tools = arguments.pop("allowed_tools")
 
+        tool_id, arguments = canonicalize_tool_invocation(tool_id, arguments)
         tool = self.get_tool(tool_id)
         if tool is None:
             return ToolResult(success=False, error=f"Tool not found: {tool_id}", error_type="TOOL_NOT_FOUND")

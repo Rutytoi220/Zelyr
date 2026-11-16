@@ -1069,15 +1069,48 @@ def get_tier_timeout(tool_name: str) -> float:
     """
     return TIER_TIMEOUTS.get(tool_name, 8.0)
 
-async def execute_tool(name: str, **kwargs) -> str:
+async def execute_tool(
+    name: str,
+    *,
+    caller_ring: Optional[int] = None,
+    allowed_tools: Optional[Any] = None,
+    **kwargs,
+) -> str:
     if not _executors:
         load_plugins()
+
+    from zelyr.tool_registry import authorize_and_validate_tool_call
+
+    decision = authorize_and_validate_tool_call(
+        name,
+        kwargs,
+        caller_ring=caller_ring,
+        allowed_tools=allowed_tools,
+        active_schemas=_schemas or None,
+        validate_schema=True,
+    )
+    if not decision.allowed:
+        return json.dumps({
+            "success": False,
+            "error": decision.detail or f"AuthorizationError: Tool '{decision.tool_name or name}' denied.",
+            "error_type": decision.error_type or "AUTHORIZATION_DENIED",
+            "reason": decision.reason or "authorization_denied",
+        })
+
+    name = decision.tool_name
+    kwargs = decision.normalized_arguments
+
     if name not in _executors:
         try:
             from zelyr.tool_registry import ToolRegistry
             registry = ToolRegistry()
             if registry.get_tool(name) is not None:
-                res = await registry.execute_async(name, **kwargs)
+                res = await registry.execute_async(
+                    name,
+                    caller_ring=caller_ring,
+                    allowed_tools=allowed_tools,
+                    **kwargs,
+                )
                 if hasattr(res, "to_dict"):
                     return json.dumps(res.to_dict(tool=name, arguments=kwargs))
                 return str(res)

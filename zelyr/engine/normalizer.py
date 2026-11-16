@@ -214,6 +214,25 @@ class SafeArgumentNormalizer:
             return val
 
         if expected_type == "string" and isinstance(val, str):
+            leaf_key = key.rsplit(".", 1)[-1].split("[", 1)[0]
+            if leaf_key in (
+                "content",
+                "text",
+                "code",
+                "source",
+                "source_code",
+                "script",
+                "body",
+                "patch",
+                "diff",
+                "search_text",
+                "replace_text",
+                "old_text",
+                "new_text",
+                "message",
+                "command",
+            ):
+                return val
             return val.strip()
 
         return val

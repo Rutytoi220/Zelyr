@@ -292,14 +292,31 @@ async def _execute_headless_run(
     tool_calls_emitted: List[Dict[str, Any]] = []
 
     async def headless_execute_tool(name: str, **kwargs: Any) -> str:
+        from zelyr.tool_registry import authorize_and_validate_tool_call, canonicalize_tool_invocation
+
         clean_name = NativeOrchestrator.normalize_tool_name(name)
+        clean_name, norm_kwargs = canonicalize_tool_invocation(clean_name, kwargs)
         norm_kwargs = NativeOrchestrator.normalize_tool_arguments(
-            clean_name, kwargs, original_name=name, active_schemas=dynamic_tools
+            clean_name, norm_kwargs, original_name=name, active_schemas=dynamic_tools
         )
-        if clean_name == "interact_with_ui" and (
-            "element_id" in norm_kwargs or norm_kwargs.get("action") in ("click_element", "fill_element")
-        ):
-            clean_name = "interact_with_browser"
+        decision = authorize_and_validate_tool_call(
+            clean_name,
+            norm_kwargs,
+            caller_ring=getattr(orch, "caller_ring", None),
+            allowed_tools=getattr(orch, "allowed_tools", None),
+            active_schemas=dynamic_tools,
+            tool_registry=getattr(orch, "tool_registry", None),
+            validate_schema=False,
+        )
+        if not decision.allowed:
+            return json.dumps({
+                "success": False,
+                "error": decision.detail,
+                "error_type": decision.error_type or "AUTHORIZATION_DENIED",
+                "reason": decision.reason or "authorization_denied",
+            })
+        clean_name = decision.tool_name
+        norm_kwargs = decision.normalized_arguments
         if not output_json:
             sys.stderr.write(f"[tool] {clean_name} {json.dumps(norm_kwargs)}\n")
             sys.stderr.flush()

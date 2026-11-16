@@ -106,35 +106,32 @@ class FallbackToolParser:
 
         target_name = canonical_name if canonical_name in effective_known else clean_name
 
-        if allowed_tools is not None:
-            allowed_set = {t for t in allowed_tools if isinstance(t, str)}
-            if target_name not in allowed_set and canonical_name not in allowed_set and clean_name not in allowed_set:
-                logger.warning(
-                    "[FallbackToolParser] Rejected invocation of %s: not in allowed_tools",
-                    target_name,
-                )
-                return None
-
-        # Parse stringified arguments if necessary
+        # Parse stringified arguments if necessary (reject non-object strings cleanly)
         args_dict: Dict[str, Any] = {}
         if isinstance(raw_args, dict):
-            args_dict = raw_args
+            args_dict = dict(raw_args)
         elif isinstance(raw_args, str):
             s = raw_args.strip()
             if s:
+                parsed: Any = None
                 try:
                     parsed = json.loads(s)
-                    if isinstance(parsed, dict):
-                        args_dict = parsed
                 except Exception:
                     try:
                         parsed = ast.literal_eval(s)
-                        if isinstance(parsed, dict):
-                            args_dict = parsed
                     except Exception:
-                        args_dict = {}
+                        return None
+                if not isinstance(parsed, dict):
+                    return None
+                args_dict = parsed
         elif raw_args is not None:
-            args_dict = {}
+            return None
+
+        # Canonicalize alias rewrites (e.g., interact_with_ui with browser DOM params -> interact_with_browser)
+        # BEFORE allowlist, ring, and schema normalization checks.
+        from zelyr.tool_registry import authorize_and_validate_tool_call, canonicalize_tool_invocation
+
+        target_name, args_dict = canonicalize_tool_invocation(target_name, args_dict)
 
         # Normalize arguments via NativeOrchestrator if available
         try:
@@ -149,33 +146,27 @@ class FallbackToolParser:
         except Exception:
             pass
 
-        # Guard against model confusing interact_with_ui with interact_with_browser on web elements
-        if target_name == "interact_with_ui" and (
-            "element_id" in args_dict or args_dict.get("action") in ("click_element", "fill_element")
-        ):
-            target_name = "interact_with_browser"
+        # Authoritative shared permission check (canonical target, allowlist, fail-closed ring)
+        decision = authorize_and_validate_tool_call(
+            target_name,
+            args_dict,
+            caller_ring=caller_ring,
+            allowed_tools=allowed_tools,
+            active_schemas=active_schemas,
+            known_tools=effective_known if effective_known else None,
+            require_registered=(known_tools is None),
+            normalize_args=False,
+            validate_schema=False,
+        )
+        if not decision.allowed:
+            logger.warning(
+                "[FallbackToolParser] Rejected invocation of %s: %s",
+                decision.tool_name or target_name,
+                decision.detail,
+            )
+            return None
 
-        # Permission check: reject prompt-injection payloads requesting unauthorized rings
-        if caller_ring is not None:
-            try:
-                from zelyr.tool_registry import ToolRegistry
-
-                reg = ToolRegistry()
-                tool_obj = reg.get_tool(target_name)
-                if tool_obj is not None:
-                    req_ring = reg._get_tool_ring(target_name, tool_obj)
-                    if caller_ring > req_ring:
-                        logger.warning(
-                            "[FallbackToolParser] Rejected invocation of %s: caller_ring %d > required_ring %d",
-                            target_name,
-                            caller_ring,
-                            req_ring,
-                        )
-                        return None
-            except Exception:
-                pass
-
-        return target_name, args_dict
+        return decision.tool_name, decision.normalized_arguments
 
     @classmethod
     def _extract_name_and_args_from_dict(cls, obj: Dict[str, Any]) -> Tuple[str, Any]:

@@ -1516,10 +1516,33 @@ class NativeOrchestrator:
         from zelyr.agents.actuator_arbiter import is_browser_window
         browser_active = is_browser_window(active_window)
 
+        from zelyr.tool_registry import authorize_and_validate_tool_call
+
+        def _is_schema_tool_authorized(t_name: str, schemas_ctx: Optional[List[Dict[str, Any]]] = None) -> bool:
+            if eff_allowed_tools is None and eff_caller_ring is None:
+                return True
+            dec = authorize_and_validate_tool_call(
+                t_name,
+                {},
+                caller_ring=eff_caller_ring,
+                allowed_tools=eff_allowed_tools,
+                active_schemas=schemas_ctx,
+                tool_registry=self.tool_registry,
+                normalize_args=False,
+                validate_schema=False,
+            )
+            return dec.allowed
+
         if disable_tools:
             payload["tools"] = []
         elif eff_tool_schemas is not None:
-            payload["tools"] = list(eff_tool_schemas)
+            payload["tools"] = [
+                t for t in eff_tool_schemas
+                if _is_schema_tool_authorized(
+                    (t.get("function", {}).get("name") or t.get("name") or ""),
+                    eff_tool_schemas,
+                )
+            ]
         else:
             if self.tool_registry is not None:
                 active_tools = payload.get("tools") or self.tool_registry.get_schemas(compact=use_compact_schemas)
@@ -1535,7 +1558,17 @@ class NativeOrchestrator:
                     if (t.get("function", {}).get("name") or t.get("name")) != "interact_with_ui"
                 ]
 
-        # Core Sandbox Protection: Ensure essential actuators (execute_command, manage_workspace_file) are never dropped
+            if eff_allowed_tools is not None or eff_caller_ring is not None:
+                payload["tools"] = [
+                    t for t in payload["tools"]
+                    if _is_schema_tool_authorized(
+                        (t.get("function", {}).get("name") or t.get("name") or ""),
+                        payload["tools"],
+                    )
+                ]
+
+        # Core Sandbox Protection: Ensure essential actuators (execute_command, manage_workspace_file) are never dropped,
+        # UNLESS explicitly excluded by the caller's allowed_tools or caller_ring restrictions.
         if not disable_tools and payload.get("tools") is not None:
             existing_tool_names = {
                 t.get("function", {}).get("name") or t.get("name")
@@ -1552,16 +1585,18 @@ class NativeOrchestrator:
                     for cand in all_registry_tools:
                         cand_name = cand.get("function", {}).get("name") or cand.get("name")
                         if cand_name == essential:
-                            payload["tools"].append(cand)
-                            existing_tool_names.add(essential)
+                            if _is_schema_tool_authorized(essential, [cand]):
+                                payload["tools"].append(cand)
+                                existing_tool_names.add(essential)
                             found = True
                             break
                     if not found:
                         for cand in get_tool_schemas(0):
                             cand_name = cand.get("function", {}).get("name") or cand.get("name")
                             if cand_name == essential:
-                                payload["tools"].append(cand)
-                                existing_tool_names.add(essential)
+                                if _is_schema_tool_authorized(essential, [cand]):
+                                    payload["tools"].append(cand)
+                                    existing_tool_names.add(essential)
                                 break
 
         # Active tool scoping during recovery: prioritize allowed_actions + foundational diagnostic tools
@@ -2320,6 +2355,8 @@ class NativeOrchestrator:
             buffered_chunks.clear()
 
         if pending_tool_calls:
+            from zelyr.tool_registry import authorize_and_validate_tool_call, canonicalize_tool_invocation
+
             # Normalize tool calls: Ollama /api/chat requires function.arguments to be a native JSON dict
             normalized_tool_calls = []
             reserved_turn_ids: set = set()
@@ -2331,6 +2368,7 @@ class NativeOrchestrator:
                 tc_id = self._unique_ledger_call_id(eff_ledger, raw_tc_id, reserved_ids=reserved_turn_ids)
                 reserved_turn_ids.add(tc_id)
 
+                args_parse_error: Optional[str] = None
                 if isinstance(fn_args_raw, dict):
                     fn_args = fn_args_raw
                 elif isinstance(fn_args_raw, str):
@@ -2338,27 +2376,35 @@ class NativeOrchestrator:
                     if not raw_str:
                         fn_args = {}
                     else:
+                        parsed_raw: Any = None
+                        parsed_ok = False
                         try:
-                            fn_args = json.loads(raw_str)
+                            parsed_raw = json.loads(raw_str)
+                            parsed_ok = True
                         except Exception:
                             try:
                                 import ast
-                                val = ast.literal_eval(raw_str)
-                                fn_args = val if isinstance(val, dict) else {}
+                                parsed_raw = ast.literal_eval(raw_str)
+                                parsed_ok = True
                             except Exception:
-                                fn_args = {}
+                                parsed_ok = False
+                        if not parsed_ok or not isinstance(parsed_raw, dict):
+                            fn_args = {}
+                            args_parse_error = "Tool arguments must be a valid JSON object/dictionary."
+                        else:
+                            fn_args = parsed_raw
                 else:
                     fn_args = {}
+                    args_parse_error = f"Tool arguments must be a JSON object/dictionary, received {type(fn_args_raw).__name__}."
 
+                # Canonicalize alias rewrites (e.g., interact_with_ui + element_id -> interact_with_browser)
+                # BEFORE argument normalization against the canonical schema and BEFORE permission checks.
+                fn_name, fn_args = canonicalize_tool_invocation(fn_name, fn_args)
                 fn_args = self.normalize_tool_arguments(
                     fn_name, fn_args, original_name=raw_fn_name, active_schemas=eff_tool_schemas
                 )
 
-                # Guard against model confusing interact_with_ui with interact_with_browser on web elements
-                if fn_name == "interact_with_ui" and ("element_id" in fn_args or fn_args.get("action") in ("click_element", "fill_element")):
-                    fn_name = "interact_with_browser"
-
-                normalized_tool_calls.append({
+                tc_entry: Dict[str, Any] = {
                     "id": tc_id,
                     "type": "function",
                     "function": {
@@ -2368,12 +2414,23 @@ class NativeOrchestrator:
                     "from_pending_proposal": bool(
                         tc.get("from_pending_proposal", False) or tc.get("source") == "pending_queue"
                     ),
-                })
+                }
+                if args_parse_error:
+                    tc_entry["_args_parse_error"] = args_parse_error
+                normalized_tool_calls.append(tc_entry)
 
+            wire_assistant_tool_calls = [
+                {
+                    "id": tc["id"],
+                    "type": tc["type"],
+                    "function": tc["function"],
+                }
+                for tc in normalized_tool_calls
+            ]
             assistant_msg = {
                 "role": "assistant",
                 "content": "".join(collected_assistant_text) if collected_assistant_text else "",
-                "tool_calls": normalized_tool_calls,
+                "tool_calls": wire_assistant_tool_calls,
             }
             payload["messages"].append(assistant_msg)
 
@@ -2396,24 +2453,49 @@ class NativeOrchestrator:
                 canonical_args = self._canonicalize_tool_args(func_args)
                 fingerprint = (func_name, canonical_args)
 
-                # Tool validation rules: manifest presence, schema validity, step limits, cycle detection
+                # Authoritative runtime permission, known-tool, and argument-schema validation
+                # applied identically to native, pending, and fallback tool calls before execution.
                 rejection_reason = None
                 rejection_detail = None
 
-                is_from_pending = bool(tc.get("source") == "pending_queue" or tc.get("from_pending_proposal", False))
-                if is_from_pending:
-                    known_tool_names = self.get_known_tool_names(eff_tool_schemas or payload.get("tools"))
-                    if eff_tool_schemas and func_name not in known_tool_names:
-                        rejection_reason = "tool_unavailable"
-                        rejection_detail = f"Tool '{func_name}' is not available in the active runtime manifest."
-
-                    if rejection_reason is None:
-                        tool_schema = self._find_tool_schema(func_name, eff_tool_schemas or payload.get("tools"))
-                        from zelyr.engine.normalizer import validate_arguments
-                        val_err = validate_arguments(func_name, tool_schema, func_args)
-                        if val_err:
-                            rejection_reason = "schema_validation_error"
-                            rejection_detail = val_err.get("error", "Schema validation failed.")
+                if tc.get("_args_parse_error"):
+                    rejection_reason = "schema_validation_error"
+                    rejection_detail = str(tc["_args_parse_error"])
+                else:
+                    auth_schemas = eff_tool_schemas if eff_tool_schemas is not None else payload.get("tools")
+                    known_for_auth = (
+                        self.get_known_tool_names(eff_tool_schemas)
+                        if eff_tool_schemas is not None
+                        else None
+                    )
+                    require_registered = (
+                        eff_tool_executor is None
+                        or self.tool_registry is not None
+                        or eff_tool_schemas is not None
+                        or eff_caller_ring is not None
+                        or eff_allowed_tools is not None
+                    )
+                    decision = authorize_and_validate_tool_call(
+                        func_name,
+                        func_args,
+                        caller_ring=eff_caller_ring,
+                        allowed_tools=eff_allowed_tools,
+                        active_schemas=auth_schemas,
+                        tool_registry=self.tool_registry,
+                        known_tools=known_for_auth,
+                        require_registered=require_registered,
+                        normalize_args=True,
+                        validate_schema=True,
+                    )
+                    if not decision.allowed:
+                        rejection_reason = decision.reason or "authorization_denied"
+                        rejection_detail = decision.detail or "Tool invocation denied by runtime authorization boundary."
+                    else:
+                        func_name = decision.tool_name
+                        func_args = decision.normalized_arguments
+                        tc["function"]["name"] = func_name
+                        tc["function"]["arguments"] = func_args
+                        fingerprint = (func_name, self._canonicalize_tool_args(func_args))
 
                 eff_step_limit = getattr(self, "max_steps", 5)
                 if rejection_reason is None and actual_step_count >= eff_step_limit:
@@ -2633,8 +2715,18 @@ class NativeOrchestrator:
                             else:
                                 tool_result = exec_call
                     else:
+                        exec_fn = self.execute_tool
+                        if exec_fn is execute_tool and (eff_caller_ring is not None or eff_allowed_tools is not None):
+                            exec_coro = exec_fn(
+                                func_name,
+                                caller_ring=eff_caller_ring,
+                                allowed_tools=eff_allowed_tools,
+                                **func_args,
+                            )
+                        else:
+                            exec_coro = exec_fn(func_name, **func_args)
                         tool_result = await asyncio.wait_for(
-                            self.execute_tool(func_name, **func_args),
+                            exec_coro,
                             timeout=timeout,
                         )
                     
