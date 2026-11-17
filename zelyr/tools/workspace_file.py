@@ -99,6 +99,13 @@ class ManageWorkspaceFileTool(BaseTool):
                 required=False,
                 default=200,
             ),
+            ToolParameter(
+                name="cwd",
+                type="string",
+                description="Optional directory to resolve relative paths against.",
+                required=False,
+                default=None,
+            ),
         ]
 
     def _resolve_path(self, path_str: str, cwd: Optional[Path] = None) -> Path:

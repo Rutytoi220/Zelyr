@@ -79,8 +79,10 @@ Zelyr synthesizes, validates, and installs new tools at runtime into `~/.config/
 ### D. Benchmark & Evaluation Harness (`zelyr.eval`)
 Zelyr includes a deterministic and live benchmark evaluation suite via [`zelyr/eval/`](zelyr/eval/):
 - **Level 1 (Deterministic Offline):** 6 self-contained tasks evaluating tool dispatch, recovery envelopes, step limits, false success rejection, memory roundtrips, and timeouts in under 3 seconds with zero GPU or network dependencies.
-- **Level 2 (Live Model Evaluation):** Exercises real multi-turn ReAct loops against local models (`qwen3:8b`, `qwen3:1.7b`) with independent disk and state validators.
+- **Level 2 (Live Model Evaluation):** Exercises real multi-turn ReAct loops against local or configured Ollama models (`qwen3:8b`, `qwen3:1.7b`) with independent disk and state validators.
 - **Level 3 (Complex Workflows):** Tests multi-step triage, tool self-repair, and containment.
+- **Levels 4 & 5 (Autonomous Runtime Patching & Multi-Agent / MCP Federation):** Evaluates multi-file runtime bug patching, triad swarm consensus, and federated MCP tool execution under explicit `TaskLocalToolScope` isolation.
+- **Matrix & Distributed Subprocess Runner (`zelyr.eval.matrix`, `zelyr.eval.distributed`):** Runs multi-model evaluation matrices and dispatches worker tasks via local `python -m zelyr.eval.distributed_worker` subprocesses spawned on the coordinator host. Each worker subprocess sends HTTP inference requests to its configured Ollama endpoint (`worker.endpoint`) while executing tools and workspace outcome verification locally in the worker subprocess.
 - **Anti-Hallucination Outcome Verification:** Rejects verbal conversational claims if real observable side-effects (e.g. disk artifacts) were not produced, tagging them as `FALSE_SUCCESS`.
 - **Measured Token Telemetry:** Distinguishes measured prompt and evaluation tokens reported by the Ollama stream from character-based estimations.
 
@@ -178,8 +180,9 @@ zelyr ui
 # Start background FastAPI compute node & OpenAI-compatible proxy
 zelyr server
 
-# Run autonomous agent with natural-language prompt
+# Run autonomous agent with natural-language prompt (optional --base-url for remote Ollama)
 zelyr run "Inspect open windows and list system memory"
+zelyr run --base-url http://192.168.1.50:11434 "Summarize repository status"
 
 # List all registered and dynamic tools
 zelyr tool list
@@ -205,11 +208,12 @@ python -m zelyr.eval --level 2 --live -m qwen3:8b --json benchmark_report.json
 ## 6. Security & Isolation Model
 
 Zelyr operates under a transparent, single-user workstation security model:
-- **SSRF Network Protection:** Outbound network requests pass through [`zelyr.security.network.validate_safe_url`](zelyr/security/network.py), blocking loopback, RFC 1918 private subnets, cloud metadata (169.254.169.254), Carrier-Grade NAT / Tailscale mesh (`100.64.0.0/10`), and re-validating redirect hops.
+- **Authoritative Tool Permission & Schema Boundary:** Every native, fallback-parsed, subagent, plugin, and registry tool call passes through [`authorize_and_validate_tool_call`](zelyr/tool_registry.py) after canonical alias resolution (`canonicalize_tool_invocation`), enforcing `allowed_tools`, fail-closed `caller_ring` privilege checks (`0 <= caller_ring <= required_ring <= 3`), and strict argument schema validation before execution.
+- **SSRF Network Protection:** Outbound web scraping and search requests pass through [`zelyr.security.network.validate_safe_url`](zelyr/security/network.py), blocking loopback, RFC 1918 private subnets, cloud metadata (`169.254.169.254`), Carrier-Grade NAT / Tailscale mesh (`100.64.0.0/10`), and re-validating redirect hops.
 - **Prompt Injection Isolation:** Web content and search results are enclosed in `<external_web_content>` XML boundaries with tag escaping.
-- **Fail-Closed Shell Confirmation:** Arbitrary shell commands require explicit interactive user approval via [`zelyr/tools/__init__.py`](zelyr/tools/__init__.py) (`_request_shell_authorization`) and fail closed in non-interactive sessions.
-- **In-Process Execution Reality:** Dynamic tools execute in-process inside the Python interpreter under the host user's UID. AST validation and `/tmp` staging verify syntax and prevent accidental errors, but do **not** constitute an OS-level kernel sandbox.
-- **Zero External Telemetry:** All inference traffic remains strictly local on loopback (`http://127.0.0.1:11434`). Zero analytics, error reports, or prompts are sent to external servers.
+- **Fail-Closed Shell Confirmation:** Arbitrary shell commands require explicit interactive user approval via [`zelyr/tools/__init__.py`](zelyr/tools/__init__.py) (`_request_shell_authorization`) and fail closed in non-interactive sessions unless `ZELYR_TESTING=1` or `ZELYR_AUTOPILOT=1` is explicitly set.
+- **Built-in vs. Dynamic Plugin Execution Reality:** Built-in Ring-0 core actuators execute in-process (or via `asyncio.to_thread`) under the host user's UID. User-created dynamic plugins (`REQUIRED_RING >= 1` in `~/.config/zelyr/tools.d/`) execute in a separate child process via [`SandboxedPluginRunner`](zelyr/core/plugin_sandbox.py) with `RLIMIT_AS` (512 MB address space cap), `RLIMIT_CORE = 0`, `/dev/null` stdin, and bounded wall-clock timeouts (`SIGTERM` followed by `SIGKILL`) for crash and memory containment. Because child processes still run under the host user's UID without kernel user/mount/network namespaces, `seccomp`, or `chroot`, this is resource/crash containment rather than an OS-level kernel sandbox.
+- **Local Default & Explicit Remote Ollama Configuration:** By default, inference traffic remains on local loopback (`http://127.0.0.1:11434`) with zero external analytics or telemetry. Operators can explicitly point Zelyr to a remote or LAN Ollama endpoint via `ZELYR_OLLAMA_BASE_URL`, `config.ollama_base_url`, or `zelyr run --base-url <url>` (validated by [`validate_ollama_base_url`](zelyr/config.py), with keep-alive and read timeouts resolved via `ZELYR_OLLAMA_KEEP_ALIVE` / `get_effective_keep_alive` and `ZELYR_OLLAMA_READ_TIMEOUT` / `get_effective_read_timeout`).
 
 For full technical specifications, read [`docs/SECURITY.md`](docs/SECURITY.md) and [`docs/security_model.md`](docs/security_model.md).
 

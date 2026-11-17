@@ -47,14 +47,12 @@ norecursedirs = [
 addopts = "--ignore=tests/fixtures --ignore=tests/unit --ignore=tests/gui --ignore=tests/e2e --ignore=tests/integration --ignore=tests/optional --ignore=tests/simulation --ignore=zelyr/tests -m 'not e2e and not requires_wayland and not hardware'"
 ```
 
-The active, consolidated test battery consists of 61 tests located directly in `tests/`:
-1. `tests/test_context_budget_fix.py`: 8K context token window and tier-aware schema filtering (5 tests).
-2. `tests/test_fast_path_router.py`: Hybrid fastest-path routing and desktop CLI interception (8 tests).
-3. `tests/test_install_bootstrap.py`: Directory auto-bootstrap, path portability, and entry points (5 tests).
-4. `tests/test_multi_turn_payload.py`: Context precedence hierarchy, Turn 2 ReAct, and thinking tokens (4 tests).
-5. `tests/test_shell_authorization.py`: Shell authorization confirmation gates and fail-closed rules (9 tests).
-6. `tests/test_swarm_blackboard.py`: Swarm blackboard store, namespace isolation, and rollback (17 tests).
-7. `tests/test_web_search.py`: SSRF security, Tailscale/CGNAT blocking, and prompt injection containment (13 tests).
+The active, consolidated test battery consists of the top-level `tests/test_*.py` modules located directly in `tests/`, covering:
+1. **Context Budgeting, Prompt Assembly & Runtime Environment:** `tests/test_context_budget_fix.py`, `tests/test_multi_turn_payload.py`, `tests/test_runtime_environment.py`, `tests/test_environment_manifest_boundaries.py`.
+2. **Tool Permission Parity, Executor Isolation & Shell/SSRF Security:** `tests/test_tool_permission_parity.py`, `tests/test_custom_executor_isolation.py`, `tests/test_shell_authorization.py`, `tests/test_web_search.py`, `tests/test_plugin_isolation.py`.
+3. **Schema Normalization, Verification & Execution Ledger:** `tests/test_argument_normalizer.py`, `tests/test_outcome_verifier.py`, `tests/test_command_output_hardened_boundary.py`, `tests/test_execution_ledger.py`, `tests/test_observation_framing.py`, `tests/test_parity_runtime_guards.py`.
+4. **Remote Ollama, Concurrency & Evaluation Matrix / Distributed Subprocess Runner:** `tests/test_remote_ollama_and_concurrency.py`, `tests/test_model_matrix.py`, `tests/test_distributed_eval.py`, `tests/test_eval_scorecard.py`, `tests/test_eval_cli.py`.
+5. **Fast-Path Routing, Packaging, Swarm Blackboard & Desktop/Browser Subsystems:** `tests/test_fast_path_router.py`, `tests/test_install_bootstrap.py`, `tests/test_swarm_blackboard.py`, `tests/test_swarm_consensus.py`, `tests/test_swarm_delegation.py`, and additional top-level `tests/test_*.py` suites.
 
 ### C. Test Isolation & Headless Safeguards ([`tests/conftest.py`](../tests/conftest.py))
 To prevent side effects on the developer's workstation during automated testing, `tests/conftest.py` enforces three automatic safeguards:

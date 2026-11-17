@@ -155,10 +155,14 @@ Each section specifies module responsibilities, public interfaces, state mutatio
 
 ### A. Configuration Module ([`zelyr/config.py`](../zelyr/config.py))
 - **Primary Responsibilities:**  
-  Resolves environment overrides, initializes required directory structures on first launch, and provides clamped context lengths.
+  Resolves environment overrides, initializes required directory structures on first launch, validates local or remote Ollama endpoint URLs and timeout parameters, and provides clamped context lengths.
 - **Verified Public Interfaces:**  
   `get_config_dir() -> Path`: Resolves `ZELYR_CONFIG_DIR` or defaults to `~/.config/zelyr`.  
   `initialize_directories(config_dir: Optional[Path] = None) -> None`: Creates `tools.d/`, `plugins/`, `sessions/`, `logs/`, `models/`.  
   `validate_and_clamp_num_ctx(val: Any) -> int`: Validates context integers within `[1024, 65536]`, defaulting to `8192`.  
-  `get_effective_num_ctx(caller_override: Optional[Any] = None) -> int`: Resolves context with 4-level precedence.
-- **Backing Tests:** [`tests/test_install_bootstrap.py`](../tests/test_install_bootstrap.py), [`tests/test_multi_turn_payload.py`](../tests/test_multi_turn_payload.py).
+  `get_effective_num_ctx(caller_override: Optional[Any] = None) -> int`: Resolves context with 4-level precedence (`caller_override` -> `ZELYR_NUM_CTX` -> `config.ollama_num_ctx` -> `8192`).
+  `validate_ollama_base_url(url: Any) -> str`: Validates `http://` or `https://` Ollama base URLs (default `http://127.0.0.1:11434`), rejecting embedded credentials, query strings, fragments, and invalid ports (`1..65535`).
+  `get_effective_ollama_base_url(caller_override: Optional[Any] = None) -> str`: Resolves the active Ollama endpoint (`caller_override` -> `ZELYR_OLLAMA_BASE_URL` -> `config.ollama_base_url` -> `http://127.0.0.1:11434`).
+  `get_effective_keep_alive(caller_override: Optional[Any] = None) -> Union[str, int]`: Resolves keep-alive duration (`caller_override` -> `ZELYR_OLLAMA_KEEP_ALIVE` -> `config.ollama_keep_alive` -> `"5m"`).
+  `get_effective_read_timeout(caller_override: Optional[Any] = None) -> float`: Resolves HTTP stream read timeout in seconds (`caller_override` -> `ZELYR_OLLAMA_READ_TIMEOUT` -> `config.ollama_read_timeout` -> `300.0`, clamped to `[5.0, 3600.0]`).
+- **Backing Tests:** [`tests/test_install_bootstrap.py`](../tests/test_install_bootstrap.py), [`tests/test_multi_turn_payload.py`](../tests/test_multi_turn_payload.py), [`tests/test_remote_ollama_and_concurrency.py`](../tests/test_remote_ollama_and_concurrency.py).

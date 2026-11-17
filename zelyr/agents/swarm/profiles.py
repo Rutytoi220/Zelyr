@@ -22,7 +22,20 @@ class CoderAgent(BaseSubagent):
 
 class ResearchAgent(BaseSubagent):
     """Specialist for querying memory, searching, and synthesizing facts."""
-    def __init__(self, event_bus, tool_registry, llm_client, session_id: Optional[str] = None):
+    DEFAULT_ALLOWED_TOOLS = [
+        "remember_fact",
+        "file_search",
+        "safe_file_search",
+        "web_search",
+        "fetch_web_page",
+        "file_read",
+        "read_file",
+        "echo",
+        "blackboard_write",
+        "blackboard_read",
+    ]
+
+    def __init__(self, event_bus, tool_registry, llm_client, session_id: Optional[str] = None, caller_ring: Optional[int] = 1, allowed_tools=None):
         super().__init__(
             name="ResearchAgent",
             description="Queries semantic memory, reads documents, and summarizes facts.",
@@ -30,7 +43,9 @@ class ResearchAgent(BaseSubagent):
             event_bus=event_bus,
             tool_registry=tool_registry,
             llm_client=llm_client,
-            session_id=session_id
+            session_id=session_id,
+            caller_ring=caller_ring,
+            allowed_tools=list(self.DEFAULT_ALLOWED_TOOLS) if allowed_tools is None else allowed_tools,
         )
         self.set_system_prompt(
             "You are ResearchAgent. You synthesize facts, search vector memory, and summarize documentation. "
@@ -39,7 +54,16 @@ class ResearchAgent(BaseSubagent):
 
 class VisionAgent(BaseSubagent):
     """Specialist for screen capture and visual analysis."""
-    def __init__(self, event_bus, tool_registry, llm_client, session_id: Optional[str] = None):
+    DEFAULT_ALLOWED_TOOLS = [
+        "vision",
+        "interact_with_ui",
+        "capture_som_screen",
+        "echo",
+        "blackboard_write",
+        "blackboard_read",
+    ]
+
+    def __init__(self, event_bus, tool_registry, llm_client, session_id: Optional[str] = None, caller_ring: Optional[int] = 1, allowed_tools=None):
         super().__init__(
             name="VisionAgent",
             description="Captures screen and analyzes UI.",
@@ -47,7 +71,9 @@ class VisionAgent(BaseSubagent):
             event_bus=event_bus,
             tool_registry=tool_registry,
             llm_client=llm_client,
-            session_id=session_id
+            session_id=session_id,
+            caller_ring=caller_ring,
+            allowed_tools=list(self.DEFAULT_ALLOWED_TOOLS) if allowed_tools is None else allowed_tools,
         )
         self.set_system_prompt(
             "You are VisionAgent. You use screen capture and visual analysis to answer questions about the current screen state."

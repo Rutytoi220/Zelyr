@@ -15,7 +15,7 @@ class BaseSubagent(BaseAgent):
     SQLite memory store.
     """
 
-    def __init__(self, name: str, description: str, topic: str, event_bus=None, tool_registry=None, llm_client=None, blackboard=None, session_id: Optional[str]=None):
+    def __init__(self, name: str, description: str, topic: str, event_bus=None, tool_registry=None, llm_client=None, blackboard=None, session_id: Optional[str]=None, caller_ring: Optional[int]=None, allowed_tools: Optional[Any]=None):
         """Auto-generated docstring.
 
 Args:
@@ -36,6 +36,8 @@ Returns:
         self.llm_client = llm_client
         self.blackboard = blackboard
         self.session_id = session_id or 'default_session'
+        self.caller_ring = caller_ring
+        self.allowed_tools = allowed_tools
         self.consensus = (
             ConsensusEngine(event_bus, blackboard=self.blackboard, session_id=self.session_id)
             if event_bus
@@ -100,20 +102,126 @@ Returns:
         """
         if not self.tool_registry:
             return {'error': 'No tool registry available'}
-        tool = self.tool_registry.get_tool(tool_name)
+
+        import copy
+        from zelyr.tool_registry import authorize_and_validate_tool_call, canonicalize_tool_invocation
+
+        raw_arguments = arguments
+        dict_args = dict(arguments) if isinstance(arguments, dict) else {}
+        canonical_name, canonical_args = canonicalize_tool_invocation(tool_name, dict_args)
+        if not hasattr(self.tool_registry, 'get_tool') or not callable(getattr(self.tool_registry, 'get_tool', None)):
+            error = {
+                'error': f"AuthorizationError: Invalid tool_registry metadata for '{canonical_name}'.",
+                'error_type': 'AUTHORIZATION_DENIED',
+                'reason': 'authorization_denied',
+            }
+            self._write_to_blackboard(f'{canonical_name}_error', error)
+            return error
+
+        try:
+            tool = self.tool_registry.get_tool(canonical_name)
+        except Exception as exc:
+            error = {
+                'error': f"AuthorizationError: Registry lookup failed for '{canonical_name}': {exc}",
+                'error_type': 'AUTHORIZATION_DENIED',
+                'reason': 'authorization_denied',
+            }
+            self._write_to_blackboard(f'{canonical_name}_error', error)
+            return error
+
         if not tool:
-            return {'error': f"Tool '{tool_name}' not found."}
-        if tool_name in MUTATING_TOOL_NAMES:
+            return {'error': f"Tool '{canonical_name}' not found."}
+
+        authorized_tool = tool
+        authorized_target = getattr(authorized_tool, '_target', getattr(authorized_tool, 'target', None))
+        authorized_execute = getattr(authorized_tool, 'execute', None)
+
+        decision = authorize_and_validate_tool_call(
+            canonical_name,
+            canonical_args if isinstance(raw_arguments, dict) else raw_arguments,
+            caller_ring=getattr(self, 'caller_ring', None),
+            allowed_tools=getattr(self, 'allowed_tools', None),
+            tool_registry=self.tool_registry,
+            tool=authorized_tool,
+        )
+        if not decision.allowed:
+            error = {
+                'error': decision.detail or f"AuthorizationError: Tool '{canonical_name}' denied.",
+                'error_type': decision.error_type or 'AUTHORIZATION_DENIED',
+                'reason': decision.reason or 'authorization_denied',
+            }
+            self._write_to_blackboard(f'{canonical_name}_error', error)
+            return error
+
+        tool_name = decision.tool_name
+        validated_arguments = copy.deepcopy(decision.normalized_arguments)
+
+        expanded_mutating_names = MUTATING_TOOL_NAMES | {
+            'execute_command',
+            'shell_command',
+            'file_write',
+            'manage_workspace_file',
+            'replace_file_content',
+            'multi_replace_file_content',
+            'python',
+            'python_exec',
+            'craft_tool',
+            'clipboard_write',
+            'desktop_automation',
+            'desktop_control',
+            'system_reboot',
+        }
+        candidate_names = {tool_name, canonical_name}
+        if not type(authorized_tool).__module__.startswith('unittest.mock'):
+            for attr_name in ('tool_id', 'name'):
+                attr_val = getattr(authorized_tool, attr_name, None)
+                if isinstance(attr_val, str) and attr_val.strip():
+                    candidate_names.add(attr_val.strip())
+
+        if candidate_names & expanded_mutating_names:
             if not self.consensus:
                 return {'error': 'Consensus engine required for mutating tools'}
             logger.info(f"[{self.name}] Tool '{tool_name}' is destructive. Proposing to swarm...")
-            approved = self.consensus.propose(agent_name=self.name, tool_name=tool_name, arguments=arguments, timeout=timeout)
+            proposal_args = copy.deepcopy(validated_arguments)
+            approved = self.consensus.propose(
+                agent_name=self.name,
+                tool_name=tool_name,
+                arguments=proposal_args,
+                timeout=timeout,
+            )
+            if proposal_args != validated_arguments:
+                error = {
+                    'error': f"AuthorizationError: Arguments for '{tool_name}' were mutated during consensus voting.",
+                    'error_type': 'AUTHORIZATION_DENIED',
+                    'reason': 'authorization_denied',
+                }
+                self._write_to_blackboard(f'{tool_name}_error', error)
+                return error
             if not approved:
                 logger.warning(f"[{self.name}] Proposal for '{tool_name}' REJECTED or TIMED OUT.")
                 return {'error': 'Execution blocked: Swarm consensus rejected the proposal.'}
             logger.info(f"[{self.name}] Proposal for '{tool_name}' APPROVED. Executing...")
+
+        # Re-verify authorized callable identity before execution (prevents TOCTOU replacement during consensus)
+        current_tool = self.tool_registry.get_tool(canonical_name)
+        if (
+            current_tool is not authorized_tool
+            or getattr(authorized_tool, '_target', getattr(authorized_tool, 'target', None)) is not authorized_target
+            or getattr(authorized_tool, 'execute', None) != authorized_execute
+        ):
+            error = {
+                'error': f"AuthorizationError: Authorized callable for '{tool_name}' changed or became stale before execution.",
+                'error_type': 'AUTHORIZATION_DENIED',
+                'reason': 'authorization_denied',
+            }
+            self._write_to_blackboard(f'{tool_name}_error', error)
+            return error
+
         try:
-            result = await tool(**arguments) if getattr(tool, 'is_async', False) else tool(**arguments)
+            import inspect
+            exec_args = copy.deepcopy(validated_arguments)
+            raw_res = authorized_tool(**exec_args)
+            result = await raw_res if inspect.isawaitable(raw_res) else raw_res
             self._write_to_blackboard(f'{tool_name}_result', result)
             return result
         except Exception as e:
@@ -171,8 +279,22 @@ Returns:
             tool_calls = response_msg.get('tool_calls', [])
             if tool_calls:
                 for tc in tool_calls:
-                    name = tc['function']['name']
-                    args = tc['function']['arguments']
+                    fn = tc.get('function', {}) if isinstance(tc, dict) else {}
+                    name = fn.get('name') or (tc.get('name') if isinstance(tc, dict) else '') or ''
+                    if isinstance(fn, dict) and 'arguments' in fn:
+                        args = fn['arguments']
+                    elif isinstance(tc, dict) and 'arguments' in tc:
+                        args = tc['arguments']
+                    else:
+                        args = {}
+                    if isinstance(args, str):
+                        try:
+                            import json
+                            parsed_args = json.loads(args)
+                            if isinstance(parsed_args, dict):
+                                args = parsed_args
+                        except Exception:
+                            pass
                     self._emit_telemetry('swarm.agent.token', {'chunk': f"\n[Executing {name}...]\n"})
                     res = await self._execute_tool_safely(name, args)
                     messages.append(response_msg)

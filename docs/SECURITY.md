@@ -121,7 +121,24 @@ def _request_shell_authorization(tool_id: str, command: str) -> bool:
 
 ---
 
-## 6. Security Invariant & Verification Matrix
+## 6. Authoritative Tool Permission Boundary & Plugin Containment `[VERIFIED]`
+
+All tool dispatches across `NativeOrchestrator` (native `tool_calls` and `FallbackToolParser`), `DelegatedSubagent`, legacy `OrchestratorAgent` / `BaseSubagent`, `ToolRegistry.execute()`, `zelyr.core.plugins.execute_tool()`, and `zelyr tool run` are governed by [`authorize_and_validate_tool_call()`](../zelyr/tool_registry.py):
+
+1. **Canonicalization Before Authorization (`canonicalize_tool_invocation`):**
+   Legacy aliases (e.g., `execute_shell` -> `execute_command`, `read_file` / `write_file` -> `manage_workspace_file`, and `interact_with_ui` with DOM `element_id` -> `interact_with_browser`) are rewritten to their canonical tool target *before* checking `allowed_tools`, `caller_ring`, or argument schemas.
+2. **Fail-Closed Ring Enforcement (`resolve_tool_ring`):**
+   Rings are integers in `0..3` where `0` is highest privilege (reserved for built-in core tools) and `1..3` are dynamic/elevated rings. A call is permitted only when `caller_ring <= required_ring`. Missing, `None`, boolean, non-integer, or out-of-range (`< 0` or `> 3`) ring metadata fails closed (`invalid_tool_ring` / `invalid_caller_ring`).
+3. **Strict Argument Normalization & Schema Validation:**
+   Arguments are coerced only through unambiguous rules (`SafeArgumentNormalizer`) while preserving whitespace-sensitive content payloads, and validated against the canonical tool's schema (`required` fields, types, `enum`, `additionalProperties: false`).
+4. **Custom Executor Isolation (`TaskLocalToolScope`):**
+   Custom `tool_executor` callbacks cannot bypass tool registration, `allowed_tools`, `caller_ring`, or schema validation unless explicitly scoped with an evaluation-only `TaskLocalToolScope` (or `bind_task_local_executor`), which blocks access to production tool registries.
+5. **Application-Level Authorization vs. Process Containment:**
+   Built-in Ring-0 tools execute in-process under the host user's UID. Dynamic plugins (`REQUIRED_RING >= 1`) run in a separate child process via [`SandboxedPluginRunner`](../zelyr/core/plugin_sandbox.py) with `RLIMIT_AS` (512 MB), `RLIMIT_CORE = 0`, `/dev/null` stdin, and bounded timeouts (`SIGTERM` -> `SIGKILL`). While this isolates plugin crashes and memory spikes from the orchestrator process, child processes still run as the host user UID without kernel namespaces, `seccomp`, or `chroot`.
+
+---
+
+## 7. Security Invariant & Verification Matrix
 
 | Security Control | Code Location | Verified Invariant | Status | Backing Test |
 | :--- | :--- | :--- | :---: | :--- |
@@ -133,3 +150,4 @@ def _request_shell_authorization(tool_id: str, command: str) -> bool:
 | **Pre-Flight Payload Limit** | [`zelyr/tools/web_search.py:fetch_web_page`](../zelyr/tools/web_search.py#L219-L225) | Aborts if Content-Length > 2 MB | **`[VERIFIED]`** | `test_fetch_web_page_content_length_limit` |
 | **Shell Auth Fail-Closed** | [`zelyr/tools/__init__.py:_request_shell_authorization`](../zelyr/tools/__init__.py#L11-L26) | Returns False if `not sys.stdin.isatty()` | **`[VERIFIED]`** | `test_non_interactive_fails_closed` |
 | **Shell Auth Interactive** | [`zelyr/tools/__init__.py:_request_shell_authorization`](../zelyr/tools/__init__.py#L11-L26) | Prompts user on interactive TTY | **`[VERIFIED]`** | `test_interactive_approved`, `test_interactive_denied` |
+| **Tool Permission Parity** | [`zelyr/tool_registry.py:authorize_and_validate_tool_call`](../zelyr/tool_registry.py) | Enforces canonicalization, `allowed_tools`, fail-closed `caller_ring`, and schema validation across all dispatch paths | **`[VERIFIED]`** | `test_tool_permission_parity.py`, `test_custom_executor_isolation.py` |

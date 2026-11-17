@@ -21,7 +21,7 @@ Release v1.4.0 of Zelyr, delivering runtime parity across local and remote Ollam
 - **Execution Ledger, Observation Framing & Goal-Aware Replanning (`zelyr.engine.execution_ledger`, `zelyr.engine.observation_framer`)**:
   - Added `TurnExecutionLedger` tracking action lifecycles (`PROPOSED`, `VALIDATED`, `DISPATCHED`, `SUCCEEDED`, `FAILED`, `REJECTED`), pending multi-tool proposal reconciliation, prohibition and repetition guards, and structured `ObservationFramingEngine` envelopes.
 - **Evaluation Matrix & Distributed Worker Harness (`zelyr.eval.matrix`, `zelyr.eval.distributed`, `zelyr.eval.distributed_worker`)**:
-  - Added reproducible multi-model evaluation matrix runner, HTTP worker server/dispatcher with fail-closed SSRF validation, and structured Markdown/JSON reporting.
+  - Added reproducible multi-model evaluation matrix runner, local worker subprocess (`zelyr.eval.distributed_worker`) spawned by `DistributedEvalRunner` on the coordinator host that sends HTTP inference requests to configured Ollama endpoints (`worker.endpoint`) with fail-closed endpoint validation while executing tools and workspace verification locally, and structured Markdown/JSON reporting.
 - **Authoritative Tool Permission Boundary & Custom Executor Isolation (`zelyr.tool_registry`, `zelyr.agents.native_orchestrator`)**:
   - Added `authorize_and_validate_tool_call`, `canonicalize_tool_invocation`, `resolve_tool_ring`, `TaskLocalToolScope`, and `bind_task_local_executor` enforcing `allowed_tools`, fail-closed `caller_ring` checks, canonical alias rewriting prior to authorization, and strict isolation between task-local test executors and production tool registries.
 

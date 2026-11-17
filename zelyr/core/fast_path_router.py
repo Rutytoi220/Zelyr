@@ -257,17 +257,31 @@ class FastestPathRouter:
                     "output": msg,
                 }
 
-        # Check generic open/navigate tools
-        plan = cls.can_route_to_cli(tool_name, arguments)
-        if plan:
-            ok, msg = cls.execute_fast_path(plan)
-            return {
-                "tool": tool_name,
-                "intercepted": True,
-                "fast_path": True,
-                "command": plan.command,
-                "success": ok,
-                "output": msg,
-            }
+        # Only evaluate generic CLI shortcuts for explicit desktop/open/service/audio action names,
+        # never hijacking unrelated registered tools (such as echo, file_read, or manage_workspace_file).
+        if tool_name in (
+            "open_url",
+            "open_browser",
+            "open_app",
+            "launch_app",
+            "start_app",
+            "open_application",
+            "open_file",
+            "open_folder",
+            "view_file",
+            "service_action",
+            "set_volume",
+        ):
+            plan = cls.can_route_to_cli(tool_name, arguments)
+            if plan:
+                ok, msg = cls.execute_fast_path(plan)
+                return {
+                    "tool": tool_name,
+                    "intercepted": True,
+                    "fast_path": True,
+                    "command": plan.command,
+                    "success": ok,
+                    "output": msg,
+                }
 
         return None

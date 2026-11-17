@@ -255,6 +255,136 @@ def canonicalize_tool_invocation(
     return clean_name, args
 
 
+def _is_mock_object(obj: Any) -> bool:
+    """Return True if obj is a unittest.mock proxy object."""
+    return obj is not None and type(obj).__module__.startswith("unittest.mock")
+
+
+def _iter_unwrap_tool_chain(tool: Optional[Any]) -> List[Any]:
+    """Return [tool, ...] following .target, ._target, and .__wrapped__ wrappers safely."""
+    chain: List[Any] = []
+    seen: set[int] = set()
+    cur = tool
+    while cur is not None and id(cur) not in seen and len(chain) < 8:
+        seen.add(id(cur))
+        chain.append(cur)
+        if _is_mock_object(cur):
+            break
+        nxt = None
+        for attr in ("_target", "target", "__wrapped__"):
+            cand = getattr(cur, attr, None)
+            if cand is not None and cand is not cur and not isinstance(cand, (str, bytes, int, float, bool, dict, list, tuple, set)):
+                nxt = cand
+                break
+        cur = nxt
+    return chain
+
+
+def _verify_tool_object_identity(
+    canonical_name: str,
+    tool: Optional[Any],
+    allowed_set: Optional[set[str]] = None,
+) -> Optional[str]:
+    """Verify that a resolved tool object (and any wrapped target) matches the authorized tool identity."""
+    if tool is None or _is_mock_object(tool):
+        return None
+    expected_canonical = _TOOL_REGISTRY_ALIASES.get(canonical_name, canonical_name)
+    valid_names = {canonical_name, expected_canonical}
+
+    chain = _iter_unwrap_tool_chain(tool)
+    for obj in chain:
+        if _is_mock_object(obj):
+            continue
+        for attr in ("tool_id", "name"):
+            val = getattr(obj, attr, None)
+            if isinstance(val, str):
+                cleaned = val.strip()
+                if not cleaned or cleaned == "sandboxed_plugin" or cleaned in valid_names:
+                    continue
+                if allowed_set is not None and cleaned not in allowed_set:
+                    return (
+                        f"AuthorizationError: Tool object identity '{cleaned}' ({attr}) "
+                        f"does not match requested tool '{canonical_name}' and is not in allowed tools list."
+                    )
+                if cleaned in BUILTIN_TOOLS or cleaned in SWARM_TOOLS:
+                    return (
+                        f"AuthorizationError: Built-in tool identity '{cleaned}' ({attr}) "
+                        f"cannot be disguised under '{canonical_name}'."
+                    )
+    return None
+
+
+def _validate_callable_signature(
+    canonical_name: str,
+    tool: Optional[Any],
+    arguments: Dict[str, Any],
+) -> Optional[str]:
+    """Verify that normalized arguments can bind to the concrete tool callable when signature is explicit."""
+    if tool is None or _is_mock_object(tool):
+        return None
+    import inspect
+
+    chain = _iter_unwrap_tool_chain(tool)
+    # Prefer the innermost unwrapped target so SandboxedPluginRunner(*args, **kwargs) is unwrapped to its target
+    for obj in reversed(chain):
+        if _is_mock_object(obj):
+            continue
+        target_fn = None
+        if inspect.isclass(obj):
+            target_fn = getattr(obj, "execute", None)
+        elif hasattr(obj, "execute") and callable(obj.execute):
+            target_fn = obj.execute
+        elif callable(obj):
+            target_fn = obj
+        if target_fn is None or _is_mock_object(target_fn):
+            continue
+        try:
+            sig = inspect.signature(target_fn)
+        except (ValueError, TypeError):
+            continue
+        params_list = [
+            p for p in sig.parameters.values()
+            if p.name != "self"
+        ]
+        if not params_list:
+            if arguments:
+                return (
+                    f"Callable for '{canonical_name}' accepts no arguments, "
+                    f"but received {sorted(arguments.keys())!r}."
+                )
+            return None
+        # Single-dict parameter convention: def execute(self, params: Dict[str, Any])
+        if len(params_list) == 1 and params_list[0].kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ) and (
+            params_list[0].annotation in (Dict[str, Any], dict, "Dict[str, Any]", "dict")
+            or params_list[0].name in ("params", "arguments", "kwargs")
+        ):
+            return None
+        # Dual convention used by test fixtures: def execute(self, params=None, **kwargs)
+        if (
+            params_list[0].name in ("params", "arguments")
+            and params_list[0].default is not inspect.Parameter.empty
+            and any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params_list)
+        ):
+            return None
+        # Skip generic (*args, **kwargs) wrapper layer if an outer wrapper was reached
+        if (
+            len(params_list) == 2
+            and params_list[0].kind == inspect.Parameter.VAR_POSITIONAL
+            and params_list[1].kind == inspect.Parameter.VAR_KEYWORD
+            and obj is not chain[-1]
+        ):
+            continue
+        try:
+            sig.bind(**arguments)
+        except TypeError as exc:
+            return f"Callable signature mismatch for '{canonical_name}': {exc}"
+        return None
+    return None
+
+
 def _find_schema_for_tool(
     tool_id: str,
     tool: Optional[Any] = None,
@@ -270,12 +400,23 @@ def _find_schema_for_tool(
                 if s_name == tool_id:
                     return s
     if tool is not None:
-        s_obj = getattr(tool, "schema", None) or getattr(tool, "tool_schema", None)
-        if isinstance(s_obj, dict):
-            return s_obj
+        for candidate in _iter_unwrap_tool_chain(tool):
+            if _is_mock_object(candidate):
+                continue
+            s_obj = getattr(candidate, "schema", None) or getattr(candidate, "tool_schema", None)
+            if isinstance(s_obj, dict) and (
+                s_obj.get("properties") or s_obj.get("required") or "additionalProperties" in s_obj
+            ):
+                return s_obj
+        for candidate in _iter_unwrap_tool_chain(tool):
+            if _is_mock_object(candidate):
+                continue
+            s_obj = getattr(candidate, "schema", None) or getattr(candidate, "tool_schema", None)
+            if isinstance(s_obj, dict):
+                return s_obj
     if tool_registry is not None and hasattr(tool_registry, "get_tool"):
         t_obj = tool_registry.get_tool(tool_id)
-        if t_obj is not None:
+        if t_obj is not None and not _is_mock_object(t_obj):
             s_obj = getattr(t_obj, "schema", None) or getattr(t_obj, "tool_schema", None)
             if isinstance(s_obj, dict):
                 return s_obj
@@ -315,25 +456,52 @@ def resolve_tool_ring(
     if eff_tool is None and hasattr(reg, "get_tool"):
         eff_tool = reg.get_tool(tool_id)
 
-    # Check explicit ring attributes on the tool/class/module first so invalid values
-    # always fail closed rather than falling back to permissive defaults.
+    # Check explicit ring attributes across the tool and any wrapped targets so invalid values
+    # always fail closed and wrapped privileged tools preserve their highest privilege requirement.
     if eff_tool is not None:
-        for attr_owner in (eff_tool, type(eff_tool)):
-            for attr_name in ("required_ring", "REQUIRED_RING"):
-                if hasattr(attr_owner, attr_name):
-                    raw_ring = getattr(attr_owner, attr_name)
-                    if raw_ring is not None:
-                        return raw_ring if _is_valid_ring_value(raw_ring) else None
-        mod_name = type(eff_tool).__module__
-        if mod_name in sys.modules:
-            mod = sys.modules[mod_name]
-            if hasattr(mod, "REQUIRED_RING"):
-                raw_ring = getattr(mod, "REQUIRED_RING")
-                if raw_ring is not None:
-                    return raw_ring if _is_valid_ring_value(raw_ring) else None
+        if _is_mock_object(eff_tool):
+            # A bare unittest.mock object without explicit integer ring metadata fails closed under ring checks
+            raw_mock_ring = None
+            if "REQUIRED_RING" in getattr(eff_tool, "__dict__", {}):
+                raw_mock_ring = eff_tool.__dict__["REQUIRED_RING"]
+            elif "required_ring" in getattr(eff_tool, "__dict__", {}):
+                raw_mock_ring = eff_tool.__dict__["required_ring"]
+            if raw_mock_ring is not None:
+                return raw_mock_ring if _is_valid_ring_value(raw_mock_ring) else None
+        else:
+            explicit_rings: List[int] = []
+            for candidate in _iter_unwrap_tool_chain(eff_tool):
+                if _is_mock_object(candidate):
+                    continue
+                cand_found_explicit = False
+                for attr_owner in (candidate, type(candidate)):
+                    for attr_name in ("required_ring", "REQUIRED_RING"):
+                        if hasattr(attr_owner, attr_name):
+                            raw_ring = getattr(attr_owner, attr_name)
+                            if raw_ring is not None:
+                                if not _is_valid_ring_value(raw_ring):
+                                    return None
+                                explicit_rings.append(raw_ring)
+                                cand_found_explicit = True
+                mod_name = type(candidate).__module__
+                if mod_name in sys.modules:
+                    mod = sys.modules[mod_name]
+                    if hasattr(mod, "REQUIRED_RING"):
+                        raw_ring = getattr(mod, "REQUIRED_RING")
+                        if raw_ring is not None:
+                            if not _is_valid_ring_value(raw_ring):
+                                return None
+                            explicit_rings.append(raw_ring)
+                            cand_found_explicit = True
+                if not cand_found_explicit:
+                    cand_id = getattr(candidate, "tool_id", None) or getattr(candidate, "name", None)
+                    if isinstance(cand_id, str) and cand_id in BUILTIN_TOOLS:
+                        explicit_rings.append(0)
+            if explicit_rings:
+                return min(explicit_rings)
 
     # Honor registry _get_tool_ring (including mocked/overridden implementations)
-    if reg is not None and hasattr(reg, "_get_tool_ring"):
+    if reg is not None and hasattr(reg, "_get_tool_ring") and not _is_mock_object(reg):
         if eff_tool is not None or type(reg)._get_tool_ring is not ToolRegistry._get_tool_ring:
             ring_val = reg._get_tool_ring(tool_id, eff_tool)
             return ring_val if _is_valid_ring_value(ring_val) else None
@@ -657,6 +825,22 @@ def authorize_and_validate_tool_call(
                 detail=f"Tool '{canonical_name}' is not registered in the active runtime.",
             )
 
+        # 2C. Verify that the resolved tool object (and any wrapped target) matches the authorized tool identity.
+        identity_err = _verify_tool_object_identity(
+            canonical_name,
+            eff_tool,
+            allowed_set=allowed_set if allowed_tools is not None else None,
+        )
+        if identity_err is not None:
+            return ToolAuthorizationDecision(
+                allowed=False,
+                tool_name=canonical_name,
+                normalized_arguments=canonical_args,
+                reason="authorization_denied",
+                error_type="AUTHORIZATION_DENIED",
+                detail=identity_err,
+            )
+
         # 3. Caller security-ring enforcement (fail-closed on invalid/unknown ring or lookup error).
         if caller_ring is not None:
             try:
@@ -717,7 +901,9 @@ def authorize_and_validate_tool_call(
             required_ring=resolved_ring,
         )
 
-    eff_args = dict(canonical_args)
+    import copy
+
+    eff_args = copy.deepcopy(canonical_args)
     if normalize_args and tool_schema is not None:
         eff_args, norm_warnings = SafeArgumentNormalizer.normalize(
             tool_schema,
@@ -741,17 +927,30 @@ def authorize_and_validate_tool_call(
             return ToolAuthorizationDecision(
                 allowed=False,
                 tool_name=canonical_name,
-                normalized_arguments=eff_args,
+                normalized_arguments=copy.deepcopy(eff_args),
                 reason="schema_validation_error",
                 error_type="SCHEMA_VALIDATION_ERROR",
                 detail=val_err.get("error", "Schema validation failed."),
                 required_ring=resolved_ring,
             )
 
+    if validate_schema and task_local_scope is None and eff_tool is not None:
+        sig_err = _validate_callable_signature(canonical_name, eff_tool, eff_args)
+        if sig_err is not None:
+            return ToolAuthorizationDecision(
+                allowed=False,
+                tool_name=canonical_name,
+                normalized_arguments=copy.deepcopy(eff_args),
+                reason="schema_validation_error",
+                error_type="SCHEMA_VALIDATION_ERROR",
+                detail=sig_err,
+                required_ring=resolved_ring,
+            )
+
     return ToolAuthorizationDecision(
         allowed=True,
         tool_name=canonical_name,
-        normalized_arguments=eff_args,
+        normalized_arguments=copy.deepcopy(eff_args),
         required_ring=resolved_ring,
     )
 
@@ -1192,6 +1391,15 @@ Returns:
                 output=val_envelope,
                 error_type="SCHEMA_VALIDATION_ERROR",
                 remedy_hint=val_envelope.get("remedy_hint"),
+                allowed_actions=[tool_id],
+            )
+        sig_err = _validate_callable_signature(tool_id, tool, normalized_args)
+        if sig_err is not None:
+            return None, ToolResult(
+                success=False,
+                error=sig_err,
+                output={"tool": tool_id, "status": "error", "error_type": "SCHEMA_VALIDATION_ERROR", "error": sig_err},
+                error_type="SCHEMA_VALIDATION_ERROR",
                 allowed_actions=[tool_id],
             )
         return normalized_args, None

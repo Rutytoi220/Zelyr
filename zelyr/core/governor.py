@@ -212,7 +212,30 @@ class ApprovalQueue:
 class ActionGovernor:
     """Evaluates whether an action requires explicit user approval."""
     
-    HIGH_RISK_TOOLS = {"shell", "bash", "execute_command", "file_write", "desktop_automation", "system_reboot"}
+    HIGH_RISK_TOOLS = {
+        "shell",
+        "bash",
+        "execute_command",
+        "shell_command",
+        "run_command",
+        "file_write",
+        "write_file",
+        "create_file",
+        "delete_file",
+        "move_file",
+        "rename_file",
+        "patch_file",
+        "append_file",
+        "manage_workspace_file",
+        "replace_file_content",
+        "multi_replace_file_content",
+        "craft_tool",
+        "python",
+        "python_exec",
+        "desktop_automation",
+        "desktop_control",
+        "system_reboot",
+    }
 
     def __init__(self, queue: ApprovalQueue = None):
         self.queue = queue or ApprovalQueue()

@@ -191,7 +191,12 @@ Returns:
                 properties[p.name] = {'type': p.type, 'description': p.description}
                 if p.required:
                     required.append(p.name)
-            return {'type': 'object', 'properties': properties, 'required': required}
+            return {
+                'type': 'object',
+                'properties': properties,
+                'required': required,
+                'additionalProperties': False,
+            }
         return {'type': 'object', 'properties': {}}
 
     def add_parameter(self, param: ToolParameter) -> None:

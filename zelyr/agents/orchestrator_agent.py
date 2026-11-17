@@ -71,7 +71,7 @@ Returns:
 class OrchestratorAgent(SimpleBaseAgent):
     """AI agent that uses an LLM + registered tools to accomplish tasks."""
 
-    def __init__(self, registry=None, bus=None, memory=None, llm=None, context_manager=None):
+    def __init__(self, registry=None, bus=None, memory=None, llm=None, context_manager=None, caller_ring: Optional[int] = None, allowed_tools: Optional[List[str]] = None):
         """Auto-generated docstring.
 
 Args:
@@ -96,6 +96,8 @@ Returns:
             logging.getLogger(__name__).error(f"PluginManager failed to initialize: {_pe}")
 
         self._agents = {}
+        self.caller_ring = caller_ring
+        self.allowed_tools = allowed_tools
         self._chat_history: List[Dict[str, str]] = []
         self._state = 'idle'
         self._context_manager = context_manager or ContextManager()
@@ -698,7 +700,16 @@ Returns:
                 for tc in pending_calls:
                     func = tc.get('function', {}) if isinstance(tc, dict) else {}
                     t_name = func.get('name') or tc.get('name') or ''
-                    if t_name in ('write_file', 'replace_file_content', 'multi_replace_file_content'):
+                    if t_name in (
+                        'write_file',
+                        'file_write',
+                        'create_file',
+                        'patch_file',
+                        'append_file',
+                        'manage_workspace_file',
+                        'replace_file_content',
+                        'multi_replace_file_content',
+                    ):
                         file_mutators += 1
                     if t_name == 'delete_file':
                         has_delete = True
@@ -1078,13 +1089,24 @@ Args:
 Returns:
     Return value.
 """
-        func = tc.get('function', {}) if isinstance(tc, dict) else {}
+        if not isinstance(tc, dict):
+            raise ValueError(f"Tool call entry must be a dictionary, received {type(tc).__name__}.")
+        func = tc.get('function', {})
+        if not isinstance(func, dict):
+            raise ValueError(f"Tool call 'function' field must be a dictionary, received {type(func).__name__}.")
         tool_name = func.get('name') or tc.get('name') or 'unknown'
-        arguments = func.get('arguments', tc.get('arguments', {}))
+        if 'arguments' in func:
+            arguments = func['arguments']
+        elif 'arguments' in tc:
+            arguments = tc['arguments']
+        else:
+            arguments = {}
         if isinstance(arguments, str):
             arguments = self._safe_json_obj(arguments)
         if not isinstance(arguments, dict):
-            arguments = {'input': arguments}
+            raise ValueError(
+                f"Tool arguments for '{tool_name}' must be a JSON object/dictionary, received {type(arguments).__name__}."
+            )
         tc_id = tc.get('id') or f"call_{hashlib.md5(f'{tool_name}:{json.dumps(arguments, sort_keys=True, default=str)}'.encode()).hexdigest()}"
         return (tool_name, arguments, tc_id)
 
@@ -1101,17 +1123,17 @@ Returns:
         fence = re.search('```(?:json)?\\s*(.*?)```', raw, flags=re.DOTALL | re.IGNORECASE)
         if fence:
             raw = fence.group(1).strip()
-        is_json_like = raw.startswith('{') or fence is not None
         if not raw.startswith('{'):
             match = re.search('\\{.*\\}', raw, flags=re.DOTALL)
-            raw = match.group(0) if match else raw
+            if match:
+                raw = match.group(0)
         try:
             parsed = json.loads(raw)
-            return parsed if isinstance(parsed, dict) else {'input': parsed}
         except Exception as e:
-            if is_json_like:
-                raise ValueError(str(e))
-            return {'input': text}
+            raise ValueError(str(e))
+        if not isinstance(parsed, dict):
+            raise ValueError(f"Expected JSON object for tool arguments, received {type(parsed).__name__}.")
+        return parsed
 
     def _create_plan(self, task: str) -> Plan:
         """Auto-generated docstring.
@@ -1185,56 +1207,168 @@ Returns:
     Return value.
 """
         start_time = time.perf_counter()
-        
+        import copy
+        from zelyr.tool_registry import authorize_and_validate_tool_call, canonicalize_tool_invocation
+
+        raw_arguments = arguments
+        dict_args = dict(arguments) if isinstance(arguments, dict) else {}
+        canonical_name, canonical_args = canonicalize_tool_invocation(tool_name, dict_args)
+
+        eff_tool = None
+        tool_source = None
+        active_plugins = getattr(self.plugin_manager, 'active_tools', {}) if hasattr(self, 'plugin_manager') else {}
+        if isinstance(active_plugins, dict) and canonical_name in active_plugins:
+            eff_tool = active_plugins[canonical_name]
+            tool_source = 'plugin'
+        elif self.registry is not None:
+            if hasattr(self.registry, 'get_tool') and callable(getattr(self.registry, 'get_tool', None)):
+                try:
+                    eff_tool = self.registry.get_tool(canonical_name)
+                    tool_source = 'registry_get'
+                except Exception as exc:
+                    return self._structured_tool_result(
+                        canonical_name or str(tool_name),
+                        dict_args,
+                        {
+                            'error': f"AuthorizationError: Registry lookup failed for '{canonical_name}': {exc}",
+                            'error_type': 'AUTHORIZATION_DENIED',
+                            'reason': 'authorization_denied',
+                        },
+                        False,
+                    )
+            elif hasattr(self.registry, 'list_tools') and callable(getattr(self.registry, 'list_tools', None)):
+                tools_collection = self.registry.list_tools()
+                if isinstance(tools_collection, dict):
+                    eff_tool = tools_collection.get(canonical_name) or next(
+                        (
+                            t for t in tools_collection.values()
+                            if getattr(t, 'name', None) == canonical_name or getattr(t, 'tool_id', None) == canonical_name
+                        ),
+                        None,
+                    )
+                elif isinstance(tools_collection, (list, tuple, set)):
+                    eff_tool = next(
+                        (
+                            t for t in tools_collection
+                            if getattr(t, 'name', None) == canonical_name or getattr(t, 'tool_id', None) == canonical_name
+                        ),
+                        None,
+                    )
+                tool_source = 'registry_list'
+
+        authorized_target = getattr(eff_tool, '_target', getattr(eff_tool, 'target', None)) if eff_tool is not None else None
+        authorized_execute = getattr(eff_tool, 'execute', None) if eff_tool is not None else None
+
+        fast_path_eligible = (
+            eff_tool is None
+            and self.registry is None
+            and not active_plugins
+            and canonical_name in ('desktop_control', 'mouse_click', 'keyboard_type', 'execute_action')
+            and getattr(self, 'caller_ring', None) in (None, 0)
+        )
+        if eff_tool is None and not fast_path_eligible:
+            #Still run authorize_and_validate_tool_call so allowlist/ring/argument errors report deterministically
+            decision = authorize_and_validate_tool_call(
+                canonical_name,
+                canonical_args if isinstance(raw_arguments, dict) else raw_arguments,
+                caller_ring=getattr(self, 'caller_ring', None),
+                allowed_tools=getattr(self, 'allowed_tools', None),
+                tool_registry=self.registry if (self.registry is not None and hasattr(self.registry, 'get_tool')) else None,
+                tool=None,
+                require_registered=True,
+            )
+            return self._structured_tool_result(
+                decision.tool_name or canonical_name or str(tool_name),
+                dict_args,
+                {
+                    'error': decision.detail or f"Tool '{canonical_name}' is not registered in the active runtime.",
+                    'error_type': decision.error_type or 'TOOL_NOT_FOUND',
+                    'reason': decision.reason or 'tool_unavailable',
+                },
+                False,
+            )
+
+        decision = authorize_and_validate_tool_call(
+            canonical_name,
+            canonical_args if isinstance(raw_arguments, dict) else raw_arguments,
+            caller_ring=getattr(self, 'caller_ring', None),
+            allowed_tools=getattr(self, 'allowed_tools', None),
+            tool_registry=self.registry if (self.registry is not None and hasattr(self.registry, 'get_tool')) else None,
+            tool=eff_tool,
+            require_registered=not fast_path_eligible,
+        )
+        if not decision.allowed:
+            return self._structured_tool_result(
+                decision.tool_name or canonical_name,
+                dict_args,
+                {
+                    'error': decision.detail or f"AuthorizationError: Tool '{canonical_name}' execution denied.",
+                    'error_type': decision.error_type or 'AUTHORIZATION_DENIED',
+                    'reason': decision.reason or 'authorization_denied',
+                },
+                False,
+            )
+        tool_name = decision.tool_name
+        validated_arguments = copy.deepcopy(decision.normalized_arguments)
+        arguments = copy.deepcopy(validated_arguments)
+
         # ── Approval Queue Guardrails ──────────────────────────────────────────
         from zelyr.core.governor import ActionGovernor
         from zelyr.config import get_config
-        
+
         gov = ActionGovernor()
         config = get_config()
-        
-        # We assume daemon/headless is True if we are not running a GUI or CLI prompt
-        # We can check if sys.stdin.isatty() or if we are in strict mode. 
-        # Actually, let's just assume user_present = False for the backend loop
-        user_present = False 
-        
-        is_approved, reason = self._run_coro_sync(gov.check_action(tool_name, arguments, config.auth_mode.name, user_present))
-        
+
+        user_present = False
+        gov_tool_name = tool_name
+        if eff_tool is not None:
+            for cand_attr in ('tool_id', 'name'):
+                cand_val = getattr(eff_tool, cand_attr, None)
+                if isinstance(cand_val, str) and cand_val in gov.HIGH_RISK_TOOLS:
+                    gov_tool_name = cand_val
+                    break
+
+        gov_args = copy.deepcopy(validated_arguments)
+        is_approved, reason = self._run_coro_sync(gov.check_action(gov_tool_name, gov_args, config.auth_mode.name, user_present))
+        if gov_args != validated_arguments:
+            return self._structured_tool_result(
+                tool_name,
+                validated_arguments,
+                {
+                    'error': f"AuthorizationError: Arguments for '{tool_name}' were mutated during governor check.",
+                    'error_type': 'AUTHORIZATION_DENIED',
+                    'reason': 'authorization_denied',
+                },
+                False,
+            )
+
         if not is_approved:
             self._emit('tool.queued', {'tool_name': tool_name, 'message': reason})
-            # Return a graceful tool result so the agent knows it's pending and can switch contexts
             return self._structured_tool_result(
-                tool_name, 
-                arguments, 
-                {'output': f"[ACTION DEFERRED]: {reason}. The system will execute it when the user returns. Please yield or move to another safe task."}, 
+                tool_name,
+                copy.deepcopy(validated_arguments),
+                {'output': f"[ACTION DEFERRED]: {reason}. The system will execute it when the user returns. Please yield or move to another safe task."},
                 True
             )
 
-        # ── Fastest Path CLI Router ──────────────────────────────────────────
-        try:
-            from zelyr.core.fast_path_router import FastestPathRouter
-            fast_res = FastestPathRouter.evaluate_and_intercept(tool_name, arguments)
-            if fast_res and fast_res.get("intercepted"):
-                self._emit('tool.started', {
-                    'tool_name': tool_name,
-                    'status': '⚡ Fastest Path CLI',
-                    'message': f"Routing to native CLI: {' '.join(fast_res.get('command', []))}..."
-                })
-                payload = {'output': fast_res.get('output'), 'error': None if fast_res.get('success') else fast_res.get('output')}
-                return self._structured_tool_result(tool_name, arguments, payload, fast_res.get('success', True))
-        except Exception as e:
-            logger.debug(f"FastestPathRouter check skipped: {e}")
+        # ── Fastest Path CLI Router (only when no concrete tool object was bound) ──
+        if fast_path_eligible:
+            try:
+                from zelyr.core.fast_path_router import FastestPathRouter
+                fast_res = FastestPathRouter.evaluate_and_intercept(tool_name, copy.deepcopy(validated_arguments))
+                if fast_res and fast_res.get("intercepted"):
+                    self._emit('tool.started', {
+                        'tool_name': tool_name,
+                        'status': '⚡ Fastest Path CLI',
+                        'message': f"Routing to native CLI: {' '.join(fast_res.get('command', []))}..."
+                    })
+                    payload = {'output': fast_res.get('output'), 'error': None if fast_res.get('success') else fast_res.get('output')}
+                    return self._structured_tool_result(tool_name, copy.deepcopy(validated_arguments), payload, fast_res.get('success', True))
+            except Exception as e:
+                logger.debug(f"FastestPathRouter check skipped: {e}")
 
 
         def _scrub_jargon(err_msg: str) -> str:
-            """Auto-generated docstring.
-
-Args:
-    err_msg: Argument.
-
-Returns:
-    Return value.
-"""
             if not err_msg:
                 return err_msg
             err_str = str(err_msg)
@@ -1243,10 +1377,54 @@ Returns:
             if 'PermissionError' in err_str or 'Permission denied' in err_str:
                 return "I don't have permission to access that file or folder. You might need to change its permissions."
             return err_str
+
+        # Verify authorized callable identity has not been replaced or mutated before execution
+        current_tool = None
+        if tool_source == 'plugin':
+            current_plugins = getattr(self.plugin_manager, 'active_tools', {}) if hasattr(self, 'plugin_manager') else {}
+            current_tool = current_plugins.get(canonical_name) if isinstance(current_plugins, dict) else None
+        elif tool_source == 'registry_get' and self.registry is not None and hasattr(self.registry, 'get_tool'):
+            current_tool = self.registry.get_tool(canonical_name)
+        elif tool_source == 'registry_list' and self.registry is not None and hasattr(self.registry, 'list_tools'):
+            tools_collection = self.registry.list_tools()
+            if isinstance(tools_collection, dict):
+                current_tool = tools_collection.get(canonical_name) or next(
+                    (
+                        t for t in tools_collection.values()
+                        if getattr(t, 'name', None) == canonical_name or getattr(t, 'tool_id', None) == canonical_name
+                    ),
+                    None,
+                )
+            elif isinstance(tools_collection, (list, tuple, set)):
+                current_tool = next(
+                    (
+                        t for t in tools_collection
+                        if getattr(t, 'name', None) == canonical_name or getattr(t, 'tool_id', None) == canonical_name
+                    ),
+                    None,
+                )
+
+        if (
+            eff_tool is None
+            or current_tool is not eff_tool
+            or getattr(eff_tool, '_target', getattr(eff_tool, 'target', None)) is not authorized_target
+            or getattr(eff_tool, 'execute', None) != authorized_execute
+        ):
+            return self._structured_tool_result(
+                tool_name,
+                copy.deepcopy(validated_arguments),
+                {
+                    'error': f"AuthorizationError: Authorized callable for '{tool_name}' changed or became stale before execution.",
+                    'error_type': 'AUTHORIZATION_DENIED',
+                    'reason': 'authorization_denied',
+                },
+                False,
+            )
+
         try:
-            # Emit UI Stream Integration
+            exec_args = copy.deepcopy(validated_arguments)
             if tool_name in ('file_read', 'read_file'):
-                path_arg = arguments.get('path', arguments.get('file_path', ''))
+                path_arg = exec_args.get('path', exec_args.get('file_path', ''))
                 self._emit('tool.started', {
                     'tool_name': tool_name,
                     'status': '📖 Reading Document',
@@ -1258,80 +1436,102 @@ Returns:
                     'status': 'Executing',
                     'message': f"{tool_name}..."
                 })
-                
-            async def _safe_execute(execute_callable, *args, **kwargs):
+
+            async def _invoke_authorized_tool(bound_tool: Any, kwargs_dict: Dict[str, Any]):
                 import inspect
                 import asyncio
-                if inspect.iscoroutinefunction(execute_callable):
-                    coro = execute_callable(*args, **kwargs)
-                else:
-                    coro = asyncio.to_thread(execute_callable, *args, **kwargs)
-                return await asyncio.wait_for(coro, timeout=30.0)
 
-            if hasattr(self, 'plugin_manager') and tool_name in self.plugin_manager.active_tools:
-                plugin = self.plugin_manager.active_tools[tool_name]
+                def _call_target():
+                    if hasattr(bound_tool, 'execute') and callable(bound_tool.execute):
+                        fn = bound_tool.execute
+                        try:
+                            sig = inspect.signature(fn)
+                            params_list = [p for p in sig.parameters.values() if p.name != 'self']
+                            single_dict = len(params_list) == 1 and params_list[0].kind in (
+                                inspect.Parameter.POSITIONAL_ONLY,
+                                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                            ) and (
+                                params_list[0].annotation in (Dict[str, Any], dict, 'Dict[str, Any]', 'dict')
+                                or params_list[0].name in ('params', 'arguments', 'kwargs')
+                            )
+                        except (ValueError, TypeError):
+                            single_dict = False
+                        return fn(kwargs_dict) if single_dict else fn(**kwargs_dict)
+                    return bound_tool(**kwargs_dict)
+
+                if hasattr(bound_tool, 'execute') and inspect.iscoroutinefunction(bound_tool.execute):
+                    sig = inspect.signature(bound_tool.execute)
+                    params_list = [p for p in sig.parameters.values() if p.name != 'self']
+                    single_dict = len(params_list) == 1 and params_list[0].kind in (
+                        inspect.Parameter.POSITIONAL_ONLY,
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    ) and (
+                        params_list[0].annotation in (Dict[str, Any], dict, 'Dict[str, Any]', 'dict')
+                        or params_list[0].name in ('params', 'arguments', 'kwargs')
+                    )
+                    coro = bound_tool.execute(kwargs_dict) if single_dict else bound_tool.execute(**kwargs_dict)
+                else:
+                    coro = asyncio.to_thread(_call_target)
+                res = await asyncio.wait_for(coro, timeout=30.0)
+                if asyncio.iscoroutine(res):
+                    res = await asyncio.wait_for(res, timeout=30.0)
+                return res
+
+            if tool_source == 'plugin':
                 try:
-                    result = await _safe_execute(plugin.execute, **arguments)
-                    payload = {'output': result, 'error': None}
-                    result_dict = self._structured_tool_result(tool_name, arguments, payload, True)
+                    result = await _invoke_authorized_tool(eff_tool, copy.deepcopy(validated_arguments))
+                    if hasattr(result, 'success') and hasattr(result, 'output'):
+                        raw_err = getattr(result, 'error', None)
+                        payload = {'output': getattr(result, 'output', None), 'error': _scrub_jargon(raw_err) if isinstance(raw_err, str) else raw_err}
+                        result_dict = self._structured_tool_result(tool_name, copy.deepcopy(validated_arguments), payload, bool(getattr(result, 'success', True)))
+                    else:
+                        payload = {'output': result, 'error': None}
+                        result_dict = self._structured_tool_result(tool_name, copy.deepcopy(validated_arguments), payload, True)
                 except asyncio.TimeoutError:
                     msg = f"[Plugin Crash] The tool '{tool_name}' exceeded the 30-second execution limit and was forcefully terminated."
                     logger.error(msg)
                     if hasattr(self, 'event_bus') and self.event_bus:
                         self.event_bus.publish_sync("system.alert", {"level": "error", "message": msg})
-                    result_dict = self._structured_tool_result(tool_name, arguments, {'error': msg}, False)
+                    result_dict = self._structured_tool_result(tool_name, copy.deepcopy(validated_arguments), {'error': msg}, False)
                 except Exception as e:
                     msg = f"[Plugin Crash] The tool '{tool_name}' crashed: {e}"
                     logger.error(msg)
                     if hasattr(self, 'event_bus') and self.event_bus:
                         self.event_bus.publish_sync("system.alert", {"level": "error", "message": msg})
-                    result_dict = self._structured_tool_result(tool_name, arguments, {'error': msg}, False)
-            elif self.registry and hasattr(self.registry, 'execute') and (hasattr(self.registry, 'has_tool') and self.registry.has_tool(tool_name) or True):
-                # Try core registry execute
+                    result_dict = self._structured_tool_result(tool_name, copy.deepcopy(validated_arguments), {'error': msg}, False)
+            else:
                 try:
-                    tool_result = await _safe_execute(self.registry.execute, tool_name, **arguments)
-                    raw_error = getattr(tool_result, 'error', None)
-                    error = _scrub_jargon(raw_error) if isinstance(raw_error, str) else None
-                    payload = {'output': getattr(tool_result, 'output', None), 'error': error}
-                    result_dict = self._structured_tool_result(tool_name, arguments, payload, bool(getattr(tool_result, 'success', False)))
+                    if hasattr(self.registry, '_pre_validate_path') and callable(getattr(self.registry, '_pre_validate_path', None)):
+                        val_err = self.registry._pre_validate_path(getattr(eff_tool, 'tool_id', None) or tool_name, copy.deepcopy(validated_arguments))
+                        if val_err is not None:
+                            raw_error = getattr(val_err, 'error', None)
+                            error = _scrub_jargon(raw_error) if isinstance(raw_error, str) else None
+                            payload = {'output': getattr(val_err, 'output', None), 'error': error}
+                            result_dict = self._structured_tool_result(tool_name, copy.deepcopy(validated_arguments), payload, False)
+                            return result_dict
+                    result = await _invoke_authorized_tool(eff_tool, copy.deepcopy(validated_arguments))
+                    if isinstance(result, dict) and {'tool', 'arguments', 'result', 'success'}.issubset(result.keys()):
+                        if 'error' in result.get('result', {}):
+                            result['result']['error'] = _scrub_jargon(result['result']['error'])
+                        result_dict = result
+                    elif hasattr(result, 'success') and (hasattr(result, 'output') or hasattr(result, 'error')):
+                        raw_err = getattr(result, 'error', None)
+                        payload = {'output': getattr(result, 'output', None), 'error': _scrub_jargon(raw_err) if isinstance(raw_err, str) else raw_err}
+                        result_dict = self._structured_tool_result(tool_name, copy.deepcopy(validated_arguments), payload, bool(getattr(result, 'success', False)))
+                    else:
+                        payload = {'output': result, 'error': None}
+                        result_dict = self._structured_tool_result(tool_name, copy.deepcopy(validated_arguments), payload, True)
                 except asyncio.TimeoutError:
                     msg = f"[Tool Crash] The tool '{tool_name}' exceeded the 30-second execution limit."
                     logger.error(msg)
-                    result_dict = self._structured_tool_result(tool_name, arguments, {'error': msg}, False)
-                except KeyError:
-                    # fallback to older execute flow
-                    result_dict = self._structured_tool_result(tool_name, arguments, {'error': f'Tool not found: {tool_name}'}, False)
+                    result_dict = self._structured_tool_result(tool_name, copy.deepcopy(validated_arguments), {'error': msg}, False)
                 except Exception as e:
                     msg = f"[Tool Crash] The tool '{tool_name}' crashed: {e}"
                     logger.error(msg)
-                    result_dict = self._structured_tool_result(tool_name, arguments, {'error': msg}, False)
-            else:
-                tools = self.registry.list_tools() if self.registry and hasattr(self.registry, 'list_tools') else {}
-                tool = tools.get(tool_name) or next((t for t in tools.values() if getattr(t, 'name', None) == tool_name), None)
-                if not tool:
-                    result_dict = self._structured_tool_result(tool_name, arguments, {'error': f'Tool not found: {tool_name}'}, False)
-                else:
-                    try:
-                        result = await _safe_execute(tool.execute, arguments)
-                        if isinstance(result, dict) and {'tool', 'arguments', 'result', 'success'}.issubset(result.keys()):
-                            if 'error' in result.get('result', {}):
-                                result['result']['error'] = _scrub_jargon(result['result']['error'])
-                            result_dict = result
-                        else:
-                            raw_err = getattr(result, 'error', None)
-                            payload = {'output': getattr(result, 'output', result), 'error': _scrub_jargon(raw_err) if isinstance(raw_err, str) else raw_err}
-                            result_dict = self._structured_tool_result(tool_name, arguments, payload, bool(getattr(result, 'success', True)))
-                    except asyncio.TimeoutError:
-                        msg = f"[Tool Crash] The tool '{tool_name}' exceeded the 30-second execution limit."
-                        logger.error(msg)
-                        result_dict = self._structured_tool_result(tool_name, arguments, {'error': msg}, False)
-                    except Exception as e:
-                        msg = f"[Tool Crash] The tool '{tool_name}' crashed: {e}"
-                        logger.error(msg)
-                        result_dict = self._structured_tool_result(tool_name, arguments, {'error': msg}, False)
+                    result_dict = self._structured_tool_result(tool_name, copy.deepcopy(validated_arguments), {'error': msg}, False)
         except Exception as exc:
             err_msg = _scrub_jargon(str(exc))
-            result_dict = self._structured_tool_result(tool_name, arguments, {'error': f'Tool Execution Failed: {err_msg}'}, False)
+            result_dict = self._structured_tool_result(tool_name, copy.deepcopy(validated_arguments), {'error': f'Tool Execution Failed: {err_msg}'}, False)
             
         out_str = result_dict.get('result', {}).get('output')
         if isinstance(out_str, str) and out_str.startswith("SCREENSHOT_BASE64:"):
