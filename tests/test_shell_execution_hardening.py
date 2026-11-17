@@ -34,8 +34,10 @@ class TestNonInteractiveEnvironmentGuards:
     """Tests verifying non-interactive defaults in execute_command."""
 
     @pytest.mark.asyncio
-    async def test_non_interactive_env_variables_injected(self):
+    async def test_non_interactive_env_variables_injected(self, monkeypatch):
         """Execute printenv and assert PAGER, TERM, DEBIAN_FRONTEND, CI, and PYTHONUNBUFFERED are set."""
+        # Ensure CI is absent from inherited environment so default CI=1 is injected
+        monkeypatch.delenv("CI", raising=False)
         cmd = (
             "python3 -c '"
             "import os; "
@@ -54,6 +56,21 @@ class TestNonInteractiveEnvironmentGuards:
         assert "DEBIAN_FRONTEND=noninteractive" in result
         assert "CI=1" in result
         assert "PYTHONUNBUFFERED=1" in result
+
+    @pytest.mark.asyncio
+    async def test_existing_ci_env_variable_is_preserved(self, monkeypatch):
+        """When CI already exists in the environment (e.g. CI=true in GitHub Actions), its value is preserved."""
+        cmd = "python3 -c 'import os; print(\"CI=\" + str(os.environ.get(\"CI\")))'"
+
+        monkeypatch.setenv("CI", "true")
+        result_true = await execute_tool("execute_command", command=cmd)
+        assert "Exit code 0" in result_true
+        assert "CI=true" in result_true
+
+        monkeypatch.setenv("CI", "custom_ci_runner")
+        result_custom = await execute_tool("execute_command", command=cmd)
+        assert "Exit code 0" in result_custom
+        assert "CI=custom_ci_runner" in result_custom
 
 
 class TestStdinIsolation:

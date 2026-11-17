@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from typing import Any, Dict
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -242,9 +243,35 @@ class TestToolRegistryValidationIntegration:
     def test_registry_execute_coerces_valid_string_types(self):
         reg = ToolRegistry()
         # manage_desktop_window has verify (boolean)
-        result = reg.execute("manage_desktop_window", action="list", verify="true")
-        assert isinstance(result, ToolResult)
-        assert result.success
+        # Mock external Hyprland IPC execution boundary to isolate argument normalization from host compositor availability
+        with patch("zelyr.tools.hyprland_ipc._handle_window_action", new_callable=AsyncMock) as mock_handle:
+            with patch("shutil.which", return_value="/usr/bin/hyprctl"):
+                mock_handle.return_value = {"status": "success", "action": "list", "clients": []}
+
+                # 1. String "true" is normalized to boolean True and passed to execution boundary
+                result = reg.execute("manage_desktop_window", action="list", verify="true")
+                assert isinstance(result, ToolResult)
+                assert result.success
+                mock_handle.assert_called_once()
+                _, kwargs = mock_handle.call_args
+                assert kwargs["verify"] is True
+                assert type(kwargs["verify"]) is bool
+
+                # 2. String "false" is normalized to boolean False
+                mock_handle.reset_mock()
+                result_false = reg.execute("manage_desktop_window", action="list", verify="false")
+                assert result_false.success
+                _, kwargs_false = mock_handle.call_args
+                assert kwargs_false["verify"] is False
+                assert type(kwargs_false["verify"]) is bool
+
+                # 3. Invalid boolean string fails closed before execution boundary
+                mock_handle.reset_mock()
+                result_invalid = reg.execute("manage_desktop_window", action="list", verify="uncoercible_bool")
+                assert isinstance(result_invalid, ToolResult)
+                assert not result_invalid.success
+                assert result_invalid.metadata.get("error_type") == "SCHEMA_VALIDATION_ERROR"
+                assert mock_handle.call_count == 0
 
     @pytest.mark.asyncio
     async def test_registry_execute_async_halts_on_missing_required_argument(self):
