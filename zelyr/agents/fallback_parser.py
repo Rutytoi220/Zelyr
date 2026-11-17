@@ -89,6 +89,8 @@ class FallbackToolParser:
         active_schemas: Optional[List[Dict[str, Any]]] = None,
         caller_ring: Optional[int] = None,
         allowed_tools: Optional[Iterable[str]] = None,
+        tool_registry: Optional[Any] = None,
+        task_local_scope: Optional[Any] = None,
     ) -> Optional[Tuple[str, Dict[str, Any]]]:
         """Validate candidate tool name and arguments against known tools and ring permissions."""
         clean_name = cls._strip_tool_prefixes(raw_name)
@@ -98,7 +100,16 @@ class FallbackToolParser:
         alias_map = cls.get_alias_map()
         canonical_name = alias_map.get(clean_name, clean_name)
 
-        effective_known = known_tools if known_tools is not None else cls.get_known_tool_names(active_schemas)
+        from zelyr.tool_registry import (
+            TaskLocalToolScope,
+            authorize_and_validate_tool_call,
+            canonicalize_tool_invocation,
+        )
+
+        if isinstance(task_local_scope, TaskLocalToolScope):
+            effective_known = known_tools if known_tools is not None else task_local_scope.get_known_tools()
+        else:
+            effective_known = known_tools if known_tools is not None else cls.get_known_tool_names(active_schemas)
 
         # Discard if tool does not resolve to a known registered tool
         if effective_known and canonical_name not in effective_known and clean_name not in effective_known:
@@ -129,8 +140,6 @@ class FallbackToolParser:
 
         # Canonicalize alias rewrites (e.g., interact_with_ui with browser DOM params -> interact_with_browser)
         # BEFORE allowlist, ring, and schema normalization checks.
-        from zelyr.tool_registry import authorize_and_validate_tool_call, canonicalize_tool_invocation
-
         target_name, args_dict = canonicalize_tool_invocation(target_name, args_dict)
 
         # Normalize arguments via NativeOrchestrator if available
@@ -153,8 +162,10 @@ class FallbackToolParser:
             caller_ring=caller_ring,
             allowed_tools=allowed_tools,
             active_schemas=active_schemas,
+            tool_registry=tool_registry,
             known_tools=effective_known if effective_known else None,
-            require_registered=(known_tools is None),
+            task_local_scope=task_local_scope,
+            require_registered=(known_tools is None and task_local_scope is None),
             normalize_args=False,
             validate_schema=False,
         )
@@ -284,6 +295,8 @@ class FallbackToolParser:
         max_calls: Optional[int] = None,
         caller_ring: Optional[int] = None,
         allowed_tools: Optional[Iterable[str]] = None,
+        tool_registry: Optional[Any] = None,
+        task_local_scope: Optional[Any] = None,
     ) -> List[ExtractedToolCall]:
         """Extract up to max_calls valid tool calls from degraded model text.
 
@@ -421,6 +434,8 @@ class FallbackToolParser:
                     active_schemas=active_schemas,
                     caller_ring=caller_ring,
                     allowed_tools=allowed_tools,
+                    tool_registry=tool_registry,
+                    task_local_scope=task_local_scope,
                 )
                 if norm_res is not None:
                     canonical_name, normalized_args = norm_res

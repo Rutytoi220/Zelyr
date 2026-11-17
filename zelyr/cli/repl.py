@@ -1002,11 +1002,34 @@ class InlineRepl:
             if in_think:
                 end_thought()
 
+            from zelyr.tool_registry import authorize_and_validate_tool_call, canonicalize_tool_invocation
+
+            raw_name = name
             name = NativeOrchestrator.normalize_tool_name(name)
-            # Automatic guardrail: prevent Tier 3 regression on browser elements
-            if name == "interact_with_ui" and ("element_id" in kwargs or kwargs.get("action") in ("click_element", "fill_element")):
+            name, kwargs = canonicalize_tool_invocation(name, kwargs)
+            if name == "interact_with_browser" and raw_name == "interact_with_ui":
                 console.print(f"\n  [dim yellow]⚡ Tier Route Correction:[/dim yellow] Redirecting 'interact_with_ui' with element_id to Tier 2 'interact_with_browser'")
-                name = "interact_with_browser"
+            kwargs = NativeOrchestrator.normalize_tool_arguments(
+                name, kwargs, original_name=raw_name, active_schemas=payload.get("tools")
+            )
+            decision = authorize_and_validate_tool_call(
+                name,
+                kwargs,
+                caller_ring=getattr(nat_orch, "caller_ring", None),
+                allowed_tools=getattr(nat_orch, "allowed_tools", None),
+                active_schemas=payload.get("tools"),
+                tool_registry=getattr(nat_orch, "tool_registry", None),
+                validate_schema=False,
+            )
+            if not decision.allowed:
+                return json.dumps({
+                    "success": False,
+                    "error": decision.detail,
+                    "error_type": decision.error_type or "AUTHORIZATION_DENIED",
+                    "reason": decision.reason or "authorization_denied",
+                })
+            name = decision.tool_name
+            kwargs = decision.normalized_arguments
 
             hint = f"Executing {name}..."
             console.print(f"\n  [tool.badge]⚡ Tool Dispatch:[/tool.badge] [tool.name]{name}[/tool.name] [dim]{json.dumps(kwargs)}[/dim]")

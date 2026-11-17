@@ -1076,10 +1076,18 @@ async def execute_tool(
     allowed_tools: Optional[Any] = None,
     **kwargs,
 ) -> str:
+    from zelyr.tool_registry import authorize_and_validate_tool_call, get_active_task_local_scope
+
+    if get_active_task_local_scope() is not None:
+        return json.dumps({
+            "success": False,
+            "error": "AuthorizationError: Isolated task-local test executor cannot access production plugin registry.",
+            "error_type": "AUTHORIZATION_DENIED",
+            "reason": "authorization_denied",
+        })
+
     if not _executors:
         load_plugins()
-
-    from zelyr.tool_registry import authorize_and_validate_tool_call
 
     decision = authorize_and_validate_tool_call(
         name,

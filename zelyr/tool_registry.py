@@ -26,10 +26,12 @@ vice-versa.  When no ``core_registry`` is provided, an isolated instance
 is created for backwards compatibility.
 """
 from __future__ import annotations
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from zelyr.compat import config_dir
 import threading
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from zelyr.tools.core import BaseTool, ToolResult
 
 
@@ -49,6 +51,177 @@ class ToolAuthorizationDecision:
 def _is_valid_ring_value(val: Any) -> bool:
     """Return True only for integer security rings in [0, 3] (excluding booleans)."""
     return isinstance(val, int) and not isinstance(val, bool) and 0 <= val <= 3
+
+
+@dataclass(frozen=True)
+class TaskLocalToolScope:
+    """Explicit, isolated test/evaluation tool scope for task-local mock executors.
+
+    Task-local test executors operate in a sealed sandbox disconnected from
+    production ToolRegistry and global zelyr.core.plugins registrations.
+    Only tools explicitly declared in ``tool_names``, ``tool_schemas``, or
+    discovered in ``tools_dir`` are recognized as registered within the scope.
+    """
+
+    tool_names: Tuple[str, ...] = ()
+    tool_schemas: Tuple[Dict[str, Any], ...] = ()
+    tools_dir: Optional[Any] = None
+    tool_rings: Optional[Dict[str, int]] = None
+
+    def __init__(
+        self,
+        tool_names: Iterable[str] = (),
+        tool_schemas: Iterable[Dict[str, Any]] = (),
+        tools_dir: Optional[Any] = None,
+        tool_rings: Optional[Dict[str, int]] = None,
+    ) -> None:
+        if isinstance(tool_names, (str, bytes, dict)) or not isinstance(tool_names, Iterable):
+            raise ValueError("TaskLocalToolScope.tool_names must be an iterable of tool name strings.")
+        cleaned_names: List[str] = []
+        for n in tool_names:
+            if not isinstance(n, str) or not n.strip():
+                raise ValueError("TaskLocalToolScope.tool_names entries must be non-empty strings.")
+            cleaned_names.append(n.strip())
+
+        if isinstance(tool_schemas, (str, bytes, dict)) or not isinstance(tool_schemas, Iterable):
+            raise ValueError("TaskLocalToolScope.tool_schemas must be an iterable of schema dicts.")
+        cleaned_schemas: List[Dict[str, Any]] = []
+        for s in tool_schemas:
+            if not isinstance(s, dict):
+                raise ValueError("TaskLocalToolScope.tool_schemas entries must be dicts.")
+            cleaned_schemas.append(s)
+
+        cleaned_rings: Optional[Dict[str, int]] = None
+        if tool_rings is not None:
+            if not isinstance(tool_rings, dict):
+                raise ValueError("TaskLocalToolScope.tool_rings must be a dict mapping tool names to integer rings.")
+            cleaned_rings = dict(tool_rings)
+
+        object.__setattr__(self, "tool_names", tuple(cleaned_names))
+        object.__setattr__(self, "tool_schemas", tuple(cleaned_schemas))
+        object.__setattr__(self, "tools_dir", tools_dir)
+        object.__setattr__(self, "tool_rings", cleaned_rings)
+
+    def get_known_tools(self) -> set[str]:
+        """Return the set of tool names declared in this isolated task-local scope."""
+        names: set[str] = set(self.tool_names)
+        for s in self.tool_schemas:
+            if isinstance(s, dict):
+                fn = s.get("function")
+                s_name = fn.get("name") if isinstance(fn, dict) else s.get("name")
+                if isinstance(s_name, str) and s_name.strip():
+                    names.add(s_name.strip())
+        if self.tools_dir is not None:
+            from pathlib import Path
+
+            try:
+                td = Path(self.tools_dir)
+                if td.is_dir():
+                    for p in td.glob("*.py"):
+                        if p.is_file() and not p.name.startswith("_"):
+                            names.add(p.stem)
+            except Exception:
+                pass
+        return names
+
+    def find_schema(
+        self,
+        tool_id: str,
+        active_schemas: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Locate schema strictly within task-local schemas (never consulting production registries)."""
+        for pool in (active_schemas or (), self.tool_schemas):
+            for s in pool:
+                if isinstance(s, dict):
+                    fn = s.get("function")
+                    s_name = fn.get("name") if isinstance(fn, dict) else s.get("name")
+                    if s_name == tool_id:
+                        return s
+        return None
+
+    def resolve_ring(
+        self,
+        tool_id: str,
+        active_schemas: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[int]:
+        """Resolve security ring strictly within task-local metadata (never consulting production registries)."""
+        if self.tool_rings is not None and tool_id in self.tool_rings:
+            raw_ring = self.tool_rings[tool_id]
+            return raw_ring if _is_valid_ring_value(raw_ring) else None
+        for pool in (active_schemas or (), self.tool_schemas):
+            for s in pool:
+                if not isinstance(s, dict):
+                    continue
+                fn = s.get("function") if isinstance(s.get("function"), dict) else {}
+                s_name = fn.get("name") or s.get("name")
+                if s_name == tool_id:
+                    for src in (fn, s):
+                        for key in ("required_ring", "ring"):
+                            if key in src and src[key] is not None:
+                                return src[key] if _is_valid_ring_value(src[key]) else None
+        return None
+
+
+_ACTIVE_TASK_LOCAL_SCOPE: ContextVar[Optional[TaskLocalToolScope]] = ContextVar(
+    "_ACTIVE_TASK_LOCAL_SCOPE",
+    default=None,
+)
+
+
+@contextmanager
+def activate_task_local_scope(scope: Optional[TaskLocalToolScope]):
+    """Bind an active TaskLocalToolScope for the duration of a task-local test executor call."""
+    if scope is None:
+        yield
+        return
+    token = _ACTIVE_TASK_LOCAL_SCOPE.set(scope)
+    try:
+        yield
+    finally:
+        _ACTIVE_TASK_LOCAL_SCOPE.reset(token)
+
+
+def get_active_task_local_scope() -> Optional[TaskLocalToolScope]:
+    """Return the active TaskLocalToolScope if running inside an isolated test executor."""
+    return _ACTIVE_TASK_LOCAL_SCOPE.get()
+
+
+def bind_task_local_executor(
+    executor: Callable[..., Any],
+    *,
+    tool_names: Iterable[str] = (),
+    tool_schemas: Iterable[Dict[str, Any]] = (),
+    tools_dir: Optional[Any] = None,
+    tool_rings: Optional[Dict[str, int]] = None,
+) -> Callable[..., Any]:
+    """Attach an explicit TaskLocalToolScope to a task-local test executor callable."""
+    if not callable(executor):
+        raise ValueError("Task-local executor must be callable.")
+    scope = TaskLocalToolScope(
+        tool_names=tool_names,
+        tool_schemas=tool_schemas,
+        tools_dir=tools_dir,
+        tool_rings=tool_rings,
+    )
+    import functools
+    import inspect
+
+    if inspect.iscoroutinefunction(executor):
+        @functools.wraps(executor)
+        async def _async_wrapped(*args: Any, **kwargs: Any) -> Any:
+            with activate_task_local_scope(scope):
+                return await executor(*args, **kwargs)
+
+        setattr(_async_wrapped, "_task_local_tool_scope", scope)
+        return _async_wrapped
+
+    @functools.wraps(executor)
+    def _sync_wrapped(*args: Any, **kwargs: Any) -> Any:
+        with activate_task_local_scope(scope):
+            return executor(*args, **kwargs)
+
+    setattr(_sync_wrapped, "_task_local_tool_scope", scope)
+    return _sync_wrapped
 
 
 _TOOL_REGISTRY_ALIASES: Dict[str, str] = {
@@ -209,6 +382,7 @@ def authorize_and_validate_tool_call(
     tool_registry: Optional[Any] = None,
     tool: Optional[Any] = None,
     known_tools: Optional[Iterable[str]] = None,
+    task_local_scope: Optional[Any] = None,
     require_registered: bool = True,
     normalize_args: bool = True,
     validate_schema: bool = True,
@@ -230,9 +404,60 @@ def authorize_and_validate_tool_call(
             detail="Empty tool name rejected.",
         )
 
+    # 0. Validate authorization metadata upfront (fail closed on malformed/conflicting metadata).
+    if task_local_scope is not None:
+        if not isinstance(task_local_scope, TaskLocalToolScope):
+            return ToolAuthorizationDecision(
+                allowed=False,
+                tool_name=canonical_name,
+                normalized_arguments=canonical_args,
+                reason="authorization_denied",
+                error_type="AUTHORIZATION_DENIED",
+                detail="AuthorizationError: Invalid task_local_scope metadata.",
+            )
+        if tool_registry is not None or tool is not None:
+            return ToolAuthorizationDecision(
+                allowed=False,
+                tool_name=canonical_name,
+                normalized_arguments=canonical_args,
+                reason="authorization_denied",
+                error_type="AUTHORIZATION_DENIED",
+                detail="AuthorizationError: Isolated task-local test scope cannot access or combine with a production tool_registry.",
+            )
+
+    if caller_ring is not None and not _is_valid_ring_value(caller_ring):
+        return ToolAuthorizationDecision(
+            allowed=False,
+            tool_name=canonical_name,
+            normalized_arguments=canonical_args,
+            reason="authorization_denied",
+            error_type="AUTHORIZATION_DENIED",
+            detail=f"AuthorizationError: Invalid caller_ring {caller_ring!r}.",
+        )
+
     # 1. Explicit tool allowlist enforcement (evaluated on canonical target name).
     if allowed_tools is not None:
-        allowed_set = {str(t) for t in allowed_tools if isinstance(t, str)}
+        if isinstance(allowed_tools, (str, bytes, dict)) or not isinstance(allowed_tools, Iterable):
+            return ToolAuthorizationDecision(
+                allowed=False,
+                tool_name=canonical_name,
+                normalized_arguments=canonical_args,
+                reason="authorization_denied",
+                error_type="AUTHORIZATION_DENIED",
+                detail="AuthorizationError: Invalid allowed_tools metadata.",
+            )
+        allowed_set: set[str] = set()
+        for item in allowed_tools:
+            if not isinstance(item, str) or not item.strip():
+                return ToolAuthorizationDecision(
+                    allowed=False,
+                    tool_name=canonical_name,
+                    normalized_arguments=canonical_args,
+                    reason="authorization_denied",
+                    error_type="AUTHORIZATION_DENIED",
+                    detail="AuthorizationError: Invalid allowed_tools entry.",
+                )
+            allowed_set.add(item.strip())
         if canonical_name not in allowed_set:
             return ToolAuthorizationDecision(
                 allowed=False,
@@ -243,38 +468,65 @@ def authorize_and_validate_tool_call(
                 detail=f"AuthorizationError: Tool '{canonical_name}' is not in allowed tools list.",
             )
 
-    # 2. Known/registered tool check (registration != permission, but unknown tools cannot run).
-    reg = tool_registry if tool_registry is not None else ToolRegistry()
-    eff_tool = tool
-    if (
-        eff_tool is None
-        and (tool_registry is not None or require_registered)
-        and hasattr(reg, "get_tool")
-    ):
-        eff_tool = reg.get_tool(canonical_name)
-
-    from zelyr.core.plugins import _executors, _rings, _schemas, load_plugins
-
-    if not _executors and not _schemas and not _rings:
-        load_plugins()
-
+    active_schemas_list: Optional[List[Dict[str, Any]]] = None
     schema_names: set[str] = set()
-    if active_schemas:
+    if active_schemas is not None:
+        if isinstance(active_schemas, (str, bytes, dict)) or not isinstance(active_schemas, Iterable):
+            return ToolAuthorizationDecision(
+                allowed=False,
+                tool_name=canonical_name,
+                normalized_arguments=canonical_args,
+                reason="authorization_denied",
+                error_type="AUTHORIZATION_DENIED",
+                detail="AuthorizationError: Invalid active_schemas metadata.",
+            )
+        active_schemas_list = []
         for s in active_schemas:
-            if isinstance(s, dict):
-                fn = s.get("function")
-                s_name = fn.get("name") if isinstance(fn, dict) else s.get("name")
-                if isinstance(s_name, str) and s_name:
-                    schema_names.add(s_name)
-
-    plugin_names = set(_executors.keys()) | {
-        (s.get("function", {}).get("name") or s.get("name"))
-        for s in _schemas
-        if isinstance(s, dict)
-    }
+            if not isinstance(s, dict):
+                return ToolAuthorizationDecision(
+                    allowed=False,
+                    tool_name=canonical_name,
+                    normalized_arguments=canonical_args,
+                    reason="authorization_denied",
+                    error_type="AUTHORIZATION_DENIED",
+                    detail="AuthorizationError: Malformed tool schema in active_schemas.",
+                )
+            fn = s.get("function")
+            s_name = fn.get("name") if isinstance(fn, dict) else s.get("name")
+            if not isinstance(s_name, str) or not s_name.strip():
+                return ToolAuthorizationDecision(
+                    allowed=False,
+                    tool_name=canonical_name,
+                    normalized_arguments=canonical_args,
+                    reason="authorization_denied",
+                    error_type="AUTHORIZATION_DENIED",
+                    detail="AuthorizationError: Malformed tool schema missing valid tool name.",
+                )
+            active_schemas_list.append(s)
+            schema_names.add(s_name.strip())
 
     if known_tools is not None:
-        known_set = {str(k) for k in known_tools if isinstance(k, str)}
+        if isinstance(known_tools, (str, bytes, dict)) or not isinstance(known_tools, Iterable):
+            return ToolAuthorizationDecision(
+                allowed=False,
+                tool_name=canonical_name,
+                normalized_arguments=canonical_args,
+                reason="authorization_denied",
+                error_type="AUTHORIZATION_DENIED",
+                detail="AuthorizationError: Invalid known_tools metadata.",
+            )
+        known_set: set[str] = set()
+        for k in known_tools:
+            if not isinstance(k, str) or not k.strip():
+                return ToolAuthorizationDecision(
+                    allowed=False,
+                    tool_name=canonical_name,
+                    normalized_arguments=canonical_args,
+                    reason="authorization_denied",
+                    error_type="AUTHORIZATION_DENIED",
+                    detail="AuthorizationError: Invalid known_tools entry.",
+                )
+            known_set.add(k.strip())
         if canonical_name not in known_set:
             return ToolAuthorizationDecision(
                 allowed=False,
@@ -285,81 +537,174 @@ def authorize_and_validate_tool_call(
                 detail=f"Tool '{canonical_name}' is not available in the active runtime manifest.",
             )
 
-    is_registered_or_schema_known = bool(
-        eff_tool is not None
-        or canonical_name in plugin_names
-        or canonical_name in BUILTIN_TOOLS
-        or canonical_name in SWARM_TOOLS
-        or canonical_name in schema_names
-    )
-    if require_registered and not is_registered_or_schema_known:
-        return ToolAuthorizationDecision(
-            allowed=False,
-            tool_name=canonical_name,
-            normalized_arguments=canonical_args,
-            reason="tool_unavailable",
-            error_type="TOOL_NOT_FOUND",
-            detail=f"Tool '{canonical_name}' is not registered in the active runtime.",
-        )
-
-    # 3. Caller security-ring enforcement (fail-closed on invalid/unknown ring or lookup error).
     resolved_ring: Optional[int] = None
-    if caller_ring is not None:
-        if not _is_valid_ring_value(caller_ring):
+    tool_schema: Optional[Dict[str, Any]] = None
+
+    # 2A. Isolated Task-Local Test Scope (strictly disconnected from production registries).
+    if task_local_scope is not None:
+        scope_known = task_local_scope.get_known_tools()
+        if canonical_name not in scope_known:
+            return ToolAuthorizationDecision(
+                allowed=False,
+                tool_name=canonical_name,
+                normalized_arguments=canonical_args,
+                reason="tool_unavailable",
+                error_type="TOOL_NOT_FOUND",
+                detail=f"Tool '{canonical_name}' is not registered in the isolated task-local test scope.",
+            )
+        if caller_ring is not None:
+            resolved_ring = task_local_scope.resolve_ring(canonical_name, active_schemas=active_schemas_list)
+            if resolved_ring is None:
+                return ToolAuthorizationDecision(
+                    allowed=False,
+                    tool_name=canonical_name,
+                    normalized_arguments=canonical_args,
+                    reason="authorization_denied",
+                    error_type="AUTHORIZATION_DENIED",
+                    detail=f"AuthorizationError: Unknown or invalid security ring for task-local tool '{canonical_name}'.",
+                )
+            if caller_ring > resolved_ring:
+                return ToolAuthorizationDecision(
+                    allowed=False,
+                    tool_name=canonical_name,
+                    normalized_arguments=canonical_args,
+                    reason="authorization_denied",
+                    error_type="AUTHORIZATION_DENIED",
+                    detail=(
+                        f"AuthorizationError: Tool '{canonical_name}' requires higher permissions "
+                        f"(requires ring {resolved_ring}, caller ring is {caller_ring})."
+                    ),
+                    required_ring=resolved_ring,
+                )
+        tool_schema = task_local_scope.find_schema(canonical_name, active_schemas=active_schemas_list)
+    else:
+        # 2B. Production Execution Boundary (must resolve against authoritative registry/plugins/schemas).
+        active_test_scope = get_active_task_local_scope()
+        if active_test_scope is not None:
+            is_local_reg_tool = (
+                tool_registry is not None
+                and hasattr(tool_registry, "_core_registry")
+                and (
+                    tool_registry._core_registry.has_tool(canonical_name)
+                    or canonical_name == "echo"
+                )
+            )
+            if not is_local_reg_tool:
+                return ToolAuthorizationDecision(
+                    allowed=False,
+                    tool_name=canonical_name,
+                    normalized_arguments=canonical_args,
+                    reason="authorization_denied",
+                    error_type="AUTHORIZATION_DENIED",
+                    detail="AuthorizationError: Isolated task-local test executor cannot access production tool registries.",
+                )
+
+        if tool_registry is not None and (
+            not hasattr(tool_registry, "get_tool") or not callable(getattr(tool_registry, "get_tool", None))
+        ):
             return ToolAuthorizationDecision(
                 allowed=False,
                 tool_name=canonical_name,
                 normalized_arguments=canonical_args,
                 reason="authorization_denied",
                 error_type="AUTHORIZATION_DENIED",
-                detail=f"AuthorizationError: Invalid caller_ring {caller_ring!r}.",
-            )
-        try:
-            resolved_ring = resolve_tool_ring(
-                canonical_name,
-                tool=eff_tool,
-                tool_registry=reg,
-                active_schemas=active_schemas,
-            )
-        except Exception as exc:
-            return ToolAuthorizationDecision(
-                allowed=False,
-                tool_name=canonical_name,
-                normalized_arguments=canonical_args,
-                reason="authorization_denied",
-                error_type="AUTHORIZATION_DENIED",
-                detail=f"AuthorizationError: Ring lookup failed for '{canonical_name}': {exc}",
-            )
-        if resolved_ring is None:
-            return ToolAuthorizationDecision(
-                allowed=False,
-                tool_name=canonical_name,
-                normalized_arguments=canonical_args,
-                reason="authorization_denied",
-                error_type="AUTHORIZATION_DENIED",
-                detail=f"AuthorizationError: Unknown or invalid security ring for tool '{canonical_name}'.",
-            )
-        if caller_ring > resolved_ring:
-            return ToolAuthorizationDecision(
-                allowed=False,
-                tool_name=canonical_name,
-                normalized_arguments=canonical_args,
-                reason="authorization_denied",
-                error_type="AUTHORIZATION_DENIED",
-                detail=(
-                    f"AuthorizationError: Tool '{canonical_name}' requires higher permissions "
-                    f"(requires ring {resolved_ring}, caller ring is {caller_ring})."
-                ),
-                required_ring=resolved_ring,
+                detail="AuthorizationError: Invalid tool_registry metadata.",
             )
 
-    # 4. Schema-backed normalization and argument validation.
-    tool_schema = _find_schema_for_tool(
-        canonical_name,
-        tool=eff_tool,
-        tool_registry=reg if (tool_registry is not None or require_registered) else None,
-        active_schemas=active_schemas,
-    )
+        reg = tool_registry if tool_registry is not None else ToolRegistry()
+        eff_tool = tool
+        if eff_tool is None and (tool_registry is not None or require_registered):
+            try:
+                eff_tool = reg.get_tool(canonical_name)
+            except Exception as exc:
+                return ToolAuthorizationDecision(
+                    allowed=False,
+                    tool_name=canonical_name,
+                    normalized_arguments=canonical_args,
+                    reason="authorization_denied",
+                    error_type="AUTHORIZATION_DENIED",
+                    detail=f"AuthorizationError: Registry lookup failed for '{canonical_name}': {exc}",
+                )
+
+        if tool_registry is not None:
+            is_registered_or_schema_known = bool(eff_tool is not None)
+        else:
+            from zelyr.core.plugins import _executors, _rings, _schemas, load_plugins
+
+            if not _executors and not _schemas and not _rings:
+                load_plugins()
+
+            plugin_names = set(_executors.keys()) | {
+                (s.get("function", {}).get("name") or s.get("name"))
+                for s in _schemas
+                if isinstance(s, dict)
+            }
+            is_registered_or_schema_known = bool(
+                eff_tool is not None
+                or canonical_name in plugin_names
+                or canonical_name in BUILTIN_TOOLS
+                or canonical_name in SWARM_TOOLS
+                or canonical_name in schema_names
+            )
+
+        if require_registered and not is_registered_or_schema_known:
+            return ToolAuthorizationDecision(
+                allowed=False,
+                tool_name=canonical_name,
+                normalized_arguments=canonical_args,
+                reason="tool_unavailable",
+                error_type="TOOL_NOT_FOUND",
+                detail=f"Tool '{canonical_name}' is not registered in the active runtime.",
+            )
+
+        # 3. Caller security-ring enforcement (fail-closed on invalid/unknown ring or lookup error).
+        if caller_ring is not None:
+            try:
+                resolved_ring = resolve_tool_ring(
+                    canonical_name,
+                    tool=eff_tool,
+                    tool_registry=reg,
+                    active_schemas=active_schemas_list,
+                )
+            except Exception as exc:
+                return ToolAuthorizationDecision(
+                    allowed=False,
+                    tool_name=canonical_name,
+                    normalized_arguments=canonical_args,
+                    reason="authorization_denied",
+                    error_type="AUTHORIZATION_DENIED",
+                    detail=f"AuthorizationError: Ring lookup failed for '{canonical_name}': {exc}",
+                )
+            if resolved_ring is None:
+                return ToolAuthorizationDecision(
+                    allowed=False,
+                    tool_name=canonical_name,
+                    normalized_arguments=canonical_args,
+                    reason="authorization_denied",
+                    error_type="AUTHORIZATION_DENIED",
+                    detail=f"AuthorizationError: Unknown or invalid security ring for tool '{canonical_name}'.",
+                )
+            if caller_ring > resolved_ring:
+                return ToolAuthorizationDecision(
+                    allowed=False,
+                    tool_name=canonical_name,
+                    normalized_arguments=canonical_args,
+                    reason="authorization_denied",
+                    error_type="AUTHORIZATION_DENIED",
+                    detail=(
+                        f"AuthorizationError: Tool '{canonical_name}' requires higher permissions "
+                        f"(requires ring {resolved_ring}, caller ring is {caller_ring})."
+                    ),
+                    required_ring=resolved_ring,
+                )
+
+        # 4. Schema-backed normalization and argument validation.
+        tool_schema = _find_schema_for_tool(
+            canonical_name,
+            tool=eff_tool,
+            tool_registry=reg if (tool_registry is not None or require_registered) else None,
+            active_schemas=active_schemas_list,
+        )
     if not args_is_dict:
         val_err = validate_arguments(canonical_name, tool_schema, arguments)
         return ToolAuthorizationDecision(

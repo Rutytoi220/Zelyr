@@ -35,6 +35,7 @@ class NativeOrchestrator:
         tool_registry: Optional[Any] = None,
         caller_ring: Optional[int] = None,
         allowed_tools: Optional[List[str]] = None,
+        task_local_scope: Optional[Any] = None,
     ):
         self._explicit_max_context_tokens = max_context_tokens
         self._max_steps = max_depth if max_depth is not None else max_steps
@@ -50,6 +51,7 @@ class NativeOrchestrator:
         self.tool_registry = tool_registry
         self.caller_ring = caller_ring
         self.allowed_tools = allowed_tools
+        self.task_local_scope = task_local_scope
         self.current_ledger: Optional[Any] = None
         self.last_finish_reason: Optional[str] = None
 
@@ -357,12 +359,27 @@ class NativeOrchestrator:
         return clean
 
     @classmethod
-    def normalize_tool_name(cls, name: Any, active_schemas: Optional[list] = None) -> str:
+    def normalize_tool_name(
+        cls,
+        name: Any,
+        active_schemas: Optional[list] = None,
+        task_local_scope: Optional[Any] = None,
+    ) -> str:
         """Normalize a tool name by stripping common prefixes and mapping hallucinated aliases to canonical tools."""
         clean = cls._strip_tool_prefixes(name)
         if not clean:
             return ""
-        if active_schemas:
+        from zelyr.tool_registry import TaskLocalToolScope
+
+        if isinstance(task_local_scope, TaskLocalToolScope):
+            scope_names = task_local_scope.get_known_tools()
+            if clean in scope_names:
+                return clean
+            target = cls.TOOL_ALIAS_MAP.get(clean)
+            if target and target in scope_names:
+                return target
+            return clean
+        if isinstance(active_schemas, (list, tuple)):
             explicit_names = set()
             for t in active_schemas:
                 if isinstance(t, dict):
@@ -374,7 +391,9 @@ class NativeOrchestrator:
             if clean in explicit_names:
                 return clean
         target = cls.TOOL_ALIAS_MAP.get(clean)
-        if target and target in cls.get_known_tool_names(active_schemas):
+        if target and target in cls.get_known_tool_names(
+            active_schemas if isinstance(active_schemas, (list, tuple)) else None
+        ):
             return target
         return clean
 
@@ -1228,12 +1247,20 @@ class NativeOrchestrator:
         pending_proposals: Optional[List[Dict[str, Any]]] = None,
         replanning_attempts: int = 0,
         max_replanning_attempts: Optional[int] = None,
+        task_local_scope: Optional[Any] = None,
     ) -> AsyncGenerator[dict, None]:
         eff_max_depth = max_depth if max_depth is not None else getattr(self, "max_depth", self.max_steps)
         eff_max_replanning = max_replanning_attempts if max_replanning_attempts is not None else getattr(self, "max_replanning_attempts", 1)
         eff_stream_provider = stream_provider or getattr(self, "stream_provider", None) or getattr(self, "model_provider", None)
         eff_tool_schemas = tool_schemas if tool_schemas is not None else getattr(self, "tool_schemas", None)
         eff_tool_executor = tool_executor or getattr(self, "tool_executor", None)
+        eff_task_local_scope = (
+            task_local_scope
+            if task_local_scope is not None
+            else getattr(self, "task_local_scope", None)
+        )
+        if eff_task_local_scope is None and eff_tool_executor is not None:
+            eff_task_local_scope = getattr(eff_tool_executor, "_task_local_tool_scope", None)
         eff_db_path = db_path or getattr(self, "db_path", None)
         curr_tool_history = turn_tool_history if turn_tool_history is not None else []
         eff_cycle_detection = self.enable_cycle_detection if enable_cycle_detection is None else enable_cycle_detection
@@ -1518,8 +1545,17 @@ class NativeOrchestrator:
 
         from zelyr.tool_registry import authorize_and_validate_tool_call
 
+        from zelyr.tool_registry import TaskLocalToolScope
+
+        is_valid_task_scope = isinstance(eff_task_local_scope, TaskLocalToolScope)
+        has_valid_registry = self.tool_registry is not None and callable(getattr(self.tool_registry, "get_schemas", None))
+        has_valid_schemas_list = (
+            isinstance(eff_tool_schemas, (list, tuple))
+            and all(isinstance(s, dict) for s in eff_tool_schemas)
+        )
+
         def _is_schema_tool_authorized(t_name: str, schemas_ctx: Optional[List[Dict[str, Any]]] = None) -> bool:
-            if eff_allowed_tools is None and eff_caller_ring is None:
+            if eff_allowed_tools is None and eff_caller_ring is None and eff_task_local_scope is None:
                 return True
             dec = authorize_and_validate_tool_call(
                 t_name,
@@ -1528,6 +1564,7 @@ class NativeOrchestrator:
                 allowed_tools=eff_allowed_tools,
                 active_schemas=schemas_ctx,
                 tool_registry=self.tool_registry,
+                task_local_scope=eff_task_local_scope,
                 normalize_args=False,
                 validate_schema=False,
             )
@@ -1535,17 +1572,39 @@ class NativeOrchestrator:
 
         if disable_tools:
             payload["tools"] = []
-        elif eff_tool_schemas is not None:
-            payload["tools"] = [
-                t for t in eff_tool_schemas
-                if _is_schema_tool_authorized(
-                    (t.get("function", {}).get("name") or t.get("name") or ""),
-                    eff_tool_schemas,
+        elif eff_task_local_scope is not None:
+            if is_valid_task_scope and self.tool_registry is None:
+                scope_schemas = (
+                    list(eff_tool_schemas)
+                    if has_valid_schemas_list
+                    else list(eff_task_local_scope.tool_schemas)
                 )
-            ]
+                payload["tools"] = [
+                    t for t in scope_schemas
+                    if _is_schema_tool_authorized(
+                        (t.get("function", {}).get("name") or t.get("name") or ""),
+                        scope_schemas,
+                    )
+                ]
+            else:
+                payload["tools"] = []
+        elif eff_tool_schemas is not None:
+            if has_valid_schemas_list:
+                payload["tools"] = [
+                    t for t in eff_tool_schemas
+                    if _is_schema_tool_authorized(
+                        (t.get("function", {}).get("name") or t.get("name") or ""),
+                        list(eff_tool_schemas),
+                    )
+                ]
+            else:
+                payload["tools"] = []
         else:
             if self.tool_registry is not None:
-                active_tools = payload.get("tools") or self.tool_registry.get_schemas(compact=use_compact_schemas)
+                if has_valid_registry:
+                    active_tools = payload.get("tools") or self.tool_registry.get_schemas(compact=use_compact_schemas)
+                else:
+                    active_tools = []
             else:
                 active_tools = payload.get("tools") or get_tool_schemas(0)
 
@@ -1568,11 +1627,18 @@ class NativeOrchestrator:
                 ]
 
         # Core Sandbox Protection: Ensure essential actuators (execute_command, manage_workspace_file) are never dropped,
-        # UNLESS explicitly excluded by the caller's allowed_tools or caller_ring restrictions.
-        if not disable_tools and payload.get("tools") is not None:
+        # UNLESS running in an isolated task-local test scope or excluded by caller restrictions.
+        if (
+            not disable_tools
+            and eff_task_local_scope is None
+            and (self.tool_registry is None or has_valid_registry)
+            and (eff_tool_schemas is None or has_valid_schemas_list)
+            and payload.get("tools") is not None
+        ):
             existing_tool_names = {
                 t.get("function", {}).get("name") or t.get("name")
                 for t in payload["tools"]
+                if isinstance(t, dict)
             }
             registry_for_essential = self.tool_registry
             if registry_for_essential is None:
@@ -1590,7 +1656,7 @@ class NativeOrchestrator:
                                 existing_tool_names.add(essential)
                             found = True
                             break
-                    if not found:
+                    if not found and self.tool_registry is None:
                         for cand in get_tool_schemas(0):
                             cand_name = cand.get("function", {}).get("name") or cand.get("name")
                             if cand_name == essential:
@@ -1857,6 +1923,7 @@ class NativeOrchestrator:
                 disable_tools=disable_tools,
                 ledger=eff_ledger,
                 enable_cycle_detection=eff_cycle_detection,
+                task_local_scope=eff_task_local_scope,
             ):
                 yield retry_chunk
             return
@@ -1870,7 +1937,11 @@ class NativeOrchestrator:
             pending_tool_calls = pending_tool_calls[:1]
             for idx_rem, anc in enumerate(additional_native, 1):
                 anc_raw = anc.get("raw_name") or anc.get("function", {}).get("name") or anc.get("name") or ""
-                anc_name = self.normalize_tool_name(anc_raw, active_schemas=eff_tool_schemas)
+                anc_name = self.normalize_tool_name(
+                    anc_raw,
+                    active_schemas=eff_tool_schemas,
+                    task_local_scope=eff_task_local_scope,
+                )
                 anc_args = anc.get("function", {}).get("arguments") or anc.get("arguments", {})
                 if isinstance(anc_args, str):
                     try:
@@ -1899,7 +1970,10 @@ class NativeOrchestrator:
             full_text = "".join(collected_assistant_text).strip()
             non_think_text = re.sub(r"<think>.*?</think>", "", full_text, flags=re.DOTALL)
             non_think_text = re.sub(r"<think>.*$", "", non_think_text, flags=re.DOTALL).strip()
-            known_tools = self.get_known_tool_names(payload.get("tools"))
+            if is_valid_task_scope:
+                known_tools = eff_task_local_scope.get_known_tools()
+            else:
+                known_tools = self.get_known_tool_names(payload.get("tools"))
 
             from zelyr.agents.fallback_parser import FallbackToolParser
 
@@ -1911,6 +1985,8 @@ class NativeOrchestrator:
                     max_calls=None,
                     caller_ring=eff_caller_ring,
                     allowed_tools=eff_allowed_tools,
+                    tool_registry=self.tool_registry,
+                    task_local_scope=eff_task_local_scope,
                 )
                 if non_think_text
                 else []
@@ -1977,7 +2053,11 @@ class NativeOrchestrator:
                 or pending_tool_calls[0].get("function", {}).get("name")
                 or pending_tool_calls[0].get("name")
             )
-            norm_new_name = self.normalize_tool_name(new_call_name, active_schemas=eff_tool_schemas)
+            norm_new_name = self.normalize_tool_name(
+                new_call_name,
+                active_schemas=eff_tool_schemas,
+                task_local_scope=eff_task_local_scope,
+            )
             p0_args_canon = self._canonicalize_tool_args(p0.get("arguments", {}))
             new_args_raw = (
                 pending_tool_calls[0].get("function", {}).get("arguments")
@@ -2087,6 +2167,7 @@ class NativeOrchestrator:
                         enable_cycle_detection=eff_cycle_detection,
                         replanning_attempts=replanning_attempts,
                         max_replanning_attempts=eff_max_replanning,
+                        task_local_scope=eff_task_local_scope,
                     ):
                         yield retry_chunk
                     return
@@ -2186,6 +2267,7 @@ class NativeOrchestrator:
                             enable_cycle_detection=eff_cycle_detection,
                             replanning_attempts=replanning_attempts,
                             max_replanning_attempts=eff_max_replanning,
+                            task_local_scope=eff_task_local_scope,
                         ):
                             yield retry_chunk
                         return
@@ -2227,6 +2309,7 @@ class NativeOrchestrator:
                     enable_cycle_detection=eff_cycle_detection,
                     replanning_attempts=replanning_attempts,
                     max_replanning_attempts=eff_max_replanning,
+                    task_local_scope=eff_task_local_scope,
                 ):
                     yield retry_chunk
                 return
@@ -2345,6 +2428,7 @@ class NativeOrchestrator:
                         enable_cycle_detection=eff_cycle_detection,
                         replanning_attempts=replanning_attempts + 1,
                         max_replanning_attempts=eff_max_replanning,
+                        task_local_scope=eff_task_local_scope,
                     ):
                         yield retry_chunk
                     return
@@ -2355,14 +2439,22 @@ class NativeOrchestrator:
             buffered_chunks.clear()
 
         if pending_tool_calls:
-            from zelyr.tool_registry import authorize_and_validate_tool_call, canonicalize_tool_invocation
+            from zelyr.tool_registry import (
+                activate_task_local_scope,
+                authorize_and_validate_tool_call,
+                canonicalize_tool_invocation,
+            )
 
             # Normalize tool calls: Ollama /api/chat requires function.arguments to be a native JSON dict
             normalized_tool_calls = []
             reserved_turn_ids: set = set()
             for idx, tc in enumerate(pending_tool_calls):
                 raw_fn_name = tc.get("raw_name") or tc.get("function", {}).get("name") or tc.get("name") or ""
-                fn_name = self.normalize_tool_name(raw_fn_name, active_schemas=eff_tool_schemas)
+                fn_name = self.normalize_tool_name(
+                    raw_fn_name,
+                    active_schemas=eff_tool_schemas,
+                    task_local_scope=eff_task_local_scope,
+                )
                 fn_args_raw = tc.get("function", {}).get("arguments") or tc.get("arguments", {})
                 raw_tc_id = tc.get("id") or f"call_native_{idx}_{uuid.uuid4().hex[:6]}"
                 tc_id = self._unique_ledger_call_id(eff_ledger, raw_tc_id, reserved_ids=reserved_turn_ids)
@@ -2461,19 +2553,18 @@ class NativeOrchestrator:
                 if tc.get("_args_parse_error"):
                     rejection_reason = "schema_validation_error"
                     rejection_detail = str(tc["_args_parse_error"])
+                elif eff_task_local_scope is not None and eff_tool_executor is None:
+                    rejection_reason = "authorization_denied"
+                    rejection_detail = (
+                        "AuthorizationError: TaskLocalToolScope requires an isolated custom "
+                        "tool_executor and cannot dispatch to production execute_tool."
+                    )
                 else:
                     auth_schemas = eff_tool_schemas if eff_tool_schemas is not None else payload.get("tools")
                     known_for_auth = (
-                        self.get_known_tool_names(eff_tool_schemas)
-                        if eff_tool_schemas is not None
+                        self.get_known_tool_names(list(eff_tool_schemas))
+                        if (eff_tool_schemas is not None and has_valid_schemas_list and eff_task_local_scope is None)
                         else None
-                    )
-                    require_registered = (
-                        eff_tool_executor is None
-                        or self.tool_registry is not None
-                        or eff_tool_schemas is not None
-                        or eff_caller_ring is not None
-                        or eff_allowed_tools is not None
                     )
                     decision = authorize_and_validate_tool_call(
                         func_name,
@@ -2483,7 +2574,8 @@ class NativeOrchestrator:
                         active_schemas=auth_schemas,
                         tool_registry=self.tool_registry,
                         known_tools=known_for_auth,
-                        require_registered=require_registered,
+                        task_local_scope=eff_task_local_scope,
+                        require_registered=True,
                         normalize_args=True,
                         validate_schema=True,
                     )
@@ -2702,18 +2794,21 @@ class NativeOrchestrator:
                 timeout_int = int(timeout)
                 try:
                     if eff_tool_executor is not None:
-                        try:
-                            exec_call = eff_tool_executor(func_name, func_args)
-                            if inspect.isawaitable(exec_call):
-                                tool_result = await asyncio.wait_for(exec_call, timeout=timeout)
-                            else:
-                                tool_result = exec_call
-                        except TypeError:
-                            exec_call = eff_tool_executor(func_name, **func_args)
-                            if inspect.isawaitable(exec_call):
-                                tool_result = await asyncio.wait_for(exec_call, timeout=timeout)
-                            else:
-                                tool_result = exec_call
+                        with activate_task_local_scope(
+                            eff_task_local_scope if is_valid_task_scope else None
+                        ):
+                            try:
+                                exec_call = eff_tool_executor(func_name, func_args)
+                                if inspect.isawaitable(exec_call):
+                                    tool_result = await asyncio.wait_for(exec_call, timeout=timeout)
+                                else:
+                                    tool_result = exec_call
+                            except TypeError:
+                                exec_call = eff_tool_executor(func_name, **func_args)
+                                if inspect.isawaitable(exec_call):
+                                    tool_result = await asyncio.wait_for(exec_call, timeout=timeout)
+                                else:
+                                    tool_result = exec_call
                     else:
                         exec_fn = self.execute_tool
                         if exec_fn is execute_tool and (eff_caller_ring is not None or eff_allowed_tools is not None):
@@ -3026,6 +3121,7 @@ class NativeOrchestrator:
                     pending_proposals=curr_pending_proposals,
                     replanning_attempts=replanning_attempts,
                     max_replanning_attempts=eff_max_replanning,
+                    task_local_scope=eff_task_local_scope,
                 ):
                     yield chunk
             elif curr_pending_proposals:

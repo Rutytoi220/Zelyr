@@ -258,7 +258,11 @@ class DelegatedSubagent(BaseSubagent):
 
     async def execute_tool_call(self, tool_name: str, arguments: Dict[str, Any]) -> str:
         """Execute a tool call with strict role allowed-tools and capability ring enforcement."""
-        # 1. Allowed tools gating
+        from zelyr.tool_registry import canonicalize_tool_invocation, resolve_tool_ring
+
+        tool_name, arguments = canonicalize_tool_invocation(tool_name, arguments)
+
+        # 1. Allowed tools gating (evaluated on canonical target name)
         if tool_name not in self.profile.allowed_tools:
             return (
                 f"AuthorizationError: Tool '{tool_name}' is not in allowed tools list "
@@ -294,13 +298,21 @@ class DelegatedSubagent(BaseSubagent):
         )
 
         # Enforce capability ring: caller_ring must not exceed required_ring (0=root, 1=user)
-        if hasattr(self.tool_registry, "_get_tool_ring"):
-            required_ring = self.tool_registry._get_tool_ring(tool_name, tool_obj)
-            if self.caller_ring > required_ring:
-                return (
-                    f"AuthorizationError: Tool '{tool_name}' requires higher permissions "
-                    f"(requires ring {required_ring}, caller ring is {self.caller_ring})."
-                )
+        try:
+            required_ring = resolve_tool_ring(
+                tool_name,
+                tool=tool_obj,
+                tool_registry=self.tool_registry,
+            )
+        except Exception as exc:
+            return f"AuthorizationError: Ring lookup failed for '{tool_name}': {exc}"
+        if required_ring is None:
+            return f"AuthorizationError: Unknown or invalid security ring for tool '{tool_name}'."
+        if self.caller_ring > required_ring:
+            return (
+                f"AuthorizationError: Tool '{tool_name}' requires higher permissions "
+                f"(requires ring {required_ring}, caller ring is {self.caller_ring})."
+            )
 
         try:
             if hasattr(self.tool_registry, "execute_async"):

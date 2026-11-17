@@ -108,10 +108,13 @@ class TestMultiTurnPayload(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(args, {"path": "crash.log"})
             return json.dumps({"status": "ok", "content": "Sample crash trace"})
 
+        from zelyr.tool_registry import TaskLocalToolScope
+
         orchestrator = NativeOrchestrator(
             stream_provider=mock_stream_provider,
             tool_executor=mock_tool_executor,
             max_depth=3,
+            task_local_scope=TaskLocalToolScope(tool_names=("mock_read",)),
         )
 
         initial_payload = {
@@ -198,10 +201,13 @@ class TestMultiTurnPayload(unittest.IsolatedAsyncioTestCase):
         async def mock_tool_executor(name: str, args: dict) -> str:
             return json.dumps({"status": "nominal"})
 
+        from zelyr.tool_registry import TaskLocalToolScope
+
         orchestrator = NativeOrchestrator(
             stream_provider=mock_stream_provider,
             tool_executor=mock_tool_executor,
             max_depth=3,
+            task_local_scope=TaskLocalToolScope(tool_names=("check_diag",)),
         )
 
         initial_payload = {
@@ -262,10 +268,13 @@ class TestMultiTurnPayload(unittest.IsolatedAsyncioTestCase):
         async def mock_tool_executor(name: str, args: dict) -> str:
             return f"Echo: {args.get('text')}"
 
+        from zelyr.tool_registry import TaskLocalToolScope
+
         orchestrator = NativeOrchestrator(
             stream_provider=mock_stream_provider,
             tool_executor=mock_tool_executor,
             max_depth=3,
+            task_local_scope=TaskLocalToolScope(tool_names=("echo_tool",)),
         )
 
         # Pass caller override in options
