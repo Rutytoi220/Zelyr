@@ -11,6 +11,8 @@ import subprocess
 import textwrap
 from pathlib import Path
 
+from zelyr import __version__ as ZELYR_VERSION
+
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -19,8 +21,6 @@ RELEASES_DIR = PROJECT_ROOT / "releases"
 BUILD_DIR = PROJECT_ROOT / "build"
 BUILD_TEMPLATES = Path(__file__).resolve().parent / "templates"
 BUILD_SCRIPTS = Path(__file__).resolve().parent / "scripts"
-
-ZELYR_VERSION = "1.0.0"
 
 
 # ------------------------------------------------------------------

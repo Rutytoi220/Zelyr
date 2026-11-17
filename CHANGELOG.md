@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-11-17
+
+Release v1.4.0 of Zelyr, delivering runtime parity across local and remote Ollama deployments, grounded environment capability manifests, authoritative tool permission parity and custom executor isolation, multi-criterion outcome verification hardening, turn execution ledgers with observation framing, and the distributed evaluation matrix harness.
+
+### Added
+- **Remote Ollama Configuration & Timeout Helpers (`zelyr.config`)**:
+  - Added `validate_ollama_base_url`, `get_effective_ollama_base_url`, `get_effective_keep_alive`, and `get_effective_read_timeout` with environment variable overrides (`ZELYR_OLLAMA_BASE_URL`, `ZELYR_OLLAMA_KEEP_ALIVE`, `ZELYR_OLLAMA_READ_TIMEOUT`) and CLI `--base-url` support.
+- **Runtime Environment Introspection & Capability Manifest (`zelyr.engine.environment`, `zelyr.core.instructions`)**:
+  - Implemented `RuntimeEnvironmentManifest` distinguishing local vs. remote inference endpoints, registered vs. available vs. caller-authorized tools, and headless/Wayland desktop state without leaking credentials into prompts.
+- **Schema Normalization & Registry Validation (`zelyr.engine.normalizer`, `zelyr.tool_registry`)**:
+  - Unified unambiguous argument coercion (`SafeArgumentNormalizer`) and schema validation (`validate_arguments`) while preserving whitespace-sensitive payload fields.
+- **Execution Ledger, Observation Framing & Goal-Aware Replanning (`zelyr.engine.execution_ledger`, `zelyr.engine.observation_framer`)**:
+  - Added `TurnExecutionLedger` tracking action lifecycles (`PROPOSED`, `VALIDATED`, `DISPATCHED`, `SUCCEEDED`, `FAILED`, `REJECTED`), pending multi-tool proposal reconciliation, prohibition and repetition guards, and structured `ObservationFramingEngine` envelopes.
+- **Evaluation Matrix & Distributed Worker Harness (`zelyr.eval.matrix`, `zelyr.eval.distributed`, `zelyr.eval.distributed_worker`)**:
+  - Added reproducible multi-model evaluation matrix runner, HTTP worker server/dispatcher with fail-closed SSRF validation, and structured Markdown/JSON reporting.
+- **Authoritative Tool Permission Boundary & Custom Executor Isolation (`zelyr.tool_registry`, `zelyr.agents.native_orchestrator`)**:
+  - Added `authorize_and_validate_tool_call`, `canonicalize_tool_invocation`, `resolve_tool_ring`, `TaskLocalToolScope`, and `bind_task_local_executor` enforcing `allowed_tools`, fail-closed `caller_ring` checks, canonical alias rewriting prior to authorization, and strict isolation between task-local test executors and production tool registries.
+
 ## [1.3.0] - 2026-11-06
 
 Production release v1.3.0 of Zelyr, delivering end-to-end autonomous systems integration: deterministic outcome verification, closed-loop error classification and recovery, direct Hyprland Wayland IPC and standalone Chrome DevTools Protocol (CDP) browser automation, token-budgeted proactive FTS5 memory hydration, hardened runtime tool crafting and hotloading, background routine actuators, and grounded multi-step developer self-repair workflows.
@@ -245,7 +263,8 @@ This release hardens the build system, wires in OTA capabilities, and eliminates
 - **AppImage Build Resilience:** Fortified `scripts/build_appimage.sh` with correct `usr/share/applications` AppDir directory structure and explicit `set -e` failure trapping.
 - **Circuit Breakers:** `SystemHealthWatchdog` now survives nested permission errors silently rather than stalling the central EventBus.
 
-[Unreleased]: https://github.com/Rutytoi220/Zelyr/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/Rutytoi220/Zelyr/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/Rutytoi220/Zelyr/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/Rutytoi220/Zelyr/compare/v1.2.0-rc1...v1.3.0
 [1.2.0-rc.1]: https://github.com/Rutytoi220/Zelyr/releases/tag/v1.2.0-rc1
 [1.1.0]: https://github.com/Rutytoi220/Zelyr/releases/tag/v1.1.0

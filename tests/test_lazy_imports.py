@@ -38,7 +38,7 @@ class TestLazyImportsPublicAPI(unittest.TestCase):
         self.assertIs(zelyr.Engine, Engine)
         self.assertIs(zelyr.ZelyrConfig, ZelyrConfig)
         self.assertIs(zelyr.AxiomConfig, ZelyrConfig)
-        self.assertEqual(zelyr.__version__, "1.3.0")
+        self.assertEqual(zelyr.__version__, "1.4.0")
 
     def test_dynamic_lookup_and_dir(self):
         """getattr resolves lazy exports, dir() includes them, unknown raises AttributeError."""
@@ -128,7 +128,7 @@ class TestLegacyCompatibility(unittest.TestCase):
             "from zelyr import *\n"
             "assert Engine is not None\n"
             "assert ZelyrConfig is not None\n"
-            "assert __version__ == '1.3.0'\n"
+            "assert __version__ == '1.4.0'\n"
         )
         res_zelyr = subprocess.run([sys.executable, "-c", code_zelyr], capture_output=True, text=True)
         self.assertEqual(res_zelyr.returncode, 0, f"from zelyr import * failed: {res_zelyr.stderr}")
@@ -137,7 +137,7 @@ class TestLegacyCompatibility(unittest.TestCase):
             "from axiom import *\n"
             "assert Engine is not None\n"
             "assert AxiomConfig is not None\n"
-            "assert __version__ == '1.3.0'\n"
+            "assert __version__ == '1.4.0'\n"
         )
         res_axiom = subprocess.run([sys.executable, "-c", code_axiom], capture_output=True, text=True)
         self.assertEqual(res_axiom.returncode, 0, f"from axiom import * failed: {res_axiom.stderr}")
@@ -173,7 +173,7 @@ class TestCLIBehaviorAndStartup(unittest.TestCase):
             text=True,
         )
         self.assertEqual(res_ver.returncode, 0)
-        self.assertIn("zelyr 1.3.0", res_ver.stdout)
+        self.assertIn("zelyr 1.4.0", res_ver.stdout)
 
         # 2. Help command
         res_help = subprocess.run(
@@ -204,6 +204,98 @@ class TestCLIBehaviorAndStartup(unittest.TestCase):
         )
         res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
         self.assertEqual(res.returncode, 0, f"litellm loaded during CLI help: {res.stderr}")
+
+
+class TestVersionConsistencyAndBuilders(unittest.TestCase):
+    """Test 10: Version parity across pyproject.toml, runtime modules, CLI, and platform builders."""
+
+    def test_authoritative_version_agreement(self):
+        """All runtime version attributes and CLI flags must agree with pyproject.toml (1.4.0)."""
+        from pathlib import Path
+        import re
+        import axiom
+        import zelyr
+        import zelyr.gui
+        import zelyr.main
+        from zelyr.services.ota_updater import AXIOM_VERSION, ZELYR_VERSION
+
+        pyproject_text = (Path(__file__).resolve().parent.parent / "pyproject.toml").read_text(encoding="utf-8")
+        match = re.search(r'(?m)^version\s*=\s*"([^"]+)"', pyproject_text)
+        self.assertIsNotNone(match)
+        expected = match.group(1)
+
+        self.assertEqual(expected, "1.4.0")
+        self.assertEqual(zelyr.__version__, expected)
+        self.assertEqual(axiom.__version__, expected)
+        self.assertEqual(zelyr.main.__version__, expected)
+        self.assertEqual(zelyr.gui.__version__, expected)
+        self.assertEqual(ZELYR_VERSION, expected)
+        self.assertEqual(AXIOM_VERSION, expected)
+
+        for flag in ("--version", "-v"):
+            res = subprocess.run(
+                [sys.executable, "-m", "zelyr.cli.main", flag],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 0)
+            self.assertEqual(res.stdout.strip(), f"zelyr {expected}")
+
+    def test_platform_builders_derive_authoritative_version(self):
+        """Linux, macOS, and Windows builders must derive 1.4.0 and embed it in artifact configs."""
+        from unittest.mock import patch
+        import zelyr
+        from zelyr.build import build_linux, build_mac, build_win
+
+        self.assertEqual(build_linux.ZELYR_VERSION, "1.4.0")
+        self.assertEqual(build_mac.ZELYR_VERSION, "1.4.0")
+        self.assertEqual(build_win.ZELYR_VERSION, "1.4.0")
+        self.assertEqual(build_linux.ZELYR_VERSION, zelyr.__version__)
+
+        # Linux nfpm config and output filenames
+        nfpm_deb = build_linux.generate_nfpm_yaml("deb")
+        self.assertIn("version: 1.4.0", nfpm_deb)
+        with (
+            patch("zelyr.build.build_linux.shutil.which", return_value="/usr/bin/nfpm"),
+            patch("zelyr.build.build_linux.subprocess.run") as mock_run,
+            patch.object(build_linux.Path, "mkdir"),
+            patch.object(build_linux.Path, "write_text"),
+        ):
+            deb_out = build_linux.build_nfpm_package("deb")
+            rpm_out = build_linux.build_nfpm_package("rpm")
+            self.assertEqual(deb_out.name, "zelyr-1.4.0-amd64.deb")
+            self.assertEqual(rpm_out.name, "zelyr-1.4.0-amd64.rpm")
+            self.assertEqual(mock_run.call_count, 2)
+
+        with (
+            patch("zelyr.build.build_linux.shutil.which", return_value="/usr/bin/appimagetool"),
+            patch("zelyr.build.build_linux.subprocess.run") as mock_appimage_run,
+            patch.object(build_linux.Path, "mkdir"),
+            patch.object(build_linux.Path, "write_text"),
+            patch.object(build_linux.Path, "chmod"),
+            patch.object(build_linux.Path, "exists", return_value=False),
+        ):
+            appimage_out = build_linux.build_appimage()
+            self.assertEqual(appimage_out.name, "Zelyr-1.4.0-x86_64.AppImage")
+            self.assertEqual(mock_appimage_run.call_count, 1)
+
+        # macOS Info.plist and DMG filename
+        plist = build_mac._generate_info_plist()
+        self.assertIn("<string>1.4.0</string>", plist)
+        with (
+            patch("zelyr.build.build_mac.build_app_bundle", return_value=build_mac.DIST_DIR / "Zelyr.app"),
+            patch("zelyr.build.build_mac.shutil.which", side_effect=lambda cmd: "/usr/bin/hdiutil" if cmd == "hdiutil" else None),
+            patch("zelyr.build.build_mac.subprocess.run") as mock_dmg_run,
+            patch.object(build_mac.Path, "mkdir"),
+        ):
+            dmg_out = build_mac.build_dmg()
+            self.assertEqual(dmg_out.name, "Zelyr-1.4.0.dmg")
+            self.assertEqual(mock_dmg_run.call_count, 1)
+
+        # Windows Inno Setup script
+        iss = build_win.generate_inno_setup_script()
+        self.assertIn("AppVersion=1.4.0", iss)
+        self.assertIn("OutputBaseFilename=Zelyr_Setup_v1.4.0", iss)
 
 
 if __name__ == "__main__":

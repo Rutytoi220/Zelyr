@@ -1,6 +1,6 @@
 # Zelyr Subsystem Catalog & Module Reference
 
-This document provides a comprehensive, module-by-module reference of verified subsystems across **Zelyr** (v1.0.0).  
+This document provides a comprehensive, module-by-module reference of verified subsystems across **Zelyr** (v1.4.0).
 Each section specifies module responsibilities, public interfaces, state mutations, failure modes, and backing unit tests.
 
 ---

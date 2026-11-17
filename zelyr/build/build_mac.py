@@ -11,12 +11,13 @@ import subprocess
 import textwrap
 from pathlib import Path
 
+from zelyr import __version__ as ZELYR_VERSION
+
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DIST_DIR = PROJECT_ROOT / "dist"
 RELEASES_DIR = PROJECT_ROOT / "releases"
-ZELYR_VERSION = "1.0.0"
 
 
 def _generate_info_plist() -> str:

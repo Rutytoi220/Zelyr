@@ -5,7 +5,8 @@ from __future__ import annotations
 import importlib
 from typing import TYPE_CHECKING, Any
 
-__version__ = "1.2.0rc1"
+from zelyr import __version__
+
 __author__ = "Zelyr Team"
 
 __all__ = [

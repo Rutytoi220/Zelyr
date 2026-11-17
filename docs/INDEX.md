@@ -1,6 +1,6 @@
 # Zelyr Documentation Index & AI Navigation Map
 
-Welcome to the technical documentation map for **Zelyr** (v1.0.0).  
+Welcome to the technical documentation map for **Zelyr** (v1.4.0).
 This index serves as the primary navigation hub for software engineers and local coding agents (including smaller models running via OpenCode and Ollama) navigating the repository.
 
 Every statement, code path, and interface in these documents is grounded in verified source code, active configurations, and observed test executions.

@@ -1,6 +1,6 @@
 # Zelyr Developer Workflow & Verification Guide
 
-This guide details the development environment setup, testing standards, linting procedures, and packaging workflows for **Zelyr** (v1.0.0).
+This guide details the development environment setup, testing standards, linting procedures, and packaging workflows for **Zelyr** (v1.4.0).
 
 ---
 
@@ -110,7 +110,7 @@ can be silently re-added to the wheel:
 ```bash
 uv run python scripts/build_dist.py --wheel --no-isolation
 ```
-This produces `dist/zelyr_core-1.0.0-py3-none-any.whl`.
+This produces `dist/zelyr_core-1.4.0-py3-none-any.whl`.
 
 The script copies only the build inputs (`pyproject.toml`, metadata files and
 the `zelyr` package) into a temporary directory, builds there, and verifies
@@ -124,7 +124,7 @@ python3 -m venv /tmp/zelyr_smoke_env
 source /tmp/zelyr_smoke_env/bin/activate
 
 # Install the built wheel
-pip install dist/zelyr_core-1.0.0-py3-none-any.whl
+pip install dist/zelyr_core-1.4.0-py3-none-any.whl
 
 # Verify executable console entry points
 zelyr --help
