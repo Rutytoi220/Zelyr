@@ -1,6 +1,6 @@
 # Zelyr Documentation Index & AI Navigation Map
 
-Welcome to the technical documentation map for **Zelyr** (v1.0.0).  
+Welcome to the technical documentation map for **Zelyr** (v1.4.0).
 This index serves as the primary navigation hub for software engineers and local coding agents (including smaller models running via OpenCode and Ollama) navigating the repository.
 
 Every statement, code path, and interface in these documents is grounded in verified source code, active configurations, and observed test executions.
@@ -72,14 +72,24 @@ ChienGPT/
 │       ├── os_desktop.py      # [VERIFIED] Media control and desktop notification tools
 │       ├── web_search.py      # [VERIFIED] Native web search and extracted text fetching
 │       └── workspace_file.py  # [VERIFIED] Workspace file reading and bounded patching
-└── tests/                     # Automated test suites (Strictly offline & headless)
+└── tests/                     # Automated test suites (Strictly offline & headless top-level test_*.py modules)
     ├── conftest.py            # [VERIFIED] Headless fixtures, mock home dir, network blocking
+    ├── test_argument_normalizer.py  # [VERIFIED] SafeArgumentNormalizer & schema validation tests
+    ├── test_command_output_hardened_boundary.py # [VERIFIED] Hardened command execution boundary tests
     ├── test_context_budget_fix.py   # [VERIFIED] 8K context token limits & tier filtering
+    ├── test_custom_executor_isolation.py # [VERIFIED] Custom executor isolation & legacy agent boundary tests
+    ├── test_distributed_eval.py     # [VERIFIED] Distributed evaluation worker subprocess & runner tests
+    ├── test_execution_ledger.py     # [VERIFIED] TurnExecutionLedger & observation framing tests
     ├── test_fast_path_router.py     # [VERIFIED] URL and app launching fast-path routing
     ├── test_install_bootstrap.py    # [VERIFIED] Portable paths, packaging, directory bootstrap
+    ├── test_model_matrix.py         # [VERIFIED] Multi-model evaluation matrix & task runner tests
     ├── test_multi_turn_payload.py   # [VERIFIED] Context precedence and Turn 2 protocol compliance
+    ├── test_outcome_verifier.py     # [VERIFIED] OutcomeVerifierEngine predicate verification tests
+    ├── test_parity_runtime_guards.py # [VERIFIED] Orchestrator runtime parity & guard tests
+    ├── test_remote_ollama_and_concurrency.py # [VERIFIED] Remote Ollama URL/timeout helpers & concurrency tests
     ├── test_shell_authorization.py  # [VERIFIED] Shell execution confirmation and fail-closed security
     ├── test_swarm_blackboard.py     # [VERIFIED] Multi-agent blackboard namespace isolation
+    ├── test_tool_permission_parity.py # [VERIFIED] Native/fallback/registry/subagent permission parity tests
     └── test_web_search.py           # [VERIFIED] Web search, extraction, SSRF, prompt injection tests
 ```
 

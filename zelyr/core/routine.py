@@ -22,6 +22,12 @@ import aiosqlite
 import croniter
 
 from zelyr.compat import data_file
+from zelyr.db.connection import (
+    checkpoint_and_close,
+    checkpoint_and_close_async,
+    get_db_connection,
+    managed_transaction,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -143,12 +149,37 @@ def parse_schedule_expression(
     if not cleaned:
         raise ValueError("Schedule expression cannot be empty.")
 
-    # Check explicit type or auto-detect
+    # Match natural interval syntax like 'every 3600s', 'every 10m', '3600s', '2 hours'
+    import re
+
+    m = re.match(
+        r"^(?:every\s+)?(\d+(?:\.\d+)?)\s*(s|sec|seconds|m|min|minutes|h|hr|hours|d|days)?$",
+        cleaned,
+        re.IGNORECASE,
+    )
+    if (schedule_type == "interval" or schedule_type is None) and m:
+        val = float(m.group(1))
+        unit = (m.group(2) or "s").lower()
+        if unit in ("s", "sec", "seconds"):
+            mult = 1
+        elif unit in ("m", "min", "minutes"):
+            mult = 60
+        elif unit in ("h", "hr", "hours"):
+            mult = 3600
+        elif unit in ("d", "days"):
+            mult = 86400
+        else:
+            mult = 1
+        total_sec = val * mult
+        if total_sec <= 0:
+            raise ValueError("Interval schedule must be greater than 0 seconds.")
+        return "interval", str(int(total_sec) if total_sec.is_integer() else total_sec)
+
+    # Check explicit type or auto-detect numeric interval
     if schedule_type == "interval" or (schedule_type is None and (cleaned.isdigit() or _is_float(cleaned))):
         val = float(cleaned)
         if val <= 0:
             raise ValueError("Interval schedule must be greater than 0 seconds.")
-        # If integer, store as int string, else float string
         return "interval", str(int(val) if val.is_integer() else val)
 
     # Assume cron
@@ -159,10 +190,8 @@ def parse_schedule_expression(
             raise ValueError(f"Invalid cron expression: '{cleaned}'")
         return "cron", cleaned
     except ImportError:
-        # If croniter is missing and caller requested cron
         if schedule_type == "cron":
             raise RuntimeError("croniter package is required for cron-based routines.")
-        # Try fallback if it looks like an interval
         if _is_float(cleaned):
             val = float(cleaned)
             return "interval", str(int(val) if val.is_integer() else val)
@@ -233,30 +262,28 @@ class RoutineDatabase:
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
 
     def _init_sqlite_sync(self) -> None:
-        with sqlite3.connect(self.db_path, timeout=10.0) as conn:
-            conn.execute("PRAGMA journal_mode = WAL;")
-            conn.execute("PRAGMA synchronous = NORMAL;")
-            conn.execute("PRAGMA busy_timeout = 10000;")
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS routines (
-                    id TEXT PRIMARY KEY,
-                    name TEXT UNIQUE NOT NULL,
-                    description TEXT DEFAULT '',
-                    schedule_type TEXT NOT NULL,
-                    schedule_expr TEXT NOT NULL,
-                    action_type TEXT NOT NULL,
-                    action_payload TEXT NOT NULL,
-                    enabled INTEGER NOT NULL DEFAULT 1,
-                    timeout_seconds REAL NOT NULL DEFAULT 120.0,
-                    metadata TEXT DEFAULT '{}',
-                    last_run_at REAL,
-                    next_run_at REAL,
-                    created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL
-                );
-                """
-            )
+        with get_db_connection(self.db_path, timeout=10.0) as conn:
+            with managed_transaction(conn):
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS routines (
+                        id TEXT PRIMARY KEY,
+                        name TEXT UNIQUE NOT NULL,
+                        description TEXT DEFAULT '',
+                        schedule_type TEXT NOT NULL,
+                        schedule_expr TEXT NOT NULL,
+                        action_type TEXT NOT NULL,
+                        action_payload TEXT NOT NULL,
+                        enabled INTEGER NOT NULL DEFAULT 1,
+                        timeout_seconds REAL NOT NULL DEFAULT 120.0,
+                        metadata TEXT DEFAULT '{}',
+                        last_run_at REAL,
+                        next_run_at REAL,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    );
+                    """
+                )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS routine_runs (
@@ -488,75 +515,74 @@ class RoutineDatabase:
             if isinstance(routine.metadata, (dict, list))
             else "{}"
         )
-        with sqlite3.connect(self.db_path, timeout=10.0) as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO routines (
-                    id, name, description, schedule_type, schedule_expr,
-                    action_type, action_payload, enabled, timeout_seconds,
-                    metadata, last_run_at, next_run_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    routine.id,
-                    routine.name,
-                    routine.description,
-                    routine.schedule_type,
-                    routine.schedule_expr,
-                    routine.action_type,
-                    payload_str,
-                    1 if routine.enabled else 0,
-                    routine.timeout_seconds,
-                    metadata_str,
-                    routine.last_run_at,
-                    routine.next_run_at,
-                    routine.created_at,
-                    routine.updated_at,
-                ),
-            )
-            conn.commit()
+        with get_db_connection(self.db_path, timeout=10.0) as conn:
+            with managed_transaction(conn):
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO routines (
+                        id, name, description, schedule_type, schedule_expr,
+                        action_type, action_payload, enabled, timeout_seconds,
+                        metadata, last_run_at, next_run_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        routine.id,
+                        routine.name,
+                        routine.description,
+                        routine.schedule_type,
+                        routine.schedule_expr,
+                        routine.action_type,
+                        payload_str,
+                        1 if routine.enabled else 0,
+                        routine.timeout_seconds,
+                        metadata_str,
+                        routine.last_run_at,
+                        routine.next_run_at,
+                        routine.created_at,
+                        routine.updated_at,
+                    ),
+                )
         return routine
 
     def sync_delete_routine(self, name_or_id: str) -> bool:
         self._init_sqlite_sync()
-        with sqlite3.connect(self.db_path, timeout=10.0) as conn:
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT id FROM routines WHERE name = ? OR id = ? OR id LIKE ?",
-                (name_or_id, name_or_id, f"{name_or_id}%"),
-            )
-            row = cur.fetchone()
-            if not row:
-                return False
-            rid = row[0]
-            cur.execute("DELETE FROM routine_runs WHERE routine_id = ?", (rid,))
-            cur.execute("DELETE FROM routines WHERE id = ?", (rid,))
-            conn.commit()
-            return True
+        with get_db_connection(self.db_path, timeout=10.0) as conn:
+            with managed_transaction(conn):
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT id FROM routines WHERE name = ? OR id = ? OR id LIKE ?",
+                    (name_or_id, name_or_id, f"{name_or_id}%"),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return False
+                rid = row[0]
+                cur.execute("DELETE FROM routine_runs WHERE routine_id = ?", (rid,))
+                cur.execute("DELETE FROM routines WHERE id = ?", (rid,))
+                return True
 
     def sync_toggle_routine(self, name_or_id: str, enabled: bool) -> bool:
         self._init_sqlite_sync()
-        with sqlite3.connect(self.db_path, timeout=10.0) as conn:
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT id FROM routines WHERE name = ? OR id = ? OR id LIKE ?",
-                (name_or_id, name_or_id, f"{name_or_id}%"),
-            )
-            row = cur.fetchone()
-            if not row:
-                return False
-            rid = row[0]
-            cur.execute(
-                "UPDATE routines SET enabled = ?, updated_at = ? WHERE id = ?",
-                (1 if enabled else 0, time.time(), rid),
-            )
-            conn.commit()
-            return True
+        with get_db_connection(self.db_path, timeout=10.0) as conn:
+            with managed_transaction(conn):
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT id FROM routines WHERE name = ? OR id = ? OR id LIKE ?",
+                    (name_or_id, name_or_id, f"{name_or_id}%"),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return False
+                rid = row[0]
+                cur.execute(
+                    "UPDATE routines SET enabled = ?, updated_at = ? WHERE id = ?",
+                    (1 if enabled else 0, time.time(), rid),
+                )
+                return True
 
     def sync_list_routines(self, include_disabled: bool = True) -> List[Dict[str, Any]]:
         self._init_sqlite_sync()
-        with sqlite3.connect(self.db_path, timeout=5.0) as conn:
-            conn.row_factory = sqlite3.Row
+        with get_db_connection(self.db_path, timeout=5.0) as conn:
             q = "SELECT * FROM routines"
             if not include_disabled:
                 q += " WHERE enabled = 1"
@@ -565,8 +591,7 @@ class RoutineDatabase:
 
     def sync_get_history(self, name_or_id: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
         self._init_sqlite_sync()
-        with sqlite3.connect(self.db_path, timeout=5.0) as conn:
-            conn.row_factory = sqlite3.Row
+        with get_db_connection(self.db_path, timeout=5.0) as conn:
             q = "SELECT * FROM routine_runs"
             p: List[Any] = []
             if name_or_id:
@@ -575,6 +600,30 @@ class RoutineDatabase:
             q += " ORDER BY started_at DESC LIMIT ?"
             p.append(limit)
             return [dict(r) for r in conn.execute(q, p).fetchall()]
+
+    async def checkpoint(self) -> None:
+        """Flush SQLite WAL journal to the main database file."""
+        if self.db_path == ":memory:":
+            return
+        try:
+            async with aiosqlite.connect(self.db_path, timeout=10.0) as db:
+                await checkpoint_and_close_async(db, mode="PASSIVE")
+        except Exception as exc:
+            logger.debug("RoutineDatabase checkpoint error: %s", exc)
+
+    def sync_checkpoint(self) -> None:
+        """Flush SQLite WAL journal synchronously."""
+        if self.db_path == ":memory:":
+            return
+        try:
+            conn = get_db_connection(self.db_path, timeout=5.0)
+            checkpoint_and_close(conn, mode="PASSIVE")
+        except Exception as exc:
+            logger.debug("RoutineDatabase sync_checkpoint error: %s", exc)
+
+    async def stop(self) -> None:
+        """Cleanly flush and stop routine database handles."""
+        await self.checkpoint()
 
 
 # ── Routine Engine ──────────────────────────────────────────────────────────
@@ -826,7 +875,12 @@ class RoutineEngine:
             self._active_tasks.clear()
 
         self._running_routines.clear()
+        await self.db.stop()
         logger.info("RoutineEngine stopped cleanly.")
+
+    async def checkpoint(self) -> None:
+        """Flush database WAL writes."""
+        await self.db.checkpoint()
 
     async def reload(self) -> None:
         """Reload routines and notify daemon/clients."""
@@ -979,8 +1033,32 @@ class RoutineEngine:
         if routine.action_type == "maintenance":
             return await self._dispatch_maintenance_action(routine)
 
-        # 4. Default Prompt action
+        # 4. Command action
+        if routine.action_type in ("command", "cmd", "shell"):
+            return await self._dispatch_command_action(routine)
+
+        # 5. Default Prompt action
         return await self._dispatch_prompt_action(routine)
+
+    async def _dispatch_command_action(self, routine: Routine) -> str:
+        """Execute a shell command action via ToolRegistry or subprocess."""
+        from zelyr.tool_registry import ToolRegistry
+
+        registry = ToolRegistry()
+        payload = routine.action_payload
+        if isinstance(payload, dict):
+            cmd = payload.get("command") or payload.get("cmd") or ""
+        else:
+            cmd = str(payload).strip()
+
+        if not cmd:
+            raise ValueError("Command action missing command string in payload.")
+
+        result = await registry.execute_async("execute_command", command=cmd)
+        if hasattr(result, "success") and not result.success:
+            err_msg = getattr(result, "error", "Command execution failed")
+            raise RuntimeError(f"Command execution failed: {err_msg}")
+        return str(getattr(result, "output", result))
 
     async def _dispatch_tool_action(self, routine: Routine) -> str:
         """Execute a tool via ToolRegistry."""

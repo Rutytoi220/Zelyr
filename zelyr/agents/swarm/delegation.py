@@ -241,8 +241,15 @@ class DelegatedSubagent(BaseSubagent):
             blackboard=blackboard,
             session_id=session_id,
         )
+        from zelyr.tool_registry import _is_valid_ring_value
+
         self.profile = profile
-        self.caller_ring = max(caller_ring, profile.default_ring)
+        if _is_valid_ring_value(caller_ring) and _is_valid_ring_value(profile.default_ring):
+            self.caller_ring = max(caller_ring, profile.default_ring)
+        else:
+            # Preserve invalid ring metadata so execution fails closed instead of clamping
+            self.caller_ring = caller_ring if not _is_valid_ring_value(caller_ring) else profile.default_ring
+        self.allowed_tools = list(profile.allowed_tools)
         self.current_depth = current_depth
         self.max_depth = max_depth
         self.isolated_messages: List[Dict[str, Any]] = []
@@ -258,8 +265,24 @@ class DelegatedSubagent(BaseSubagent):
 
     async def execute_tool_call(self, tool_name: str, arguments: Dict[str, Any]) -> str:
         """Execute a tool call with strict role allowed-tools and capability ring enforcement."""
-        # 1. Allowed tools gating
-        if tool_name not in self.profile.allowed_tools:
+        import copy
+        from zelyr.tool_registry import (
+            _is_valid_ring_value,
+            authorize_and_validate_tool_call,
+            canonicalize_tool_invocation,
+        )
+
+        if not _is_valid_ring_value(getattr(self, "caller_ring", None)):
+            return f"AuthorizationError: Invalid caller_ring {getattr(self, 'caller_ring', None)!r}."
+
+        if not isinstance(arguments, dict):
+            return f"Error: Arguments for '{tool_name}' must be a JSON object/dictionary."
+
+        raw_arguments = copy.deepcopy(arguments)
+        tool_name, arguments = canonicalize_tool_invocation(tool_name, raw_arguments)
+
+        # 1. Allowed tools gating (evaluated on canonical target name)
+        if not isinstance(self.profile.allowed_tools, (list, tuple, set)) or tool_name not in self.profile.allowed_tools:
             return (
                 f"AuthorizationError: Tool '{tool_name}' is not in allowed tools list "
                 f"for role '{self.profile.role}'."
@@ -283,24 +306,43 @@ class DelegatedSubagent(BaseSubagent):
             val = self.read_blackboard(key)
             return json.dumps({"success": True, "key": key, "value": val})
 
-        # 3. ToolRegistry dispatch with capability ring validation
+        # 3. ToolRegistry dispatch with authoritative boundary validation
         if self.tool_registry is None:
             return f"Error: No tool registry available to execute '{tool_name}'."
 
-        tool_obj = (
-            self.tool_registry.get_tool(tool_name)
-            if hasattr(self.tool_registry, "get_tool")
-            else None
-        )
+        try:
+            tool_obj = (
+                self.tool_registry.get_tool(tool_name)
+                if hasattr(self.tool_registry, "get_tool")
+                else None
+            )
+        except Exception as exc:
+            return f"AuthorizationError: Registry lookup failed for '{tool_name}': {exc}"
 
-        # Enforce capability ring: caller_ring must not exceed required_ring (0=root, 1=user)
-        if hasattr(self.tool_registry, "_get_tool_ring"):
-            required_ring = self.tool_registry._get_tool_ring(tool_name, tool_obj)
-            if self.caller_ring > required_ring:
-                return (
-                    f"AuthorizationError: Tool '{tool_name}' requires higher permissions "
-                    f"(requires ring {required_ring}, caller ring is {self.caller_ring})."
-                )
+        authorized_target = getattr(tool_obj, "_target", getattr(tool_obj, "target", None)) if tool_obj is not None else None
+        authorized_execute = getattr(tool_obj, "execute", None) if tool_obj is not None else None
+
+        decision = authorize_and_validate_tool_call(
+            tool_name,
+            arguments,
+            caller_ring=self.caller_ring,
+            allowed_tools=self.profile.allowed_tools,
+            tool_registry=self.tool_registry if hasattr(self.tool_registry, "get_tool") else None,
+            tool=tool_obj,
+        )
+        if not decision.allowed:
+            return decision.detail or f"AuthorizationError: Tool '{tool_name}' execution denied."
+
+        tool_name = decision.tool_name
+        validated_arguments = copy.deepcopy(decision.normalized_arguments)
+
+        if hasattr(self.tool_registry, "get_tool"):
+            if (
+                self.tool_registry.get_tool(tool_name) is not tool_obj
+                or (tool_obj is not None and getattr(tool_obj, "_target", getattr(tool_obj, "target", None)) is not authorized_target)
+                or (tool_obj is not None and getattr(tool_obj, "execute", None) != authorized_execute)
+            ):
+                return f"AuthorizationError: Authorized callable for '{tool_name}' changed before execution."
 
         try:
             if hasattr(self.tool_registry, "execute_async"):
@@ -308,21 +350,19 @@ class DelegatedSubagent(BaseSubagent):
                     tool_name,
                     caller_ring=self.caller_ring,
                     allowed_tools=self.profile.allowed_tools,
-                    **arguments,
+                    **copy.deepcopy(validated_arguments),
                 )
             elif hasattr(self.tool_registry, "execute"):
                 res = self.tool_registry.execute(
                     tool_name,
                     caller_ring=self.caller_ring,
                     allowed_tools=self.profile.allowed_tools,
-                    **arguments,
+                    **copy.deepcopy(validated_arguments),
                 )
             elif tool_obj:
-                res = (
-                    await tool_obj(**arguments)
-                    if getattr(tool_obj, "is_async", False)
-                    else tool_obj(**arguments)
-                )
+                import inspect
+                raw_res = tool_obj(**copy.deepcopy(validated_arguments))
+                res = await raw_res if inspect.isawaitable(raw_res) else raw_res
             else:
                 return f"Tool '{tool_name}' not found."
 
@@ -442,16 +482,22 @@ class DelegatedSubagent(BaseSubagent):
                         })
 
                         for tc in tool_calls:
-                            fn = tc.get("function", {})
-                            name = fn.get("name") or tc.get("name")
-                            args = fn.get("arguments") or tc.get("arguments", {})
+                            fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                            name = (fn.get("name") if isinstance(fn, dict) else None) or (tc.get("name") if isinstance(tc, dict) else None) or ""
+                            if isinstance(fn, dict) and "arguments" in fn:
+                                args = fn["arguments"]
+                            elif isinstance(tc, dict) and "arguments" in tc:
+                                args = tc["arguments"]
+                            else:
+                                args = {}
                             if isinstance(args, str):
                                 try:
                                     args = json.loads(args)
                                 except Exception:
-                                    args = {}
+                                    # Preserve malformed string so execute_tool_call rejects it as non-dict
+                                    pass
 
-                            tc_id = tc.get("id") or f"call_{name}_{turn}"
+                            tc_id = (tc.get("id") if isinstance(tc, dict) else None) or f"call_{name}_{turn}"
                             tool_out = await self.execute_tool_call(name, args)
 
                             self.isolated_messages.append({

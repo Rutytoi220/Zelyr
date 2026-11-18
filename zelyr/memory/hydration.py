@@ -1,4 +1,4 @@
-"""Zelyr Contextual Memory Hydration Engine.
+"""Zelyr Contextual Memory Hydration Engine (Facade for zelyr.engine.memory_hydration).
 
 Implements relevance-based retrieval, composite ranking (BM25 + recency + utility),
 and hard token-budgeted prompt hydration for NativeOrchestrator.
@@ -10,6 +10,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from zelyr.db.memory import MemoryStore, get_db_path
+from zelyr.engine.memory_hydration import MemoryHydrator, hydrate_context_memory as _engine_hydrate
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,17 @@ def hydrate_context_memory(
     if not query_str:
         return ""
 
-    mem_store = store or MemoryStore(db_path=db_path or get_db_path())
-    relevant = mem_store.get_relevant_memories(query_str, max_tokens=max_tokens)
-    return format_contextual_memory(relevant)
+    if store is not None:
+        relevant = store.get_relevant_memories(query_str, max_tokens=max_tokens)
+        return format_contextual_memory(relevant)
+
+    hydrator = MemoryHydrator(db_path=db_path or get_db_path(), max_tokens=max_tokens)
+    memories = hydrator.get_relevant_memories(query_str)
+    return hydrator.format_recalled_memory_block(memories)
+
+
+__all__ = [
+    "format_contextual_memory",
+    "hydrate_context_memory",
+    "MemoryHydrator",
+]

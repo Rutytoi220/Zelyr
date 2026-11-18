@@ -24,11 +24,11 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
+from zelyr import __version__ as ZELYR_VERSION
 from zelyr.compat import data_dir
 
 logger = logging.getLogger(__name__)
 
-ZELYR_VERSION = "1.2.0rc1"
 AXIOM_VERSION = ZELYR_VERSION  # legacy public constant
 GITHUB_API_URL = "https://api.github.com/repos/Rutytoi220/Zelyr/releases/latest"
 

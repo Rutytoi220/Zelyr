@@ -1,7 +1,31 @@
 """Zelyr Deterministic Evaluation Subsystem."""
 
 from zelyr.eval.context import EvaluationContext
+from zelyr.eval.distributed import (
+    DistributedEvalRunner,
+    DistributedTaskResult,
+    DistributedTaskSpec,
+    DistributedTaskStatus,
+    ModelMetadata,
+    ResourceAwareScheduler,
+    TaskAssignment,
+    WorkerConfig,
+    WorkerSnapshot,
+    build_compatibility_suite,
+    build_standard_s_suite,
+    load_worker_configs,
+    probe_worker_async,
+    unload_worker_eval_models_async,
+)
+from zelyr.eval.distributed_report import compute_model_metrics, generate_distributed_reports
 from zelyr.eval.harness import EvalHarness, EvaluationHarness, LiveOllamaStreamAdapter, check_ollama_status_async
+from zelyr.eval.matrix import (
+    ArchetypeMetrics,
+    MatrixTaskOutcome,
+    ModelMatrixEvaluator,
+    format_matrix_table,
+    render_matrix_scorecard_markdown,
+)
 from zelyr.eval.metrics import EvalStatus, TaskResult, export_json_report, format_summary_table
 from zelyr.eval.provider import DeterministicModelProvider, MockTurn
 from zelyr.eval.report import BenchmarkReport
@@ -122,4 +146,25 @@ __all__ = [
     "generate_benchmark_scorecard",
     "render_markdown_scorecard",
     "export_scorecard",
+    "ModelMatrixEvaluator",
+    "ArchetypeMetrics",
+    "MatrixTaskOutcome",
+    "format_matrix_table",
+    "render_matrix_scorecard_markdown",
+    "DistributedEvalRunner",
+    "DistributedTaskResult",
+    "DistributedTaskSpec",
+    "DistributedTaskStatus",
+    "ModelMetadata",
+    "ResourceAwareScheduler",
+    "TaskAssignment",
+    "WorkerConfig",
+    "WorkerSnapshot",
+    "build_compatibility_suite",
+    "build_standard_s_suite",
+    "compute_model_metrics",
+    "generate_distributed_reports",
+    "load_worker_configs",
+    "probe_worker_async",
+    "unload_worker_eval_models_async",
 ]

@@ -14,12 +14,16 @@ class ToolResult:
         metadata: Optional[Dict] = None,
         remedy_hint: Optional[str] = None,
         allowed_actions: Optional[List[str]] = None,
+        error_type: Optional[str] = None,
     ):
         """Represents the result of a tool execution."""
         self.success = success
         self.output = output
         self.error = error
         self.metadata = metadata or {}
+        self.error_type = error_type or self.metadata.get("error_type")
+        if self.error_type:
+            self.metadata["error_type"] = self.error_type
         self.remedy_hint = remedy_hint if remedy_hint is not None else self.metadata.get("remedy_hint")
         self.allowed_actions = allowed_actions if allowed_actions is not None else self.metadata.get("allowed_actions", [])
         if self.remedy_hint:
@@ -42,6 +46,8 @@ class ToolResult:
             result["remedy_hint"] = self.remedy_hint
         if self.allowed_actions:
             result["allowed_actions"] = self.allowed_actions
+        if self.error_type:
+            result["error_type"] = self.error_type
 
         envelope = {
             "tool": tool,
@@ -51,6 +57,8 @@ class ToolResult:
         }
         if not self.success and self.error:
             envelope["error"] = self.error
+        if self.error_type:
+            envelope["error_type"] = self.error_type
         if self.remedy_hint:
             envelope["remedy_hint"] = self.remedy_hint
         if self.allowed_actions:
@@ -183,7 +191,12 @@ Returns:
                 properties[p.name] = {'type': p.type, 'description': p.description}
                 if p.required:
                     required.append(p.name)
-            return {'type': 'object', 'properties': properties, 'required': required}
+            return {
+                'type': 'object',
+                'properties': properties,
+                'required': required,
+                'additionalProperties': False,
+            }
         return {'type': 'object', 'properties': {}}
 
     def add_parameter(self, param: ToolParameter) -> None:

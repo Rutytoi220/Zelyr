@@ -396,3 +396,149 @@ class TestFacadeImportsAndParity:
         assert cb.estimate_tokens is bm.estimate_tokens
         assert cb.count_message_tokens is bm.count_message_tokens
         assert cb.estimate_messages_tokens is bm.estimate_messages_tokens
+
+
+class TestStage15ThinkingCompaction:
+    """Ensure large <think> reasoning blocks are compacted before Stage 2 evicts actual tool observations."""
+
+    def test_stage15_compacts_think_blocks_before_evicting_tool_turns(self):
+        """When <think> tags push messages over budget, Stage 1.5 strips <think> so Turn 1 tool observations survive."""
+        engine = ContextBudgetEngine()
+        huge_think = "<think>\n" + ("Detailed chain of thought reasoning token segment. " * 120) + "\n</think>\n"
+
+        messages = [
+            {"role": "system", "content": "You are Zelyr. Keep answers concise."},
+            {"role": "user", "content": "Read inspect_target.txt and overwrite it with UPDATED_909."},
+            {
+                "role": "assistant",
+                "content": huge_think,
+                "tool_calls": [{"id": "c_read", "type": "function", "function": {"name": "manage_workspace_file", "arguments": '{"action": "read"}'}}],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "c_read",
+                "name": "manage_workspace_file",
+                "content": "[TOOL OBSERVATION: manage_workspace_file]\nOLD_STALE_VALUE",
+            },
+            {
+                "role": "user",
+                "content": "Continue with the write step.",
+            },
+        ]
+
+        total_before = estimate_messages_tokens(messages)
+        # Budget chosen so raw <think> overflows target_budget, while compacted conversation fits easily
+        max_ctx = 1600
+        reserve = 400
+        target_budget = max_ctx - reserve
+        assert total_before > target_budget
+
+        compacted = engine.apply_context_budget(messages, max_context_tokens=max_ctx, reserve_tokens=reserve)
+        assert estimate_messages_tokens(compacted) <= target_budget
+
+        # Tool observation from Turn 1 must NOT be evicted into a summary anchor!
+        assert not any("[Previous conversation summary:" in str(m.get("content", "")) for m in compacted)
+        tool_msgs = [m for m in compacted if m.get("role") == "tool"]
+        assert len(tool_msgs) == 1
+        assert "OLD_STALE_VALUE" in tool_msgs[0]["content"]
+        # Tool calls metadata intact while bulky <think> was stripped
+        assist_msgs = [m for m in compacted if m.get("role") == "assistant"]
+        assert len(assist_msgs) == 1
+        assert "<think>" not in str(assist_msgs[0].get("content", ""))
+        assert assist_msgs[0].get("tool_calls")
+
+    def test_under_budget_preserves_think_blocks(self):
+        """Under budget / fast-path conversations must continue preserving <think> tags."""
+        engine = ContextBudgetEngine()
+        messages = [
+            {"role": "system", "content": "Directives."},
+            {"role": "user", "content": "Hello."},
+            {"role": "assistant", "content": "<think>Short reasoning.</think>\nHi there!"},
+            {"role": "user", "content": "Next."},
+        ]
+        res = engine.apply_context_budget(messages, max_context_tokens=8192, reserve_tokens=1000)
+        assert "<think>Short reasoning.</think>" in res[2]["content"]
+
+
+class TestConfigBudgetLimitsAndFailurePreservation:
+    """Verify Commit 5 budgeting source-of-truth, estimates, error retention, and overflow errors."""
+
+    def test_config_source_of_truth_and_heuristic_estimate_labels(self):
+        from zelyr.config import ZelyrConfig
+
+        engine = ContextBudgetEngine(reserve_ratio=0.20, min_reserve_tokens=500)
+        cfg = ZelyrConfig(ollama_num_ctx=4096)
+
+        # Config supplies effective num_ctx instead of defaulting silently to 32k catalog
+        limit, reserve = engine.calculate_budget(model_name="qwen2.5:7b", config=cfg)
+        assert limit == 4096
+        assert reserve == 819
+
+        # Explicit caller override wins over config
+        ov_limit, _ = engine.calculate_budget(model_name="qwen2.5:7b", max_context_tokens=16384, config=cfg)
+        assert ov_limit == 16384
+
+        tools = [{"type": "function", "function": {"name": "execute_command", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}}}]
+        headroom = engine.get_context_headroom(
+            [{"role": "system", "content": "System"}, {"role": "user", "content": "Hi"}],
+            model_name="qwen2.5:7b",
+            tools=tools,
+            config=cfg,
+        )
+        assert headroom["token_counting_mode"] == "heuristic_estimate"
+        assert headroom["estimated_tools_tokens"] > 0
+        assert headroom["estimated_current_tokens"] == headroom["current_tokens"]
+        assert headroom["target_budget"] == 4096 - 819 - headroom["estimated_tools_tokens"]
+
+    def test_stage2_preserves_failure_evidence_and_tool_call_arguments(self):
+        engine = ContextBudgetEngine()
+        messages = [
+            {"role": "system", "content": "System instructions."},
+            {"role": "user", "content": "Root task: fix and verify config.json."},
+            {
+                "role": "assistant",
+                "content": "Writing file.",
+                "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "manage_workspace_file", "arguments": {"path": "config.json"}}}],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "name": "manage_workspace_file",
+                "content": (
+                    "[TOOL OBSERVATION: manage_workspace_file]\n"
+                    "- Status: SUCCESS\n"
+                    "[Outcome Verification Failed]:\n"
+                    "- Failed Criterion: file_contains:config.json:READY\n"
+                    "- Verifier Reason: Missing READY token\n"
+                    + ("filler " * 220)
+                ),
+            },
+            {"role": "user", "content": "Current turn: finalize cleanly."},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "c2", "type": "function", "function": {"name": "verify_outcome", "arguments": {"check": "file_contains", "target": "config.json", "expected": "READY"}}}],
+            },
+            {"role": "tool", "tool_call_id": "c2", "name": "verify_outcome", "content": "Pending"},
+        ]
+        pruned, evicted = engine.stage2_prune_turns(messages, target_budget=400)
+        assert evicted > 0
+        summary_msg = next(m for m in pruned if "[Previous conversation summary:" in str(m.get("content", "")))
+        assert "Preserved failures/verification errors" in summary_msg["content"]
+        assert "file_contains:config.json:READY" in summary_msg["content"]
+        active_assist = next(m for m in pruned if m.get("role") == "assistant" and m.get("tool_calls") and m["tool_calls"][0]["id"] == "c2")
+        assert active_assist["tool_calls"][0]["function"]["arguments"] == {"check": "file_contains", "target": "config.json", "expected": "READY"}
+
+    def test_oversized_required_context_fails_explicitly(self):
+        from zelyr.engine.budget_manager import ContextBudgetLimitError
+
+        engine = ContextBudgetEngine()
+        oversized = [
+            {"role": "system", "content": "Mandatory system directive " * 80},
+            {"role": "user", "content": "Mandatory root prompt " * 80},
+        ]
+        with pytest.raises(ContextBudgetLimitError) as exc_info:
+            engine.enforce_context_budget(oversized, max_context_tokens=500, reserve_tokens=100)
+        err_dict = exc_info.value.to_dict()
+        assert err_dict["error_type"] == "CONTEXT_BUDGET_EXCEEDED"
+        assert err_dict["required_tokens"] > err_dict["target_budget"]

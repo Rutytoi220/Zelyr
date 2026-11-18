@@ -7,29 +7,105 @@ Compatible with Chrome, Chromium, Brave, Zen Browser, and Electron apps.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
 import websockets
 
+from zelyr.engine.browser_cdp import CDPBrowserClient
 from zelyr.tools.core import BaseTool, ToolParameter, ToolResult
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_CDP_PORTS = [9222, 9223, 9224]
 
+# Standard Zelyr Plugin Interface
+REQUIRED_RING = 2
+TIER = 2
+TUI_HINT = "Navigating browser page..."
+
+TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "interact_with_browser",
+        "description": (
+            "Tier 2 Semantic UI Automation: Browser and tab automation via direct Chrome DevTools Protocol (CDP) "
+            "and Zelyr WebExtension bridge. Use 'click_element' with 'element_id' from get_page_snapshot. "
+            "Actions: 'get_page_snapshot', 'click_element', 'fill_element', 'scroll_page', 'navigate_url', "
+            "'capture_tab_screenshot', 'switch_tab', 'list_tabs', 'open_tab', 'close_tab', 'evaluate_script', 'click', 'type', 'get_dom'."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": (
+                        "The browser action: 'get_page_snapshot', 'click_element', 'fill_element', 'scroll_page', "
+                        "'navigate_url', 'capture_tab_screenshot', 'switch_tab', 'list_tabs', 'open_tab', 'close_tab', "
+                        "'evaluate_script', 'click', 'type', 'get_dom'."
+                    ),
+                },
+                "element_id": {
+                    "type": "integer",
+                    "description": "Numeric snapshot ID of the interactive element from get_page_snapshot.",
+                },
+                "text": {
+                    "type": "string",
+                    "description": "Text to fill or type into an element.",
+                },
+                "url": {
+                    "type": "string",
+                    "description": "Target URL to open or navigate to.",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Tab title or URL query to search and switch to.",
+                },
+                "direction": {
+                    "type": "string",
+                    "enum": ["down", "up", "top", "bottom"],
+                    "description": "Scroll direction when action is 'scroll_page'.",
+                },
+                "amount": {
+                    "type": "integer",
+                    "description": "Scroll offset in pixels (default 600).",
+                },
+                "submit": {
+                    "type": "boolean",
+                    "description": "Whether to submit the form after filling the element.",
+                },
+                "selector": {
+                    "type": "string",
+                    "description": "CSS selector for DOM interaction.",
+                },
+                "expression": {
+                    "type": "string",
+                    "description": "JavaScript expression to evaluate.",
+                },
+                "tab_id": {
+                    "type": "string",
+                    "description": "Target tab ID or filter.",
+                },
+            },
+            "required": ["action"],
+        },
+    },
+}
+
 
 class InteractWithBrowserTool(BaseTool):
     """Semantic browser automation using the Zelyr WebExtension bridge & Chrome DevTools Protocol."""
 
-    def __init__(self):
+    def __init__(self, cdp_client: Optional[CDPBrowserClient] = None):
         super().__init__(
             tool_id="interact_with_browser",
             name="interact_with_browser",
             description=(
-                "Tier 2 Semantic UI Automation: Browser and tab automation via Zelyr WebExtension bridge. "
+                "Tier 2 Semantic UI Automation: Browser and tab automation via Zelyr WebExtension bridge & Chrome DevTools Protocol. "
                 "Use 'click_element' with 'element_id' from the latest get_page_snapshot to click buttons, links, or controls on the page. "
                 "Actions: 'navigate_url' (navigate active tab in-place), 'capture_tab_screenshot' (capture PNG of viewport), "
                 "'evaluate_script' (execute JS expression in active tab), 'get_page_snapshot' (list numbered interactive elements), "
@@ -44,6 +120,7 @@ class InteractWithBrowserTool(BaseTool):
             requires_window=True,
             token_cost=250,
         )
+        self.cdp_client = cdp_client
         self.parameters = [
             ToolParameter(
                 name="action",
@@ -268,7 +345,7 @@ class InteractWithBrowserTool(BaseTool):
                         target_url = params.get("query") or params.get("url") or "<url>"
                         if "open_tabs" in ext_res:
                             tabs_summary = ", ".join([f"'{t.get('title') or t.get('url')}'" for t in ext_res["open_tabs"]])
-                            error_msg = f"{error_msg}. Open tabs: [{tabs_summary}]."
+                            error_msg = f"{error_msg}. Open tabs: [{tabs_summary}]. Hint: Use action='open_tab' to open a new tab."
                         if not remedy_hint:
                             remedy_hint = f"Call list_tabs to see valid targets, or open_tab with url='{target_url}' to launch it."
                         if not allowed_actions:
@@ -282,6 +359,21 @@ class InteractWithBrowserTool(BaseTool):
                         metadata={"open_tabs": ext_res.get("open_tabs", [])} if "open_tabs" in ext_res else None,
                     )
                 else:
+                    # WebExtension not connected. Attempt direct CDP fallback if available or injected.
+                    port = int(params.get("port") or 9222)
+                    cdp = self.cdp_client or CDPBrowserClient(port=port)
+                    cdp_ready = False
+                    if self.cdp_client is not None:
+                        cdp_ready = True
+                    else:
+                        try:
+                            cdp_ready = await cdp.is_available()
+                        except Exception:
+                            cdp_ready = False
+
+                    if cdp_ready:
+                        return await self._execute_cdp(cdp, action, params, selector, text, expression, tab_id)
+
                     elem_id = params.get("element_id")
                     target_url = params.get("query") or params.get("url") or "<url>"
                     base_err = (
@@ -295,6 +387,7 @@ class InteractWithBrowserTool(BaseTool):
                             error=base_err,
                             remedy_hint="Call get_page_snapshot to refresh element IDs, or scroll_page down if the element is below the viewport.",
                             allowed_actions=["get_page_snapshot", "scroll_page"],
+                            output={"status": "error", "error_type": "BROWSER_UNAVAILABLE", "error": base_err},
                         )
                     elif action == "switch_tab":
                         return ToolResult(
@@ -302,12 +395,14 @@ class InteractWithBrowserTool(BaseTool):
                             error=base_err,
                             remedy_hint=f"Call list_tabs to see valid targets, or open_tab with url='{target_url}' to launch it.",
                             allowed_actions=["list_tabs", "open_tab"],
+                            output={"status": "error", "error_type": "BROWSER_UNAVAILABLE", "error": base_err},
                         )
                     return ToolResult(
                         False,
                         error=base_err,
                         remedy_hint="Ensure the browser extension is running or use Tier 1 execute_command or manage_desktop_window.",
                         allowed_actions=["execute_command", "manage_desktop_window"],
+                        output={"status": "error", "error_type": "BROWSER_UNAVAILABLE", "error": base_err},
                     )
             except ConnectionResetError:
                 return ToolResult(
@@ -331,6 +426,7 @@ class InteractWithBrowserTool(BaseTool):
                         error=base_err,
                         remedy_hint="Call get_page_snapshot to refresh element IDs, or scroll_page down if the element is below the viewport.",
                         allowed_actions=["get_page_snapshot", "scroll_page"],
+                        output={"status": "error", "error_type": "BROWSER_UNAVAILABLE", "error": base_err},
                     )
                 elif action == "switch_tab":
                     return ToolResult(
@@ -338,159 +434,157 @@ class InteractWithBrowserTool(BaseTool):
                         error=base_err,
                         remedy_hint=f"Call list_tabs to see valid targets, or open_tab with url='{target_url}' to launch it.",
                         allowed_actions=["list_tabs", "open_tab"],
+                        output={"status": "error", "error_type": "BROWSER_UNAVAILABLE", "error": base_err},
                     )
                 return ToolResult(
                     False,
                     error=base_err,
                     remedy_hint="Ensure the browser extension is running or use Tier 1 execute_command or manage_desktop_window.",
                     allowed_actions=["execute_command", "manage_desktop_window"],
+                    output={"status": "error", "error_type": "BROWSER_UNAVAILABLE", "error": base_err},
                 )
 
-        # Legacy CDP path (strictly exercised only when _force_cdp=True)
+        # Legacy or explicit CDP path (_force_cdp=True)
         port = int(params.get("port") or 9222)
+        cdp = self.cdp_client or CDPBrowserClient(port=port)
+        return await self._execute_cdp(cdp, action, params, selector, text, expression, tab_id)
 
-        # Handle list_tabs discovery
-        if action in ("list_tabs", "tabs"):
-            ports_to_try = [port] + [p for p in DEFAULT_CDP_PORTS if p != port]
-            async with httpx.AsyncClient(timeout=1.5) as client:
-                for p in ports_to_try:
-                    try:
-                        resp = await client.get(f"http://127.0.0.1:{p}/json")
-                        if resp.status_code == 200:
-                            targets = resp.json()
-                            summary = [
-                                {
-                                    "id": t.get("id"),
-                                    "title": t.get("title"),
-                                    "url": t.get("url"),
-                                    "type": t.get("type"),
-                                }
-                                for t in targets
-                            ]
-                            return ToolResult(True, output={"port": p, "tabs": summary})
-                    except Exception:
-                        continue
-            return ToolResult(
-                False,
-                error="No running browser found on CDP debug ports (9222, 9223). Start browser with '--remote-debugging-port=9222'.",
-            )
-
-        # Discover active page WebSocket
-        ws_url, page_info, err = await self._discover_tab(port, tab_id)
-        if not ws_url or err:
-            return ToolResult(
-                False,
-                error=(
-                    "CDP Connection Failed: Browser is not running with remote debugging enabled. "
-                    "Ensure Zen Browser, Chrome, or Brave is launched with '--remote-debugging-port=9222'."
-                ),
-            )
-
+    async def _execute_cdp(
+        self,
+        cdp: CDPBrowserClient,
+        action: str,
+        params: Dict[str, Any],
+        selector: str,
+        text: str,
+        expression: str,
+        tab_id: str,
+    ) -> ToolResult:
+        """Execute browser action using direct CDPBrowserClient."""
         try:
-            if action == "click":
-                if not selector:
-                    return ToolResult(False, error="CSS selector is required for 'click' action.")
-
-                js_click = f"""
-                (() => {{
-                    const el = document.querySelector({json.dumps(selector)});
-                    if (!el) return {{ success: false, error: "Element not found for selector: " + {json.dumps(selector)} }};
-                    el.scrollIntoView({{ block: "center", inline: "center", behavior: "instant" }});
-                    el.focus();
-                    el.click();
-                    el.dispatchEvent(new MouseEvent('mousedown', {{ bubbles: true, cancelable: true, view: window }}));
-                    el.dispatchEvent(new MouseEvent('mouseup', {{ bubbles: true, cancelable: true, view: window }}));
-                    return {{
-                        success: true,
-                        tag: el.tagName,
-                        text: (el.innerText || el.value || "").slice(0, 100),
-                        selector: {json.dumps(selector)}
-                    }};
-                }})()
-                """
-                resp = await self._send_cdp(ws_url, "Runtime.evaluate", {
-                    "expression": js_click,
-                    "returnByValue": True,
-                    "awaitPromise": True,
-                })
-                result = resp.get("result", {}).get("result", {}).get("value", {})
-                if isinstance(result, dict) and not result.get("success", False):
-                    return ToolResult(False, error=result.get("error", "Click failed."))
-                return ToolResult(True, output=result)
-
-            elif action == "type":
-                if not selector:
-                    return ToolResult(False, error="CSS selector is required for 'type' action.")
-
-                js_type = f"""
-                (() => {{
-                    const el = document.querySelector({json.dumps(selector)});
-                    if (!el) return {{ success: false, error: "Element not found for selector: " + {json.dumps(selector)} }};
-                    el.scrollIntoView({{ block: "center", inline: "center", behavior: "instant" }});
-                    el.focus();
-                    if ('value' in el) {{
-                        el.value = {json.dumps(text)};
-                        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                        el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    }} else {{
-                        el.textContent = {json.dumps(text)};
-                        el.dispatchEvent(new InputEvent('input', {{ bubbles: true, data: {json.dumps(text)} }}));
-                    }}
-                    return {{
-                        success: true,
-                        selector: {json.dumps(selector)},
-                        typed: {json.dumps(text)}
-                    }};
-                }})()
-                """
-                resp = await self._send_cdp(ws_url, "Runtime.evaluate", {
-                    "expression": js_type,
-                    "returnByValue": True,
-                    "awaitPromise": True,
-                })
-                result = resp.get("result", {}).get("result", {}).get("value", {})
-                if isinstance(result, dict) and not result.get("success", False):
-                    return ToolResult(False, error=result.get("error", "Type failed."))
-                return ToolResult(True, output=result)
-
-            elif action in ("evaluate", "js", "exec"):
-                if not expression:
-                    return ToolResult(False, error="JavaScript expression is required for 'evaluate' action.")
-
-                resp = await self._send_cdp(ws_url, "Runtime.evaluate", {
-                    "expression": expression,
-                    "returnByValue": True,
-                    "awaitPromise": True,
-                })
-                res_obj = resp.get("result", {}).get("result", {})
-                if "value" in res_obj:
-                    return ToolResult(True, output=res_obj["value"])
-                return ToolResult(True, output=res_obj)
-
-            elif action in ("get_content", "read_page", "content"):
-                js_content = """
-                (() => {
-                    return {
-                        title: document.title,
-                        url: location.href,
-                        body_text: (document.body ? document.body.innerText : "").slice(0, 3000)
-                    };
-                })()
-                """
-                resp = await self._send_cdp(ws_url, "Runtime.evaluate", {
-                    "expression": js_content,
-                    "returnByValue": True,
-                    "awaitPromise": True,
-                })
-                result = resp.get("result", {}).get("result", {}).get("value", {})
-                return ToolResult(True, output=result)
-
+            if action in ("get_page_snapshot", "snapshot"):
+                res = await cdp.get_page_snapshot()
+            elif action in ("click_element",):
+                elem_id = params.get("element_id")
+                if elem_id is None:
+                    return ToolResult(False, error="Numeric 'element_id' is required for 'click_element' action.")
+                res = await cdp.click_element(elem_id)
+            elif action in ("fill_element",):
+                elem_id = params.get("element_id")
+                if elem_id is None:
+                    return ToolResult(False, error="Numeric 'element_id' is required for 'fill_element' action.")
+                res = await cdp.fill_element(elem_id, text=text)
+            elif action in ("click",):
+                elem_id = params.get("element_id")
+                if elem_id is not None:
+                    res = await cdp.click_element(elem_id)
+                elif selector:
+                    res = await cdp.click_selector(selector)
+                else:
+                    return ToolResult(False, error="CSS selector or element_id is required for 'click' action.")
+            elif action in ("type",):
+                elem_id = params.get("element_id")
+                if elem_id is not None:
+                    res = await cdp.fill_element(elem_id, text=text)
+                elif selector:
+                    res = await cdp.type_selector(selector, text=text)
+                else:
+                    return ToolResult(False, error="CSS selector or element_id is required for 'type' action.")
+            elif action in ("scroll_page", "scroll"):
+                res = await cdp.scroll_page(
+                    direction=str(params.get("direction", "down") or "down"),
+                    amount=int(params.get("amount", 600) or 600),
+                )
+            elif action in ("switch_tab", "switch"):
+                query = str(params.get("query", "") or params.get("url", "") or tab_id or "")
+                res = await cdp.switch_tab(query=query)
+            elif action in ("list_tabs", "tabs"):
+                tabs = await cdp.list_tabs()
+                res = {"status": "success", "tabs": tabs}
+            elif action in ("open_tab", "new_tab"):
+                target_url = str(params.get("url", "") or "about:blank")
+                res = await cdp.open_tab(url=target_url)
+            elif action in ("close_tab",):
+                res = await cdp.close_tab(target_id=tab_id or None)
+            elif action in ("navigate_url", "navigate"):
+                target_url = str(params.get("url", "") or "")
+                res = await cdp.navigate(url=target_url)
+            elif action in ("capture_tab_screenshot", "screenshot"):
+                b64_data = await cdp.capture_screenshot()
+                screenshot_path = "/tmp/zelyr_tab_capture.png"
+                try:
+                    if b64_data:
+                        Path(screenshot_path).write_bytes(base64.b64decode(b64_data))
+                    res = {
+                        "status": "success",
+                        "screenshot_path": screenshot_path,
+                        "format": "png",
+                        "length": len(b64_data),
+                    }
+                except Exception as save_err:
+                    return ToolResult(False, error=f"Failed saving screenshot: {save_err}")
+            elif action in ("evaluate_script", "evaluate", "js", "exec"):
+                expr = expression or str(params.get("expression", "") or "")
+                if not expr:
+                    return ToolResult(False, error="JavaScript expression is required for 'evaluate_script' action.")
+                eval_val = await cdp.evaluate_script(expr)
+                res = {"status": "success", "result": eval_val}
+            elif action in ("extract_page_content", "get_dom", "content"):
+                res = await cdp.get_page_snapshot()
+            elif action in ("get_active_tab",):
+                tabs = await cdp.list_tabs()
+                active = tabs[0] if tabs else {}
+                res = {"status": "success", "tab_id": active.get("id"), "tab": active}
             else:
                 return ToolResult(
                     False,
-                    error=f"Unknown browser action '{action}'. Supported actions: click, type, evaluate, get_content, list_tabs.",
+                    error=f"Unknown browser action '{action}'. Supported actions: get_page_snapshot, click_element, fill_element, scroll_page, switch_tab, open_tab, close_tab, navigate_url, capture_tab_screenshot, evaluate_script, list_tabs.",
                 )
+
+            if isinstance(res, dict) and res.get("status") == "error":
+                return ToolResult(
+                    False,
+                    error=res.get("error", "CDP browser command failed."),
+                    remedy_hint=res.get("remedy_hint"),
+                    allowed_actions=res.get("allowed_actions"),
+                    output=res,
+                )
+            return ToolResult(True, output=res)
 
         except Exception as exc:
             logger.exception("Error executing CDP command")
-            return ToolResult(False, error=f"CDP command execution error: {exc}")
+            return ToolResult(
+                False,
+                error=f"CDP command execution error: {exc}",
+                remedy_hint="Verify browser remote debugging endpoint is reachable.",
+                allowed_actions=["interact_with_browser"],
+                output={"status": "error", "error_type": "BROWSER_UNAVAILABLE", "error": str(exc)},
+            )
+
+
+async def execute(
+    action: str = "get_page_snapshot",
+    client: Optional[CDPBrowserClient] = None,
+    **kwargs: Any,
+) -> str:
+    """Standard dynamic tool plugin entry point. Returns serialized JSON string."""
+    tool = InteractWithBrowserTool(cdp_client=client)
+    res = await tool.execute({"action": action, **kwargs})
+    if res.success:
+        return json.dumps(res.output if isinstance(res.output, (dict, list)) else {"output": res.output})
+    return json.dumps({
+        "status": "error",
+        "error": res.error,
+        "remedy_hint": res.remedy_hint,
+        "allowed_actions": res.allowed_actions,
+        **(res.output if isinstance(res.output, dict) else {}),
+    })
+
+
+__all__ = [
+    "InteractWithBrowserTool",
+    "execute",
+    "TOOL_SCHEMA",
+    "REQUIRED_RING",
+    "TIER",
+    "TUI_HINT",
+]

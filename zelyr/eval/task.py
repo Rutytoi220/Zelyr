@@ -27,6 +27,7 @@ class EvalTask:
     custom_tools: Optional[Dict[str, Callable[..., Any]]] = None
     tool_schemas: Optional[List[Dict[str, Any]]] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+    enable_cycle_detection: bool = True
 
     # Backward-compatibility aliases for L1 evaluation suite
     fake_tools: Dict[str, Callable[..., Any]] = field(default_factory=dict)

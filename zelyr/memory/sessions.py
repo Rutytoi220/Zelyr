@@ -9,6 +9,7 @@ from typing import Dict, List, Any, Optional, Union
 import uuid
 
 import aiosqlite
+from zelyr.db.connection import checkpoint_and_close, get_db_connection
 from zelyr.memory.db import MemoryDatabaseManager
 
 logger = logging.getLogger(__name__)
@@ -32,16 +33,22 @@ class SessionManager:
     def _get_conn(self) -> sqlite3.Connection:
         if self.db_path == ":memory:":
             if self._mem_conn is None:
-                self._mem_conn = sqlite3.connect(":memory:", timeout=30.0)
-                self._mem_conn.row_factory = sqlite3.Row
-                self._mem_conn.execute("PRAGMA foreign_keys=ON;")
+                self._mem_conn = get_db_connection(":memory:", timeout=30.0)
             return self._mem_conn
 
-        conn = sqlite3.connect(self.db_path, timeout=30.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA foreign_keys=ON;")
-        return conn
+        return get_db_connection(self.db_path, timeout=30.0)
+
+    def close(self) -> None:
+        """Safely checkpoint and close database connections."""
+        if self._mem_conn is not None:
+            checkpoint_and_close(self._mem_conn)
+            self._mem_conn = None
+        elif self.db_path != ":memory:":
+            try:
+                conn = get_db_connection(self.db_path, timeout=5.0)
+                checkpoint_and_close(conn)
+            except Exception as exc:
+                logger.debug("Failed to checkpoint sessions database on close: %s", exc)
 
     def _init_db(self) -> None:
         """Initialize sessions and session_messages tables with schema migrations."""

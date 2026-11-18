@@ -12,7 +12,30 @@ from typing import TYPE_CHECKING, Any
 from zelyr.compat import sync_legacy_env
 sync_legacy_env()
 
-__version__ = "1.2.0rc1"
+
+def _resolve_version() -> str:
+    """Resolve package version from pyproject.toml in source checkouts or dist-info metadata."""
+    from pathlib import Path
+    import re
+
+    pyproject_path = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    if pyproject_path.is_file():
+        try:
+            text = pyproject_path.read_text(encoding="utf-8")
+            match = re.search(r'(?m)^version\s*=\s*"([^"]+)"', text)
+            if match:
+                return match.group(1)
+        except OSError:
+            pass
+    try:
+        from importlib.metadata import version
+
+        return version("zelyr-core")
+    except Exception:
+        return "1.4.0"
+
+
+__version__ = _resolve_version()
 __author__ = "Zelyr Team"
 __description__ = "Local-first AI orchestration framework"
 

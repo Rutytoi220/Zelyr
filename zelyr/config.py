@@ -63,6 +63,18 @@ def validate_and_clamp_num_ctx(val: Any) -> int:
 
     return int_val
 
+
+def validate_ollama_base_url(val: Any) -> str:
+    """Normalize an Ollama endpoint URL while preserving localhost-to-IPv4 canonicalization."""
+    if not isinstance(val, str):
+        return 'http://127.0.0.1:11434'
+    cleaned = val.strip().rstrip('/')
+    if not cleaned:
+        return 'http://127.0.0.1:11434'
+    if '://' not in cleaned:
+        cleaned = f'http://{cleaned}'
+    return cleaned.replace('localhost', '127.0.0.1').rstrip('/')
+
 class AuthMode(Enum):
     STRICT = 'strict'
     BASIC = 'basic'
@@ -100,6 +112,8 @@ Returns:
     ollama_base_url: str = 'http://127.0.0.1:11434'
     ollama_model: str = 'qwen3:8b'
     ollama_num_ctx: int = 8192
+    ollama_keep_alive: str = '5m'
+    ollama_read_timeout: float = 300.0
     power_saving_model: str = 'qwen2.5:1.5b'
     embedding_model: str = 'nomic-embed-text'
     ollama_temperature: float = 0.7
@@ -155,7 +169,7 @@ Returns:
                 filtered['persona']['directives'] = [config_dict['special_instructions']]
                 
         if 'ollama_base_url' in filtered and isinstance(filtered['ollama_base_url'], str):
-            filtered['ollama_base_url'] = filtered['ollama_base_url'].replace("localhost", "127.0.0.1")
+            filtered['ollama_base_url'] = validate_ollama_base_url(filtered['ollama_base_url'])
 
         if 'ollama_num_ctx' in filtered:
             filtered['ollama_num_ctx'] = validate_and_clamp_num_ctx(filtered['ollama_num_ctx'])
@@ -177,6 +191,8 @@ Returns:
             'ollama_base_url': self.ollama_base_url, 
             'ollama_model': self.ollama_model, 
             'ollama_num_ctx': self.ollama_num_ctx,
+            'ollama_keep_alive': self.ollama_keep_alive,
+            'ollama_read_timeout': self.ollama_read_timeout,
             'embedding_model': self.embedding_model, 
             'ollama_temperature': self.ollama_temperature, 
             'db_path': self.db_path, 
@@ -233,6 +249,71 @@ Returns:
             return validate_and_clamp_num_ctx(self.ollama_num_ctx)
 
         return 8192
+
+    def get_effective_ollama_base_url(self, caller_override: Optional[Any] = None) -> str:
+        """Resolve effective Ollama base URL with explicit precedence:
+        1. Caller/Task override
+        2. ZELYR_OLLAMA_BASE_URL / AXIOM_OLLAMA_BASE_URL
+        3. OLLAMA_HOST environment variable
+        4. Config setting 'ollama_base_url'
+        5. System default: 'http://127.0.0.1:11434'
+        """
+        if isinstance(caller_override, str) and caller_override.strip():
+            return validate_ollama_base_url(caller_override)
+
+        env_url = get_env("OLLAMA_BASE_URL")
+        if isinstance(env_url, str) and env_url.strip():
+            return validate_ollama_base_url(env_url)
+
+        ollama_host = os.environ.get("OLLAMA_HOST")
+        if isinstance(ollama_host, str) and ollama_host.strip():
+            return validate_ollama_base_url(ollama_host)
+
+        if hasattr(self, "ollama_base_url") and isinstance(self.ollama_base_url, str) and self.ollama_base_url.strip():
+            return validate_ollama_base_url(self.ollama_base_url)
+
+        return 'http://127.0.0.1:11434'
+
+    def get_effective_keep_alive(self, caller_override: Optional[Any] = None) -> Any:
+        """Resolve bounded Ollama keep_alive setting (preserving explicit 0 to unload)."""
+        if caller_override is not None and caller_override != "":
+            return caller_override
+
+        env_ka = get_env("OLLAMA_KEEP_ALIVE")
+        if env_ka is not None and env_ka.strip():
+            cleaned = env_ka.strip()
+            return 0 if cleaned == "0" else cleaned
+
+        cfg_ka = getattr(self, "ollama_keep_alive", None)
+        if cfg_ka is not None and cfg_ka != "":
+            return cfg_ka
+
+        return "5m"
+
+    def get_effective_read_timeout(self, caller_override: Optional[Any] = None) -> float:
+        """Resolve Ollama HTTP stream read timeout (seconds) with fallback to 300.0."""
+        def _parse_timeout(val: Any) -> Optional[float]:
+            if val is None or isinstance(val, bool):
+                return None
+            try:
+                parsed = float(val)
+            except (TypeError, ValueError):
+                return None
+            return parsed if parsed >= 5.0 else None
+
+        override_val = _parse_timeout(caller_override)
+        if override_val is not None:
+            return override_val
+
+        env_val = _parse_timeout(get_env("OLLAMA_READ_TIMEOUT"))
+        if env_val is not None:
+            return env_val
+
+        cfg_val = _parse_timeout(getattr(self, "ollama_read_timeout", None))
+        if cfg_val is not None:
+            return cfg_val
+
+        return 300.0
 
     def save(self) -> None:
         """Save configuration to ~/.config/zelyr/config.json."""

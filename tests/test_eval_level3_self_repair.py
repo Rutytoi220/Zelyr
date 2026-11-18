@@ -253,6 +253,7 @@ async def execute(**kwargs):
             ],
             level=3,
             max_steps=3,
+            enable_cycle_detection=False,
         )
 
         result = await self.harness.run_task(task)

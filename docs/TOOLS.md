@@ -1,6 +1,6 @@
 # Zelyr Tool Creation & Extension Guide
 
-This guide documents the real pattern for adding, configuring, and testing tools in **Zelyr** (v1.0.0).  
+This guide documents the real pattern for adding, configuring, and testing tools in **Zelyr** (v1.4.0).
 Zelyr supports two complementary tool creation models:
 1. **Dynamic File Plugins (`~/.config/zelyr/tools.d/<name>.py`):** Standalone Python files automatically loaded and hot-reloaded by [`zelyr/core/plugins.py`](../zelyr/core/plugins.py).
 2. **Subclassed Native Tools ([`zelyr/tools/base.py`](../zelyr/tools/base.py)):** Structured object-oriented tool classes inheriting from `BaseTool`.
@@ -19,9 +19,11 @@ Every tool in Zelyr belongs to a capability tier that controls when it is expose
 | **3** | **Visual Fallback** | 600 | Set-of-Mark (SoM) bounding box detection, OCR, VLM | `interact_with_ui`, `capture_som_screen` |
 
 ### Security Rings (`REQUIRED_RING`):
-- `Ring 0`: System-critical built-in tools. Always accessible by default.
-- `Ring 1`: Elevated tools requiring explicit authorization.
-- `Ring 2` / `Ring 3`: Sandboxed user tools.
+- `Ring 0`: Immutable built-in core tools only (`zelyr/tools/` and core actuators in `zelyr/core/plugins.py`). Dynamic plugins in `tools.d/` are forbidden by [`validate_tool_ast`](../zelyr/tools/validator.py) from declaring `REQUIRED_RING = 0`.
+- `Ring 1` / `Ring 2` / `Ring 3`: Valid ring levels (`1..3`) for user-created or runtime-crafted dynamic plugins in `tools.d/`.
+- **Authoritative Ring & Allowlist Enforcement:** Every tool invocation passes through [`authorize_and_validate_tool_call`](../zelyr/tool_registry.py) after canonical alias resolution (`canonicalize_tool_invocation`). A caller with privilege ring `caller_ring` can only invoke tools where `0 <= caller_ring <= required_ring <= 3` (lower ring numbers represent higher privilege; invalid, missing, boolean, or out-of-range ring metadata fails closed). When `allowed_tools` is supplied, the canonical tool name must appear in the allowlist.
+- **Evaluation-Only Task Scope (`TaskLocalToolScope`):** Isolated evaluation fixtures that use synthetic mock tool names with a custom `tool_executor` must opt in explicitly via `TaskLocalToolScope` (or `bind_task_local_executor`), which blocks access to production `ToolRegistry` and plugin registries.
+- **Execution Model (`SandboxedPluginRunner` vs. In-Process):** Built-in Ring-0 tools run in-process (or via `asyncio.to_thread`), whereas dynamic plugins (`REQUIRED_RING >= 1`) execute in a child process managed by [`SandboxedPluginRunner`](../zelyr/core/plugin_sandbox.py) with `RLIMIT_AS` (512 MB), `RLIMIT_CORE = 0`, `/dev/null` stdin, and bounded wall-clock timeouts (`SIGTERM` -> `SIGKILL`). This provides crash and memory containment under the host user's UID, not OS-level kernel namespace/seccomp isolation.
 
 ---
 
@@ -65,8 +67,8 @@ TOOL_SCHEMA: Dict[str, Any] = {
 # 2. Interactive TUI spinner message
 TUI_HINT: str = "🔍 Checking git repository status..."
 
-# 3. Security ring level (0=system, 1=elevated, 2=user)
-REQUIRED_RING: int = 0
+# 3. Security ring level (1..3 for dynamic plugins; Ring 0 is reserved for built-in core tools)
+REQUIRED_RING: int = 1
 
 # 4. Capability tier (0=Core, 1=IPC/OS, 2=Browser, 3=Vision)
 TIER: int = 1
@@ -107,6 +109,14 @@ async def execute(repo_path: str = ".", short: bool = True, **kwargs) -> str:
             "remedy_hint": "Check if git is installed and repo_path is valid.",
             "allowed_actions": [],
         })
+
+
+# 6. Deterministic self-test required by validate_tool_ast for crafted tools
+def self_test() -> bool:
+    """Verify schema and basic contract without mutating workspace state."""
+    assert TOOL_SCHEMA["function"]["name"] == "inspect_git_status"
+    assert REQUIRED_RING in (1, 2, 3)
+    return True
 ```
 
 ---

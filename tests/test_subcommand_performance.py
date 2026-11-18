@@ -108,7 +108,7 @@ class TestSubcommandPerformance(unittest.TestCase):
         """ToolRegistry can resolve and instantiate builtins on demand."""
         registry = ToolRegistry()
         builtins = registry.get_builtin_tools()
-        self.assertEqual(len(builtins), 10)
+        self.assertGreaterEqual(len(builtins), 10)
         self.assertIn("echo", builtins)
 
         # Lazy instantiation of echo

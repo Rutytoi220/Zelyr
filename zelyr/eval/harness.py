@@ -421,12 +421,22 @@ class EvalHarness:
                 if inspect.isawaitable(s_res):
                     await s_res
 
+            from zelyr.tool_registry import TaskLocalToolScope
+
+            task_local_scope = TaskLocalToolScope(
+                tool_names=tuple(tools_map.keys()),
+                tool_schemas=tuple(task.tool_schemas or ()),
+                tools_dir=tools_dir,
+            )
+
             orchestrator = NativeOrchestrator(
                 max_depth=task.max_steps,
                 stream_provider=stream_chat_fn,
                 tool_schemas=task.tool_schemas,
                 tool_executor=scoped_tool_executor,
                 db_path=str(db_path),
+                enable_cycle_detection=getattr(task, "enable_cycle_detection", True),
+                task_local_scope=task_local_scope,
             )
 
             payload = {

@@ -63,11 +63,26 @@ class TaskResult:
 def format_summary_table(results: List[TaskResult]) -> str:
     """Format a list of TaskResult records into a clean ASCII table."""
     total = len(results)
-    passed = sum(1 for r in results if r.status == EvalStatus.PASS)
-    false_success = sum(1 for r in results if r.status == EvalStatus.FALSE_SUCCESS)
-    failed = sum(1 for r in results if r.status in (EvalStatus.FAIL, EvalStatus.TOOL_ERROR))
-    step_limits = sum(1 for r in results if r.status == EvalStatus.STEP_LIMIT_EXCEEDED)
-    timeouts = sum(1 for r in results if r.status == EvalStatus.TIMEOUT)
+    passed = 0
+    false_success = 0
+    failed = 0
+    step_limits = 0
+    timeouts = 0
+
+    for r in results:
+        exp = r.artifacts.get("expected_status") if isinstance(r.artifacts, dict) else None
+        status_val = r.status.value if isinstance(r.status, EvalStatus) else str(r.status)
+        is_passed = (status_val in ("PASS", "PASSED")) or (exp is not None and status_val == str(exp))
+        if is_passed:
+            passed += 1
+        elif r.status == EvalStatus.FALSE_SUCCESS:
+            false_success += 1
+        elif r.status in (EvalStatus.FAIL, EvalStatus.TOOL_ERROR):
+            failed += 1
+        elif r.status == EvalStatus.STEP_LIMIT_EXCEEDED:
+            step_limits += 1
+        elif r.status == EvalStatus.TIMEOUT:
+            timeouts += 1
 
     lines = [
         "=" * 90,
@@ -81,7 +96,12 @@ def format_summary_table(results: List[TaskResult]) -> str:
     ]
 
     for r in results:
-        status_str = r.status.value if isinstance(r.status, EvalStatus) else str(r.status)
+        exp = r.artifacts.get("expected_status") if isinstance(r.artifacts, dict) else None
+        status_val = r.status.value if isinstance(r.status, EvalStatus) else str(r.status)
+        if exp is not None and status_val == str(exp):
+            status_str = "PASS"
+        else:
+            status_str = status_val
         tok_disp = f"{r.measured_tokens} (m)" if r.measured_tokens is not None else str(r.estimated_tokens)
         lines.append(
             f"{r.task_id:<30} {status_str:<20} {r.step_count:<6} {tok_disp:<14} {r.duration_seconds:<9.3f}s"

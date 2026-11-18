@@ -1,6 +1,6 @@
 # Zelyr Architecture & Execution Flow Specification
 
-This document specifies the runtime architecture, request lifecycle, context budgeting, and tool routing mechanisms in **Zelyr** (v1.0.0).  
+This document specifies the runtime architecture, request lifecycle, context budgeting, and tool routing mechanisms in **Zelyr** (v1.4.0).
 All architecture claims are grounded in verified source code and reproducible automated tests.
 
 ---

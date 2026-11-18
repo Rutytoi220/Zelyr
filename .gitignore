@@ -176,6 +176,7 @@ patch_*.py
 fix_*.py
 verify_*.py
 !scripts/verify_zelyr.py
+!zelyr/tools/verify_outcome.py
 summary*.md
 restart_server.sh
 refactor*.py

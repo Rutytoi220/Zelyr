@@ -60,6 +60,14 @@ def _sandbox_worker(
         except Exception:
             pass
 
+    # Redirect stdin to devnull to prevent child process hanging on parent stdin
+    try:
+        devnull_fd = os.open(os.devnull, os.O_RDONLY)
+        os.dup2(devnull_fd, 0)
+        os.close(devnull_fd)
+    except Exception:
+        pass
+
     try:
         # Disable faulthandler in the isolated child to prevent stderr noise on deliberate crashes
         try:
@@ -268,8 +276,13 @@ class SandboxedPluginRunner(BaseTool):
         )
 
         try:
-            proc.start()
-            child_conn.close()
+            try:
+                proc.start()
+            finally:
+                try:
+                    child_conn.close()
+                except Exception:
+                    pass
 
             # Poll for worker response up to timeout threshold with process liveness checks
             import time
@@ -377,17 +390,18 @@ class SandboxedPluginRunner(BaseTool):
             # Guarantee child process cleanup to prevent zombie processes
             try:
                 if proc.is_alive():
-                    proc.terminate()
+                    proc.kill()
                     proc.join(timeout=0.5)
-                    if proc.is_alive():
-                        proc.kill()
-                        proc.join(timeout=0.5)
                 elif proc.exitcode is None:
                     proc.join(timeout=0.5)
             except Exception:
                 pass
             try:
                 parent_conn.close()
+            except Exception:
+                pass
+            try:
+                child_conn.close()
             except Exception:
                 pass
 

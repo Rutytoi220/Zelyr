@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import uuid
@@ -22,6 +23,243 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+class AwaitableTuple(tuple):
+    """Tuple subclass supporting both synchronous unpacking and optional await."""
+
+    def __await__(self):
+        async def _coro():
+            return self
+
+        return _coro().__await__()
+
+
+class ToolASTSecurityVisitor(ast.NodeVisitor):
+    """AST visitor enforcing security invariants and blocking dangerous operations."""
+
+    def __init__(self) -> None:
+        self.error: Optional[str] = None
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if self.error:
+            return
+        if node.attr in ("__subclasses__", "__globals__", "__builtins__", "__code__"):
+            self.error = f"Security violation: Access to dangerous dunder '{node.attr}' is disallowed."
+            return
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        if self.error:
+            return
+        if isinstance(node.func, ast.Name):
+            if node.func.id in ("eval", "exec", "__import__"):
+                self.error = f"Security violation: Call to dynamic evaluation function '{node.func.id}()' is disallowed."
+                return
+        self.generic_visit(node)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if self.error:
+            return
+        if node.id == "__builtins__":
+            self.error = "Security violation: Direct access to '__builtins__' is disallowed."
+            return
+        self.generic_visit(node)
+
+
+def validate_tool_ast(code: str) -> Tuple[bool, Optional[str]]:
+    """Validate dynamic tool candidate code against AST security policies and contract exports.
+
+    Rules:
+    - Parses code via ast.parse. Returns (False, "Syntax error: <details>") on SyntaxError.
+    - Traverses via ast.NodeVisitor:
+      * Disallows dangerous dunder attribute accesses: __subclasses__, __globals__, __builtins__, __code__.
+      * Disallows dynamic evaluation functions: calls to eval(), exec(), __import__.
+    - Validates required module-level constants and functions:
+      * TOOL_SCHEMA as dictionary containing 'name', 'description', and 'parameters'.
+      * REQUIRED_RING (integer in range 1-3).
+      * TIER (integer in range 1-3).
+      * Function execute (def execute or async def execute).
+      * Callable self_test function (def self_test or async def self_test).
+    """
+    if not code or not code.strip():
+        return False, "Tool code cannot be empty."
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        line = e.lineno or 1
+        col = e.offset or 1
+        msg = e.msg or "syntax error"
+        return False, f"Syntax error at line {line}, col {col}: {msg}"
+    except Exception as e:
+        return False, f"Syntax error: {e}"
+
+    # 1. AST Security Visitor
+    visitor = ToolASTSecurityVisitor()
+    visitor.visit(tree)
+    if visitor.error:
+        return False, visitor.error
+
+    # 2. Top-level definitions check
+    has_execute = False
+    has_self_test = False
+    tool_schema_node: Optional[ast.AST] = None
+    required_ring_val: Optional[Any] = None
+    tier_val: Optional[Any] = None
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name == "execute":
+                has_execute = True
+            elif node.name == "self_test":
+                has_self_test = True
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    if target.id == "TOOL_SCHEMA":
+                        tool_schema_node = node.value
+                    elif target.id == "REQUIRED_RING":
+                        if isinstance(node.value, ast.Constant):
+                            required_ring_val = node.value.value
+                    elif target.id == "TIER":
+                        if isinstance(node.value, ast.Constant):
+                            tier_val = node.value.value
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name):
+                if node.target.id == "TOOL_SCHEMA":
+                    tool_schema_node = node.value
+                elif node.target.id == "REQUIRED_RING":
+                    if isinstance(node.value, ast.Constant):
+                        required_ring_val = node.value.value
+                elif node.target.id == "TIER":
+                    if isinstance(node.value, ast.Constant):
+                        tier_val = node.value.value
+
+    # Validate execute
+    if not has_execute:
+        return False, "Missing required function: 'execute' (must define def execute or async def execute)."
+
+    # Validate self_test
+    if not has_self_test:
+        return False, "Missing required callable self-test function: 'self_test' (must define def self_test or async def self_test)."
+
+    # Validate TOOL_SCHEMA
+    if tool_schema_node is None:
+        return False, "Missing required constant 'TOOL_SCHEMA'."
+    if not isinstance(tool_schema_node, ast.Dict):
+        return False, "TOOL_SCHEMA must be defined as a dictionary."
+
+    schema_keys: Set[str] = set()
+    function_subdict_node: Optional[ast.Dict] = None
+    for k, v in zip(tool_schema_node.keys, tool_schema_node.values):
+        if isinstance(k, ast.Constant) and isinstance(k.value, str):
+            schema_keys.add(k.value)
+            if k.value == "function" and isinstance(v, ast.Dict):
+                function_subdict_node = v
+
+    has_direct_keys = {"name", "description", "parameters"}.issubset(schema_keys)
+    has_nested_keys = False
+    if function_subdict_node is not None:
+        fn_keys = {
+            k.value
+            for k in function_subdict_node.keys
+            if isinstance(k, ast.Constant) and isinstance(k.value, str)
+        }
+        has_nested_keys = {"name", "description", "parameters"}.issubset(fn_keys)
+
+    if not (has_direct_keys or has_nested_keys):
+        return False, "TOOL_SCHEMA must contain 'name', 'description', and 'parameters' fields."
+
+    # Validate REQUIRED_RING
+    if required_ring_val is None:
+        return False, "Missing required constant 'REQUIRED_RING'."
+    if not isinstance(required_ring_val, int) or isinstance(required_ring_val, bool):
+        return False, f"REQUIRED_RING must be an integer, got {type(required_ring_val).__name__}."
+    if required_ring_val not in (1, 2, 3):
+        return False, f"Invalid REQUIRED_RING '{required_ring_val}': dynamic tools must claim a ring between 1 and 3 (Ring 0 is reserved)."
+
+    # Validate TIER
+    if tier_val is None:
+        return False, "Missing required constant 'TIER'."
+    if not isinstance(tier_val, int) or isinstance(tier_val, bool):
+        return False, f"TIER must be an integer, got {type(tier_val).__name__}."
+    if tier_val not in (1, 2, 3):
+        return False, f"Invalid TIER '{tier_val}': must be an integer in [1, 3]."
+
+    return True, None
+
+
+def _run_sandbox_worker(temp_path: Path, timeout: float = 3.0) -> Tuple[bool, Optional[str]]:
+    """Execute candidate self_test in child process with stdin redirected to devnull."""
+    worker_code = (
+        "import sys, importlib.util, asyncio, inspect\n"
+        f"spec = importlib.util.spec_from_file_location('stage_candidate', r'{temp_path}')\n"
+        "if not spec or not spec.loader:\n"
+        "    sys.stderr.write('Failed to create module specification.')\n"
+        "    sys.exit(10)\n"
+        "mod = importlib.util.module_from_spec(spec)\n"
+        "try:\n"
+        "    spec.loader.exec_module(mod)\n"
+        "except Exception as e:\n"
+        "    sys.stderr.write(f'Module loading exception: {e}')\n"
+        "    sys.exit(11)\n"
+        "if not hasattr(mod, 'self_test'):\n"
+        "    sys.stderr.write('Missing self_test callable.')\n"
+        "    sys.exit(12)\n"
+        "fn = getattr(mod, 'self_test')\n"
+        "try:\n"
+        "    res = asyncio.run(fn()) if inspect.iscoroutinefunction(fn) else fn()\n"
+        "    if res is True:\n"
+        "        sys.exit(0)\n"
+        "    sys.stderr.write(f'self_test() returned {res!r}, expected True.')\n"
+        "    sys.exit(1)\n"
+        "except Exception as exc:\n"
+        "    sys.stderr.write(f'self_test() raised exception: {exc}')\n"
+        "    sys.exit(2)\n"
+    )
+    with open(os.devnull, "r") as devnull_r:
+        proc = subprocess.run(
+            [sys.executable, "-c", worker_code],
+            stdin=devnull_r,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    if proc.returncode == 0:
+        return True, None
+    err_msg = proc.stderr.strip() or proc.stdout.strip() or f"Process exited with code {proc.returncode}"
+    return False, err_msg
+
+
+def execute_sandbox_self_test(code: str, timeout: float = 3.0) -> AwaitableTuple:
+    """Execute candidate code self_test in an isolated child process with strict cleanup invariant.
+
+    Guarantees:
+    - Writes to unique staging file: /tmp/zelyr_stage_{uuid}.py
+    - Redirects child stdin to os.devnull
+    - Enforces strict timeout
+    - Returns (True, None) if self_test() returns True and exit code is 0
+    - Returns (False, error) on exception, False return, or timeout
+    - Unlinks staging file in a try ... finally block on both success and failure
+    """
+    marker = uuid.uuid4().hex[:8]
+    temp_path = Path("/tmp") / f"zelyr_stage_{marker}.py"
+    try:
+        temp_path.write_text(code, encoding="utf-8")
+        try:
+            ok, err = _run_sandbox_worker(temp_path, timeout=timeout)
+            return AwaitableTuple((ok, err))
+        except subprocess.TimeoutExpired:
+            return AwaitableTuple((False, f"Self-test timed out after {timeout:.1f}s."))
+        except Exception as exc:
+            return AwaitableTuple((False, f"Sandbox self-test failed to execute: {exc}"))
+    finally:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
 
 
 @dataclass
@@ -37,6 +275,9 @@ class ValidationResult:
 
 class ToolValidator:
     """Validates dynamic tool code against Zelyr's runtime contract."""
+
+    validate_tool_ast = staticmethod(validate_tool_ast)
+    execute_sandbox_self_test = staticmethod(execute_sandbox_self_test)
 
     REQUIRED_EXPORTS: Set[str] = {
         "TOOL_SCHEMA",
@@ -288,8 +529,13 @@ class ToolValidator:
                         params_to_use[rk] = {}
 
             # 5. Execute dry-run under strict timeout
+            import io
+            import contextlib
+            stdout_buf = io.StringIO()
+            stderr_buf = io.StringIO()
             try:
-                result = await asyncio.wait_for(exec_fn(**params_to_use), timeout=timeout)
+                with contextlib.redirect_stdout(stdout_buf), contextlib.redirect_stderr(stderr_buf):
+                    result = await asyncio.wait_for(exec_fn(**params_to_use), timeout=timeout)
             except asyncio.TimeoutError:
                 return ValidationResult(
                     is_valid=False,

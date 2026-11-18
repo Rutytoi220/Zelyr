@@ -1,11 +1,13 @@
 """Windows Packaging — Inno Setup Script Generator.
 
-Produces ``zelyr_setup.iss`` that compiles into ``Zelyr_Setup_v5.2.0.exe``
+Produces ``zelyr_setup.iss`` that compiles into ``Zelyr_Setup_v1.4.0.exe``
 from the frozen PyInstaller binaries.
 """
 import logging
 import textwrap
 from pathlib import Path
+
+from zelyr import __version__ as ZELYR_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -13,7 +15,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DIST_DIR = PROJECT_ROOT / "dist"
 RELEASES_DIR = PROJECT_ROOT / "releases"
 BUILD_DIR = PROJECT_ROOT / "build"
-ZELYR_VERSION = "1.0.0"
 
 
 def generate_inno_setup_script() -> str:
