@@ -84,7 +84,7 @@ ChienGPT/
     ├── test_install_bootstrap.py    # [VERIFIED] Portable paths, packaging, directory bootstrap
     ├── test_model_matrix.py         # [VERIFIED] Multi-model evaluation matrix & task runner tests
     ├── test_multi_turn_payload.py   # [VERIFIED] Context precedence and Turn 2 protocol compliance
-    ├── test_outcome_verifier.py     # [VERIFIED] OutcomeVerifierEngine predicate verification tests
+    ├── test_outcome_verifier.py     # [VERIFIED] OutcomeVerifier predicate verification tests
     ├── test_parity_runtime_guards.py # [VERIFIED] Orchestrator runtime parity & guard tests
     ├── test_remote_ollama_and_concurrency.py # [VERIFIED] Remote Ollama URL/timeout helpers & concurrency tests
     ├── test_shell_authorization.py  # [VERIFIED] Shell execution confirmation and fail-closed security

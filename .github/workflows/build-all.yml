@@ -1,29 +1,43 @@
 name: Build Cross-Platform Zelyr
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Release tag to build cross-platform artifacts for (e.g. v1.4.0)'
+        required: true
+        type: string
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
     name: Build on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-    
+
     steps:
-      - name: Checkout Code
+      - name: Checkout requested tag
         uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
+      - name: Verify checked-out commit matches requested tag and version
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: python scripts/check_release_tag.py --tag-env RELEASE_TAG --check-checkout --check-version
 
       - name: Install Dependencies
         run: |
@@ -31,7 +45,7 @@ jobs:
           pip install pyinstaller build
           pip install -r requirements.txt || echo "No requirements.txt found, skipping."
           pip install -e .
-          
+
       - name: Install FPM (Linux Only)
         if: runner.os == 'Linux'
         run: |
@@ -48,53 +62,64 @@ jobs:
 
       - name: Package .deb and .rpm (Linux)
         if: runner.os == 'Linux'
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
+          VERSION="${RELEASE_TAG#v}"
           mkdir -p build_pkg/usr/lib/zelyr build_pkg/usr/bin
           cp -r dist/Zelyr/* build_pkg/usr/lib/zelyr/
           chmod +x build_pkg/usr/lib/zelyr/Zelyr
           ln -sf /usr/lib/zelyr/Zelyr build_pkg/usr/bin/zelyr
-          
+
           # Create Post-Install script
           cat << 'EOF' > post_install.sh
           #!/bin/bash
           echo "Zelyr has been installed. Run 'zelyr daemon install' to configure the background service."
           EOF
           chmod +x post_install.sh
-          
-          fpm -s dir -t deb -n zelyr -v ${GITHUB_REF_NAME#v} --architecture amd64 --after-install post_install.sh -C build_pkg .
-          fpm -s dir -t rpm -n zelyr -v ${GITHUB_REF_NAME#v} --architecture x86_64 --after-install post_install.sh -C build_pkg .
+
+          fpm -s dir -t deb -n zelyr -v "$VERSION" --architecture amd64 --after-install post_install.sh -C build_pkg .
+          fpm -s dir -t rpm -n zelyr -v "$VERSION" --architecture x86_64 --after-install post_install.sh -C build_pkg .
 
       - name: Package .dmg (macOS)
         if: runner.os == 'macOS'
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
+          VERSION="${RELEASE_TAG#v}"
           mkdir -p build_app/Zelyr.app/Contents/MacOS
           cp -r dist/Zelyr/* build_app/Zelyr.app/Contents/MacOS/
           chmod +x build_app/Zelyr.app/Contents/MacOS/Zelyr
-          create-dmg --volname "Zelyr Installer" --window-pos 200 120 --window-size 800 400 --icon-size 100 --icon "Zelyr.app" 200 190 --hide-extension "Zelyr.app" --app-drop-link 600 185 "zelyr_latest.dmg" build_app/
+          create-dmg --volname "Zelyr Installer" --window-pos 200 120 --window-size 800 400 --icon-size 100 --icon "Zelyr.app" 200 190 --hide-extension "Zelyr.app" --app-drop-link 600 185 "Zelyr-v${VERSION}-macos.dmg" build_app/
 
-      - name: Upload Artifacts (Linux)
+      - name: Package complete --onedir .zip bundle (Windows)
+        if: runner.os == 'Windows'
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: python scripts/package_windows_bundle.py --tag-env RELEASE_TAG --source-dir dist/Zelyr --outdir .
+
+      - name: Upload Build Artifacts (Linux)
         if: runner.os == 'Linux'
-        uses: softprops/action-gh-release@v2
+        uses: actions/upload-artifact@v4
         with:
-          files: |
+          name: release-linux-pkgs
+          path: |
             *.deb
             *.rpm
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          
-      - name: Upload Artifacts (macOS)
-        if: runner.os == 'macOS'
-        uses: softprops/action-gh-release@v2
-        with:
-          files: zelyr_latest.dmg
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          if-no-files-found: error
 
-      - name: Upload Artifacts (Windows)
-        if: runner.os == 'Windows'
-        uses: softprops/action-gh-release@v2
+      - name: Upload Build Artifacts (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
         with:
-          files: |
-            dist/Zelyr/Zelyr.exe
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: release-macos-dmg
+          path: Zelyr-v*-macos.dmg
+          if-no-files-found: error
+
+      - name: Upload Build Artifacts (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-bundle
+          path: Zelyr-v*-windows-x64.zip
+          if-no-files-found: error

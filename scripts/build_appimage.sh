@@ -124,16 +124,32 @@ EOF
 chmod +x "$APPDIR/AppRun"
 
 # 3. AppImage Packaging
-echo -e "${BLUE}[INFO]${NC} Checking for appimagetool..."
-if [ ! -f "appimagetool-x86_64.AppImage" ]; then
-    echo -e "${BLUE}[INFO]${NC} Downloading appimagetool..."
-    wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
-    chmod +x appimagetool-x86_64.AppImage
+APPIMAGETOOL_VERSION="1.9.1"
+APPIMAGETOOL_URL="https://github.com/AppImage/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-x86_64.AppImage"
+APPIMAGETOOL_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+APPIMAGETOOL_BIN="appimagetool-${APPIMAGETOOL_VERSION}-x86_64.AppImage"
+
+verify_appimagetool_checksum() {
+    echo "${APPIMAGETOOL_SHA256}  ${APPIMAGETOOL_BIN}" | sha256sum -c --status -
+}
+
+echo -e "${BLUE}[INFO]${NC} Checking for pinned appimagetool ${APPIMAGETOOL_VERSION}..."
+if [ ! -f "${APPIMAGETOOL_BIN}" ]; then
+    echo -e "${BLUE}[INFO]${NC} Downloading appimagetool ${APPIMAGETOOL_VERSION}..."
+    wget -q -O "${APPIMAGETOOL_BIN}" "${APPIMAGETOOL_URL}"
 fi
+
+if ! verify_appimagetool_checksum; then
+    echo -e "${RED}[ERROR]${NC} SHA256 checksum verification failed for ${APPIMAGETOOL_BIN}."
+    echo -e "${RED}[ERROR]${NC} Expected: ${APPIMAGETOOL_SHA256}"
+    rm -f "${APPIMAGETOOL_BIN}"
+    exit 1
+fi
+chmod +x "${APPIMAGETOOL_BIN}"
 
 echo -e "${BLUE}[INFO]${NC} Packaging AppImage..."
 # Run appimagetool silently to avoid noisy stdout, but set -e ensures we catch exit codes
-./appimagetool-x86_64.AppImage "$APPDIR" "$APPIMAGE_NAME" > /dev/null
+ARCH=x86_64 "./${APPIMAGETOOL_BIN}" "$APPDIR" "$APPIMAGE_NAME" > /dev/null
 
 echo -e "${BLUE}[INFO]${NC} Cleaning up temporary AppDir..."
 rm -rf "$APPDIR"

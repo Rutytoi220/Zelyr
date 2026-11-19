@@ -18,7 +18,7 @@ Release v1.4.0 of Zelyr, delivering runtime parity across local and remote Ollam
   - Implemented `RuntimeEnvironmentManifest` distinguishing local vs. remote inference endpoints, registered vs. available vs. caller-authorized tools, and headless/Wayland desktop state without leaking credentials into prompts.
 - **Schema Normalization & Registry Validation (`zelyr.engine.normalizer`, `zelyr.tool_registry`)**:
   - Unified unambiguous argument coercion (`SafeArgumentNormalizer`) and schema validation (`validate_arguments`) while preserving whitespace-sensitive payload fields.
-- **Execution Ledger, Observation Framing & Goal-Aware Replanning (`zelyr.engine.execution_ledger`, `zelyr.engine.observation_framer`)**:
+- **Execution Ledger, Observation Framing & Goal-Aware Replanning (`zelyr.engine.execution_ledger`, `zelyr.engine.observation_framing`)**:
   - Added `TurnExecutionLedger` tracking action lifecycles (`PROPOSED`, `VALIDATED`, `DISPATCHED`, `SUCCEEDED`, `FAILED`, `REJECTED`), pending multi-tool proposal reconciliation, prohibition and repetition guards, and structured `ObservationFramingEngine` envelopes.
 - **Evaluation Matrix & Distributed Worker Harness (`zelyr.eval.matrix`, `zelyr.eval.distributed`, `zelyr.eval.distributed_worker`)**:
   - Added reproducible multi-model evaluation matrix runner, local worker subprocess (`zelyr.eval.distributed_worker`) spawned by `DistributedEvalRunner` on the coordinator host that sends HTTP inference requests to configured Ollama endpoints (`worker.endpoint`) with fail-closed endpoint validation while executing tools and workspace verification locally, and structured Markdown/JSON reporting.
@@ -31,7 +31,7 @@ Production release v1.3.0 of Zelyr, delivering end-to-end autonomous systems int
 
 ### Added
 - **Deterministic State Outcome Verifier (`verify_outcome`)**:
-  - Implemented `OutcomeVerifierEngine` in `zelyr.engine.verifier` and canonical `VerifyOutcomeTool` in `zelyr.tools.verify_outcome`.
+  - Implemented `OutcomeVerifier` in `zelyr.engine.verifier` and canonical `VerifyOutcomeTool` in `zelyr.tools.verify_outcome`.
   - Supports deterministic verification across 7 operational predicates: file existence, literal/regex content matching, SHA256 checksums, JSON schema key validation, process lifecycle states, TCP port binding, and command output evaluation.
   - Added CLI verification mode: `zelyr run --verify "<goal>"` with exit code 0 on verified success, exit code 2 on verification failure.
 - **Closed-Loop Error Classification & Recovery (`ErrorClassifier`)**:
@@ -264,8 +264,8 @@ This release hardens the build system, wires in OTA capabilities, and eliminates
 - **Circuit Breakers:** `SystemHealthWatchdog` now survives nested permission errors silently rather than stalling the central EventBus.
 
 [Unreleased]: https://github.com/Rutytoi220/Zelyr/compare/v1.4.0...HEAD
-[1.4.0]: https://github.com/Rutytoi220/Zelyr/compare/v1.3.0...v1.4.0
-[1.3.0]: https://github.com/Rutytoi220/Zelyr/compare/v1.2.0-rc1...v1.3.0
+[1.4.0]: https://github.com/Rutytoi220/Zelyr/compare/v1.2.0-rc1...v1.4.0
+[1.3.0]: https://github.com/Rutytoi220/Zelyr/compare/v1.2.0-rc1...addcb1d
 [1.2.0-rc.1]: https://github.com/Rutytoi220/Zelyr/releases/tag/v1.2.0-rc1
 [1.1.0]: https://github.com/Rutytoi220/Zelyr/releases/tag/v1.1.0
 [1.0.0]: https://github.com/Rutytoi220/Zelyr/releases/tag/v1.0.0
