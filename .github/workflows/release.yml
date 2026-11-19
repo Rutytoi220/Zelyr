@@ -1,26 +1,33 @@
-name: Release AppImage
+name: Build Linux AppImage
 
 on:
-  push:
-    tags:
-      - 'v*'
-  workflow_dispatch:
+  workflow_call:
     inputs:
       tag:
-        description: 'Existing release tag to attach the AppImage to (e.g. v1.2.0-rc1)'
+        description: 'Release tag to build the AppImage for (e.g. v1.4.0)'
         required: true
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test:
     name: Headless Test Suite
     runs-on: ubuntu-22.04
+    permissions:
+      contents: read
     steps:
-      - name: Checkout code
+      - name: Checkout requested tag
         uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Verify checked-out commit matches requested tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: python3 scripts/check_release_tag.py --tag-env RELEASE_TAG --check-checkout --check-version
 
       - name: Install Linux GUI and Headless Qt Dependencies
         run: |
@@ -35,7 +42,9 @@ jobs:
             libxcb-shape0
 
       - name: Set up uv
-        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
 
       - name: Install dependencies
         run: |
@@ -49,13 +58,23 @@ jobs:
         run: |
           uv run pytest tests/ -v
 
-  build-and-release:
-    name: Build & Release AppImage
+  build-appimage:
+    name: Build AppImage
     needs: test
     runs-on: ubuntu-22.04
+    permissions:
+      contents: read
     steps:
-      - name: Checkout code
+      - name: Checkout requested tag
         uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Verify checked-out commit matches requested tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: python3 scripts/check_release_tag.py --tag-env RELEASE_TAG --check-checkout --check-version
 
       - name: Install Linux GUI and Headless Qt Dependencies
         run: |
@@ -72,18 +91,19 @@ jobs:
             libxcb-shape0
 
       - name: Set up uv
-        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
 
       - name: Build AppImage
         env:
-          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
           bash scripts/build_appimage.sh "$RELEASE_TAG"
 
-      - name: Upload Release Asset
-        uses: softprops/action-gh-release@v1
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
         with:
-          files: Zelyr-*.AppImage
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: appimage-linux
+          path: Zelyr-v*-x86_64.AppImage
+          if-no-files-found: error

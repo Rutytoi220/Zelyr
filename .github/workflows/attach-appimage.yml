@@ -1,0 +1,47 @@
+name: Attach AppImage to Existing Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to attach the AppImage to (e.g. v1.4.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Test & Build AppImage
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ inputs.tag }}
+    permissions:
+      contents: read
+
+  attach-appimage:
+    name: Attach AppImage to Existing Release (Manual Recovery)
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download AppImage artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: appimage-linux
+          path: release-assets
+
+      - name: Verify and upload AppImage to existing GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          APPIMAGE_FILE="release-assets/Zelyr-v${VERSION}-x86_64.AppImage"
+          test -s "$APPIMAGE_FILE"
+          gh release view "$RELEASE_TAG" --repo "$GH_REPO" > /dev/null
+          gh release upload "$RELEASE_TAG" "$APPIMAGE_FILE" --repo "$GH_REPO"

@@ -5,19 +5,17 @@ on:
     tags:
       - 'v*.*.*'
 
-jobs:
-  build-and-publish:
-    name: Build and Publish to PyPI
-    runs-on: ubuntu-latest
-    environment:
-      name: pypi
-      url: https://pypi.org/p/zelyr-core
-    permissions:
-      id-token: write  # IMPORTANT: mandatory for trusted publishing
-      contents: write  # IMPORTANT: mandatory for creating GitHub Releases
+permissions:
+  contents: read
 
+jobs:
+  validate-and-build-dist:
+    name: Validate Tag & Build Python Distributions
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - name: Checkout repository
+      - name: Checkout tagged commit
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -25,7 +23,12 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
+
+      - name: Verify tag matches commit and pyproject.toml version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python scripts/check_release_tag.py --tag-env RELEASE_TAG --check-checkout --check-version
 
       - name: Install build dependencies
         run: |
@@ -33,27 +36,115 @@ jobs:
           pip install build
 
       - name: Build package distributions
-        run: |
-          python scripts/build_dist.py
+        run: python scripts/build_dist.py
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - name: Upload Python distribution artifacts
+        uses: actions/upload-artifact@v4
         with:
-          generate_release_notes: true
-          files: |
+          name: python-dist
+          path: |
             dist/*.whl
             dist/*.tar.gz
+          if-no-files-found: error
+
+  appimage:
+    name: Test & Build Linux AppImage
+    needs: validate-and-build-dist
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ github.ref_name }}
+    permissions:
+      contents: read
+
+  cross-platform:
+    name: Build Cross-Platform Installers
+    needs: validate-and-build-dist
+    uses: ./.github/workflows/build-all.yml
+    with:
+      tag: ${{ github.ref_name }}
+    permissions:
+      contents: read
+
+  pypi-publish:
+    name: Build and Publish to PyPI
+    needs: [validate-and-build-dist, appimage, cross-platform]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/zelyr-core
+    permissions:
+      id-token: write  # IMPORTANT: mandatory for trusted publishing
+      contents: read
+    steps:
+      - name: Checkout validation scripts
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ github.ref_name }}
+          sparse-checkout: scripts
+
+      - name: Download Python distribution artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist
+
+      - name: Verify exact Python distribution filenames
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 scripts/check_release_assets.py --tag-env RELEASE_TAG --assets-dir dist --mode pypi
+          ls -la dist/
 
       - name: Publish package distributions to PyPI
         id: pypi-publish
         uses: pypa/gh-action-pypi-publish@release/v1
-        continue-on-error: true
 
-      - name: PyPI Trusted Publishing Diagnostic Notice
-        if: steps.pypi-publish.outcome == 'failure'
+      - name: PyPI Publication Failure Diagnostics
+        if: failure() && steps.pypi-publish.outcome == 'failure'
         run: |
-          echo "::warning title=PyPI Trusted Publishing Inactive::PyPI publication failed because the repository has not yet been registered as a Trusted Publisher on PyPI (https://pypi.org/manage/account/publishing/). GitHub Release creation succeeded and distribution assets (.whl, .tar.gz) are attached."
-          echo "To enable automated PyPI uploads:"
-          echo "  1. Log into https://pypi.org"
-          echo "  2. Go to Publishing -> Add a new publisher (GitHub Actions)"
-          echo "  3. Set Owner: ${{ github.repository_owner }}, Repository: ${{ github.event.repository.name }}, Workflow: publish.yml, Environment: pypi"
+          echo "::error title=PyPI Publication Failed::PyPI publication failed; GitHub Release publication has been blocked to prevent a misleading release state."
+          echo "Inspect the 'Publish package distributions to PyPI' logs above for the exact failure cause (e.g., invalid-publisher, duplicate filename/version, metadata rejection, or network failure)."
+          echo "If registering PyPI Trusted Publishing for the first time at https://pypi.org/manage/account/publishing/:"
+          echo "  Owner: ${{ github.repository_owner }}, Repository: ${{ github.event.repository.name }}, Workflow: publish.yml, Environment: pypi"
+          echo "If a partial upload occurred (e.g., .tar.gz uploaded before .whl failed), inspect https://pypi.org/p/zelyr-core before retrying because PyPI rejects re-uploading existing filenames."
+
+  github-release:
+    name: Create and Publish GitHub Release
+    needs: [validate-and-build-dist, appimage, cross-platform, pypi-publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Sole workflow job authorized to create/publish the release on tag push
+    steps:
+      - name: Checkout validation scripts
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ github.ref_name }}
+          sparse-checkout: scripts
+
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify exact versioned release assets are present
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          ls -la release-assets/
+          python3 scripts/check_release_assets.py --tag-env RELEASE_TAG --assets-dir release-assets --mode release
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/*.whl
+            release-assets/*.tar.gz
+            release-assets/*.AppImage
+            release-assets/*.deb
+            release-assets/*.rpm
+            release-assets/*.dmg
+            release-assets/*.zip
