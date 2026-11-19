@@ -33,7 +33,7 @@ def generate_nfpm_yaml(target: str) -> str:
         arch: amd64
         platform: linux
         version: {ZELYR_VERSION}
-        maintainer: rutytoi <charlesbbm@outlook.fr>
+        maintainer: Zelyr Contributors
         description: Zelyr — Local-First AI Operating System for Linux
         vendor: Zelyr Project
         homepage: https://github.com/Rutytoi220/Zelyr

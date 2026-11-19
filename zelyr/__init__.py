@@ -32,7 +32,7 @@ def _resolve_version() -> str:
 
         return version("zelyr-core")
     except Exception:
-        return "1.4.0"
+        return "1.4.1"
 
 
 __version__ = _resolve_version()

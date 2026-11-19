@@ -4,9 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zelyr-core"
-version = "1.4.0"
+version = "1.4.1"
 authors = [
-  { name="Zelyr Contributors", email="admin@zelyr.local" },
+  { name = "Zelyr Contributors" },
 ]
 description = "A Local-First AI Operating System for Linux."
 readme = "README.md"
