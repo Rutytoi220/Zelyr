@@ -1,6 +1,6 @@
 # Zelyr Security Architecture & Isolation Invariants
 
-This document details the security architecture, threat models, network boundaries, and execution gates in **Zelyr** (v1.4.0).
+This document details the security architecture, threat models, network boundaries, and execution gates in **Zelyr** (v1.4.1).
 Every security control documented here is source-verified and tested by automated regression suites.
 
 ---

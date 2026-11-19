@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-11-19
+
+Patch release fixing PyPI package metadata so `zelyr-core` passes PyPI Core Metadata validation. The `v1.4.0` tag was pushed but that version was never published to PyPI (or as a GitHub Release) because PyPI rejected its distribution metadata.
+
+### Fixed
+- **PyPI Author Metadata (`pyproject.toml`)**: Removed the reserved `.local` author email (`admin@zelyr.local`) that PyPI rejected with HTTP 400 during `v1.4.0` publication, retaining `Zelyr Contributors` as the package author.
+- **Linux Package Metadata (`zelyr/build/build_linux.py`)**: Removed personal email contact information from generated nFPM `.deb`/`.rpm` package metadata, setting `maintainer: Zelyr Contributors`.
+- **Distribution Metadata Regression Coverage (`tests/test_release_workflows.py`, `tests/test_build_identity.py`)**: Added validation rejecting reserved and special-use email domains (`.local`, `.invalid`, `.test`, `.localhost`, `.example`) and personal contact leaks in generated package metadata.
+
 ## [1.4.0] - 2026-11-17
 
 Release v1.4.0 of Zelyr, delivering runtime parity across local and remote Ollama deployments, grounded environment capability manifests, authoritative tool permission parity and custom executor isolation, multi-criterion outcome verification hardening, turn execution ledgers with observation framing, and the distributed evaluation matrix harness.
@@ -263,7 +272,8 @@ This release hardens the build system, wires in OTA capabilities, and eliminates
 - **AppImage Build Resilience:** Fortified `scripts/build_appimage.sh` with correct `usr/share/applications` AppDir directory structure and explicit `set -e` failure trapping.
 - **Circuit Breakers:** `SystemHealthWatchdog` now survives nested permission errors silently rather than stalling the central EventBus.
 
-[Unreleased]: https://github.com/Rutytoi220/Zelyr/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/Rutytoi220/Zelyr/compare/v1.4.1...HEAD
+[1.4.1]: https://github.com/Rutytoi220/Zelyr/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/Rutytoi220/Zelyr/compare/v1.2.0-rc1...v1.4.0
 [1.3.0]: https://github.com/Rutytoi220/Zelyr/compare/v1.2.0-rc1...addcb1d
 [1.2.0-rc.1]: https://github.com/Rutytoi220/Zelyr/releases/tag/v1.2.0-rc1

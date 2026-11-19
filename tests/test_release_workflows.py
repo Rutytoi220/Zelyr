@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import subprocess
 import sys
+import tarfile
 import zipfile
+from email.parser import Parser
+from email.utils import getaddresses
 from pathlib import Path
 
 import pytest
@@ -616,3 +620,131 @@ class TestPackageWindowsBundle:
         )
         assert proc.returncode == 0, proc.stderr
         assert (outdir / "Zelyr-v1.4.0-windows-x64.zip").is_file()
+
+
+RESERVED_EMAIL_SUFFIXES = (".local", ".invalid", ".test", ".localhost", ".example")
+RESERVED_EMAIL_DOMAINS = {"localhost", "example.com", "example.net", "example.org"}
+
+
+def _assert_no_reserved_email_domains(metadata_text: str) -> None:
+    """Parse RFC 5322 Core Metadata and reject reserved or special-use email domains."""
+    msg = Parser().parsestr(metadata_text)
+    for header in ("Author-email", "Maintainer-email"):
+        values = msg.get_all(header, [])
+        for _display_name, addr in getaddresses(values):
+            if not addr:
+                continue
+            assert "@" in addr, f"Malformed email address in {header}: {addr!r}"
+            domain = addr.rsplit("@", 1)[1].strip().lower().rstrip(".")
+            if domain in RESERVED_EMAIL_DOMAINS or any(domain.endswith(suffix) for suffix in RESERVED_EMAIL_SUFFIXES):
+                raise AssertionError(
+                    f"Reserved or special-use email domain in {header}: {addr!r} (domain={domain!r})"
+                )
+
+
+class TestDistributionMetadataIntegrity:
+    """Regression tests ensuring PyPI distribution metadata never uses reserved email domains."""
+
+    @pytest.mark.parametrize(
+        "bad_email",
+        [
+            "admin@zelyr.local",
+            "dev@zelyr.invalid",
+            "ci@zelyr.test",
+            "root@host.localhost",
+            "user@localhost",
+            "maintainer@zelyr.example",
+            "maintainer@example.com",
+        ],
+    )
+    def test_rejects_reserved_and_special_use_email_domains(self, bad_email: str) -> None:
+        metadata = f"Metadata-Version: 2.1\nName: zelyr-core\nVersion: 1.4.1\nAuthor-email: Zelyr Contributors <{bad_email}>\n"
+        with pytest.raises(AssertionError, match="Reserved or special-use email domain"):
+            _assert_no_reserved_email_domains(metadata)
+
+    def test_accepts_author_without_email_and_valid_public_email(self) -> None:
+        _assert_no_reserved_email_domains(
+            "Metadata-Version: 2.1\nName: zelyr-core\nVersion: 1.4.1\nAuthor: Zelyr Contributors\n"
+        )
+        _assert_no_reserved_email_domains(
+            "Metadata-Version: 2.1\nName: zelyr-core\nVersion: 1.4.1\nAuthor-email: Zelyr Contributors <dev@zelyr.org>\n"
+        )
+
+    def test_pyproject_authors_have_no_reserved_emails(self) -> None:
+        """Parse pyproject.toml and validate every declared contact email (if any)."""
+        if check_release_tag.tomllib is None:
+            pytest.skip("neither tomllib nor tomli is available to parse pyproject.toml")
+
+        data = check_release_tag.tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        project = data["project"]
+        assert project["name"] == "zelyr-core"
+        assert any(entry.get("name") == "Zelyr Contributors" for entry in project["authors"])
+
+        for field in ("authors", "maintainers"):
+            for entry in project.get(field, []):
+                email = entry.get("email")
+                if email:
+                    # A valid public address may be added in the future; reserved ones must never be.
+                    _assert_no_reserved_email_domains(f"Author-email: {entry.get('name', '')} <{email}>\n")
+
+    def test_built_distribution_metadata_is_pypi_compliant(self, tmp_path: Path) -> None:
+        """Build actual distribution metadata and verify no reserved email domains are emitted."""
+        expected_version = check_release_tag.read_project_version(REPO_ROOT / "pyproject.toml")
+        metadata_payloads: list[tuple[str, str]] = []
+
+        if importlib.util.find_spec("build") is not None:
+            outdir = tmp_path / "dist"
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts" / "build_dist.py"),
+                    "--no-isolation",
+                    "--outdir",
+                    str(outdir),
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert proc.returncode == 0, f"build_dist.py failed:\n{proc.stdout}\n{proc.stderr}"
+
+            wheel = outdir / f"zelyr_core-{expected_version}-py3-none-any.whl"
+            sdist = outdir / f"zelyr_core-{expected_version}.tar.gz"
+            assert wheel.is_file(), f"Expected wheel not built: {wheel}"
+            assert sdist.is_file(), f"Expected sdist not built: {sdist}"
+
+            with zipfile.ZipFile(wheel, "r") as zf:
+                meta_name = next(n for n in zf.namelist() if n.endswith(".dist-info/METADATA"))
+                metadata_payloads.append(("wheel:METADATA", zf.read(meta_name).decode("utf-8")))
+
+            with tarfile.open(sdist, "r:gz") as tf:
+                pkg_info_member = next(m for m in tf.getmembers() if m.name.endswith("/PKG-INFO"))
+                extracted = tf.extractfile(pkg_info_member)
+                assert extracted is not None
+                metadata_payloads.append(("sdist:PKG-INFO", extracted.read().decode("utf-8")))
+        else:
+            import setuptools.build_meta as build_meta
+
+            meta_dir = tmp_path / "meta"
+            meta_dir.mkdir()
+            prev_cwd = os.getcwd()
+            try:
+                os.chdir(REPO_ROOT)
+                dist_info = build_meta.prepare_metadata_for_build_wheel(str(meta_dir))
+            finally:
+                os.chdir(prev_cwd)
+            metadata_text = (meta_dir / dist_info / "METADATA").read_text(encoding="utf-8")
+            metadata_payloads.append(("dist-info:METADATA", metadata_text))
+
+        assert metadata_payloads, "No distribution metadata was generated for inspection"
+        for label, payload in metadata_payloads:
+            msg = Parser().parsestr(payload)
+            assert msg["Name"] == "zelyr-core", f"{label} Name mismatch"
+            assert msg["Version"] == expected_version, f"{label} Version mismatch"
+            author_headers = " ".join(msg.get(h, "") for h in ("Author", "Author-email"))
+            assert "Zelyr Contributors" in author_headers, f"{label} lost the author name"
+            # Only inspect metadata headers: the long description (README body) is not validated by PyPI.
+            header_text = "\n".join(f"{key}: {value}" for key, value in msg.items())
+            assert "admin@zelyr.local" not in header_text, f"{label} still contains admin@zelyr.local"
+            _assert_no_reserved_email_domains(payload)

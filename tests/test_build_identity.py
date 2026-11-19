@@ -5,6 +5,8 @@ from __future__ import annotations
 import plistlib
 from pathlib import Path
 
+import yaml
+
 
 def test_package_generators_use_zelyr_identity() -> None:
     from zelyr.build.build_linux import generate_nfpm_yaml
@@ -13,7 +15,12 @@ def test_package_generators_use_zelyr_identity() -> None:
     from zelyr.build.freeze import build_data_args
 
     nfpm = generate_nfpm_yaml("deb")
+    nfpm_data = yaml.safe_load(nfpm)
     assert "name: zelyr" in nfpm
+    assert nfpm_data["maintainer"] == "Zelyr Contributors"
+    assert "charlesbbm" not in nfpm.lower()
+    assert "outlook" not in nfpm.lower()
+    assert ".local" not in nfpm.lower()
     assert "homepage: https://github.com/Rutytoi220/Zelyr" in nfpm
     assert "/usr/bin/zelyr-daemon" in nfpm
     assert "/usr/share/applications/Zelyr.desktop" in nfpm

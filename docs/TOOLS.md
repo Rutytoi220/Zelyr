@@ -1,6 +1,6 @@
 # Zelyr Tool Creation & Extension Guide
 
-This guide documents the real pattern for adding, configuring, and testing tools in **Zelyr** (v1.4.0).
+This guide documents the real pattern for adding, configuring, and testing tools in **Zelyr** (v1.4.1).
 Zelyr supports two complementary tool creation models:
 1. **Dynamic File Plugins (`~/.config/zelyr/tools.d/<name>.py`):** Standalone Python files automatically loaded and hot-reloaded by [`zelyr/core/plugins.py`](../zelyr/core/plugins.py).
 2. **Subclassed Native Tools ([`zelyr/tools/base.py`](../zelyr/tools/base.py)):** Structured object-oriented tool classes inheriting from `BaseTool`.
