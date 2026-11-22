@@ -10,7 +10,12 @@ from typing import Any, Dict, Optional
 from PIL import Image
 
 from zelyr.tools.core import BaseTool, ToolResult, ToolParameter
-from zelyr.core.vision_engine.singleton import get_grounding_engine
+from zelyr.core.vision_engine.singleton import (
+    _is_optional_spotless_module_error,
+    get_grounding_engine,
+    is_spotless_arms_available,
+    run_reflex_action,
+)
 from zelyr.config import get_config
 
 logger = logging.getLogger(__name__)
@@ -111,6 +116,32 @@ class InteractWithUITool(BaseTool):
                     "You MUST use interact_with_browser with action='click_element' or 'fill_element'."
                 ),
             )
+
+        # Primary Tier 3 Path: Closed-loop Spotless-Arms VLA via persistent /dev/uinput (<0.1ms actuation)
+        move_only = bool(params.get("move_only", False))
+        max_ticks = int(params.get("max_ticks", 6))
+        use_legacy_json = bool(params.get("use_legacy_json", False))
+
+        if not use_legacy_json and is_spotless_arms_available():
+            try:
+                reflex = await asyncio.to_thread(
+                    run_reflex_action,
+                    instruction,
+                    max_ticks,
+                    move_only,
+                )
+                msg = (
+                    f"Closed-loop VLA reflex '{instruction}' completed in {reflex['total_ms']:.1f}ms "
+                    f"({reflex['ticks']} ticks, K={reflex['k_schedule']}, xy={reflex['final_xy']}, "
+                    f"clicked={reflex['clicked']}, converged={reflex['converged']}, "
+                    f"halted={reflex['halted_reason']}, backend={reflex['backend']}, "
+                    f"peak_vram={reflex['peak_vram_gb']:.2f}GB)."
+                )
+                return ToolResult(True, output=msg, metadata=reflex)
+            except ModuleNotFoundError as exc:
+                if not _is_optional_spotless_module_error(exc):
+                    raise
+                logger.warning("spotless-arms unavailable (%s); falling back to legacy single-shot VLM.", exc)
 
         image_bytes = None
         
