@@ -1628,7 +1628,18 @@ class NativeOrchestrator:
         )
 
         def _is_schema_tool_authorized(t_name: str, schemas_ctx: Optional[List[Dict[str, Any]]] = None) -> bool:
-            if eff_allowed_tools is None and eff_caller_ring is None and eff_task_local_scope is None:
+            is_ext_candidate = False
+            if self.tool_registry is not None:
+                if hasattr(self.tool_registry, "get_external_tool_entry") and self.tool_registry.get_external_tool_entry(t_name) is not None:
+                    is_ext_candidate = True
+                elif hasattr(self.tool_registry, "get_tool") and callable(getattr(self.tool_registry, "get_tool", None)):
+                    try:
+                        reg_t = self.tool_registry.get_tool(t_name)
+                        if reg_t is not None and getattr(reg_t, "is_external", False):
+                            is_ext_candidate = True
+                    except Exception:
+                        pass
+            if not is_ext_candidate and eff_allowed_tools is None and eff_caller_ring is None and eff_task_local_scope is None:
                 return True
             dec = authorize_and_validate_tool_call(
                 t_name,
@@ -1681,7 +1692,28 @@ class NativeOrchestrator:
             else:
                 active_tools = payload.get("tools") or get_tool_schemas(0)
 
-            payload["tools"] = filter_tool_schemas_by_tier(active_tools, tier, is_browser=browser_active)
+            # Keep authorized, live external tools eligible across automation tiers while preserving native tier gating
+            external_names: set[str] = set()
+            if self.tool_registry is not None and callable(getattr(self.tool_registry, "get_tool", None)):
+                for s in active_tools:
+                    s_name = (s.get("function", {}).get("name") or s.get("name") or "") if isinstance(s, dict) else ""
+                    if s_name:
+                        try:
+                            reg_t = self.tool_registry.get_tool(s_name)
+                            if reg_t is not None and getattr(reg_t, "is_external", False):
+                                external_names.add(s_name)
+                        except Exception:
+                            pass
+            native_tools_only = [
+                s for s in active_tools
+                if (s.get("function", {}).get("name") or s.get("name") or "") not in external_names
+            ]
+            external_tools_only = [
+                s for s in active_tools
+                if (s.get("function", {}).get("name") or s.get("name") or "") in external_names
+            ]
+            payload["tools"] = filter_tool_schemas_by_tier(native_tools_only, tier, is_browser=browser_active)
+            payload["tools"].extend(external_tools_only)
 
             # Strict negative gating: purge Tier 3 interact_with_ui whenever a browser window is active
             if browser_active:
@@ -1690,14 +1722,13 @@ class NativeOrchestrator:
                     if (t.get("function", {}).get("name") or t.get("name")) != "interact_with_ui"
                 ]
 
-            if eff_allowed_tools is not None or eff_caller_ring is not None:
-                payload["tools"] = [
-                    t for t in payload["tools"]
-                    if _is_schema_tool_authorized(
-                        (t.get("function", {}).get("name") or t.get("name") or ""),
-                        payload["tools"],
-                    )
-                ]
+            payload["tools"] = [
+                t for t in payload["tools"]
+                if _is_schema_tool_authorized(
+                    (t.get("function", {}).get("name") or t.get("name") or ""),
+                    payload["tools"],
+                )
+            ]
 
         # Core Sandbox Protection: Ensure essential actuators (execute_command, manage_workspace_file) are never dropped,
         # UNLESS running in an isolated task-local test scope or excluded by caller restrictions.
@@ -2909,7 +2940,25 @@ class NativeOrchestrator:
                                     tool_result = exec_call
                     else:
                         exec_fn = self.execute_tool
-                        if exec_fn is execute_tool and (eff_caller_ring is not None or eff_allowed_tools is not None):
+                        dispatched_via_instance_registry = False
+                        if exec_fn is execute_tool and self.tool_registry is not None and callable(getattr(self.tool_registry, "execute_async", None)):
+                            try:
+                                from zelyr.core.plugins import _executors as _plugin_executors
+                                reg_tool = self.tool_registry.get_tool(func_name) if callable(getattr(self.tool_registry, "get_tool", None)) else None
+                                if reg_tool is not None and (
+                                    getattr(reg_tool, "is_external", False) or func_name not in _plugin_executors
+                                ):
+                                    dispatched_via_instance_registry = True
+                            except Exception:
+                                reg_tool = None
+                        if dispatched_via_instance_registry:
+                            exec_coro = self.tool_registry.execute_async(
+                                func_name,
+                                caller_ring=eff_caller_ring,
+                                allowed_tools=eff_allowed_tools,
+                                **func_args,
+                            )
+                        elif exec_fn is execute_tool and (eff_caller_ring is not None or eff_allowed_tools is not None):
                             exec_coro = exec_fn(
                                 func_name,
                                 caller_ring=eff_caller_ring,

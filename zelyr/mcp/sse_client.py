@@ -8,6 +8,7 @@ with exponential backoff, and tool bridging into Zelyr's ToolRegistry.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import urllib.parse
@@ -25,6 +26,8 @@ class MCPSSEBridgedTool(BaseTool):
     over an MCPSSEClient transport.
     """
 
+    is_external: bool = True
+
     def __init__(
         self,
         server_name: str,
@@ -32,30 +35,54 @@ class MCPSSEBridgedTool(BaseTool):
         mcp_tool_def: Dict[str, Any],
         timeout: float = 30.0,
     ) -> None:
+        from zelyr.tools.external import sanitize_external_text, sanitize_source_endpoint
+
         self._server_name = server_name
         self._client = client
         self._remote_tool_name = mcp_tool_def.get("name", "")
         self._timeout = timeout
+        self.is_external = True
+        self.source_id = f"mcp:{server_name}"
+        self.source_type = "mcp_sse"
+        self.external_tool_name = self._remote_tool_name
+        self.source_endpoint = sanitize_source_endpoint(getattr(client, "url", server_name))
+        self.required_ring = 1
 
         tool_id = f"mcp__{server_name}__{self._remote_tool_name}"
-        desc = f"[{server_name} MCP] " + mcp_tool_def.get("description", "")
+        raw_desc = sanitize_external_text(mcp_tool_def.get("description", ""))
+        desc = f"[{server_name} MCP] " + raw_desc
 
-        super().__init__(tool_id=tool_id, name=tool_id, description=desc)
+        super().__init__(tool_id=tool_id, name=tool_id, description=desc, requires_bridge=True)
 
         input_schema = mcp_tool_def.get("inputSchema", {})
-        props = input_schema.get("properties", {})
-        req = input_schema.get("required", [])
+        self._preserved_input_schema: Optional[Dict[str, Any]] = (
+            copy.deepcopy(input_schema)
+            if isinstance(input_schema, dict) and input_schema
+            else None
+        )
+        props = input_schema.get("properties", {}) if isinstance(input_schema, dict) else {}
+        req = input_schema.get("required", []) if isinstance(input_schema, dict) else []
 
-        for param_name, meta in props.items():
-            self.add_parameter(
-                ToolParameter(
-                    name=param_name,
-                    type=meta.get("type", "string"),
-                    description=meta.get("description", ""),
-                    required=param_name in req,
-                    default=meta.get("default"),
+        if isinstance(props, dict):
+            req_set = set(req) if isinstance(req, list) else set()
+            for param_name, meta in props.items():
+                if not isinstance(meta, dict):
+                    continue
+                self.add_parameter(
+                    ToolParameter(
+                        name=param_name,
+                        type=meta.get("type", "string"),
+                        description=sanitize_external_text(meta.get("description", ""), max_len=200),
+                        required=param_name in req_set,
+                        default=meta.get("default"),
+                    )
                 )
-            )
+
+    @property
+    def schema(self) -> Dict[str, Any]:
+        if self._preserved_input_schema is not None:
+            return copy.deepcopy(self._preserved_input_schema)
+        return super().schema
 
     async def execute(self, params: Optional[Dict[str, Any]] = None, **kwargs: Any) -> ToolResult:
         """Execute the remote MCP tool via HTTP/SSE."""

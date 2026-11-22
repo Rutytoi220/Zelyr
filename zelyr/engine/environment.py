@@ -1055,12 +1055,17 @@ class RuntimeEnvironmentManifest:
                 required_deps.append("graphical_display_session")
                 missing_deps.append("graphical_display_session")
         else:
-            mod_name = type(tool_obj).__module__ if tool_obj is not None else ""
-            execution_mode = (
-                "sandboxed_plugin"
-                if "dynamic_tools" in mod_name or "plugin" in mod_name
-                else "builtin_in_process"
-            )
+            is_ext = bool(getattr(tool_obj, "is_external", False))
+            if is_ext:
+                src_type = str(getattr(tool_obj, "source_type", "external") or "external")
+                execution_mode = f"external_{src_type}" if not src_type.startswith("external") else src_type
+            else:
+                mod_name = type(tool_obj).__module__ if tool_obj is not None else ""
+                execution_mode = (
+                    "sandboxed_plugin"
+                    if "dynamic_tools" in mod_name or "plugin" in mod_name
+                    else "builtin_in_process"
+                )
 
         # Honor explicit tool object dependency declarations & is_available() hook
         if tool_obj is not None:
@@ -1126,8 +1131,10 @@ class RuntimeEnvironmentManifest:
         else:
             status = CapabilityStatus.AVAILABLE.value
 
-        return {
+        is_ext_tool = bool(getattr(tool_obj, "is_external", False)) if tool_obj is not None else False
+        detail_entry: Dict[str, Any] = {
             "tool_id": tool_id,
+            "origin": "external" if is_ext_tool else "native",
             "status": status,
             "enabled": enabled,
             "available": is_available,
@@ -1142,6 +1149,13 @@ class RuntimeEnvironmentManifest:
             "verified": True,
             "verification_source": "detected",
         }
+        if is_ext_tool:
+            detail_entry["source_id"] = str(getattr(tool_obj, "source_id", "external") or "external")
+            detail_entry["source_type"] = str(getattr(tool_obj, "source_type", "external") or "external")
+            detail_entry["external_tool_name"] = str(
+                getattr(tool_obj, "external_tool_name", tool_id) or tool_id
+            )
+        return detail_entry
 
     @classmethod
     def get_tool_capability_summary(
@@ -1288,6 +1302,135 @@ class RuntimeEnvironmentManifest:
             "unauthorized": unauthorized_names,
             "details": details_map,
         }
+
+    @classmethod
+    def get_external_tools_summary(
+        cls,
+        tool_registry: Optional[Any] = None,
+        caller_ring: Optional[int] = None,
+        allowed_tools: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Collect sanitized external/fallback tool source health, counts, and lifecycle details."""
+        empty_counts = {
+            "sources": 0,
+            "healthy_sources": 0,
+            "discovered": 0,
+            "validated": 0,
+            "authorized": 0,
+            "available": 0,
+            "unavailable": 0,
+            "degraded": 0,
+            "schema_failures": 0,
+        }
+        if tool_registry is None:
+            return {
+                "registry_known": False,
+                "sources": {},
+                "counts": dict(empty_counts),
+                "available": [],
+                "unavailable": [],
+                "degraded": [],
+                "authorized": [],
+                "validation_failures": [],
+                "details": {},
+            }
+
+        ext_fn = getattr(tool_registry, "get_external_manifest_summary", None)
+        if callable(ext_fn):
+            try:
+                summary = ext_fn(caller_ring=caller_ring, allowed_tools=allowed_tools)
+                if isinstance(summary, dict):
+                    out = dict(summary)
+                    out.setdefault("registry_known", True)
+                    return _scrub_structure(out)
+            except Exception as exc:
+                logger.debug("External manifest summary failed: %s", exc)
+
+        # Fallback introspection for lightweight/legacy registries holding is_external=True tools
+        raw_tools = {}
+        if callable(getattr(tool_registry, "list_tools", None)):
+            cand = tool_registry.list_tools()
+            if isinstance(cand, dict):
+                raw_tools = dict(cand)
+
+        sources: Dict[str, Dict[str, Any]] = {}
+        avail: List[str] = []
+        unavail: List[str] = []
+        auth_ids: List[str] = []
+        details: Dict[str, Dict[str, Any]] = {}
+        for tid, tobj in sorted(raw_tools.items()):
+            if not getattr(tobj, "is_external", False):
+                continue
+            sid = str(getattr(tobj, "source_id", "external") or "external")
+            stype = str(getattr(tobj, "source_type", "external") or "external")
+            ep = cls._sanitize_endpoint_url(str(getattr(tobj, "source_endpoint", "") or "")) or sid
+            is_avail = True
+            if callable(getattr(tobj, "is_available", None)):
+                try:
+                    is_avail = bool(tobj.is_available())
+                except Exception:
+                    is_avail = False
+            if is_avail:
+                avail.append(tid)
+                auth_ids.append(tid)
+            else:
+                unavail.append(tid)
+            src_rec = sources.setdefault(
+                sid,
+                {
+                    "source_id": sid,
+                    "source_type": stype,
+                    "endpoint": ep,
+                    "health": "HEALTHY" if is_avail else "UNAVAILABLE",
+                    "discovered_count": 0,
+                    "authorized_count": 0,
+                    "available_count": 0,
+                    "unavailable_count": 0,
+                    "validation_failure_count": 0,
+                    "last_error": None,
+                },
+            )
+            src_rec["discovered_count"] += 1
+            if is_avail:
+                src_rec["authorized_count"] += 1
+                src_rec["available_count"] += 1
+            else:
+                src_rec["unavailable_count"] += 1
+                src_rec["health"] = "UNAVAILABLE"
+            details[tid] = {
+                "tool_id": tid,
+                "source_id": sid,
+                "source_type": stype,
+                "external_tool_name": str(getattr(tobj, "external_tool_name", tid) or tid),
+                "lifecycle": "AVAILABLE" if is_avail else "UNAVAILABLE",
+                "authorized": True,
+                "schema_valid": True,
+                "is_external": True,
+            }
+
+        return _scrub_structure(
+            {
+                "registry_known": True,
+                "sources": sources,
+                "counts": {
+                    "sources": len(sources),
+                    "healthy_sources": sum(1 for s in sources.values() if s["health"] == "HEALTHY"),
+                    "discovered": len(details),
+                    "validated": len(details),
+                    "authorized": len(auth_ids),
+                    "available": len(avail),
+                    "unavailable": len(unavail),
+                    "degraded": 0,
+                    "schema_failures": 0,
+                },
+                "available": avail,
+                "unavailable": unavail,
+                "degraded": [],
+                "authorized": auth_ids,
+                "validation_failures": [],
+                "details": details,
+            }
+        )
 
     @classmethod
     def get_active_actuators(
@@ -1592,7 +1735,13 @@ class RuntimeEnvironmentManifest:
                         enabled_keys = tuple(sorted(c.keys()))
                 except Exception:
                     enabled_keys = ()
-            reg_sig = (id(tool_registry), raw_keys, enabled_keys)
+            ext_mgr = getattr(tool_registry, "_external_manager", None)
+            ext_sig = (
+                ext_mgr.state_signature()
+                if ext_mgr is not None and callable(getattr(ext_mgr, "state_signature", None))
+                else ()
+            )
+            reg_sig = (id(tool_registry), raw_keys, enabled_keys, ext_sig)
 
         if allowed_tools is None:
             allowed_sig: Any = None
@@ -1677,6 +1826,12 @@ class RuntimeEnvironmentManifest:
             caller_ring=caller_ring,
             allowed_tools=allowed_tools,
         )
+        external_summary = cls.get_external_tools_summary(
+            tool_registry=tool_registry,
+            caller_ring=caller_ring,
+            allowed_tools=allowed_tools,
+        )
+        tools_summary["external"] = dict(external_summary.get("counts") or {})
         actuators = cls.get_active_actuators(
             tool_registry=tool_registry,
             caller_ring=caller_ring,
@@ -1705,6 +1860,7 @@ class RuntimeEnvironmentManifest:
             "system": system_info,
             "ai_infrastructure": ai_info,
             "tools": tools_summary,
+            "external_tools": external_summary,
             "integrations": integrations,
         }
 
@@ -1753,6 +1909,15 @@ class RuntimeEnvironmentManifest:
             f"- Degraded/Unavailable: {unavailable_str}\n"
             "- Constraints: Non-interactive execution, DEVNULL stdin, no interactive sudo."
         )
+        ext_tools = manifest.get("external_tools") or {}
+        ext_counts = ext_tools.get("counts") or {}
+        if ext_counts.get("sources", 0) > 0 or ext_counts.get("discovered", 0) > 0:
+            ext_line = (
+                f"\n- External: {ext_counts.get('available', 0)}/{ext_counts.get('discovered', 0)} "
+                f"avail ({ext_counts.get('healthy_sources', 0)}/{ext_counts.get('sources', 0)} src)"
+            )
+            if len(block) + len(ext_line) <= 480:
+                block += ext_line
         return _scrub_secret_text(block)
 
     @classmethod
@@ -1857,5 +2022,34 @@ class RuntimeEnvironmentManifest:
             src = int_meta.get("source", "unknown")
             det = int_meta.get("details", "")
             lines.append(f"  • {int_name:<20} [{st:<11}] (source={src}) {det}")
+
+        ext_info = data.get("external_tools") or {}
+        ext_counts = ext_info.get("counts") or {}
+        if ext_info.get("registry_known") or ext_counts.get("sources", 0) > 0 or ext_counts.get("discovered", 0) > 0:
+            lines.extend(["", "[External Tools]"])
+            lines.append(
+                f"  Counts:        {ext_counts.get('sources', 0)} sources "
+                f"({ext_counts.get('healthy_sources', 0)} healthy) · "
+                f"{ext_counts.get('discovered', 0)} discovered · "
+                f"{ext_counts.get('authorized', 0)} authorized · "
+                f"{ext_counts.get('available', 0)} available · "
+                f"{ext_counts.get('unavailable', 0)} unavailable · "
+                f"{ext_counts.get('schema_failures', 0)} schema failures"
+            )
+            for sid, smeta in sorted((ext_info.get("sources") or {}).items()):
+                lines.append(
+                    f"  • source={sid:<18} [{smeta.get('health', 'UNKNOWN'):<12}] "
+                    f"type={smeta.get('source_type', 'external')} endpoint={smeta.get('endpoint', 'unknown')}"
+                )
+            for tid, tmeta in sorted((ext_info.get("details") or {}).items()):
+                lines.append(
+                    f"    - {tid:<28} [{tmeta.get('lifecycle', 'UNKNOWN'):<11}] "
+                    f"source={tmeta.get('source_id', '?')} authorized={tmeta.get('authorized', False)}"
+                )
+            for verr in ext_info.get("validation_failures") or []:
+                lines.append(
+                    f"    ! schema_error tool={verr.get('tool_id', '?')} ({verr.get('error_type', 'ERROR')}): "
+                    f"{verr.get('error', '')}"
+                )
 
         return _scrub_secret_text("\n".join(lines))

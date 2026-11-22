@@ -268,7 +268,13 @@ class ObservationFramingEngine:
         if status == "ERROR":
             from zelyr.engine.error_classifier import classify_tool_error
 
-            classification = classify_tool_error(tool_name, exit_code, output, error)
+            classification = classify_tool_error(
+                tool_name,
+                exit_code,
+                output,
+                error,
+                error_type=error_type or None,
+            )
             if not error_type:
                 error_type = classification.error_type
             if not remedy_hint:
@@ -304,6 +310,21 @@ class ObservationFramingEngine:
                 else:
                     summary = f"Tool '{tool_name}' failed ({error_type or 'ERROR'})."
 
+        ext_source_meta: Optional[Dict[str, Any]] = None
+        if isinstance(parsed, dict):
+            res_block = parsed.get("result") if isinstance(parsed.get("result"), dict) else None
+            cand_meta = None
+            if res_block and isinstance(res_block.get("metadata"), dict):
+                cand_meta = res_block["metadata"]
+            elif isinstance(parsed.get("metadata"), dict):
+                cand_meta = parsed["metadata"]
+            if cand_meta and cand_meta.get("external") is True:
+                ext_source_meta = {
+                    "source_id": str(cand_meta.get("source_id") or "external"),
+                    "source_type": str(cand_meta.get("source_type") or "external"),
+                    "external_tool_name": str(cand_meta.get("external_tool_name") or tool_name),
+                }
+
         # Format as JSON if requested
         if as_json:
             formatted_error = ""
@@ -320,6 +341,11 @@ class ObservationFramingEngine:
                 "output": output,
                 "error": formatted_error if status == "ERROR" else "",
             }
+            if ext_source_meta is not None:
+                data_payload["external"] = True
+                data_payload["source_id"] = ext_source_meta["source_id"]
+                data_payload["source_type"] = ext_source_meta["source_type"]
+                data_payload["external_tool_name"] = ext_source_meta["external_tool_name"]
             if status == "SUCCESS":
                 if verified is True:
                     data_payload["guidance"] = "Action completed and machine state verified."
@@ -357,6 +383,10 @@ class ObservationFramingEngine:
             f"- Verified: {'TRUE' if verified is True else ('FALSE' if verified is False else 'N/A')}",
             f"- Summary: {summary}",
         ]
+        if ext_source_meta is not None:
+            lines.append(
+                f"- External Source: {ext_source_meta['source_id']} ({ext_source_meta['external_tool_name']})"
+            )
 
         if status == "SUCCESS":
             if verified is True:

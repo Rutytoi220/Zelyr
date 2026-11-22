@@ -454,6 +454,13 @@ def resolve_tool_ring(
     if reg is None:
         reg = ToolRegistry()
 
+    # External fallback tools always derive required_ring from host policy, never remote metadata.
+    if reg is not None and not _is_mock_object(reg) and hasattr(reg, "get_external_tool_entry"):
+        ext_entry = reg.get_external_tool_entry(tool_id)
+        if ext_entry is not None:
+            raw_ext_ring = getattr(ext_entry, "required_ring", None)
+            return raw_ext_ring if _is_valid_ring_value(raw_ext_ring) else None
+
     eff_tool = tool
     if eff_tool is None and hasattr(reg, "get_tool"):
         eff_tool = reg.get_tool(tool_id)
@@ -800,7 +807,15 @@ def authorize_and_validate_tool_call(
                     or canonical_name == "echo"
                 )
             )
-            if not is_local_reg_tool:
+            local_cand = tool_registry.get_tool(canonical_name) if is_local_reg_tool and hasattr(tool_registry, "get_tool") else None
+            is_external_escape = (
+                (
+                    getattr(local_cand, "is_external", False)
+                    or (hasattr(tool_registry, "get_external_tool_entry") and tool_registry.get_external_tool_entry(canonical_name) is not None)
+                )
+                and canonical_name not in active_test_scope.get_known_tools()
+            )
+            if not is_local_reg_tool or is_external_escape:
                 return ToolAuthorizationDecision(
                     allowed=False,
                     tool_name=canonical_name,
@@ -835,6 +850,52 @@ def authorize_and_validate_tool_call(
                     reason="authorization_denied",
                     error_type="AUTHORIZATION_DENIED",
                     detail=f"AuthorizationError: Registry lookup failed for '{canonical_name}': {exc}",
+                )
+
+        # External fallback lifecycle & authorization check (never expose or execute unauthorized/disconnected tools)
+        ext_entry = (
+            reg.get_external_tool_entry(canonical_name)
+            if (reg is not None and not _is_mock_object(reg) and hasattr(reg, "get_external_tool_entry"))
+            else None
+        )
+        if ext_entry is not None:
+            if not getattr(ext_entry, "authorized", False):
+                return ToolAuthorizationDecision(
+                    allowed=False,
+                    tool_name=canonical_name,
+                    normalized_arguments={},
+                    reason="authorization_denied",
+                    error_type="AUTHORIZATION_DENIED",
+                    detail=(
+                        f"AuthorizationError: External tool '{canonical_name}' from source "
+                        f"'{ext_entry.source_id}' is not authorized for execution."
+                    ),
+                )
+            ext_lc = getattr(getattr(ext_entry, "lifecycle", None), "value", str(getattr(ext_entry, "lifecycle", "")))
+            if ext_lc != "AVAILABLE" or eff_tool is None or (
+                hasattr(eff_tool, "is_available") and not eff_tool.is_available()
+            ):
+                return ToolAuthorizationDecision(
+                    allowed=False,
+                    tool_name=canonical_name,
+                    normalized_arguments={},
+                    reason="tool_unavailable",
+                    error_type="TOOL_UNAVAILABLE",
+                    detail=(
+                        f"External tool '{canonical_name}' from source '{ext_entry.source_id}' "
+                        f"is unavailable ({ext_lc or 'UNAVAILABLE'})."
+                    ),
+                )
+
+        if eff_tool is not None and getattr(eff_tool, "is_external", False):
+            if hasattr(eff_tool, "is_available") and not eff_tool.is_available():
+                return ToolAuthorizationDecision(
+                    allowed=False,
+                    tool_name=canonical_name,
+                    normalized_arguments={},
+                    reason="tool_unavailable",
+                    error_type="TOOL_UNAVAILABLE",
+                    detail=f"External tool '{canonical_name}' registration is stale or source disconnected.",
                 )
 
         if tool_registry is not None:
@@ -1190,6 +1251,76 @@ Returns:
         from zelyr.core.registry import Registry as CoreRegistry
         self._core_registry = core_registry or CoreRegistry()
         self._lock = threading.RLock()
+        self._external_manager: Optional[Any] = None
+
+    @property
+    def external_manager(self):
+        """Return the lazily initialized ExternalToolManager integrated with this registry."""
+        with self._lock:
+            if self._external_manager is None:
+                from zelyr.tools.external import ExternalToolManager
+
+                self._external_manager = ExternalToolManager(self)
+            return self._external_manager
+
+    @property
+    def external_policy(self):
+        """Return the active ExternalToolPolicy governing external fallback tools."""
+        return self.external_manager.policy
+
+    def register_external_source(self, source):
+        """Register an ExternalToolSource (without discovering or authorizing tools automatically)."""
+        return self.external_manager.register_source(source)
+
+    def remove_external_source(self, source_id: str) -> bool:
+        """Remove an external source and invalidate all stale registrations."""
+        return self.external_manager.remove_source(source_id)
+
+    async def discover_external_tools(self, source_id: Optional[str] = None):
+        """Discover and validate tools from external sources (defaulting newly discovered tools to unauthorized)."""
+        return await self.external_manager.discover_all(source_id=source_id)
+
+    async def refresh_external_tools(self, source_id: Optional[str] = None):
+        """Refresh external tool discovery and lifecycle state safely."""
+        return await self.external_manager.discover_all(source_id=source_id)
+
+    def authorize_external_source(self, source_id: str) -> None:
+        """Explicitly allow an external source in host policy (per-tool approval still required)."""
+        self.external_manager.authorize_source(source_id)
+
+    def revoke_external_source(self, source_id: str, *, block: bool = False) -> None:
+        """Revoke an external source and unregister all its tools cleanly."""
+        self.external_manager.revoke_source(source_id, block=block)
+
+    def authorize_external_tool(self, tool_id: str, *, authorize_source: bool = True) -> bool:
+        """Explicitly authorize an external tool for registration and execution."""
+        return self.external_manager.authorize_tool(tool_id, authorize_source=authorize_source)
+
+    def revoke_external_tool(self, tool_id: str, *, block: bool = False) -> None:
+        """Revoke an external tool and remove it from active execution."""
+        self.external_manager.revoke_tool(tool_id, block=block)
+
+    def mark_external_source_status(self, source_id: str, health, *, error: Optional[str] = None) -> None:
+        """Update external source health and invalidate stale tools if unhealthy."""
+        self.external_manager.mark_source_status(source_id, health, error=error)
+
+    def get_external_tool_entry(self, tool_id: str):
+        """Return tracked external tool metadata entry, or None."""
+        if self._external_manager is None:
+            return None
+        return self._external_manager.get_tool_entry(tool_id)
+
+    def get_external_manifest_summary(
+        self,
+        *,
+        caller_ring: Optional[int] = None,
+        allowed_tools: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Return structured external tool manifest telemetry scoped to caller policy."""
+        return self.external_manager.get_manifest_summary(
+            caller_ring=caller_ring,
+            allowed_tools=allowed_tools,
+        )
 
     def register(self, tool: BaseTool) -> None:
         """Register ``tool`` using its own ``tool_id`` as the registry key."""
@@ -1318,6 +1449,8 @@ Returns:
                 self.get_tool(tid)
         schemas: List[Dict[str, Any]] = []
         for tool_id, tool in self.list_tools().items():
+            if getattr(tool, 'is_external', False) and hasattr(tool, 'is_available') and not tool.is_available():
+                continue
             if not hasattr(tool, 'description') or not hasattr(tool, 'schema'):
                 continue
             schemas.append({'type': 'function', 'function': {'name': tool_id, 'description': tool.description or tool_id, 'parameters': tool.schema or {'type': 'object', 'properties': {}}}})
@@ -1370,6 +1503,11 @@ Returns:
         for an unregistered tool identifier.
         """
         import sys
+
+        ext_entry = self.get_external_tool_entry(tool_id)
+        if ext_entry is not None:
+            raw_ext_ring = getattr(ext_entry, "required_ring", None)
+            return raw_ext_ring if _is_valid_ring_value(raw_ext_ring) else None
 
         if tool is not None:
             for attr_owner in (tool, type(tool)):
@@ -1442,11 +1580,12 @@ Returns:
         from zelyr.engine.normalizer import SafeArgumentNormalizer, _schema_error
 
         tool_schema = getattr(tool, "schema", None) or getattr(tool, "tool_schema", None)
+        eff_arg_source = "model" if getattr(tool, "is_external", False) else argument_source
         normalized_args, _, val_envelope = SafeArgumentNormalizer.normalize_and_validate(
             tool_id,
             tool_schema,
             arguments,
-            argument_source=argument_source,
+            argument_source=eff_arg_source,
         )
         if val_envelope is not None:
             return None, ToolResult(
@@ -1495,6 +1634,21 @@ Returns:
         tool_id, arguments = canonicalize_tool_invocation(tool_id, arguments)
         tool = self.get_tool(tool_id)
         if tool is None:
+            ext_entry = self.get_external_tool_entry(tool_id)
+            if ext_entry is not None:
+                if not getattr(ext_entry, "authorized", False):
+                    return ToolResult(
+                        success=False,
+                        output="",
+                        error=f"AuthorizationError: External tool '{tool_id}' from source '{ext_entry.source_id}' is not authorized.",
+                        error_type="AUTHORIZATION_DENIED",
+                    )
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=f"External tool '{tool_id}' from source '{ext_entry.source_id}' is unavailable ({ext_entry.lifecycle.value}).",
+                    error_type="TOOL_UNAVAILABLE",
+                )
             return ToolResult(success=False, error=f"Tool not found: {tool_id}", error_type="TOOL_NOT_FOUND")
 
         auth_error = self._authorize_execution(tool_id, tool, caller_ring, allowed_tools)
@@ -1563,6 +1717,21 @@ Returns:
         tool_id, arguments = canonicalize_tool_invocation(tool_id, arguments)
         tool = self.get_tool(tool_id)
         if tool is None:
+            ext_entry = self.get_external_tool_entry(tool_id)
+            if ext_entry is not None:
+                if not getattr(ext_entry, "authorized", False):
+                    return ToolResult(
+                        success=False,
+                        output="",
+                        error=f"AuthorizationError: External tool '{tool_id}' from source '{ext_entry.source_id}' is not authorized.",
+                        error_type="AUTHORIZATION_DENIED",
+                    )
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=f"External tool '{tool_id}' from source '{ext_entry.source_id}' is unavailable ({ext_entry.lifecycle.value}).",
+                    error_type="TOOL_UNAVAILABLE",
+                )
             return ToolResult(success=False, error=f"Tool not found: {tool_id}", error_type="TOOL_NOT_FOUND")
 
         auth_error = self._authorize_execution(tool_id, tool, caller_ring, allowed_tools)
