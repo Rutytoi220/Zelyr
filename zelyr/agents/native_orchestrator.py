@@ -36,6 +36,7 @@ class NativeOrchestrator:
         caller_ring: Optional[int] = None,
         allowed_tools: Optional[List[str]] = None,
         task_local_scope: Optional[Any] = None,
+        central_ledger: Optional[Any] = None,
     ):
         self._explicit_max_context_tokens = max_context_tokens
         self._max_steps = max_depth if max_depth is not None else max_steps
@@ -52,6 +53,7 @@ class NativeOrchestrator:
         self.caller_ring = caller_ring
         self.allowed_tools = allowed_tools
         self.task_local_scope = task_local_scope
+        self.central_ledger = central_ledger
         self.current_ledger: Optional[Any] = None
         self.last_finish_reason: Optional[str] = None
 
@@ -1322,6 +1324,244 @@ class NativeOrchestrator:
         max_replanning_attempts: Optional[int] = None,
         task_local_scope: Optional[Any] = None,
     ) -> AsyncGenerator[dict, None]:
+        """Stream ReAct execution while recording a root persistent execution ledger entry."""
+        if depth > 0 or is_retry:
+            async for chunk in self._generate_stream_core(
+                payload,
+                depth=depth,
+                is_retry=is_retry,
+                stream_provider=stream_provider,
+                tool_schemas=tool_schemas,
+                tool_executor=tool_executor,
+                db_path=db_path,
+                max_depth=max_depth,
+                turn_tool_history=turn_tool_history,
+                actual_step_count=actual_step_count,
+                disable_tools=disable_tools,
+                enable_cycle_detection=enable_cycle_detection,
+                ledger=ledger,
+                pending_proposals=pending_proposals,
+                replanning_attempts=replanning_attempts,
+                max_replanning_attempts=max_replanning_attempts,
+                task_local_scope=task_local_scope,
+            ):
+                yield chunk
+            return
+
+        from zelyr.engine.execution_ledger import (
+            ActionState,
+            ExecutionStatus,
+            LedgerEventType,
+            TurnExecutionLedger,
+            VerificationStatus,
+            detect_false_success,
+            get_default_central_ledger,
+        )
+
+        eff_ledger = ledger if ledger is not None else TurnExecutionLedger()
+        self.current_ledger = eff_ledger
+
+        eff_caller_ring = payload.get("caller_ring") if "caller_ring" in payload else getattr(self, "caller_ring", None)
+        eff_task_local_scope = task_local_scope if task_local_scope is not None else getattr(self, "task_local_scope", None)
+        if eff_task_local_scope is None:
+            eff_exec = tool_executor or getattr(self, "tool_executor", None)
+            if eff_exec is not None:
+                eff_task_local_scope = getattr(eff_exec, "_task_local_tool_scope", None)
+
+        central_ledger = (
+            getattr(self, "central_ledger", None)
+            or payload.get("central_ledger")
+            or getattr(eff_ledger, "_central_ledger", None)
+            or get_default_central_ledger()
+        )
+        exec_id = getattr(eff_ledger, "_execution_id", None)
+        owns_root_exec = False
+        user_prompt = ""
+        for msg in reversed(payload.get("messages", [])):
+            if msg.get("role") == "user":
+                c = msg.get("content", "")
+                if isinstance(c, list):
+                    c = " ".join(part.get("text", "") for part in c if isinstance(part, dict))
+                if isinstance(c, str) and not c.startswith(("[SYSTEM", "[ACTUATOR RECOVERY")):
+                    user_prompt = c
+                    break
+
+        acceptance_spec = payload.get("acceptance_criteria") or getattr(self, "acceptance_criteria", None)
+        if not exec_id:
+            owns_root_exec = True
+            rec = central_ledger.create_execution(
+                user_prompt,
+                source_component="native_orchestrator",
+                caller_ring=eff_caller_ring,
+                task_local_scoped=bool(eff_task_local_scope),
+                status=ExecutionStatus.RUNNING,
+                metadata={
+                    "model": payload.get("model"),
+                    "has_acceptance_criteria": bool(acceptance_spec),
+                },
+            )
+            exec_id = rec.execution_id
+
+        eff_ledger.attach_central_ledger(
+            central_ledger,
+            exec_id,
+            caller_ring=eff_caller_ring,
+            task_local_scoped=bool(eff_task_local_scope),
+            source_component="native_orchestrator",
+        )
+        eff_ledger._root_meta = {"cancelled": False, "timed_out": False, "error": None, "connection_error": False}
+        central_ledger.record_event(
+            exec_id,
+            LedgerEventType.PLANNING_DECISION,
+            status="planned",
+            caller_ring=eff_caller_ring,
+            task_local_scoped=bool(eff_task_local_scope),
+            metadata={
+                "max_steps": getattr(self, "max_steps", 5),
+                "has_acceptance_criteria": bool(acceptance_spec),
+            },
+            idempotency_key=f"{exec_id}:plan:root",
+        )
+
+        collected_out: List[str] = []
+        caught_exc: Optional[Exception] = None
+        was_cancelled = False
+        try:
+            async for chunk in self._generate_stream_core(
+                payload,
+                depth=depth,
+                is_retry=is_retry,
+                stream_provider=stream_provider,
+                tool_schemas=tool_schemas,
+                tool_executor=tool_executor,
+                db_path=db_path,
+                max_depth=max_depth,
+                turn_tool_history=turn_tool_history,
+                actual_step_count=actual_step_count,
+                disable_tools=disable_tools,
+                enable_cycle_detection=enable_cycle_detection,
+                ledger=eff_ledger,
+                pending_proposals=pending_proposals,
+                replanning_attempts=replanning_attempts,
+                max_replanning_attempts=max_replanning_attempts,
+                task_local_scope=task_local_scope,
+            ):
+                for ch in chunk.get("choices", []) if isinstance(chunk, dict) else []:
+                    delta = ch.get("delta", {}) if isinstance(ch, dict) else {}
+                    txt = delta.get("content")
+                    if isinstance(txt, str) and txt:
+                        collected_out.append(txt)
+                yield chunk
+        except asyncio.CancelledError:
+            was_cancelled = True
+            raise
+        except Exception as exc:
+            caught_exc = exc
+            raise
+        finally:
+            if owns_root_exec and getattr(eff_ledger, "_execution_id", None) == exec_id:
+                existing_rec = central_ledger.get_execution(exec_id)
+                already_finalized = (
+                    existing_rec is not None
+                    and existing_rec.status
+                    in (
+                        ExecutionStatus.COMPLETED.value,
+                        ExecutionStatus.COMPLETED_UNVERIFIED.value,
+                        ExecutionStatus.FAILED.value,
+                        ExecutionStatus.CANCELLED.value,
+                        ExecutionStatus.TIMED_OUT.value,
+                    )
+                )
+                if not already_finalized:
+                    root_meta = getattr(eff_ledger, "_root_meta", {}) or {}
+                    final_text = "".join(collected_out)
+                    all_records = [eff_ledger._records[cid] for cid in eff_ledger._order]
+                    has_ver_fail = any(getattr(r, "verification_failed", False) for r in all_records)
+                    has_unresolved = eff_ledger.has_unresolved_failures()
+                    has_verified = bool(eff_ledger.verified_actions() or eff_ledger.get_verified_targets())
+                    total_acts = eff_ledger.total_actions()
+
+                    if (
+                        was_cancelled
+                        or getattr(self, "_cancelled", False)
+                        or payload.get("cancelled", False)
+                        or root_meta.get("cancelled")
+                    ):
+                        final_status = ExecutionStatus.CANCELLED
+                        ver_status = VerificationStatus.INTERRUPTED
+                        err_msg = "Task cancelled"
+                    elif root_meta.get("timed_out") and has_unresolved:
+                        final_status = ExecutionStatus.TIMED_OUT
+                        ver_status = VerificationStatus.INTERRUPTED
+                        err_msg = root_meta.get("error") or "Tool execution timed out"
+                    elif caught_exc is not None or root_meta.get("connection_error"):
+                        final_status = ExecutionStatus.FAILED
+                        ver_status = VerificationStatus.INTERRUPTED
+                        err_msg = str(caught_exc) if caught_exc else (root_meta.get("error") or "Orchestration error")
+                    elif has_ver_fail:
+                        final_status = ExecutionStatus.FAILED
+                        ver_status = VerificationStatus.VERIFICATION_FAILED
+                        err_msg = "Outcome verification failed"
+                    elif has_unresolved:
+                        ver_status = (
+                            VerificationStatus.CLAIMED_UNVERIFIED
+                            if detect_false_success(final_text, has_unresolved=True)
+                            else VerificationStatus.NOT_VERIFIED
+                        )
+                        final_status = ExecutionStatus.FAILED
+                        unresolved = eff_ledger.unresolved_failures()
+                        err_msg = unresolved[-1].error if unresolved else "Unresolved action failure"
+                    elif has_verified:
+                        final_status = ExecutionStatus.COMPLETED
+                        ver_status = VerificationStatus.VERIFIED
+                        err_msg = None
+                    elif total_acts > 0:
+                        if acceptance_spec and detect_false_success(final_text, has_unresolved=False):
+                            ver_status = VerificationStatus.CLAIMED_UNVERIFIED
+                        else:
+                            ver_status = VerificationStatus.NOT_VERIFIED
+                        final_status = ExecutionStatus.COMPLETED_UNVERIFIED
+                        err_msg = None
+                    else:
+                        if acceptance_spec:
+                            final_status = ExecutionStatus.FAILED
+                            ver_status = VerificationStatus.NOT_VERIFIED
+                            err_msg = "Task ended without executing or verifying required acceptance criteria"
+                        else:
+                            final_status = ExecutionStatus.COMPLETED
+                            ver_status = VerificationStatus.NOT_VERIFIED
+                            err_msg = None
+
+                    eff_ledger.set_verification_status(ver_status)
+                    central_ledger.finalize_execution(
+                        exec_id,
+                        status=final_status,
+                        verification_status=ver_status,
+                        final_summary=final_text[:1024] if final_text else None,
+                        error=err_msg,
+                        metadata={"total_actions": total_acts, "verified_targets": eff_ledger.get_verified_targets()},
+                    )
+
+    async def _generate_stream_core(
+        self,
+        payload: dict,
+        depth: int = 0,
+        is_retry: bool = False,
+        stream_provider: Optional[Callable[[dict], AsyncGenerator[dict, None]]] = None,
+        tool_schemas: Optional[List[Dict[str, Any]]] = None,
+        tool_executor: Optional[Callable[[str, dict], Awaitable[Any]]] = None,
+        db_path: Optional[str] = None,
+        max_depth: Optional[int] = None,
+        turn_tool_history: Optional[List[tuple]] = None,
+        actual_step_count: int = 0,
+        disable_tools: bool = False,
+        enable_cycle_detection: Optional[bool] = None,
+        ledger: Optional[Any] = None,
+        pending_proposals: Optional[List[Dict[str, Any]]] = None,
+        replanning_attempts: int = 0,
+        max_replanning_attempts: Optional[int] = None,
+        task_local_scope: Optional[Any] = None,
+    ) -> AsyncGenerator[dict, None]:
         eff_max_depth = max_depth if max_depth is not None else getattr(self, "max_depth", self.max_steps)
         eff_max_replanning = max_replanning_attempts if max_replanning_attempts is not None else getattr(self, "max_replanning_attempts", 1)
         eff_stream_provider = stream_provider or getattr(self, "stream_provider", None) or getattr(self, "model_provider", None)
@@ -1340,9 +1580,12 @@ class NativeOrchestrator:
 
         from zelyr.engine.execution_ledger import (
             ActionState,
+            LedgerEventType,
             TurnExecutionLedger,
+            VerificationStatus,
             detect_consultant_deferral,
             detect_false_success,
+            execution_scope,
             has_imperative_action_intent,
             has_valid_inaction_justification,
             is_truthful_failure_report,
@@ -1374,6 +1617,8 @@ class NativeOrchestrator:
         payload["_pending_proposals"] = curr_pending_proposals
 
         if getattr(self, "_cancelled", False) or payload.get("cancelled", False):
+            if hasattr(eff_ledger, "_root_meta") and isinstance(eff_ledger._root_meta, dict):
+                eff_ledger._root_meta["cancelled"] = True
             if eff_ledger:
                 eff_ledger.discard_pending_proposals(reason="task_cancelled")
             curr_pending_proposals.clear()
@@ -1383,6 +1628,16 @@ class NativeOrchestrator:
         if depth >= eff_max_depth:
             if eff_ledger:
                 eff_ledger.discard_pending_proposals(reason="max_depth_reached")
+                if getattr(eff_ledger, "_central_ledger", None) and getattr(eff_ledger, "_execution_id", None):
+                    from zelyr.engine.execution_ledger import LedgerEventType
+
+                    eff_ledger._central_ledger.record_event(
+                        eff_ledger._execution_id,
+                        LedgerEventType.PLANNING_DECISION,
+                        status="max_depth_reached",
+                        metadata={"depth": depth, "max_depth": eff_max_depth},
+                        idempotency_key=f"{eff_ledger._execution_id}:plan:max_depth:{depth}",
+                    )
             curr_pending_proposals.clear()
             yield {"choices": [{"delta": {"content": f"\n[Notice: Reached maximum autonomous ReAct steps ({eff_max_depth}).]\n"}}]}
             return
@@ -1390,6 +1645,16 @@ class NativeOrchestrator:
         if actual_step_count >= eff_step_limit:
             if eff_ledger:
                 eff_ledger.discard_pending_proposals(reason="step_limit_reached")
+                if getattr(eff_ledger, "_central_ledger", None) and getattr(eff_ledger, "_execution_id", None):
+                    from zelyr.engine.execution_ledger import LedgerEventType
+
+                    eff_ledger._central_ledger.record_event(
+                        eff_ledger._execution_id,
+                        LedgerEventType.PLANNING_DECISION,
+                        status="step_limit_reached",
+                        metadata={"actual_step_count": actual_step_count, "step_limit": eff_step_limit},
+                        idempotency_key=f"{eff_ledger._execution_id}:plan:step_limit:{actual_step_count}",
+                    )
             curr_pending_proposals.clear()
             disable_tools = True
 
@@ -1980,11 +2245,17 @@ class NativeOrchestrator:
                 else:
                     yield data
         except httpx.ConnectError as exc:
+            if hasattr(eff_ledger, "_root_meta") and isinstance(eff_ledger._root_meta, dict):
+                eff_ledger._root_meta["connection_error"] = True
+                eff_ledger._root_meta["error"] = str(exc)
             if eff_ledger.has_pending_proposals():
                 eff_ledger.discard_pending_proposals(reason="connection_error")
             yield {"choices": [{"delta": {"content": f"\n⚠️ [Connection Error] Could not connect to local AI engine at {base_url}: {exc}. Ensure Ollama is running.\n"}}]}
             return
         except httpx.RequestError as exc:
+            if hasattr(eff_ledger, "_root_meta") and isinstance(eff_ledger._root_meta, dict):
+                eff_ledger._root_meta["connection_error"] = True
+                eff_ledger._root_meta["error"] = str(exc)
             if eff_ledger.has_pending_proposals():
                 eff_ledger.discard_pending_proposals(reason="request_error")
             err_detail = str(exc).strip()
@@ -2240,6 +2511,23 @@ class NativeOrchestrator:
             ]
             if unresolved_exec_for_gate and depth < min(4, eff_max_depth - 1):
                 if detect_false_success(clean_text, has_unresolved=True):
+                    if getattr(eff_ledger, "_central_ledger", None) and getattr(eff_ledger, "_execution_id", None):
+                        from zelyr.engine.execution_ledger import VerificationStatus as _VS
+
+                        eff_ledger._central_ledger.record_event(
+                            eff_ledger._execution_id,
+                            LedgerEventType.VERIFICATION_RECORDED,
+                            status=_VS.CLAIMED_UNVERIFIED.value,
+                            metadata={"detail": "Model claimed completion despite unresolved failure", "depth": depth},
+                            idempotency_key=f"{eff_ledger._execution_id}:claimed_unverified:{depth}",
+                        )
+                        eff_ledger._central_ledger.record_event(
+                            eff_ledger._execution_id,
+                            LedgerEventType.RECOVERY_ATTEMPT,
+                            status="remediation_requested",
+                            metadata={"reason": "false_success_gate", "depth": depth},
+                            idempotency_key=f"{eff_ledger._execution_id}:false_success_recovery:{depth}",
+                        )
                     buffered_chunks.clear()
                     collected_assistant_text.clear()
 
@@ -2522,6 +2810,18 @@ class NativeOrchestrator:
                         eff_ledger._replan_verified_marker = len(eff_ledger.get_verified_targets())
                         eff_ledger._replan_verified_outcomes = list(verified_outcomes)
                         eff_ledger._replan_unfulfilled_count = len(unfulfilled_outcomes)
+                        if getattr(eff_ledger, "_central_ledger", None) and getattr(eff_ledger, "_execution_id", None):
+                            eff_ledger._central_ledger.record_event(
+                                eff_ledger._execution_id,
+                                LedgerEventType.PLANNING_DECISION,
+                                status="replanning",
+                                metadata={
+                                    "replanning_attempt": replanning_attempts + 1,
+                                    "unfulfilled_count": len(unfulfilled_outcomes),
+                                    "verified_count": len(verified_outcomes),
+                                },
+                                idempotency_key=f"{eff_ledger._execution_id}:replan:{replanning_attempts + 1}:{depth}",
+                            )
                     except Exception:
                         pass
 
@@ -2647,6 +2947,43 @@ class NativeOrchestrator:
 
             for tc in normalized_tool_calls:
                 if tc["id"] not in eff_ledger._records:
+                    if hasattr(eff_ledger, "set_call_source_metadata") and self.tool_registry is not None:
+                        try:
+                            ext_entry = (
+                                self.tool_registry.get_external_tool_entry(tc["function"]["name"])
+                                if callable(getattr(self.tool_registry, "get_external_tool_entry", None))
+                                else None
+                            )
+                            reg_t = (
+                                self.tool_registry.get_tool(tc["function"]["name"])
+                                if callable(getattr(self.tool_registry, "get_tool", None))
+                                else None
+                            )
+                            is_ext = bool(ext_entry is not None or (reg_t is not None and getattr(reg_t, "is_external", False)))
+                            src_id = (
+                                getattr(ext_entry, "source_id", None)
+                                if ext_entry is not None
+                                else (getattr(reg_t, "source_id", None) if reg_t is not None else "native")
+                            )
+                            src_type = (
+                                getattr(ext_entry, "source_type", None)
+                                if ext_entry is not None
+                                else (getattr(reg_t, "source_type", None) if reg_t is not None else "native")
+                            )
+                            ext_tname = (
+                                getattr(ext_entry, "external_tool_name", None)
+                                if ext_entry is not None
+                                else (getattr(reg_t, "external_tool_name", None) if reg_t is not None else None)
+                            )
+                            eff_ledger.set_call_source_metadata(
+                                tc["id"],
+                                is_external=is_ext,
+                                source_id=src_id,
+                                source_type=src_type,
+                                extra={"external_tool_name": ext_tname} if ext_tname else {},
+                            )
+                        except Exception:
+                            pass
                     eff_ledger.record_proposed(
                         tc["id"],
                         tc["function"]["name"],
@@ -2905,73 +3242,136 @@ class NativeOrchestrator:
                     }
                     payload["messages"].append(tool_msg)
                     curr_tool_history.append((fingerprint, "rejected"))
-                    eff_ledger.record_dispatched(tool_call_id)
+                    if getattr(eff_ledger, "_central_ledger", None) and getattr(eff_ledger, "_execution_id", None):
+                        from zelyr.engine.execution_ledger import LedgerEventType
+
+                        c_id = eff_ledger._execution_id
+                        is_schema_err = err_payload.get("error_type") == "SCHEMA_VALIDATION_ERROR"
+                        eff_ledger._central_ledger.record_event(
+                            c_id,
+                            LedgerEventType.ARGUMENT_VALIDATED if is_schema_err else LedgerEventType.AUTHORIZATION_DECISION,
+                            tool_id=func_name,
+                            status="invalid" if is_schema_err else "denied",
+                            correlation_id=tool_call_id,
+                            caller_ring=eff_caller_ring,
+                            task_local_scoped=bool(eff_task_local_scope),
+                            metadata={"reason": rejection_reason, "detail": rejection_detail},
+                            idempotency_key=f"{c_id}:{tool_call_id}:{'validated' if is_schema_err else 'auth'}",
+                        )
+                    eff_ledger.record_dispatched(tool_call_id, emit_event=False)
                     eff_ledger.record_observation(
                         tool_call_id,
                         status="rejected",
                         output=synth_content,
                         error=f"[{rejection_reason}] {rejection_detail}",
+                        rejection_reason=rejection_reason,
                     )
                     continue
 
                 actual_step_count += 1
                 if actual_step_count >= eff_step_limit:
                     force_disable_next = True
+                if getattr(eff_ledger, "_central_ledger", None) and getattr(eff_ledger, "_execution_id", None):
+                    from zelyr.engine.execution_ledger import LedgerEventType
+
+                    eff_ledger._central_ledger.record_event(
+                        eff_ledger._execution_id,
+                        LedgerEventType.AUTHORIZATION_DECISION,
+                        tool_id=func_name,
+                        status="allowed",
+                        correlation_id=tool_call_id,
+                        caller_ring=eff_caller_ring,
+                        task_local_scoped=bool(eff_task_local_scope),
+                        idempotency_key=f"{eff_ledger._execution_id}:{tool_call_id}:auth",
+                    )
                 eff_ledger.record_validated(tool_call_id)
                 eff_ledger.record_dispatched(tool_call_id)
                 timeout = get_tier_timeout(func_name)
                 timeout_int = int(timeout)
+                from contextlib import nullcontext
+                from zelyr.engine.execution_ledger import execution_scope
+
+                ledger_scope_cm = (
+                    execution_scope(
+                        eff_ledger._central_ledger,
+                        eff_ledger._execution_id,
+                        caller_ring=eff_caller_ring,
+                        task_local_scoped=bool(eff_task_local_scope),
+                        source_component="native_orchestrator",
+                        correlation_id=tool_call_id,
+                        owned_by_outer=True,
+                    )
+                    if (getattr(eff_ledger, "_central_ledger", None) and getattr(eff_ledger, "_execution_id", None))
+                    else nullcontext(None)
+                )
                 try:
-                    if eff_tool_executor is not None:
-                        with activate_task_local_scope(
-                            eff_task_local_scope if is_valid_task_scope else None
-                        ):
-                            try:
-                                exec_call = eff_tool_executor(func_name, func_args)
-                                if inspect.isawaitable(exec_call):
-                                    tool_result = await asyncio.wait_for(exec_call, timeout=timeout)
-                                else:
-                                    tool_result = exec_call
-                            except TypeError:
-                                exec_call = eff_tool_executor(func_name, **func_args)
-                                if inspect.isawaitable(exec_call):
-                                    tool_result = await asyncio.wait_for(exec_call, timeout=timeout)
-                                else:
-                                    tool_result = exec_call
-                    else:
-                        exec_fn = self.execute_tool
-                        dispatched_via_instance_registry = False
-                        if exec_fn is execute_tool and self.tool_registry is not None and callable(getattr(self.tool_registry, "execute_async", None)):
-                            try:
-                                from zelyr.core.plugins import _executors as _plugin_executors
-                                reg_tool = self.tool_registry.get_tool(func_name) if callable(getattr(self.tool_registry, "get_tool", None)) else None
-                                if reg_tool is not None and (
-                                    getattr(reg_tool, "is_external", False) or func_name not in _plugin_executors
-                                ):
-                                    dispatched_via_instance_registry = True
-                            except Exception:
-                                reg_tool = None
-                        if dispatched_via_instance_registry:
-                            exec_coro = self.tool_registry.execute_async(
-                                func_name,
-                                caller_ring=eff_caller_ring,
-                                allowed_tools=eff_allowed_tools,
-                                **func_args,
-                            )
-                        elif exec_fn is execute_tool and (eff_caller_ring is not None or eff_allowed_tools is not None):
-                            exec_coro = exec_fn(
-                                func_name,
-                                caller_ring=eff_caller_ring,
-                                allowed_tools=eff_allowed_tools,
-                                **func_args,
-                            )
+                    with ledger_scope_cm as call_ctx:
+                        if eff_tool_executor is not None:
+                            with activate_task_local_scope(
+                                eff_task_local_scope if is_valid_task_scope else None
+                            ):
+                                try:
+                                    exec_call = eff_tool_executor(func_name, func_args)
+                                    if inspect.isawaitable(exec_call):
+                                        tool_result = await asyncio.wait_for(exec_call, timeout=timeout)
+                                    else:
+                                        tool_result = exec_call
+                                except TypeError:
+                                    exec_call = eff_tool_executor(func_name, **func_args)
+                                    if inspect.isawaitable(exec_call):
+                                        tool_result = await asyncio.wait_for(exec_call, timeout=timeout)
+                                    else:
+                                        tool_result = exec_call
                         else:
-                            exec_coro = exec_fn(func_name, **func_args)
-                        tool_result = await asyncio.wait_for(
-                            exec_coro,
-                            timeout=timeout,
+                            exec_fn = self.execute_tool
+                            dispatched_via_instance_registry = False
+                            if exec_fn is execute_tool and self.tool_registry is not None and callable(getattr(self.tool_registry, "execute_async", None)):
+                                try:
+                                    from zelyr.core.plugins import _executors as _plugin_executors
+                                    reg_tool = self.tool_registry.get_tool(func_name) if callable(getattr(self.tool_registry, "get_tool", None)) else None
+                                    if reg_tool is not None and (
+                                        getattr(reg_tool, "is_external", False) or func_name not in _plugin_executors
+                                    ):
+                                        dispatched_via_instance_registry = True
+                                except Exception:
+                                    reg_tool = None
+                            if dispatched_via_instance_registry:
+                                exec_coro = self.tool_registry.execute_async(
+                                    func_name,
+                                    caller_ring=eff_caller_ring,
+                                    allowed_tools=eff_allowed_tools,
+                                    **func_args,
+                                )
+                            elif exec_fn is execute_tool and (eff_caller_ring is not None or eff_allowed_tools is not None):
+                                exec_coro = exec_fn(
+                                    func_name,
+                                    caller_ring=eff_caller_ring,
+                                    allowed_tools=eff_allowed_tools,
+                                    **func_args,
+                                )
+                            else:
+                                exec_coro = exec_fn(func_name, **func_args)
+                            tool_result = await asyncio.wait_for(
+                                exec_coro,
+                                timeout=timeout,
+                            )
+
+                    extra_telemetry: Dict[str, Any] = {}
+                    raw_res_meta = getattr(tool_result, "metadata", None)
+                    if isinstance(raw_res_meta, dict):
+                        extra_telemetry.update(raw_res_meta)
+                    bag = getattr(call_ctx, "telemetry_bag", None)
+                    if isinstance(bag, dict) and bag:
+                        extra_telemetry.update(bag)
+                    if extra_telemetry and hasattr(eff_ledger, "set_call_source_metadata"):
+                        eff_ledger.set_call_source_metadata(
+                            tool_call_id,
+                            is_external=extra_telemetry.get("is_external", extra_telemetry.get("external")),
+                            source_id=extra_telemetry.get("source_id"),
+                            source_type=extra_telemetry.get("source_type"),
+                            extra=extra_telemetry,
                         )
-                    
+
                     if hasattr(tool_result, "to_dict"):
                         tool_dict = tool_result.to_dict(tool=func_name, arguments=func_args)
                         tool_result = json.dumps(tool_dict, indent=2)
@@ -2979,6 +3379,11 @@ class NativeOrchestrator:
                         tool_result = json.dumps(tool_result, indent=2)
                     res_str = tool_result
                 except (TimeoutError, asyncio.TimeoutError):
+                    if hasattr(eff_ledger, "_root_meta") and isinstance(eff_ledger._root_meta, dict):
+                        eff_ledger._root_meta["timed_out"] = True
+                        eff_ledger._root_meta["error"] = f"Tool execution timed out after {timeout_int}s"
+                    if hasattr(eff_ledger, "set_call_source_metadata"):
+                        eff_ledger.set_call_source_metadata(tool_call_id, extra={"timed_out": True, "timeout_s": timeout_int})
                     res_str = json.dumps({
                         "success": False,
                         "error": f"Tool execution timed out after {timeout_int}s. Try a faster Tier 1 command or verify active window.",

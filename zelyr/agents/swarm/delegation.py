@@ -266,27 +266,111 @@ class DelegatedSubagent(BaseSubagent):
     async def execute_tool_call(self, tool_name: str, arguments: Dict[str, Any]) -> str:
         """Execute a tool call with strict role allowed-tools and capability ring enforcement."""
         import copy
+        import uuid
+        from contextlib import nullcontext
+        from zelyr.engine.execution_ledger import (
+            ExecutionStatus,
+            LedgerEventType,
+            VerificationStatus,
+            execution_scope,
+            get_active_execution_context,
+            get_default_central_ledger,
+        )
         from zelyr.tool_registry import (
             _is_valid_ring_value,
             authorize_and_validate_tool_call,
             canonicalize_tool_invocation,
         )
 
-        if not _is_valid_ring_value(getattr(self, "caller_ring", None)):
-            return f"AuthorizationError: Invalid caller_ring {getattr(self, 'caller_ring', None)!r}."
+        ctx = get_active_execution_context()
+        ledger = (ctx.ledger if ctx is not None else None) or getattr(self, "execution_ledger", None) or get_default_central_ledger()
+        own_exec = ctx is None
+        eff_ring = getattr(self, "caller_ring", None)
+        if own_exec:
+            exec_rec = ledger.create_execution(
+                f"swarm_subagent:{self.name}:{tool_name}",
+                source_component="swarm_delegation",
+                caller_ring=eff_ring if isinstance(eff_ring, int) and not isinstance(eff_ring, bool) else None,
+                status=ExecutionStatus.RUNNING,
+            )
+            exec_id = exec_rec.execution_id
+        else:
+            exec_id = ctx.execution_id  # type: ignore[union-attr]
+        call_id = f"sub_{uuid.uuid4().hex[:12]}"
+
+        def _finish_sub_call(res_status: str, *, err: Optional[str] = None, meta: Optional[Dict[str, Any]] = None, is_ext: bool = False, src_id: Optional[str] = None, src_type: Optional[str] = None) -> None:
+            try:
+                ledger.record_event(
+                    exec_id,
+                    LedgerEventType.TOOL_EXECUTION_RESULT,
+                    tool_id=tool_name,
+                    source_id=src_id,
+                    source_type=src_type,
+                    is_external=is_ext,
+                    status=res_status,
+                    correlation_id=call_id,
+                    caller_ring=eff_ring if isinstance(eff_ring, int) and not isinstance(eff_ring, bool) else None,
+                    metadata={**(meta or {}), **({"error": err} if err else {})},
+                    idempotency_key=f"{exec_id}:{call_id}:result",
+                )
+                if own_exec:
+                    ledger.finalize_execution(
+                        exec_id,
+                        status=ExecutionStatus.COMPLETED_UNVERIFIED if res_status == "succeeded" else ExecutionStatus.FAILED,
+                        verification_status=VerificationStatus.NOT_VERIFIED,
+                        error=err,
+                    )
+            except Exception:
+                pass
+
+        try:
+            ledger.record_event(
+                exec_id,
+                LedgerEventType.TOOL_SELECTED,
+                tool_id=tool_name,
+                status="selected",
+                correlation_id=call_id,
+                caller_ring=eff_ring if isinstance(eff_ring, int) and not isinstance(eff_ring, bool) else None,
+                metadata={"role": self.profile.role, "arguments": arguments if isinstance(arguments, dict) else {}},
+                idempotency_key=f"{exec_id}:{call_id}:selected",
+            )
+        except Exception:
+            pass
+
+        if not _is_valid_ring_value(eff_ring):
+            msg = f"AuthorizationError: Invalid caller_ring {eff_ring!r}."
+            _finish_sub_call("rejected", err=msg)
+            return msg
 
         if not isinstance(arguments, dict):
-            return f"Error: Arguments for '{tool_name}' must be a JSON object/dictionary."
+            msg = f"Error: Arguments for '{tool_name}' must be a JSON object/dictionary."
+            _finish_sub_call("failed", err=msg)
+            return msg
 
         raw_arguments = copy.deepcopy(arguments)
         tool_name, arguments = canonicalize_tool_invocation(tool_name, raw_arguments)
 
         # 1. Allowed tools gating (evaluated on canonical target name)
         if not isinstance(self.profile.allowed_tools, (list, tuple, set)) or tool_name not in self.profile.allowed_tools:
-            return (
+            msg = (
                 f"AuthorizationError: Tool '{tool_name}' is not in allowed tools list "
                 f"for role '{self.profile.role}'."
             )
+            try:
+                ledger.record_event(
+                    exec_id,
+                    LedgerEventType.AUTHORIZATION_DECISION,
+                    tool_id=tool_name,
+                    status="denied",
+                    correlation_id=call_id,
+                    caller_ring=eff_ring,
+                    metadata={"reason": "tool_not_in_allowed_tools", "role": self.profile.role},
+                    idempotency_key=f"{exec_id}:{call_id}:auth",
+                )
+            except Exception:
+                pass
+            _finish_sub_call("rejected", err=msg)
+            return msg
 
         # 2. Built-in blackboard tool handlers
         if tool_name in ("blackboard_write", "blackboard_post"):
@@ -295,20 +379,28 @@ class DelegatedSubagent(BaseSubagent):
             if value is None:
                 value = arguments.get("content") or arguments.get("data")
             if not key:
-                return "Error: 'key' is required for blackboard_write."
+                msg = "Error: 'key' is required for blackboard_write."
+                _finish_sub_call("failed", err=msg)
+                return msg
             self.write_blackboard(key, value)
+            _finish_sub_call("succeeded", meta={"key": key})
             return json.dumps({"success": True, "key": key, "recorded": True})
 
         if tool_name in ("blackboard_read", "read_blackboard"):
             key = arguments.get("key")
             if not key:
-                return "Error: 'key' is required for blackboard_read."
+                msg = "Error: 'key' is required for blackboard_read."
+                _finish_sub_call("failed", err=msg)
+                return msg
             val = self.read_blackboard(key)
+            _finish_sub_call("succeeded", meta={"key": key})
             return json.dumps({"success": True, "key": key, "value": val})
 
         # 3. ToolRegistry dispatch with authoritative boundary validation
         if self.tool_registry is None:
-            return f"Error: No tool registry available to execute '{tool_name}'."
+            msg = f"Error: No tool registry available to execute '{tool_name}'."
+            _finish_sub_call("failed", err=msg)
+            return msg
 
         try:
             tool_obj = (
@@ -317,10 +409,15 @@ class DelegatedSubagent(BaseSubagent):
                 else None
             )
         except Exception as exc:
-            return f"AuthorizationError: Registry lookup failed for '{tool_name}': {exc}"
+            msg = f"AuthorizationError: Registry lookup failed for '{tool_name}': {exc}"
+            _finish_sub_call("rejected", err=msg)
+            return msg
 
         authorized_target = getattr(tool_obj, "_target", getattr(tool_obj, "target", None)) if tool_obj is not None else None
         authorized_execute = getattr(tool_obj, "execute", None) if tool_obj is not None else None
+        is_ext = bool(getattr(tool_obj, "is_external", False)) if tool_obj is not None else False
+        src_id = getattr(tool_obj, "source_id", None) if tool_obj is not None else None
+        src_type = getattr(tool_obj, "source_type", None) if tool_obj is not None else None
 
         decision = authorize_and_validate_tool_call(
             tool_name,
@@ -332,7 +429,25 @@ class DelegatedSubagent(BaseSubagent):
             argument_source="model",
         )
         if not decision.allowed:
-            return decision.detail or f"AuthorizationError: Tool '{tool_name}' execution denied."
+            msg = decision.detail or f"AuthorizationError: Tool '{tool_name}' execution denied."
+            try:
+                ledger.record_event(
+                    exec_id,
+                    LedgerEventType.AUTHORIZATION_DECISION,
+                    tool_id=tool_name,
+                    source_id=src_id,
+                    source_type=src_type,
+                    is_external=is_ext,
+                    status="denied",
+                    correlation_id=call_id,
+                    caller_ring=eff_ring,
+                    metadata={"reason": decision.reason or msg},
+                    idempotency_key=f"{exec_id}:{call_id}:auth",
+                )
+            except Exception:
+                pass
+            _finish_sub_call("rejected", err=msg, is_ext=is_ext, src_id=src_id, src_type=src_type)
+            return msg
 
         tool_name = decision.tool_name
         validated_arguments = copy.deepcopy(decision.normalized_arguments)
@@ -343,192 +458,290 @@ class DelegatedSubagent(BaseSubagent):
                 or (tool_obj is not None and getattr(tool_obj, "_target", getattr(tool_obj, "target", None)) is not authorized_target)
                 or (tool_obj is not None and getattr(tool_obj, "execute", None) != authorized_execute)
             ):
-                return f"AuthorizationError: Authorized callable for '{tool_name}' changed before execution."
+                msg = f"AuthorizationError: Authorized callable for '{tool_name}' changed before execution."
+                _finish_sub_call("rejected", err=msg, is_ext=is_ext, src_id=src_id, src_type=src_type)
+                return msg
 
         try:
-            if hasattr(self.tool_registry, "execute_async"):
-                res = await self.tool_registry.execute_async(
-                    tool_name,
-                    caller_ring=self.caller_ring,
-                    allowed_tools=self.profile.allowed_tools,
-                    **copy.deepcopy(validated_arguments),
-                )
-            elif hasattr(self.tool_registry, "execute"):
-                res = self.tool_registry.execute(
-                    tool_name,
-                    caller_ring=self.caller_ring,
-                    allowed_tools=self.profile.allowed_tools,
-                    **copy.deepcopy(validated_arguments),
-                )
-            elif tool_obj:
-                import inspect
-                raw_res = tool_obj(**copy.deepcopy(validated_arguments))
-                res = await raw_res if inspect.isawaitable(raw_res) else raw_res
-            else:
-                return f"Tool '{tool_name}' not found."
+            ledger.record_event(
+                exec_id,
+                LedgerEventType.AUTHORIZATION_DECISION,
+                tool_id=tool_name,
+                source_id=src_id,
+                source_type=src_type,
+                is_external=is_ext,
+                status="allowed",
+                correlation_id=call_id,
+                caller_ring=eff_ring,
+                idempotency_key=f"{exec_id}:{call_id}:auth",
+            )
+            ledger.record_event(
+                exec_id,
+                LedgerEventType.TOOL_EXECUTION_START,
+                tool_id=tool_name,
+                source_id=src_id,
+                source_type=src_type,
+                is_external=is_ext,
+                status="started",
+                correlation_id=call_id,
+                caller_ring=eff_ring,
+                metadata={"arguments": validated_arguments},
+                idempotency_key=f"{exec_id}:{call_id}:started",
+            )
+        except Exception:
+            pass
+
+        try:
+            with execution_scope(
+                ledger,
+                exec_id,
+                caller_ring=eff_ring,
+                source_component="swarm_delegation",
+                correlation_id=call_id,
+                owned_by_outer=True,
+            ):
+                if hasattr(self.tool_registry, "execute_async"):
+                    res = await self.tool_registry.execute_async(
+                        tool_name,
+                        caller_ring=self.caller_ring,
+                        allowed_tools=self.profile.allowed_tools,
+                        **copy.deepcopy(validated_arguments),
+                    )
+                elif hasattr(self.tool_registry, "execute"):
+                    res = self.tool_registry.execute(
+                        tool_name,
+                        caller_ring=self.caller_ring,
+                        allowed_tools=self.profile.allowed_tools,
+                        **copy.deepcopy(validated_arguments),
+                    )
+                elif tool_obj:
+                    import inspect
+                    raw_res = tool_obj(**copy.deepcopy(validated_arguments))
+                    res = await raw_res if inspect.isawaitable(raw_res) else raw_res
+                else:
+                    msg = f"Tool '{tool_name}' not found."
+                    _finish_sub_call("failed", err=msg)
+                    return msg
 
             if isinstance(res, ToolResult):
                 output_str = res.output if res.success else (res.error or "Tool execution failed")
+                ok = bool(res.success)
+                res_meta = getattr(res, "metadata", None)
             elif hasattr(res, "output"):
                 output_str = str(res.output)
+                ok = True
+                res_meta = getattr(res, "metadata", None)
             else:
                 output_str = str(res)
+                ok = True
+                res_meta = None
 
+            _finish_sub_call(
+                "succeeded" if ok else "failed",
+                err=None if ok else str(output_str),
+                meta=res_meta if isinstance(res_meta, dict) else {"output_preview": str(output_str)[:512]},
+                is_ext=is_ext,
+                src_id=src_id,
+                src_type=src_type,
+            )
             self.write_blackboard(f"{tool_name}_result", output_str)
             return output_str
         except Exception as exc:
             err = f"Error executing '{tool_name}': {exc}"
+            _finish_sub_call("failed", err=str(exc), is_ext=is_ext, src_id=src_id, src_type=src_type)
             self.write_blackboard(f"{tool_name}_error", str(exc))
             return err
 
     async def run(self, task: str, context: Optional[Dict[str, Any]] = None) -> AgentResult:
         """Execute the subagent task in an isolated private context bubble."""
-        self._emit_telemetry("swarm.agent.started", {"assigned_task": task, "role": self.profile.role})
+        from zelyr.engine.execution_ledger import (
+            ExecutionStatus,
+            LedgerEventType,
+            VerificationStatus,
+            execution_scope,
+            get_default_central_ledger,
+        )
+
+        sub_ledger = getattr(self, "execution_ledger", None) or get_default_central_ledger()
+        eff_ring = getattr(self, "caller_ring", None)
+        sub_exec = sub_ledger.create_execution(
+            task,
+            source_component="swarm_delegation",
+            caller_ring=eff_ring if isinstance(eff_ring, int) and not isinstance(eff_ring, bool) else None,
+            status=ExecutionStatus.RUNNING,
+            metadata={"role": self.profile.role, "agent_name": self.name},
+        )
+        sub_exec_id = sub_exec.execution_id
+        self._emit_telemetry("swarm.agent.started", {"assigned_task": task, "role": self.profile.role, "execution_id": sub_exec_id})
         self.isolated_messages = []
 
-        # System prompt
-        if self.system_prompt:
-            self.isolated_messages.append({"role": "system", "content": self.system_prompt})
+        try:
+            with execution_scope(
+                sub_ledger,
+                sub_exec_id,
+                caller_ring=eff_ring if isinstance(eff_ring, int) and not isinstance(eff_ring, bool) else None,
+                source_component="swarm_delegation",
+                owned_by_outer=False,
+            ):
+                # System prompt
+                if self.system_prompt:
+                    self.isolated_messages.append({"role": "system", "content": self.system_prompt})
 
-        # Pre-seed blackboard from context if provided
-        if context:
-            self.isolated_messages.append({"role": "system", "content": f"[Shared Context]: {json.dumps(context)}"})
-            if isinstance(context, dict):
-                for k, v in context.items():
-                    if not str(k).startswith("_"):
-                        self.write_blackboard(str(k), v)
+                # Pre-seed blackboard from context if provided
+                if context:
+                    self.isolated_messages.append({"role": "system", "content": f"[Shared Context]: {json.dumps(context)}"})
+                    if isinstance(context, dict):
+                        for k, v in context.items():
+                            if not str(k).startswith("_"):
+                                self.write_blackboard(str(k), v)
 
-        # Task query
-        self.isolated_messages.append({"role": "user", "content": task})
+                # Task query
+                self.isolated_messages.append({"role": "user", "content": task})
 
-        # Collect allowed tool schemas
-        tool_schemas: List[Dict[str, Any]] = []
-        if self.tool_registry is not None and hasattr(self.tool_registry, "list_tools"):
-            registered = self.tool_registry.list_tools()
-            for t_name in self.profile.allowed_tools:
-                if t_name in registered:
-                    tool_instance = registered[t_name]
-                    if hasattr(tool_instance, "schema"):
-                        tool_schemas.append({
-                            "type": "function",
-                            "function": {
-                                "name": t_name,
-                                "description": getattr(tool_instance, "description", ""),
-                                "parameters": tool_instance.schema,
+                # Collect allowed tool schemas
+                tool_schemas: List[Dict[str, Any]] = []
+                if self.tool_registry is not None and hasattr(self.tool_registry, "list_tools"):
+                    registered = self.tool_registry.list_tools()
+                    for t_name in self.profile.allowed_tools:
+                        if t_name in registered:
+                            tool_instance = registered[t_name]
+                            if hasattr(tool_instance, "schema"):
+                                tool_schemas.append({
+                                    "type": "function",
+                                    "function": {
+                                        "name": t_name,
+                                        "description": getattr(tool_instance, "description", ""),
+                                        "parameters": tool_instance.schema,
+                                    },
+                                })
+
+                # Add synthetic schemas for blackboard operations if allowed
+                if "blackboard_write" in self.profile.allowed_tools:
+                    tool_schemas.append({
+                        "type": "function",
+                        "function": {
+                            "name": "blackboard_write",
+                            "description": "Write a named artifact to the shared Swarm blackboard.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "key": {"type": "string", "description": "Artifact storage key."},
+                                    "value": {"type": "string", "description": "Artifact content or JSON."},
+                                },
+                                "required": ["key", "value"],
                             },
-                        })
-
-        # Add synthetic schemas for blackboard operations if allowed
-        if "blackboard_write" in self.profile.allowed_tools:
-            tool_schemas.append({
-                "type": "function",
-                "function": {
-                    "name": "blackboard_write",
-                    "description": "Write a named artifact to the shared Swarm blackboard.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "key": {"type": "string", "description": "Artifact storage key."},
-                            "value": {"type": "string", "description": "Artifact content or JSON."},
                         },
-                        "required": ["key", "value"],
-                    },
-                },
-            })
-        if "blackboard_read" in self.profile.allowed_tools:
-            tool_schemas.append({
-                "type": "function",
-                "function": {
-                    "name": "blackboard_read",
-                    "description": "Read a named artifact from the shared Swarm blackboard.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "key": {"type": "string", "description": "Artifact storage key to retrieve."},
+                    })
+                if "blackboard_read" in self.profile.allowed_tools:
+                    tool_schemas.append({
+                        "type": "function",
+                        "function": {
+                            "name": "blackboard_read",
+                            "description": "Read a named artifact from the shared Swarm blackboard.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "key": {"type": "string", "description": "Artifact storage key to retrieve."},
+                                },
+                                "required": ["key"],
+                            },
                         },
-                        "required": ["key"],
-                    },
-                },
-            })
+                    })
 
-        max_turns = 10
-        final_output = ""
+                max_turns = 10
+                final_output = ""
+                content = ""
 
-        # Deterministic ReAct loop
-        if self.llm_client is not None:
-            for turn in range(max_turns):
-                try:
-                    # Invoke model
-                    if hasattr(self.llm_client, "generate"):
-                        resp = self.llm_client.generate(self.isolated_messages, tools=tool_schemas)
-                    elif callable(self.llm_client):
-                        resp = self.llm_client(self.isolated_messages, tools=tool_schemas)
-                    else:
-                        resp = {"content": f"Subagent {self.name} finished task."}
-
-                    if asyncio.iscoroutine(resp):
-                        resp = await resp
-
-                    if isinstance(resp, str):
-                        resp = {"content": resp}
-
-                    content = resp.get("content", "")
-                    tool_calls = resp.get("tool_calls", [])
-
-                    if tool_calls:
-                        self.isolated_messages.append({
-                            "role": "assistant",
-                            "content": content or "",
-                            "tool_calls": tool_calls,
-                        })
-
-                        for tc in tool_calls:
-                            fn = tc.get("function", {}) if isinstance(tc, dict) else {}
-                            name = (fn.get("name") if isinstance(fn, dict) else None) or (tc.get("name") if isinstance(tc, dict) else None) or ""
-                            if isinstance(fn, dict) and "arguments" in fn:
-                                args = fn["arguments"]
-                            elif isinstance(tc, dict) and "arguments" in tc:
-                                args = tc["arguments"]
+                # Deterministic ReAct loop
+                if self.llm_client is not None:
+                    for turn in range(max_turns):
+                        try:
+                            # Invoke model
+                            if hasattr(self.llm_client, "generate"):
+                                resp = self.llm_client.generate(self.isolated_messages, tools=tool_schemas)
+                            elif callable(self.llm_client):
+                                resp = self.llm_client(self.isolated_messages, tools=tool_schemas)
                             else:
-                                args = {}
-                            if isinstance(args, str):
-                                try:
-                                    args = json.loads(args)
-                                except Exception:
-                                    # Preserve malformed string so execute_tool_call rejects it as non-dict
-                                    pass
+                                resp = {"content": f"Subagent {self.name} finished task."}
 
-                            tc_id = (tc.get("id") if isinstance(tc, dict) else None) or f"call_{name}_{turn}"
-                            tool_out = await self.execute_tool_call(name, args)
+                            if asyncio.iscoroutine(resp):
+                                resp = await resp
 
-                            self.isolated_messages.append({
-                                "role": "tool",
-                                "name": name,
-                                "tool_call_id": tc_id,
-                                "content": str(tool_out),
-                            })
-                    else:
-                        final_output = content
-                        break
-                except Exception as exc:
-                    logger.error("[%s] Error during ReAct turn %d: %s", self.name, turn, exc)
-                    raise exc
+                            if isinstance(resp, str):
+                                resp = {"content": resp}
 
-            if not final_output:
-                final_output = content or f"Subagent [{self.name}] completed {max_turns} execution turns."
-        else:
-            # Deterministic fallback when no LLM is configured (e.g. offline tests)
-            final_output = f"Subagent [{self.name}] executed task: {task}"
-            self.write_blackboard("task_result", final_output)
+                            content = resp.get("content", "")
+                            tool_calls = resp.get("tool_calls", [])
 
-        self.write_blackboard("final_output", final_output)
-        self._emit_telemetry("swarm.agent.completed", {"result_summary": final_output})
-        return AgentResult(
-            success=True,
-            output=final_output,
-            steps_taken=[f"turn_{i}" for i in range(len(self.isolated_messages))],
-            metadata={"role": self.profile.role, "turns": len(self.isolated_messages)},
-        )
+                            if tool_calls:
+                                self.isolated_messages.append({
+                                    "role": "assistant",
+                                    "content": content or "",
+                                    "tool_calls": tool_calls,
+                                })
+
+                                for tc in tool_calls:
+                                    fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                                    name = (fn.get("name") if isinstance(fn, dict) else None) or (tc.get("name") if isinstance(tc, dict) else None) or ""
+                                    if isinstance(fn, dict) and "arguments" in fn:
+                                        args = fn["arguments"]
+                                    elif isinstance(tc, dict) and "arguments" in tc:
+                                        args = tc["arguments"]
+                                    else:
+                                        args = {}
+                                    if isinstance(args, str):
+                                        try:
+                                            args = json.loads(args)
+                                        except Exception:
+                                            # Preserve malformed string so execute_tool_call rejects it as non-dict
+                                            pass
+
+                                    tc_id = (tc.get("id") if isinstance(tc, dict) else None) or f"call_{name}_{turn}"
+                                    tool_out = await self.execute_tool_call(name, args)
+
+                                    self.isolated_messages.append({
+                                        "role": "tool",
+                                        "name": name,
+                                        "tool_call_id": tc_id,
+                                        "content": str(tool_out),
+                                    })
+                            else:
+                                final_output = content
+                                break
+                        except Exception as exc:
+                            logger.error("[%s] Error during ReAct turn %d: %s", self.name, turn, exc)
+                            raise exc
+
+                    if not final_output:
+                        final_output = content or f"Subagent [{self.name}] completed {max_turns} execution turns."
+                else:
+                    # Deterministic fallback when no LLM is configured (e.g. offline tests)
+                    final_output = f"Subagent [{self.name}] executed task: {task}"
+                    self.write_blackboard("task_result", final_output)
+
+                self.write_blackboard("final_output", final_output)
+                self._emit_telemetry("swarm.agent.completed", {"result_summary": final_output})
+                sub_ledger.finalize_execution(
+                    sub_exec_id,
+                    status=ExecutionStatus.COMPLETED_UNVERIFIED,
+                    verification_status=VerificationStatus.NOT_VERIFIED,
+                    final_summary=final_output,
+                    metadata={"role": self.profile.role, "turns": len(self.isolated_messages)},
+                )
+                return AgentResult(
+                    success=True,
+                    output=final_output,
+                    steps_taken=[f"turn_{i}" for i in range(len(self.isolated_messages))],
+                    metadata={"role": self.profile.role, "turns": len(self.isolated_messages), "execution_id": sub_exec_id},
+                )
+        except Exception as exc:
+            sub_ledger.finalize_execution(
+                sub_exec_id,
+                status=ExecutionStatus.FAILED,
+                verification_status=VerificationStatus.INTERRUPTED,
+                error=str(exc),
+            )
+            raise
 
 
 class SubagentDelegationTool(BaseTool):

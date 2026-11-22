@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from zelyr.compat import config_dir
 import threading
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+import uuid
 from zelyr.tools.core import BaseTool, ToolResult
 
 
@@ -1239,19 +1240,200 @@ class ToolRegistry:
     that existing ``ToolRegistry()`` call-sites continue to work.
     """
 
-    def __init__(self, core_registry=None) -> None:
-        """Auto-generated docstring.
-
-Args:
-    core_registry: Argument.
-
-Returns:
-    Return value.
-"""
+    def __init__(self, core_registry=None, execution_ledger: Optional[Any] = None) -> None:
+        """Initialize the ToolRegistry adapter over the underlying core registry."""
         from zelyr.core.registry import Registry as CoreRegistry
         self._core_registry = core_registry or CoreRegistry()
         self._lock = threading.RLock()
         self._external_manager: Optional[Any] = None
+        self.execution_ledger: Optional[Any] = execution_ledger
+
+    def _begin_standalone_ledger_call(
+        self,
+        tool_id: str,
+        caller_ring: Optional[int],
+        allowed_tools: Optional[Any],
+        arguments: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Create/resolve standalone execution ledger context when not already owned by an orchestrator."""
+        from zelyr.engine.execution_ledger import (
+            ExecutionStatus,
+            LedgerEventType,
+            attach_call_telemetry,
+            get_active_execution_context,
+            get_default_central_ledger,
+        )
+
+        ext_entry = self.get_external_tool_entry(tool_id)
+        tool_obj = self.get_tool(tool_id)
+        is_external = bool(ext_entry is not None or (tool_obj is not None and getattr(tool_obj, "is_external", False)))
+        source_id = (
+            getattr(ext_entry, "source_id", None)
+            if ext_entry is not None
+            else (getattr(tool_obj, "source_id", None) if tool_obj is not None else "native")
+        )
+        source_type = (
+            getattr(ext_entry, "source_type", None)
+            if ext_entry is not None
+            else (getattr(tool_obj, "source_type", None) if tool_obj is not None else "native")
+        )
+        ext_tool_name = (
+            getattr(ext_entry, "external_tool_name", None)
+            if ext_entry is not None
+            else (getattr(tool_obj, "external_tool_name", None) if tool_obj is not None else None)
+        )
+
+        ctx = get_active_execution_context()
+        if ctx is not None and ctx.owned_by_outer:
+            source_info: Dict[str, Any] = {
+                "is_external": is_external,
+                "source_id": source_id,
+                "source_type": source_type,
+            }
+            if ext_tool_name:
+                source_info["external_tool_name"] = ext_tool_name
+            attach_call_telemetry(source_info)
+            return None
+
+        ledger = (
+            (ctx.ledger if ctx is not None else None)
+            or getattr(self, "execution_ledger", None)
+            or get_default_central_ledger()
+        )
+        own_execution = ctx is None
+        eff_ring = caller_ring if caller_ring is not None else (ctx.caller_ring if ctx is not None else None)
+        call_id = f"tr_{uuid.uuid4().hex[:12]}"
+        if own_execution:
+            rec = ledger.create_execution(
+                f"tool:{tool_id}",
+                source_component="tool_registry",
+                caller_ring=eff_ring,
+                task_local_scoped=False,
+                status=ExecutionStatus.RUNNING,
+                metadata={"tool_id": tool_id, "is_external": is_external, "source_id": source_id},
+            )
+            exec_id = rec.execution_id
+        else:
+            exec_id = ctx.execution_id  # type: ignore[union-attr]
+
+        try:
+            ledger.record_event(
+                exec_id,
+                LedgerEventType.TOOL_SELECTED,
+                tool_id=tool_id,
+                source_id=source_id,
+                source_type=source_type,
+                is_external=is_external,
+                status="selected",
+                correlation_id=call_id,
+                caller_ring=eff_ring,
+                metadata={
+                    "external_tool_name": ext_tool_name,
+                    "arguments": arguments,
+                },
+                idempotency_key=f"{exec_id}:{call_id}:selected",
+            )
+        except Exception:
+            pass
+
+        return {
+            "ledger": ledger,
+            "execution_id": exec_id,
+            "call_id": call_id,
+            "own_execution": own_execution,
+            "tool_id": tool_id,
+            "source_id": source_id,
+            "source_type": source_type,
+            "is_external": is_external,
+            "external_tool_name": ext_tool_name,
+            "caller_ring": eff_ring,
+            "allowed_tools_scoped": allowed_tools is not None,
+        }
+
+    @staticmethod
+    def _finish_standalone_ledger_call(
+        tracker: Optional[Dict[str, Any]],
+        result: Optional[ToolResult],
+        *,
+        stage_error: Optional[str] = None,
+        error_type: Optional[str] = None,
+        telemetry_bag: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not tracker:
+            return
+        from zelyr.engine.execution_ledger import ExecutionStatus, LedgerEventType, VerificationStatus
+
+        ledger = tracker["ledger"]
+        exec_id = tracker["execution_id"]
+        call_id = tracker["call_id"]
+        tool_id = tracker["tool_id"]
+        source_id = tracker["source_id"]
+        source_type = tracker["source_type"]
+        is_external = bool(tracker["is_external"])
+        eff_ring = tracker["caller_ring"]
+        own_execution = bool(tracker["own_execution"])
+
+        try:
+            success = bool(result is not None and getattr(result, "success", False)) and stage_error is None
+            err_text = stage_error or (getattr(result, "error", None) if result is not None else None)
+            eff_err_type = error_type or (getattr(result, "error_type", None) if result is not None else None)
+            res_meta = getattr(result, "metadata", None) if result is not None else None
+            merged_meta: Dict[str, Any] = {}
+            if tracker.get("external_tool_name"):
+                merged_meta["external_tool_name"] = tracker["external_tool_name"]
+            if isinstance(telemetry_bag, dict) and telemetry_bag:
+                merged_meta.update(telemetry_bag)
+            if isinstance(res_meta, dict) and res_meta:
+                merged_meta.update(res_meta)
+            if err_text:
+                merged_meta["error"] = str(err_text)
+            if eff_err_type:
+                merged_meta["error_type"] = eff_err_type
+            if result is not None and getattr(result, "output", None) is not None and success:
+                merged_meta["output_preview"] = str(getattr(result, "output", ""))[:512]
+
+            status_str = "succeeded" if success else ("rejected" if eff_err_type == "AUTHORIZATION_DENIED" else "failed")
+            ledger.record_event(
+                exec_id,
+                LedgerEventType.TOOL_EXECUTION_RESULT,
+                tool_id=tool_id,
+                source_id=source_id,
+                source_type=source_type,
+                is_external=is_external,
+                status=status_str,
+                correlation_id=call_id,
+                caller_ring=eff_ring,
+                metadata=merged_meta,
+                idempotency_key=f"{exec_id}:{call_id}:result",
+            )
+            verified_flag = bool(isinstance(res_meta, dict) and res_meta.get("verified") is True)
+            if own_execution:
+                if not success:
+                    ledger.finalize_execution(
+                        exec_id,
+                        status=ExecutionStatus.FAILED,
+                        verification_status=VerificationStatus.NOT_VERIFIED,
+                        error=str(err_text or f"Tool '{tool_id}' failed"),
+                        metadata=merged_meta,
+                    )
+                elif verified_flag or (tool_id == "verify_outcome" and success):
+                    ledger.finalize_execution(
+                        exec_id,
+                        status=ExecutionStatus.COMPLETED,
+                        verification_status=VerificationStatus.VERIFIED,
+                        final_summary=f"Tool '{tool_id}' succeeded and verified",
+                        metadata=merged_meta,
+                    )
+                else:
+                    ledger.finalize_execution(
+                        exec_id,
+                        status=ExecutionStatus.COMPLETED_UNVERIFIED,
+                        verification_status=VerificationStatus.NOT_VERIFIED,
+                        final_summary=f"Tool '{tool_id}' executed",
+                        metadata=merged_meta,
+                    )
+        except Exception:
+            pass
 
     @property
     def external_manager(self):
@@ -1618,6 +1800,39 @@ Returns:
             )
         return normalized_args, None
 
+    @staticmethod
+    def _emit_tracker_stage(
+        tracker: Optional[Dict[str, Any]],
+        event_type_name: str,
+        status: str,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+        suffix: str = "",
+    ) -> None:
+        if not tracker:
+            return
+        from zelyr.engine.execution_ledger import LedgerEventType
+
+        try:
+            ev_type = getattr(LedgerEventType, event_type_name)
+            exec_id = tracker["execution_id"]
+            call_id = tracker["call_id"]
+            tracker["ledger"].record_event(
+                exec_id,
+                ev_type,
+                tool_id=tracker["tool_id"],
+                source_id=tracker["source_id"],
+                source_type=tracker["source_type"],
+                is_external=bool(tracker["is_external"]),
+                status=status,
+                correlation_id=call_id,
+                caller_ring=tracker["caller_ring"],
+                metadata=metadata or {},
+                idempotency_key=f"{exec_id}:{call_id}:{suffix}" if suffix else None,
+            )
+        except Exception:
+            pass
+
     def execute(
         self,
         tool_id: str,
@@ -1632,51 +1847,88 @@ Returns:
             allowed_tools = arguments.pop("allowed_tools")
 
         tool_id, arguments = canonicalize_tool_invocation(tool_id, arguments)
+        tracker = self._begin_standalone_ledger_call(tool_id, caller_ring, allowed_tools, arguments)
         tool = self.get_tool(tool_id)
         if tool is None:
             ext_entry = self.get_external_tool_entry(tool_id)
             if ext_entry is not None:
                 if not getattr(ext_entry, "authorized", False):
-                    return ToolResult(
+                    res = ToolResult(
                         success=False,
                         output="",
                         error=f"AuthorizationError: External tool '{tool_id}' from source '{ext_entry.source_id}' is not authorized.",
                         error_type="AUTHORIZATION_DENIED",
                     )
-                return ToolResult(
+                    self._emit_tracker_stage(tracker, "AUTHORIZATION_DECISION", "denied", metadata={"reason": "external_tool_not_authorized"}, suffix="auth")
+                    self._finish_standalone_ledger_call(tracker, res, error_type="AUTHORIZATION_DENIED")
+                    return res
+                res = ToolResult(
                     success=False,
                     output="",
                     error=f"External tool '{tool_id}' from source '{ext_entry.source_id}' is unavailable ({ext_entry.lifecycle.value}).",
                     error_type="TOOL_UNAVAILABLE",
                 )
-            return ToolResult(success=False, error=f"Tool not found: {tool_id}", error_type="TOOL_NOT_FOUND")
+                self._emit_tracker_stage(tracker, "AUTHORIZATION_DECISION", "denied", metadata={"reason": f"external_unavailable:{ext_entry.lifecycle.value}"}, suffix="auth")
+                self._finish_standalone_ledger_call(tracker, res, error_type="TOOL_UNAVAILABLE")
+                return res
+            res = ToolResult(success=False, error=f"Tool not found: {tool_id}", error_type="TOOL_NOT_FOUND")
+            self._finish_standalone_ledger_call(tracker, res, error_type="TOOL_NOT_FOUND")
+            return res
 
         auth_error = self._authorize_execution(tool_id, tool, caller_ring, allowed_tools)
         if auth_error:
+            self._emit_tracker_stage(tracker, "AUTHORIZATION_DECISION", "denied", metadata={"reason": getattr(auth_error, "error", "denied")}, suffix="auth")
+            self._finish_standalone_ledger_call(tracker, auth_error, error_type=getattr(auth_error, "error_type", "AUTHORIZATION_DENIED"))
             return auth_error
+        self._emit_tracker_stage(tracker, "AUTHORIZATION_DECISION", "allowed", metadata={"allowed_tools_scoped": allowed_tools is not None}, suffix="auth")
 
         if getattr(tool, 'requires_approval', False):
             try:
                 from zelyr.services.governor import GovernorService
                 governor = GovernorService.instance()
                 if governor and governor.is_strict_mode():
-                    return ToolResult(success=False, error="This tool requires approval, but was invoked synchronously. Governor gates are only supported in async mode.")
+                    res = ToolResult(success=False, error="This tool requires approval, but was invoked synchronously. Governor gates are only supported in async mode.")
+                    self._finish_standalone_ledger_call(tracker, res, error_type="AUTHORIZATION_DENIED")
+                    return res
             except Exception:
                 pass
         val_error = self._pre_validate_path(tool.tool_id, arguments)
         if val_error:
+            self._emit_tracker_stage(tracker, "ARGUMENT_VALIDATED", "invalid", metadata={"error": getattr(val_error, "error", "invalid path")}, suffix="validated")
+            self._finish_standalone_ledger_call(tracker, val_error)
             return val_error
 
         normalized_args, schema_error = self._normalize_and_validate(tool_id, tool, arguments)
         if schema_error is not None or normalized_args is None:
+            self._emit_tracker_stage(tracker, "ARGUMENT_VALIDATED", "invalid", metadata={"error": getattr(schema_error, "error", "schema error")}, suffix="validated")
+            self._finish_standalone_ledger_call(tracker, schema_error)
             return schema_error  # type: ignore[return-value]
         arguments = normalized_args
+        self._emit_tracker_stage(tracker, "ARGUMENT_VALIDATED", "valid", metadata={"arguments": arguments}, suffix="validated")
+        self._emit_tracker_stage(tracker, "TOOL_EXECUTION_START", "started", metadata={"arguments": arguments}, suffix="started")
 
+        from contextlib import nullcontext
+        from zelyr.engine.execution_ledger import execution_scope
+
+        scope_cm = (
+            execution_scope(
+                tracker["ledger"],
+                tracker["execution_id"],
+                caller_ring=tracker["caller_ring"],
+                source_component="tool_registry",
+                correlation_id=tracker["call_id"],
+                owned_by_outer=True,
+            )
+            if tracker
+            else nullcontext(None)
+        )
         try:
-            res = tool(**arguments)
-            if isinstance(res, ToolResult):
-                return res
-            return ToolResult(success=True, output=res)
+            with scope_cm as call_ctx:
+                raw_res = tool(**arguments)
+                res = raw_res if isinstance(raw_res, ToolResult) else ToolResult(success=True, output=raw_res)
+                bag = getattr(call_ctx, "telemetry_bag", None)
+            self._finish_standalone_ledger_call(tracker, res, telemetry_bag=bag)
+            return res
         except Exception as exc:
             import traceback
             import logging
@@ -1685,13 +1937,17 @@ Returns:
                 logging.getLogger("zelyr.plugin_crash").error(tb)
             from zelyr.utils.optional_deps import OptionalDependencyError
             if isinstance(exc, (ImportError, OptionalDependencyError)):
-                return ToolResult(
+                res = ToolResult(
                     success=False,
                     output="",
                     error=f"Tool requires optional dependency: {exc}",
                     error_type="TOOL_UNAVAILABLE",
                 )
-            return ToolResult(success=False, error=str(exc))
+                self._finish_standalone_ledger_call(tracker, res, error_type="TOOL_UNAVAILABLE")
+                return res
+            res = ToolResult(success=False, error=str(exc))
+            self._finish_standalone_ledger_call(tracker, res)
+            return res
 
     async def execute_async(
         self,
@@ -1707,6 +1963,8 @@ Returns:
         """
         import asyncio
         import inspect
+        from contextlib import nullcontext
+        from zelyr.engine.execution_ledger import execution_scope
         from zelyr.tools.core import ToolResult
 
         if caller_ring is None and "caller_ring" in arguments:
@@ -1715,28 +1973,40 @@ Returns:
             allowed_tools = arguments.pop("allowed_tools")
 
         tool_id, arguments = canonicalize_tool_invocation(tool_id, arguments)
+        tracker = self._begin_standalone_ledger_call(tool_id, caller_ring, allowed_tools, arguments)
         tool = self.get_tool(tool_id)
         if tool is None:
             ext_entry = self.get_external_tool_entry(tool_id)
             if ext_entry is not None:
                 if not getattr(ext_entry, "authorized", False):
-                    return ToolResult(
+                    res = ToolResult(
                         success=False,
                         output="",
                         error=f"AuthorizationError: External tool '{tool_id}' from source '{ext_entry.source_id}' is not authorized.",
                         error_type="AUTHORIZATION_DENIED",
                     )
-                return ToolResult(
+                    self._emit_tracker_stage(tracker, "AUTHORIZATION_DECISION", "denied", metadata={"reason": "external_tool_not_authorized"}, suffix="auth")
+                    self._finish_standalone_ledger_call(tracker, res, error_type="AUTHORIZATION_DENIED")
+                    return res
+                res = ToolResult(
                     success=False,
                     output="",
                     error=f"External tool '{tool_id}' from source '{ext_entry.source_id}' is unavailable ({ext_entry.lifecycle.value}).",
                     error_type="TOOL_UNAVAILABLE",
                 )
-            return ToolResult(success=False, error=f"Tool not found: {tool_id}", error_type="TOOL_NOT_FOUND")
+                self._emit_tracker_stage(tracker, "AUTHORIZATION_DECISION", "denied", metadata={"reason": f"external_unavailable:{ext_entry.lifecycle.value}"}, suffix="auth")
+                self._finish_standalone_ledger_call(tracker, res, error_type="TOOL_UNAVAILABLE")
+                return res
+            res = ToolResult(success=False, error=f"Tool not found: {tool_id}", error_type="TOOL_NOT_FOUND")
+            self._finish_standalone_ledger_call(tracker, res, error_type="TOOL_NOT_FOUND")
+            return res
 
         auth_error = self._authorize_execution(tool_id, tool, caller_ring, allowed_tools)
         if auth_error:
+            self._emit_tracker_stage(tracker, "AUTHORIZATION_DECISION", "denied", metadata={"reason": getattr(auth_error, "error", "denied")}, suffix="auth")
+            self._finish_standalone_ledger_call(tracker, auth_error, error_type=getattr(auth_error, "error_type", "AUTHORIZATION_DENIED"))
             return auth_error
+        self._emit_tracker_stage(tracker, "AUTHORIZATION_DECISION", "allowed", metadata={"allowed_tools_scoped": allowed_tools is not None}, suffix="auth")
 
         if getattr(tool, 'requires_approval', False):
             try:
@@ -1745,32 +2015,59 @@ Returns:
                 if governor and governor.is_strict_mode():
                     approved = await governor.request_approval(tool.name, arguments)
                     if not approved:
-                        return ToolResult(
+                        res = ToolResult(
                             success=False,
                             error="User denied execution via The Governor.",
                             error_type="AUTHORIZATION_DENIED",
                         )
+                        self._emit_tracker_stage(tracker, "AUTHORIZATION_DECISION", "denied", metadata={"reason": "governor_denied"}, suffix="auth")
+                        self._finish_standalone_ledger_call(tracker, res, error_type="AUTHORIZATION_DENIED")
+                        return res
             except Exception as e:
-                return ToolResult(success=False, error=f"Governor failed: {e}")
+                res = ToolResult(success=False, error=f"Governor failed: {e}")
+                self._finish_standalone_ledger_call(tracker, res)
+                return res
         val_error = self._pre_validate_path(tool.tool_id, arguments)
         if val_error:
+            self._emit_tracker_stage(tracker, "ARGUMENT_VALIDATED", "invalid", metadata={"error": getattr(val_error, "error", "invalid path")}, suffix="validated")
+            self._finish_standalone_ledger_call(tracker, val_error)
             return val_error
 
         normalized_args, schema_error = self._normalize_and_validate(tool_id, tool, arguments)
         if schema_error is not None or normalized_args is None:
+            self._emit_tracker_stage(tracker, "ARGUMENT_VALIDATED", "invalid", metadata={"error": getattr(schema_error, "error", "schema error")}, suffix="validated")
+            self._finish_standalone_ledger_call(tracker, schema_error)
             return schema_error  # type: ignore[return-value]
         arguments = normalized_args
+        self._emit_tracker_stage(tracker, "ARGUMENT_VALIDATED", "valid", metadata={"arguments": arguments}, suffix="validated")
+        self._emit_tracker_stage(tracker, "TOOL_EXECUTION_START", "started", metadata={"arguments": arguments}, suffix="started")
 
+        scope_cm = (
+            execution_scope(
+                tracker["ledger"],
+                tracker["execution_id"],
+                caller_ring=tracker["caller_ring"],
+                source_component="tool_registry",
+                correlation_id=tracker["call_id"],
+                owned_by_outer=True,
+            )
+            if tracker
+            else nullcontext(None)
+        )
         try:
-            sig = inspect.signature(tool.execute)
-            params_list = list(sig.parameters.values())
-            single_dict_param = len(params_list) == 1 and (params_list[0].annotation == Dict[str, Any] or params_list[0].name in ('params', 'arguments', 'kwargs'))
-            if single_dict_param:
-                result = tool.execute(arguments)
-            else:
-                result = tool.execute(**arguments)
-            if asyncio.iscoroutine(result):
-                return await result
+            with scope_cm as call_ctx:
+                sig = inspect.signature(tool.execute)
+                params_list = list(sig.parameters.values())
+                single_dict_param = len(params_list) == 1 and (params_list[0].annotation == Dict[str, Any] or params_list[0].name in ('params', 'arguments', 'kwargs'))
+                if single_dict_param:
+                    result = tool.execute(arguments)
+                else:
+                    result = tool.execute(**arguments)
+                if asyncio.iscoroutine(result):
+                    result = await result
+                res_obj = result if isinstance(result, ToolResult) else ToolResult(success=True, output=result)
+                bag = getattr(call_ctx, "telemetry_bag", None)
+            self._finish_standalone_ledger_call(tracker, res_obj, telemetry_bag=bag)
             return result
         except Exception as exc:
             import traceback
@@ -1780,10 +2077,14 @@ Returns:
                 logging.getLogger("zelyr.plugin_crash").error(tb)
             from zelyr.utils.optional_deps import OptionalDependencyError
             if isinstance(exc, (ImportError, OptionalDependencyError)):
-                return ToolResult(
+                res = ToolResult(
                     success=False,
                     output="",
                     error=f"Tool requires optional dependency: {exc}",
                     error_type="TOOL_UNAVAILABLE",
                 )
-            return ToolResult(success=False, error=str(exc))
+                self._finish_standalone_ledger_call(tracker, res, error_type="TOOL_UNAVAILABLE")
+                return res
+            res = ToolResult(success=False, error=str(exc))
+            self._finish_standalone_ledger_call(tracker, res)
+            return res

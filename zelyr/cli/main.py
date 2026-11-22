@@ -591,6 +591,42 @@ async def _execute_headless_run(
         else:
             has_unresolved_ledger = bool(ledger.unresolved_failures())
 
+    if ledger is not None and getattr(ledger, "_central_ledger", None) is not None and getattr(ledger, "_execution_id", None):
+        from zelyr.engine.execution_ledger import (
+            ExecutionStatus,
+            LedgerEventType,
+            VerificationStatus,
+        )
+
+        c_ledger = ledger._central_ledger
+        c_exec_id = ledger._execution_id
+        if v_results:
+            all_v_ok = all(res.success for _, _, res in v_results)
+            for v_check, v_target, v_res in v_results:
+                c_ledger.record_event(
+                    c_exec_id,
+                    LedgerEventType.VERIFICATION_RECORDED,
+                    status=VerificationStatus.VERIFIED.value if v_res.success else VerificationStatus.VERIFICATION_FAILED.value,
+                    metadata={"check": v_check, "target": v_target, "error": getattr(v_res, "error", None)},
+                )
+            if all_v_ok and not has_unresolved_ledger:
+                ledger.set_verification_status(VerificationStatus.VERIFIED)
+                c_ledger.finalize_execution(
+                    c_exec_id,
+                    status=ExecutionStatus.COMPLETED,
+                    verification_status=VerificationStatus.VERIFIED,
+                    final_summary=final_answer,
+                )
+            else:
+                ledger.set_verification_status(VerificationStatus.VERIFICATION_FAILED)
+                c_ledger.finalize_execution(
+                    c_exec_id,
+                    status=ExecutionStatus.FAILED,
+                    verification_status=VerificationStatus.VERIFICATION_FAILED,
+                    error="Post-run outcome verification failed",
+                    final_summary=final_answer,
+                )
+
     if output_json:
         from zelyr.engine.execution_ledger import TurnExecutionLedger
 
@@ -852,6 +888,139 @@ def cmd_env(args: argparse.Namespace) -> None:
 
     report = RuntimeEnvironmentManifest.format_diagnostic_report(manifest)
     print(report)
+
+
+def _open_cli_ledger(db_path: Optional[str]) -> tuple[Any, bool]:
+    """Open ledger instance lazily for CLI diagnostics commands."""
+    from zelyr.engine.execution_ledger import CentralExecutionLedger, get_default_central_ledger
+
+    if db_path:
+        return CentralExecutionLedger(db_path=db_path, raise_on_persistence_error=False), True
+    return get_default_central_ledger(), False
+
+
+def cmd_executions(args: argparse.Namespace) -> None:
+    """List recent persistent execution ledger records."""
+    import datetime
+
+    ledger, owns_conn = _open_cli_ledger(getattr(args, "db_path", None))
+    try:
+        records = ledger.list_executions(
+            limit=int(getattr(args, "limit", 20) or 20),
+            status=getattr(args, "status", None),
+            tool_id=getattr(args, "tool", None),
+            event_type=getattr(args, "event_type", None),
+        )
+        if getattr(args, "json", False):
+            payload = {
+                "count": len(records),
+                "db_path": str(ledger.db_path),
+                "persistence_errors": ledger.get_persistence_errors(),
+                "executions": [r.to_dict() for r in records],
+            }
+            print(json.dumps(payload, indent=2))
+            return
+
+        if not records:
+            print("No execution records found.")
+            return
+
+        print(f"Execution Ledger ({ledger.db_path}) — {len(records)} record(s):")
+        for rec in records:
+            ts_str = datetime.datetime.fromtimestamp(rec.created_at).strftime("%Y-%m-%d %H:%M:%S")
+            prompt_snip = (rec.task_prompt or "").replace("\n", " ")[:60]
+            print(
+                f"  {rec.execution_id}  "
+                f"status={rec.status}  "
+                f"verify={rec.verification_status}  "
+                f"events={rec.event_count}  "
+                f"src={rec.source_component}  "
+                f"at={ts_str}  "
+                f"{prompt_snip}"
+            )
+    finally:
+        if owns_conn:
+            ledger.close()
+
+
+def cmd_execution(args: argparse.Namespace) -> None:
+    """Inspect a single execution record and its ordered timeline of events."""
+    import datetime
+
+    exec_query = getattr(args, "execution_id", "")
+    ledger, owns_conn = _open_cli_ledger(getattr(args, "db_path", None))
+    try:
+        record, matches = ledger.find_execution_by_prefix(exec_query)
+        if record is None:
+            if len(matches) > 1:
+                sys.stderr.write(
+                    f"Ambiguous execution ID prefix '{exec_query}': matched {', '.join(matches[:5])}\n"
+                )
+            else:
+                sys.stderr.write(f"Execution '{exec_query}' not found.\n")
+            sys.stderr.flush()
+            sys.exit(1)
+
+        summary = ledger.get_execution_summary(
+            record.execution_id,
+            event_type=getattr(args, "event_type", None),
+            tool_id=getattr(args, "tool", None),
+        )
+        if summary is None:
+            sys.stderr.write(f"Execution '{record.execution_id}' not found.\n")
+            sys.stderr.flush()
+            sys.exit(1)
+
+        if getattr(args, "json", False):
+            print(json.dumps(summary, indent=2))
+            return
+
+        rec_d = summary["execution"]
+        created_str = datetime.datetime.fromtimestamp(rec_d["created_at"]).strftime("%Y-%m-%d %H:%M:%S")
+        print(f"Execution:           {rec_d['execution_id']}")
+        print(f"Status:              {rec_d['status']}")
+        print(f"Verification Status: {rec_d['verification_status']}")
+        print(f"Source Component:    {rec_d['source_component']}")
+        print(f"Created At:          {created_str}")
+        if rec_d.get("caller_ring") is not None:
+            print(f"Caller Ring:         {rec_d['caller_ring']}")
+        if rec_d.get("task_local_scoped"):
+            print("Task Local Scoped:   true")
+        if rec_d.get("task_prompt"):
+            print(f"Task Prompt:         {rec_d['task_prompt']}")
+        if rec_d.get("final_summary"):
+            print(f"Final Summary:       {rec_d['final_summary']}")
+        if rec_d.get("error"):
+            print(f"Error:               {rec_d['error']}")
+        if summary["tools_used"]:
+            print(f"Tools Used:          {', '.join(summary['tools_used'])}")
+        if summary["external_tools"]:
+            ext_desc = ", ".join(
+                f"{e['tool_id']} ({e.get('source_type')}:{e.get('source_id')})"
+                for e in summary["external_tools"]
+            )
+            print(f"External Tools:      {ext_desc}")
+        if summary["persistence_errors"]:
+            print(f"Persistence Errors:  {len(summary['persistence_errors'])}")
+        events = summary["events"]
+        print(f"Events ({len(events)}):")
+        for ev in events:
+            t_str = datetime.datetime.fromtimestamp(ev["timestamp"]).strftime("%H:%M:%S.%f")[:-3]
+            ext_tag = f" [ext:{ev['source_id']}]" if ev.get("is_external") else ""
+            tool_part = f" tool={ev['tool_id']}" if ev.get("tool_id") else ""
+            flags = []
+            if ev.get("redacted"):
+                flags.append("redacted")
+            if ev.get("truncated"):
+                flags.append("truncated")
+            flag_str = f" ({','.join(flags)})" if flags else ""
+            print(
+                f"  #{ev['sequence_number']:03d} [{t_str}] {ev['event_type']} "
+                f"status={ev['status']}{tool_part}{ext_tag}{flag_str}"
+            )
+    finally:
+        if owns_conn:
+            ledger.close()
 
 
 def cmd_test(_args: argparse.Namespace) -> None:
@@ -1362,6 +1531,27 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Force-refresh cached manifest state",
     )
 
+    p_execs = sub.add_parser(
+        "executions",
+        help="List recent centralized execution ledger records",
+    )
+    p_execs.add_argument("--limit", "-n", type=int, default=20, help="Maximum executions to list (default: 20)")
+    p_execs.add_argument("--status", type=str, default=None, help="Filter executions by status")
+    p_execs.add_argument("--tool", type=str, default=None, help="Filter executions involving a tool ID")
+    p_execs.add_argument("--event-type", type=str, default=None, help="Filter executions containing an event type")
+    p_execs.add_argument("--json", action="store_true", default=False, help="Output structured JSON")
+    p_execs.add_argument("--db-path", type=str, default=None, help="Override execution ledger SQLite DB path")
+
+    p_exec = sub.add_parser(
+        "execution",
+        help="Inspect an execution ledger record and its ordered events",
+    )
+    p_exec.add_argument("execution_id", type=str, help="Execution ID or unique prefix to inspect")
+    p_exec.add_argument("--event-type", type=str, default=None, help="Filter timeline events by event type")
+    p_exec.add_argument("--tool", type=str, default=None, help="Filter timeline events by tool ID")
+    p_exec.add_argument("--json", action="store_true", default=False, help="Output structured JSON summary")
+    p_exec.add_argument("--db-path", type=str, default=None, help="Override execution ledger SQLite DB path")
+
     sub.add_parser("test",   help="Run the automated test suite")
     p_eval = sub.add_parser("eval", help="Run Zelyr evaluation benchmark suite")
     p_eval.add_argument("eval_args", nargs=argparse.REMAINDER, help="Arguments passed to evaluation runner")
@@ -1493,6 +1683,8 @@ def main() -> None:
         "status":   cmd_status,
         "env":      cmd_env,
         "manifest": cmd_env,
+        "executions": cmd_executions,
+        "execution":  cmd_execution,
         "test":     cmd_test,
         "eval":   cmd_eval,
         "daemon": cmd_daemon,

@@ -71,7 +71,7 @@ Returns:
 class OrchestratorAgent(SimpleBaseAgent):
     """AI agent that uses an LLM + registered tools to accomplish tasks."""
 
-    def __init__(self, registry=None, bus=None, memory=None, llm=None, context_manager=None, caller_ring: Optional[int] = None, allowed_tools: Optional[List[str]] = None):
+    def __init__(self, registry=None, bus=None, memory=None, llm=None, context_manager=None, caller_ring: Optional[int] = None, allowed_tools: Optional[List[str]] = None, execution_ledger=None):
         """Auto-generated docstring.
 
 Args:
@@ -85,6 +85,8 @@ Returns:
     Return value.
 """
         super().__init__(name='orchestrator', registry=registry, bus=bus, memory=memory)
+        self.execution_ledger = execution_ledger
+        self._current_execution_id: Optional[str] = None
         
         # ── Dynamic Plugin Loader ──────────────────────────────────────────── #
         try:
@@ -220,6 +222,63 @@ Args:
 Returns:
     Return value.
 """
+        from zelyr.engine.execution_ledger import (
+            ExecutionStatus,
+            LedgerEventType,
+            VerificationStatus,
+            execution_scope,
+            get_default_central_ledger,
+        )
+
+        central_ledger = getattr(self, "execution_ledger", None) or get_default_central_ledger()
+        exec_rec = central_ledger.create_execution(
+            task,
+            source_component="orchestrator_agent",
+            caller_ring=getattr(self, "caller_ring", None),
+            status=ExecutionStatus.RUNNING,
+            metadata={"session_id": session_id, "use_tools": bool(use_tools)},
+        )
+        exec_id = exec_rec.execution_id
+        self._current_execution_id = exec_id
+        try:
+            with execution_scope(
+                central_ledger,
+                exec_id,
+                caller_ring=getattr(self, "caller_ring", None),
+                source_component="orchestrator_agent",
+                owned_by_outer=True,
+            ):
+                result = await self._agentic_loop_core(task, steps, use_tools=use_tools, session_id=session_id, timeout=timeout)
+            final_status = ExecutionStatus.COMPLETED_UNVERIFIED if getattr(result, "success", False) else ExecutionStatus.FAILED
+            ver_status = VerificationStatus.NOT_VERIFIED
+            final_summary = None
+            out = getattr(result, "output", None)
+            if isinstance(out, dict) and out.get("response"):
+                final_summary = str(out["response"])[:512]
+                out.setdefault("execution_id", exec_id)
+            elif out is not None:
+                final_summary = str(out)[:512]
+            central_ledger.finalize_execution(
+                exec_id,
+                status=final_status,
+                verification_status=ver_status,
+                final_summary=final_summary,
+                error=getattr(result, "error", None),
+            )
+            return result
+        except Exception as exc:
+            central_ledger.finalize_execution(
+                exec_id,
+                status=ExecutionStatus.FAILED,
+                verification_status=VerificationStatus.INTERRUPTED,
+                error=str(exc),
+            )
+            raise
+        finally:
+            if self._current_execution_id == exec_id:
+                self._current_execution_id = None
+
+    async def _agentic_loop_core(self, task: str, steps: List[str], use_tools: bool=True, session_id: Optional[str]=None, timeout: Optional[float]=None) -> AgentResult:
         session_id = str(session_id or uuid.uuid4())
         plan = self._load_plan(session_id) or self._create_plan(task)
         state = AgentState.THINK
@@ -1208,13 +1267,151 @@ Args:
 Returns:
     Return value.
 """
+        import copy
+        import uuid
+        from zelyr.engine.execution_ledger import (
+            ExecutionStatus,
+            LedgerEventType,
+            VerificationStatus,
+            execution_scope,
+            get_active_execution_context,
+            get_default_central_ledger,
+        )
+        from zelyr.tool_registry import authorize_and_validate_tool_call, canonicalize_tool_invocation
+
+        ctx = get_active_execution_context()
+        ledger = (
+            (ctx.ledger if ctx is not None else None)
+            or getattr(self, "execution_ledger", None)
+            or get_default_central_ledger()
+        )
+        own_exec = ctx is None and not getattr(self, "_current_execution_id", None)
+        eff_ring = getattr(self, "caller_ring", None)
+        exec_id = (
+            (ctx.execution_id if ctx is not None else None)
+            or getattr(self, "_current_execution_id", None)
+            or ledger.create_execution(
+                f"orchestrator_tool:{tool_name}",
+                source_component="orchestrator_agent",
+                caller_ring=eff_ring,
+                status=ExecutionStatus.RUNNING,
+            ).execution_id
+        )
+        call_id = f"oa_{uuid.uuid4().hex[:12]}"
+
+        def _record_oa_outcome(
+            result_dict: Dict[str, Any],
+            *,
+            t_id: str,
+            src_id: Optional[str] = None,
+            src_type: Optional[str] = None,
+            is_ext: bool = False,
+            auth_status: Optional[str] = None,
+            auth_reason: Optional[str] = None,
+            timed_out: bool = False,
+        ) -> Dict[str, Any]:
+            try:
+                ok = bool(result_dict.get("success", False))
+                res_inner = result_dict.get("result") if isinstance(result_dict.get("result"), dict) else {}
+                err = res_inner.get("error")
+                err_type = res_inner.get("error_type")
+                if auth_status:
+                    ledger.record_event(
+                        exec_id,
+                        LedgerEventType.AUTHORIZATION_DECISION,
+                        tool_id=t_id,
+                        source_id=src_id,
+                        source_type=src_type,
+                        is_external=is_ext,
+                        status=auth_status,
+                        correlation_id=call_id,
+                        caller_ring=eff_ring,
+                        metadata={"reason": auth_reason} if auth_reason else {},
+                        idempotency_key=f"{exec_id}:{call_id}:auth",
+                    )
+                res_status = (
+                    "timed_out"
+                    if timed_out
+                    else ("succeeded" if ok else ("rejected" if err_type == "AUTHORIZATION_DENIED" else "failed"))
+                )
+                ledger.record_event(
+                    exec_id,
+                    LedgerEventType.TOOL_EXECUTION_RESULT,
+                    tool_id=t_id,
+                    source_id=src_id,
+                    source_type=src_type,
+                    is_external=is_ext,
+                    status=res_status,
+                    correlation_id=call_id,
+                    caller_ring=eff_ring,
+                    metadata={"error": err, "error_type": err_type, "output_preview": str(res_inner.get("output", ""))[:512] if ok else None},
+                    idempotency_key=f"{exec_id}:{call_id}:result",
+                )
+                if own_exec:
+                    ledger.finalize_execution(
+                        exec_id,
+                        status=(
+                            ExecutionStatus.TIMED_OUT
+                            if timed_out
+                            else (ExecutionStatus.COMPLETED_UNVERIFIED if ok else ExecutionStatus.FAILED)
+                        ),
+                        verification_status=VerificationStatus.INTERRUPTED if timed_out else VerificationStatus.NOT_VERIFIED,
+                        error=str(err) if err else None,
+                    )
+            except Exception:
+                pass
+            return result_dict
+
+        res_dict = await self._execute_tool_core(
+            tool_name,
+            arguments,
+            ledger=ledger,
+            exec_id=exec_id,
+            call_id=call_id,
+            eff_ring=eff_ring,
+            record_outcome=_record_oa_outcome,
+            authorize_fn=authorize_and_validate_tool_call,
+            canon_fn=canonicalize_tool_invocation,
+            exec_scope_fn=execution_scope,
+        )
+        return res_dict
+
+    async def _execute_tool_core(
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        *,
+        ledger: Any,
+        exec_id: str,
+        call_id: str,
+        eff_ring: Optional[int],
+        record_outcome: Any,
+        authorize_fn: Any,
+        canon_fn: Any,
+        exec_scope_fn: Any,
+    ) -> Dict[str, Any]:
+        """Execute validated tool call and emit centralized execution events."""
         start_time = time.perf_counter()
         import copy
-        from zelyr.tool_registry import authorize_and_validate_tool_call, canonicalize_tool_invocation
+        from zelyr.engine.execution_ledger import LedgerEventType
+        authorize_and_validate_tool_call = authorize_fn
 
         raw_arguments = arguments
         dict_args = dict(arguments) if isinstance(arguments, dict) else {}
-        canonical_name, canonical_args = canonicalize_tool_invocation(tool_name, dict_args)
+        canonical_name, canonical_args = canon_fn(tool_name, dict_args)
+        try:
+            ledger.record_event(
+                exec_id,
+                LedgerEventType.TOOL_SELECTED,
+                tool_id=canonical_name or str(tool_name),
+                status="selected",
+                correlation_id=call_id,
+                caller_ring=eff_ring,
+                metadata={"arguments": canonical_args},
+                idempotency_key=f"{exec_id}:{call_id}:selected",
+            )
+        except Exception:
+            pass
 
         eff_tool = None
         tool_source = None
@@ -1260,6 +1457,9 @@ Returns:
 
         authorized_target = getattr(eff_tool, '_target', getattr(eff_tool, 'target', None)) if eff_tool is not None else None
         authorized_execute = getattr(eff_tool, 'execute', None) if eff_tool is not None else None
+        is_ext = bool(getattr(eff_tool, 'is_external', False)) if eff_tool is not None else False
+        src_id = getattr(eff_tool, 'source_id', None) if eff_tool is not None else None
+        src_type = getattr(eff_tool, 'source_type', None) if eff_tool is not None else None
 
         fast_path_eligible = (
             eff_tool is None
@@ -1280,7 +1480,7 @@ Returns:
                 require_registered=True,
                 argument_source='model',
             )
-            return self._structured_tool_result(
+            res = self._structured_tool_result(
                 decision.tool_name or canonical_name or str(tool_name),
                 dict_args,
                 {
@@ -1289,6 +1489,12 @@ Returns:
                     'reason': decision.reason or 'tool_unavailable',
                 },
                 False,
+            )
+            return record_outcome(
+                res,
+                t_id=decision.tool_name or canonical_name or str(tool_name),
+                auth_status="denied" if decision.error_type == "AUTHORIZATION_DENIED" else None,
+                auth_reason=decision.detail,
             )
 
         decision = authorize_and_validate_tool_call(
@@ -1302,7 +1508,7 @@ Returns:
             argument_source='model',
         )
         if not decision.allowed:
-            return self._structured_tool_result(
+            res = self._structured_tool_result(
                 decision.tool_name or canonical_name,
                 dict_args,
                 {
@@ -1311,6 +1517,15 @@ Returns:
                     'reason': decision.reason or 'authorization_denied',
                 },
                 False,
+            )
+            return record_outcome(
+                res,
+                t_id=decision.tool_name or canonical_name,
+                src_id=src_id,
+                src_type=src_type,
+                is_ext=is_ext,
+                auth_status="denied",
+                auth_reason=decision.detail or decision.reason,
             )
         tool_name = decision.tool_name
         validated_arguments = copy.deepcopy(decision.normalized_arguments)
@@ -1335,7 +1550,7 @@ Returns:
         gov_args = copy.deepcopy(validated_arguments)
         is_approved, reason = self._run_coro_sync(gov.check_action(gov_tool_name, gov_args, config.auth_mode.name, user_present))
         if gov_args != validated_arguments:
-            return self._structured_tool_result(
+            res = self._structured_tool_result(
                 tool_name,
                 validated_arguments,
                 {
@@ -1345,15 +1560,17 @@ Returns:
                 },
                 False,
             )
+            return record_outcome(res, t_id=tool_name, src_id=src_id, src_type=src_type, is_ext=is_ext, auth_status="denied", auth_reason="arguments_mutated")
 
         if not is_approved:
             self._emit('tool.queued', {'tool_name': tool_name, 'message': reason})
-            return self._structured_tool_result(
+            res = self._structured_tool_result(
                 tool_name,
                 copy.deepcopy(validated_arguments),
                 {'output': f"[ACTION DEFERRED]: {reason}. The system will execute it when the user returns. Please yield or move to another safe task."},
                 True
             )
+            return record_outcome(res, t_id=tool_name, src_id=src_id, src_type=src_type, is_ext=is_ext, auth_status="deferred", auth_reason=reason)
 
         # ── Fastest Path CLI Router (only when no concrete tool object was bound) ──
         if fast_path_eligible:
@@ -1367,7 +1584,8 @@ Returns:
                         'message': f"Routing to native CLI: {' '.join(fast_res.get('command', []))}..."
                     })
                     payload = {'output': fast_res.get('output'), 'error': None if fast_res.get('success') else fast_res.get('output')}
-                    return self._structured_tool_result(tool_name, copy.deepcopy(validated_arguments), payload, fast_res.get('success', True))
+                    res = self._structured_tool_result(tool_name, copy.deepcopy(validated_arguments), payload, fast_res.get('success', True))
+                    return record_outcome(res, t_id=tool_name, auth_status="allowed")
             except Exception as e:
                 logger.debug(f"FastestPathRouter check skipped: {e}")
 
@@ -1414,7 +1632,7 @@ Returns:
             or getattr(eff_tool, '_target', getattr(eff_tool, 'target', None)) is not authorized_target
             or getattr(eff_tool, 'execute', None) != authorized_execute
         ):
-            return self._structured_tool_result(
+            res = self._structured_tool_result(
                 tool_name,
                 copy.deepcopy(validated_arguments),
                 {
@@ -1424,7 +1642,38 @@ Returns:
                 },
                 False,
             )
+            return record_outcome(res, t_id=tool_name, src_id=src_id, src_type=src_type, is_ext=is_ext, auth_status="denied", auth_reason="toctou_stale_callable")
 
+        try:
+            ledger.record_event(
+                exec_id,
+                LedgerEventType.AUTHORIZATION_DECISION,
+                tool_id=tool_name,
+                source_id=src_id,
+                source_type=src_type,
+                is_external=is_ext,
+                status="allowed",
+                correlation_id=call_id,
+                caller_ring=eff_ring,
+                idempotency_key=f"{exec_id}:{call_id}:auth",
+            )
+            ledger.record_event(
+                exec_id,
+                LedgerEventType.TOOL_EXECUTION_START,
+                tool_id=tool_name,
+                source_id=src_id,
+                source_type=src_type,
+                is_external=is_ext,
+                status="started",
+                correlation_id=call_id,
+                caller_ring=eff_ring,
+                metadata={"arguments": validated_arguments},
+                idempotency_key=f"{exec_id}:{call_id}:started",
+            )
+        except Exception:
+            pass
+
+        timed_out_exec = False
         try:
             exec_args = copy.deepcopy(validated_arguments)
             if tool_name in ('file_read', 'read_file'):
@@ -1446,40 +1695,56 @@ Returns:
                 import asyncio
 
                 def _call_target():
-                    if hasattr(bound_tool, 'execute') and callable(bound_tool.execute):
-                        fn = bound_tool.execute
-                        try:
-                            sig = inspect.signature(fn)
-                            params_list = [p for p in sig.parameters.values() if p.name != 'self']
-                            single_dict = len(params_list) == 1 and params_list[0].kind in (
-                                inspect.Parameter.POSITIONAL_ONLY,
-                                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                            ) and (
-                                params_list[0].annotation in (Dict[str, Any], dict, 'Dict[str, Any]', 'dict')
-                                or params_list[0].name in ('params', 'arguments', 'kwargs')
-                            )
-                        except (ValueError, TypeError):
-                            single_dict = False
-                        return fn(kwargs_dict) if single_dict else fn(**kwargs_dict)
-                    return bound_tool(**kwargs_dict)
+                    with exec_scope_fn(
+                        ledger,
+                        exec_id,
+                        caller_ring=eff_ring,
+                        source_component="orchestrator_agent",
+                        correlation_id=call_id,
+                        owned_by_outer=True,
+                    ):
+                        if hasattr(bound_tool, 'execute') and callable(bound_tool.execute):
+                            fn = bound_tool.execute
+                            try:
+                                sig = inspect.signature(fn)
+                                params_list = [p for p in sig.parameters.values() if p.name != 'self']
+                                single_dict = len(params_list) == 1 and params_list[0].kind in (
+                                    inspect.Parameter.POSITIONAL_ONLY,
+                                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                                ) and (
+                                    params_list[0].annotation in (Dict[str, Any], dict, 'Dict[str, Any]', 'dict')
+                                    or params_list[0].name in ('params', 'arguments', 'kwargs')
+                                )
+                            except (ValueError, TypeError):
+                                single_dict = False
+                            return fn(kwargs_dict) if single_dict else fn(**kwargs_dict)
+                        return bound_tool(**kwargs_dict)
 
-                if hasattr(bound_tool, 'execute') and inspect.iscoroutinefunction(bound_tool.execute):
-                    sig = inspect.signature(bound_tool.execute)
-                    params_list = [p for p in sig.parameters.values() if p.name != 'self']
-                    single_dict = len(params_list) == 1 and params_list[0].kind in (
-                        inspect.Parameter.POSITIONAL_ONLY,
-                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                    ) and (
-                        params_list[0].annotation in (Dict[str, Any], dict, 'Dict[str, Any]', 'dict')
-                        or params_list[0].name in ('params', 'arguments', 'kwargs')
-                    )
-                    coro = bound_tool.execute(kwargs_dict) if single_dict else bound_tool.execute(**kwargs_dict)
-                else:
-                    coro = asyncio.to_thread(_call_target)
-                res = await asyncio.wait_for(coro, timeout=30.0)
-                if asyncio.iscoroutine(res):
-                    res = await asyncio.wait_for(res, timeout=30.0)
-                return res
+                with exec_scope_fn(
+                    ledger,
+                    exec_id,
+                    caller_ring=eff_ring,
+                    source_component="orchestrator_agent",
+                    correlation_id=call_id,
+                    owned_by_outer=True,
+                ):
+                    if hasattr(bound_tool, 'execute') and inspect.iscoroutinefunction(bound_tool.execute):
+                        sig = inspect.signature(bound_tool.execute)
+                        params_list = [p for p in sig.parameters.values() if p.name != 'self']
+                        single_dict = len(params_list) == 1 and params_list[0].kind in (
+                            inspect.Parameter.POSITIONAL_ONLY,
+                            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        ) and (
+                            params_list[0].annotation in (Dict[str, Any], dict, 'Dict[str, Any]', 'dict')
+                            or params_list[0].name in ('params', 'arguments', 'kwargs')
+                        )
+                        coro = bound_tool.execute(kwargs_dict) if single_dict else bound_tool.execute(**kwargs_dict)
+                    else:
+                        coro = asyncio.to_thread(_call_target)
+                    res = await asyncio.wait_for(coro, timeout=30.0)
+                    if asyncio.iscoroutine(res):
+                        res = await asyncio.wait_for(res, timeout=30.0)
+                    return res
 
             if tool_source == 'plugin':
                 try:
@@ -1492,6 +1757,7 @@ Returns:
                         payload = {'output': result, 'error': None}
                         result_dict = self._structured_tool_result(tool_name, copy.deepcopy(validated_arguments), payload, True)
                 except asyncio.TimeoutError:
+                    timed_out_exec = True
                     msg = f"[Plugin Crash] The tool '{tool_name}' exceeded the 30-second execution limit and was forcefully terminated."
                     logger.error(msg)
                     if hasattr(self, 'event_bus') and self.event_bus:
@@ -1512,7 +1778,7 @@ Returns:
                             error = _scrub_jargon(raw_error) if isinstance(raw_error, str) else None
                             payload = {'output': getattr(val_err, 'output', None), 'error': error}
                             result_dict = self._structured_tool_result(tool_name, copy.deepcopy(validated_arguments), payload, False)
-                            return result_dict
+                            return record_outcome(result_dict, t_id=tool_name, src_id=src_id, src_type=src_type, is_ext=is_ext)
                     result = await _invoke_authorized_tool(eff_tool, copy.deepcopy(validated_arguments))
                     if isinstance(result, dict) and {'tool', 'arguments', 'result', 'success'}.issubset(result.keys()):
                         if 'error' in result.get('result', {}):
@@ -1526,6 +1792,7 @@ Returns:
                         payload = {'output': result, 'error': None}
                         result_dict = self._structured_tool_result(tool_name, copy.deepcopy(validated_arguments), payload, True)
                 except asyncio.TimeoutError:
+                    timed_out_exec = True
                     msg = f"[Tool Crash] The tool '{tool_name}' exceeded the 30-second execution limit."
                     logger.error(msg)
                     result_dict = self._structured_tool_result(tool_name, copy.deepcopy(validated_arguments), {'error': msg}, False)
@@ -1558,7 +1825,7 @@ Returns:
             self._emit('assist.app.launched', {'app_name': arguments.get('app_name')})
         elif tool_name == 'file_opener':
             self._emit('assist.file.opened', {'file_path': arguments.get('file_path')})
-        return result_dict
+        return record_outcome(result_dict, t_id=tool_name, src_id=src_id, src_type=src_type, is_ext=is_ext, timed_out=timed_out_exec)
 
     def _format_observation_response(self, observation: Dict[str, Any]) -> str:
         """Render a tool result without masking empty document extraction failures."""

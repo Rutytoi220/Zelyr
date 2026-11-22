@@ -7,22 +7,117 @@ execution observation, and deterministic verification.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+import contextvars
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 import json
+import logging
 import os
 from pathlib import Path
 import re
+import sqlite3
+import threading
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
+import uuid
+
+
+logger = logging.getLogger("zelyr.execution_ledger")
 
 
 class InvalidStateTransitionError(ValueError):
     """Raised when an invalid action lifecycle state transition is attempted."""
 
 
+class LedgerPersistenceError(RuntimeError):
+    """Raised when persistent execution ledger storage fails."""
+
+
+class ExecutionIsolationError(PermissionError):
+    """Raised when an operation attempts to cross task execution boundaries."""
+
+
+MAX_LEDGER_TEXT_BYTES = 1024
+MAX_LEDGER_METADATA_BYTES = 4096
+MAX_LEDGER_COLLECTION_ITEMS = 24
+MAX_LEDGER_DEPTH = 4
+
+_SENSITIVE_KEY_SUBSTRINGS = (
+    "api_key",
+    "apikey",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "authorization",
+    "auth_header",
+    "cookie",
+    "private_key",
+    "credential",
+    "x_api_key",
+    "x-api-key",
+    "bearer",
+)
+
+_LARGE_PAYLOAD_KEYS = (
+    "image_b64",
+    "_vision_b64",
+    "screenshot_b64",
+    "raw_bytes",
+    "binary_data",
+    "screenshot",
+    "audio_bytes",
+    "video_bytes",
+)
+
+_NON_SECRET_ENV_NAMES = frozenset({
+    "HOME",
+    "PATH",
+    "PWD",
+    "OLDPWD",
+    "SHELL",
+    "TERM",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "USER",
+    "USERNAME",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_RUNTIME_DIR",
+    "ZELYR_CONFIG_DIR",
+    "ZELYR_DATA_DIR",
+    "ZELYR_MEMORY_DB",
+    "ZELYR_LEDGER_DB",
+    "PYTHONPATH",
+    "VIRTUAL_ENV",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+})
+
+
+def _collect_sensitive_env_values() -> List[str]:
+    """Collect non-trivial secret environment values for dynamic scrubbing."""
+    secrets: List[str] = []
+    for k, v in os.environ.items():
+        if not v or not isinstance(v, str) or k in _NON_SECRET_ENV_NAMES:
+            continue
+        k_upper = k.upper()
+        if any(tok in k_upper for tok in ("KEY", "TOKEN", "SECRET", "PASS", "CREDENTIAL", "AUTH", "PRIVATE")):
+            stripped = v.strip()
+            if len(stripped) >= 8 and not stripped.startswith(("/", "~")):
+                secrets.append(stripped)
+    secrets.sort(key=len, reverse=True)
+    return secrets
+
+
 def _redact_sensitive_text(text: Optional[str]) -> Optional[str]:
-    """Scrub common credentials/tokens before storing error strings in the ledger."""
+    """Scrub common credentials/tokens and sensitive env values before storing strings in the ledger."""
     if text is None:
         return None
     raw = str(text)
@@ -31,11 +126,18 @@ def _redact_sensitive_text(text: Optional[str]) -> Optional[str]:
     scrubbed = re.sub(r"(?i)(https?://)([^:/@\s]+):([^/@\s]+)@", r"\1\2:[REDACTED]@", raw)
     scrubbed = re.sub(r"(?i)\b(bearer\s+)[a-z0-9._\-+=]+", r"\1[REDACTED]", scrubbed)
     scrubbed = re.sub(r"\bsk-[A-Za-z0-9_\-]{8,}", "[REDACTED]", scrubbed)
+    scrubbed = re.sub(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{12,}", "[REDACTED]", scrubbed)
+    scrubbed = re.sub(r"\bgithub_pat_[A-Za-z0-9_]{16,}", "[REDACTED]", scrubbed)
+    scrubbed = re.sub(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}", "[REDACTED]", scrubbed)
+    scrubbed = re.sub(r"\bAKIA[0-9A-Z]{16}\b", "[REDACTED]", scrubbed)
     scrubbed = re.sub(
-        r"(?i)\b(api[_-]?key|token|secret|password)\s*([=:])\s*['\"]?([^\s,'\"&;]+)['\"]?",
+        r"(?i)\b(api[_-]?key|token|secret|password|passwd|authorization|cookie)\s*([=:])\s*['\"]?([^\s,'\"&;]+)['\"]?",
         r"\1\2[REDACTED]",
         scrubbed,
     )
+    for env_secret in _collect_sensitive_env_values():
+        if env_secret in scrubbed:
+            scrubbed = scrubbed.replace(env_secret, "[REDACTED]")
     return scrubbed
 
 
@@ -804,11 +906,102 @@ def _is_action_resolved_by_later(failed: ActionRecord, later: ActionRecord) -> b
 class TurnExecutionLedger:
     """Authoritative ledger recording all proposed, dispatched, and observed actions."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        execution_id: Optional[str] = None,
+        central_ledger: Optional[CentralExecutionLedger] = None,
+        caller_ring: Optional[int] = None,
+        task_local_scoped: bool = False,
+        source_component: Optional[str] = None,
+    ) -> None:
         self._records: Dict[str, ActionRecord] = {}
         self._order: List[str] = []
         self._verified_targets: Set[str] = set()
         self._pending_call_ids: List[str] = []
+        self._execution_id: Optional[str] = execution_id
+        self._central_ledger: Optional[CentralExecutionLedger] = central_ledger
+        self._caller_ring: Optional[int] = caller_ring
+        self._task_local_scoped: bool = bool(task_local_scoped)
+        self._source_component: Optional[str] = source_component
+        self._call_source_meta: Dict[str, Dict[str, Any]] = {}
+        self._verification_status_override: Optional[str] = None
+
+    def attach_central_ledger(
+        self,
+        central_ledger: Optional[CentralExecutionLedger],
+        execution_id: str,
+        *,
+        caller_ring: Optional[int] = None,
+        task_local_scoped: Optional[bool] = None,
+        source_component: Optional[str] = None,
+    ) -> None:
+        """Bind a persistent CentralExecutionLedger instance to this turn ledger."""
+        self._central_ledger = central_ledger
+        self._execution_id = execution_id
+        if caller_ring is not None:
+            self._caller_ring = caller_ring
+        if task_local_scoped is not None:
+            self._task_local_scoped = bool(task_local_scoped)
+        if source_component is not None:
+            self._source_component = source_component
+
+    def set_call_source_metadata(self, call_id: str, **meta: Any) -> None:
+        """Attach trusted source/telemetry metadata (e.g., external MCP or VLA info) for a call."""
+        if not call_id:
+            return
+        entry = self._call_source_meta.setdefault(call_id, {})
+        for k, v in meta.items():
+            if v is not None:
+                entry[k] = v
+
+    def set_verification_status(self, verification_status: Union[VerificationStatus, str]) -> None:
+        """Record an explicit overall verification status override for reporting."""
+        self._verification_status_override = (
+            verification_status.value
+            if isinstance(verification_status, VerificationStatus)
+            else str(verification_status)
+        )
+
+    def _emit_central_event(
+        self,
+        event_type: LedgerEventType,
+        *,
+        call_id: Optional[str] = None,
+        tool_id: Optional[str] = None,
+        status: str = "recorded",
+        metadata: Optional[Dict[str, Any]] = None,
+        idempotency_suffix: Optional[str] = None,
+    ) -> None:
+        if self._central_ledger is None or not self._execution_id:
+            return
+        src_meta = self._call_source_meta.get(call_id or "", {})
+        eff_tool = tool_id or (self._records[call_id].tool_name if call_id and call_id in self._records else None)
+        merged_meta = dict(src_meta.get("extra", {})) if isinstance(src_meta.get("extra"), dict) else {}
+        if metadata:
+            merged_meta.update(metadata)
+        idem_key = (
+            f"{self._execution_id}:{call_id}:{idempotency_suffix}"
+            if call_id and idempotency_suffix
+            else (f"{self._execution_id}:{idempotency_suffix}" if idempotency_suffix else None)
+        )
+        try:
+            self._central_ledger.record_event(
+                self._execution_id,
+                event_type,
+                tool_id=eff_tool,
+                source_id=src_meta.get("source_id"),
+                source_type=src_meta.get("source_type"),
+                is_external=bool(src_meta.get("is_external", False)),
+                status=status,
+                correlation_id=call_id,
+                caller_ring=self._caller_ring,
+                task_local_scoped=self._task_local_scoped,
+                metadata=merged_meta,
+                idempotency_key=idem_key,
+            )
+        except Exception as exc:
+            logger.debug("Non-fatal central event hook error (%s): %s", event_type.value, exc)
 
     def record_target_verified(
         self,
@@ -822,6 +1015,11 @@ class TurnExecutionLedger:
             if any(targets_match(target, vt, self._verified_targets, check_type=check_type) for vt in self._verified_targets):
                 return
             self._verified_targets.add(norm)
+            self._emit_central_event(
+                LedgerEventType.VERIFICATION_RECORDED,
+                status=VerificationStatus.VERIFIED.value,
+                metadata={"target": norm, "check_type": check_type, "detail": detail or "verified"},
+            )
 
     def invalidate_target_verification(
         self,
@@ -837,12 +1035,14 @@ class TurnExecutionLedger:
         ]
         for vt in to_remove:
             self._verified_targets.discard(vt)
+        invalidated_any = bool(to_remove)
         for cid in self._order:
             rec = self._records.get(cid)
             if not rec or rec.state != ActionState.VERIFIED:
                 continue
             rec_target = _extract_action_target(rec.tool_name, rec.arguments)
             if rec_target and targets_match(target, rec_target, check_type=check_type):
+                invalidated_any = True
                 self._records[cid] = ActionRecord(
                     call_id=rec.call_id,
                     tool_name=rec.tool_name,
@@ -860,6 +1060,12 @@ class TurnExecutionLedger:
                     rejection_reason=rec.rejection_reason,
                     verification_failed=rec.verification_failed,
                 )
+        if invalidated_any:
+            self._emit_central_event(
+                LedgerEventType.VERIFICATION_RECORDED,
+                status="verification_invalidated",
+                metadata={"target": target, "check_type": check_type},
+            )
 
     def is_target_verified(self, target: str, check_type: Optional[str] = None) -> bool:
         """Check if a target resource has been verified without colliding distinct directory paths."""
@@ -924,6 +1130,14 @@ class TurnExecutionLedger:
             self._order.append(call_id)
         if call_id not in self._pending_call_ids:
             self._pending_call_ids.append(call_id)
+        self._emit_central_event(
+            LedgerEventType.TOOL_SELECTED,
+            call_id=call_id,
+            tool_id=tool_name,
+            status="proposed",
+            metadata={"turn": turn, "raw_name": raw_name or tool_name, "arguments": rec.arguments},
+            idempotency_suffix="selected",
+        )
 
     def get_pending_proposals(self) -> List[ActionRecord]:
         """Return list of proposed actions awaiting validation and dispatch."""
@@ -993,8 +1207,16 @@ class TurnExecutionLedger:
                 rejection_reason=old.rejection_reason,
                 verification_failed=old.verification_failed,
             )
+            self._emit_central_event(
+                LedgerEventType.ARGUMENT_VALIDATED,
+                call_id=call_id,
+                tool_id=old.tool_name,
+                status="valid",
+                metadata={"arguments": old.arguments},
+                idempotency_suffix="validated",
+            )
 
-    def record_dispatched(self, call_id: str) -> None:
+    def record_dispatched(self, call_id: str, *, emit_event: bool = True) -> None:
         """Record that an action was dispatched for host execution."""
         old = self._validate_transition(
             call_id,
@@ -1020,6 +1242,15 @@ class TurnExecutionLedger:
                 rejection_reason=old.rejection_reason,
                 verification_failed=old.verification_failed,
             )
+            if emit_event:
+                self._emit_central_event(
+                    LedgerEventType.TOOL_EXECUTION_START,
+                    call_id=call_id,
+                    tool_id=old.tool_name,
+                    status="started",
+                    metadata={"arguments": old.arguments},
+                    idempotency_suffix="started",
+                )
         else:
             rec = ActionRecord(
                 call_id=call_id,
@@ -1029,6 +1260,13 @@ class TurnExecutionLedger:
             )
             self._records[call_id] = rec
             self._order.append(call_id)
+            if emit_event:
+                self._emit_central_event(
+                    LedgerEventType.TOOL_EXECUTION_START,
+                    call_id=call_id,
+                    status="started",
+                    idempotency_suffix="started",
+                )
 
     def record_authorized(self, call_id: str) -> None:
         """Record that an action was authorized for host execution."""
@@ -1052,6 +1290,13 @@ class TurnExecutionLedger:
                 raw_name=old.raw_name,
                 rejection_reason=old.rejection_reason,
                 verification_failed=old.verification_failed,
+            )
+            self._emit_central_event(
+                LedgerEventType.AUTHORIZATION_DECISION,
+                call_id=call_id,
+                tool_id=old.tool_name,
+                status="allowed",
+                idempotency_suffix="auth",
             )
 
     def record_executed(self, call_id: str) -> None:
@@ -1113,6 +1358,14 @@ class TurnExecutionLedger:
         )
         if call_id not in self._order:
             self._order.append(call_id)
+        self._emit_central_event(
+            LedgerEventType.AUTHORIZATION_DECISION,
+            call_id=call_id,
+            tool_id=tool_name or None,
+            status="denied",
+            metadata={"reason": safe_reason},
+            idempotency_suffix="rejected",
+        )
 
     def record_cancelled(self, call_id: str, reason: Optional[str] = None) -> None:
         """Record that an action was cancelled or aborted before or during execution."""
@@ -1144,6 +1397,14 @@ class TurnExecutionLedger:
         )
         if call_id not in self._order:
             self._order.append(call_id)
+        self._emit_central_event(
+            LedgerEventType.TOOL_EXECUTION_RESULT,
+            call_id=call_id,
+            tool_id=tool_name or None,
+            status="cancelled",
+            metadata={"reason": safe_reason or "Action cancelled"},
+            idempotency_suffix="cancelled",
+        )
 
     def record_partially_completed(
         self,
@@ -1184,6 +1445,14 @@ class TurnExecutionLedger:
         )
         if call_id not in self._order:
             self._order.append(call_id)
+        self._emit_central_event(
+            LedgerEventType.TOOL_EXECUTION_RESULT,
+            call_id=call_id,
+            tool_id=tool_name or None,
+            status="partially_completed",
+            metadata={"error": safe_err, "exit_code": exit_code},
+            idempotency_suffix="partial",
+        )
 
     def record_observed(
         self,
@@ -1219,6 +1488,14 @@ class TurnExecutionLedger:
             turn=old.turn,
             raw_name=old.raw_name,
         )
+        self._emit_central_event(
+            LedgerEventType.OBSERVATION_UPDATED,
+            call_id=call_id,
+            tool_id=old.tool_name,
+            status="observed",
+            metadata={"exit_code": exit_code, "output_preview": str(output)[:512] if output is not None else None},
+            idempotency_suffix="observed",
+        )
 
     def record_unverified(
         self,
@@ -1251,6 +1528,14 @@ class TurnExecutionLedger:
             timestamp=old.timestamp,
             turn=old.turn,
             raw_name=old.raw_name,
+        )
+        self._emit_central_event(
+            LedgerEventType.VERIFICATION_RECORDED,
+            call_id=call_id,
+            tool_id=old.tool_name,
+            status=VerificationStatus.NOT_VERIFIED.value,
+            metadata={"detail": reason},
+            idempotency_suffix="unverified",
         )
 
     def record_verified(
@@ -1298,6 +1583,14 @@ class TurnExecutionLedger:
             verification_failed=False,
             failed_targets=[],
             verified_targets=merged_targets,
+        )
+        self._emit_central_event(
+            LedgerEventType.VERIFICATION_RECORDED,
+            call_id=call_id,
+            tool_id=old.tool_name,
+            status=VerificationStatus.VERIFIED.value,
+            metadata={"detail": detail or "Independently verified", "verified_targets": merged_targets},
+            idempotency_suffix="verified",
         )
 
     def record_observation(
@@ -1425,6 +1718,63 @@ class TurnExecutionLedger:
         )
         if call_id not in self._order:
             self._order.append(call_id)
+        if status == "timed_out" or (
+            isinstance(effective_error, str) and "timed out" in effective_error.lower() and is_failure
+        ):
+            res_status = "timed_out"
+        elif final_state == ActionState.FAILED and (
+            status == "rejected" or (effective_rejection_reason is not None)
+        ):
+            res_status = "rejected"
+        elif is_failure:
+            res_status = "failed"
+        else:
+            res_status = "succeeded"
+        self._emit_central_event(
+            LedgerEventType.TOOL_EXECUTION_RESULT,
+            call_id=call_id,
+            tool_id=tool_name or None,
+            status=res_status,
+            metadata={
+                "exit_code": effective_exit_code,
+                "error": effective_error,
+                "rejection_reason": effective_rejection_reason,
+                "verified": effective_verified,
+            },
+            idempotency_suffix="result",
+        )
+        self._emit_central_event(
+            LedgerEventType.OBSERVATION_UPDATED,
+            call_id=call_id,
+            tool_id=tool_name or None,
+            status=final_state.value,
+            metadata={
+                "output_preview": str(output)[:512] if output is not None else None,
+                "verification_detail": effective_detail,
+                "verification_failed": effective_verification_failed,
+                "verified_targets": eff_verified_targets,
+                "failed_targets": eff_failed_targets,
+            },
+            idempotency_suffix="observed",
+        )
+        if effective_verified:
+            self._emit_central_event(
+                LedgerEventType.VERIFICATION_RECORDED,
+                call_id=call_id,
+                tool_id=tool_name or None,
+                status=VerificationStatus.VERIFIED.value,
+                metadata={"detail": effective_detail, "verified_targets": eff_verified_targets},
+                idempotency_suffix="verified",
+            )
+        elif effective_verification_failed:
+            self._emit_central_event(
+                LedgerEventType.VERIFICATION_RECORDED,
+                call_id=call_id,
+                tool_id=tool_name or None,
+                status=VerificationStatus.VERIFICATION_FAILED.value,
+                metadata={"detail": effective_detail, "failed_targets": eff_failed_targets},
+                idempotency_suffix="verification_failed",
+            )
 
     def get_record(self, call_id: str) -> Optional[ActionRecord]:
         """Return an ActionRecord by call identity, or None if not recorded."""
@@ -1616,6 +1966,14 @@ class TurnExecutionLedger:
                 rejection_reason=old.rejection_reason,
                 verification_failed=old.verification_failed,
             )
+            self._emit_central_event(
+                LedgerEventType.RECOVERY_ATTEMPT,
+                call_id=call_id,
+                tool_id=old.tool_name,
+                status="retry_requested",
+                metadata={"attempt": new_attempts, "error": old.error},
+                idempotency_suffix=f"recovery:{new_attempts}",
+            )
             return new_attempts
         return 0
 
@@ -1656,6 +2014,14 @@ class TurnExecutionLedger:
                 raw_name=old.raw_name,
                 rejection_reason=old.rejection_reason,
                 verification_failed=old.verification_failed,
+            )
+            self._emit_central_event(
+                LedgerEventType.RECOVERY_ATTEMPT,
+                call_id=call_id,
+                tool_id=old.tool_name,
+                status="terminal_blocker",
+                metadata={"recovery_attempts": old.recovery_attempts, "error": old.error},
+                idempotency_suffix="terminal",
             )
 
     def is_terminal(self, call_id: Optional[str] = None) -> bool:
@@ -1753,7 +2119,7 @@ class TurnExecutionLedger:
     def to_dict(self) -> Dict[str, Any]:
         """Structured summary for CLI/headless reporting."""
         records = [self._records[cid] for cid in self._order]
-        return {
+        out: Dict[str, Any] = {
             "total_actions": self.total_actions(),
             "successful_actions": [a.to_dict() for a in self.successful_actions()],
             "failed_actions": [a.to_dict() for a in self.failed_actions()],
@@ -1762,6 +2128,22 @@ class TurnExecutionLedger:
             "pending_proposals": [a.to_dict() for a in self.get_pending_proposals()],
             "records": [r.to_dict() for r in records],
         }
+        if self._execution_id is not None or self._central_ledger is not None:
+            out["execution_id"] = self._execution_id
+            if self._verification_status_override is not None:
+                out["verification_status"] = self._verification_status_override
+            elif self.verified_actions():
+                out["verification_status"] = VerificationStatus.VERIFIED.value
+            elif any(getattr(r, "verification_failed", False) for r in records):
+                out["verification_status"] = VerificationStatus.VERIFICATION_FAILED.value
+            else:
+                out["verification_status"] = VerificationStatus.NOT_VERIFIED.value
+            out["persistence_errors"] = (
+                self._central_ledger.get_persistence_errors()
+                if self._central_ledger is not None
+                else []
+            )
+        return out
 
 
 # False-success and non-actuation detection rules
@@ -2462,3 +2844,1426 @@ def find_unfulfilled_task_requirements(
                 unfulfilled_outcomes.append(fail_desc)
 
     return verified_outcomes, unfulfilled_outcomes
+
+
+# ---------------------------------------------------------------------------
+# Centralized Persistent Execution Ledger
+# ---------------------------------------------------------------------------
+
+
+class ExecutionStatus(str, Enum):
+    """Top-level task or standalone execution status."""
+
+    INITIALIZED = "initialized"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    COMPLETED_UNVERIFIED = "completed_unverified"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    TIMED_OUT = "timed_out"
+
+
+class VerificationStatus(str, Enum):
+    """Outcome verification status distinct from model completion claims."""
+
+    NOT_VERIFIED = "not_verified"
+    VERIFIED = "verified"
+    VERIFICATION_FAILED = "verification_failed"
+    CLAIMED_UNVERIFIED = "claimed_unverified"
+    INTERRUPTED = "interrupted"
+
+
+class LedgerEventType(str, Enum):
+    """Structured event types recorded in chronological execution order."""
+
+    TASK_INITIALIZED = "task_initialized"
+    PLANNING_DECISION = "planning_decision"
+    TOOL_SELECTED = "tool_selected"
+    AUTHORIZATION_DECISION = "authorization_decision"
+    ARGUMENT_VALIDATED = "argument_validated"
+    TOOL_EXECUTION_START = "tool_execution_start"
+    TOOL_EXECUTION_RESULT = "tool_execution_result"
+    RECOVERY_ATTEMPT = "recovery_attempt"
+    OBSERVATION_UPDATED = "observation_updated"
+    VERIFICATION_RECORDED = "verification_recorded"
+    TASK_TERMINATED = "task_terminated"
+
+
+_PROMPT_INJECTION_PATTERNS = (
+    re.compile(r"(?i)\[\s*(?:system|developer|assistant|admin|override|instruction)[^\]]*\]"),
+    re.compile(r"(?i)<\|\s*(?:im_start|im_end|system|assistant|user)\s*\|>"),
+    re.compile(r"(?i)\bignore\s+(?:all\s+)?(?:previous|prior|above)\s+instructions?\b"),
+    re.compile(r"(?i)\byou\s+are\s+now\b"),
+)
+
+
+def _strip_control_and_bidi(raw: str) -> str:
+    """Remove non-printable control characters, ANSI escapes, and bidi overrides."""
+    cleaned = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", raw)
+    cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]", "", cleaned)
+    return cleaned
+
+
+def sanitize_ledger_text(
+    text: Optional[str],
+    *,
+    max_bytes: int = MAX_LEDGER_TEXT_BYTES,
+    is_external: bool = False,
+    strip_injection: bool = True,
+) -> Tuple[Optional[str], bool, bool]:
+    """Sanitize, redact secrets, neutralize injections, and bound ledger text.
+
+    Returns:
+        Tuple of ``(sanitized_text, redacted, truncated)``.
+    """
+    if text is None:
+        return None, False, False
+
+    raw = str(text)
+    if not raw:
+        return "", False, False
+
+    redacted = False
+    truncated = False
+
+    scrubbed = _redact_sensitive_text(raw) or ""
+    if scrubbed != raw:
+        redacted = True
+
+    cleaned = _strip_control_and_bidi(scrubbed)
+    if strip_injection or is_external:
+        try:
+            from zelyr.tools.external import sanitize_external_text
+
+            cleaned = sanitize_external_text(cleaned, max_len=max(max_bytes, 128) * 2)
+        except Exception:
+            pass
+        for pat in _PROMPT_INJECTION_PATTERNS:
+            if pat.search(cleaned):
+                cleaned = pat.sub("[FILTERED_INSTRUCTION]", cleaned)
+                redacted = True
+
+    encoded = cleaned.encode("utf-8", errors="replace")
+    if len(encoded) > max_bytes:
+        truncated = True
+        suffix = b"... [TRUNCATED]"
+        budget = max(0, max_bytes - len(suffix))
+        clipped = encoded[:budget].decode("utf-8", errors="ignore")
+        cleaned = clipped + "... [TRUNCATED]"
+
+    return cleaned, redacted, truncated
+
+
+def _is_sensitive_key_name(key: str) -> bool:
+    low = key.lower().strip()
+    if any(sub in low for sub in _SENSITIVE_KEY_SUBSTRINGS):
+        return True
+    upper = key.upper().strip()
+    if upper not in _NON_SECRET_ENV_NAMES and any(
+        tok in upper for tok in ("_KEY", "_TOKEN", "_SECRET", "_PASS", "CREDENTIAL", "AUTH")
+    ):
+        return True
+    return False
+
+
+def _sanitize_value(
+    value: Any,
+    *,
+    depth: int,
+    max_text_bytes: int,
+    is_external: bool,
+    key_hint: str = "",
+) -> Tuple[Any, bool, bool]:
+    """Recursively sanitize, redact, and bound arbitrary Python values for storage."""
+    if key_hint:
+        low_key = key_hint.lower()
+        if _is_sensitive_key_name(key_hint):
+            return "[REDACTED]", True, False
+        if any(lk in low_key for lk in _LARGE_PAYLOAD_KEYS):
+            size_hint = len(value) if isinstance(value, (str, bytes, bytearray, list, dict)) else None
+            summary = {"omitted": True, "reason": "large_payload"}
+            if size_hint is not None:
+                summary["size"] = size_hint
+            return summary, False, True
+
+    if value is None or isinstance(value, (bool, int)):
+        return value, False, False
+
+    if isinstance(value, float):
+        return value, False, False
+
+    if isinstance(value, (bytes, bytearray)):
+        return {"omitted": True, "reason": "binary_payload", "size": len(value)}, False, True
+
+    if isinstance(value, str):
+        safe_s, was_redacted, was_trunc = sanitize_ledger_text(
+            value,
+            max_bytes=max_text_bytes,
+            is_external=is_external,
+            strip_injection=True,
+        )
+        return safe_s, was_redacted, was_trunc
+
+    if depth >= MAX_LEDGER_DEPTH:
+        safe_s, was_redacted, _ = sanitize_ledger_text(
+            str(value),
+            max_bytes=min(128, max_text_bytes),
+            is_external=is_external,
+            strip_injection=True,
+        )
+        return f"{safe_s} [TRUNCATED_DEPTH]", was_redacted, True
+
+    redacted = False
+    truncated = False
+
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        items = list(value.items())
+        if len(items) > MAX_LEDGER_COLLECTION_ITEMS:
+            items = items[:MAX_LEDGER_COLLECTION_ITEMS]
+            truncated = True
+        for k, v in items:
+            safe_k, k_red, k_trunc = sanitize_ledger_text(
+                str(k),
+                max_bytes=128,
+                is_external=is_external,
+                strip_injection=True,
+            )
+            redacted = redacted or k_red
+            truncated = truncated or k_trunc
+            safe_v, v_red, v_trunc = _sanitize_value(
+                v,
+                depth=depth + 1,
+                max_text_bytes=max_text_bytes,
+                is_external=is_external,
+                key_hint=str(k),
+            )
+            redacted = redacted or v_red
+            truncated = truncated or v_trunc
+            out[safe_k or "_"] = safe_v
+        if len(value) > MAX_LEDGER_COLLECTION_ITEMS:
+            out["_omitted_keys"] = len(value) - MAX_LEDGER_COLLECTION_ITEMS
+        return out, redacted, truncated
+
+    if isinstance(value, (list, tuple, set)):
+        seq = list(value)
+        if len(seq) > MAX_LEDGER_COLLECTION_ITEMS:
+            seq = seq[:MAX_LEDGER_COLLECTION_ITEMS]
+            truncated = True
+        out_list: List[Any] = []
+        for item in seq:
+            safe_item, i_red, i_trunc = _sanitize_value(
+                item,
+                depth=depth + 1,
+                max_text_bytes=max_text_bytes,
+                is_external=is_external,
+            )
+            redacted = redacted or i_red
+            truncated = truncated or i_trunc
+            out_list.append(safe_item)
+        if len(value) > MAX_LEDGER_COLLECTION_ITEMS:
+            out_list.append({"_omitted_items": len(value) - MAX_LEDGER_COLLECTION_ITEMS})
+        return out_list, redacted, truncated
+
+    safe_s, was_red, was_trunc = sanitize_ledger_text(
+        str(value),
+        max_bytes=min(256, max_text_bytes),
+        is_external=is_external,
+        strip_injection=True,
+    )
+    return safe_s, was_red, was_trunc
+
+
+def sanitize_ledger_payload(
+    data: Optional[Dict[str, Any]],
+    *,
+    is_external: bool = False,
+    max_bytes: int = MAX_LEDGER_METADATA_BYTES,
+) -> Tuple[Dict[str, Any], bool, bool]:
+    """Sanitize, redact, and size-bound metadata dictionary before SQLite persistence."""
+    if not data:
+        return {}, False, False
+
+    raw_dict = data if isinstance(data, dict) else {"value": data}
+    sanitized, redacted, truncated = _sanitize_value(
+        raw_dict,
+        depth=0,
+        max_text_bytes=min(MAX_LEDGER_TEXT_BYTES, max_bytes // 2 if max_bytes >= 512 else max_bytes),
+        is_external=is_external,
+    )
+    if not isinstance(sanitized, dict):
+        sanitized = {"value": sanitized}
+
+    encoded = json.dumps(sanitized, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+    if len(encoded) > max_bytes:
+        truncated = True
+        # Progressively shrink bulky preview fields first, then keep compact summary
+        trimmed = dict(sanitized)
+        for drop_key in ("raw_output", "output", "output_preview", "arguments", "arguments_preview", "detail", "summary", "error"):
+            if len(json.dumps(trimmed, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")) <= max_bytes:
+                break
+            if drop_key in trimmed and isinstance(trimmed[drop_key], str):
+                clipped, _, _ = sanitize_ledger_text(trimmed[drop_key], max_bytes=128, is_external=is_external)
+                trimmed[drop_key] = clipped
+            elif drop_key in trimmed:
+                trimmed[drop_key] = "[TRUNCATED]"
+        while (
+            len(trimmed) > 1
+            and len(json.dumps(trimmed, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")) > max_bytes
+        ):
+            longest_key = max(trimmed.keys(), key=lambda k: len(str(trimmed[k])))
+            trimmed.pop(longest_key, None)
+        trimmed["truncated"] = True
+        sanitized = trimmed
+
+    return sanitized, redacted, truncated
+
+
+@dataclass(frozen=True)
+class ExecutionEvent:
+    """Single immutable ordered event in an execution timeline."""
+
+    event_id: str
+    execution_id: str
+    sequence_number: int
+    timestamp: float
+    event_type: str
+    tool_id: Optional[str] = None
+    source_id: Optional[str] = None
+    source_type: Optional[str] = None
+    is_external: bool = False
+    status: str = "recorded"
+    correlation_id: Optional[str] = None
+    caller_ring: Optional[int] = None
+    task_local_scoped: bool = False
+    redacted: bool = False
+    truncated: bool = False
+    idempotency_key: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "event_id": self.event_id,
+            "execution_id": self.execution_id,
+            "sequence_number": self.sequence_number,
+            "timestamp": self.timestamp,
+            "event_type": self.event_type,
+            "tool_id": self.tool_id,
+            "source_id": self.source_id,
+            "source_type": self.source_type,
+            "is_external": bool(self.is_external),
+            "status": self.status,
+            "correlation_id": self.correlation_id,
+            "caller_ring": self.caller_ring,
+            "task_local_scoped": bool(self.task_local_scoped),
+            "redacted": bool(self.redacted),
+            "truncated": bool(self.truncated),
+            "idempotency_key": self.idempotency_key,
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_row(cls, row: Union[sqlite3.Row, Dict[str, Any]]) -> ExecutionEvent:
+        d = dict(row)
+        raw_meta = d.get("metadata_json") if "metadata_json" in d else d.get("metadata", {})
+        if isinstance(raw_meta, str):
+            try:
+                meta = json.loads(raw_meta) if raw_meta else {}
+            except Exception:
+                meta = {}
+        elif isinstance(raw_meta, dict):
+            meta = dict(raw_meta)
+        else:
+            meta = {}
+        return cls(
+            event_id=str(d["event_id"]),
+            execution_id=str(d["execution_id"]),
+            sequence_number=int(d["sequence_number"]),
+            timestamp=float(d["timestamp"]),
+            event_type=str(d["event_type"]),
+            tool_id=d.get("tool_id"),
+            source_id=d.get("source_id"),
+            source_type=d.get("source_type"),
+            is_external=bool(d.get("is_external", False)),
+            status=str(d.get("status", "recorded")),
+            correlation_id=d.get("correlation_id"),
+            caller_ring=d.get("caller_ring"),
+            task_local_scoped=bool(d.get("task_local_scoped", False)),
+            redacted=bool(d.get("redacted", False)),
+            truncated=bool(d.get("truncated", False)),
+            idempotency_key=d.get("idempotency_key"),
+            metadata=meta,
+        )
+
+
+@dataclass(frozen=True)
+class ExecutionRecord:
+    """Top-level persistent execution record."""
+
+    execution_id: str
+    task_prompt: str
+    status: str = ExecutionStatus.INITIALIZED.value
+    verification_status: str = VerificationStatus.NOT_VERIFIED.value
+    source_component: str = "runtime"
+    parent_execution_id: Optional[str] = None
+    caller_ring: Optional[int] = None
+    task_local_scoped: bool = False
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    completed_at: Optional[float] = None
+    final_summary: Optional[str] = None
+    error: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    redacted: bool = False
+    truncated: bool = False
+    event_count: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "execution_id": self.execution_id,
+            "parent_execution_id": self.parent_execution_id,
+            "task_prompt": self.task_prompt,
+            "status": self.status,
+            "verification_status": self.verification_status,
+            "source_component": self.source_component,
+            "caller_ring": self.caller_ring,
+            "task_local_scoped": bool(self.task_local_scoped),
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "completed_at": self.completed_at,
+            "final_summary": self.final_summary,
+            "error": self.error,
+            "metadata": dict(self.metadata),
+            "redacted": bool(self.redacted),
+            "truncated": bool(self.truncated),
+            "event_count": self.event_count,
+        }
+
+    @classmethod
+    def from_row(cls, row: Union[sqlite3.Row, Dict[str, Any]], event_count: Optional[int] = None) -> ExecutionRecord:
+        d = dict(row)
+        raw_meta = d.get("metadata_json") if "metadata_json" in d else d.get("metadata", {})
+        if isinstance(raw_meta, str):
+            try:
+                meta = json.loads(raw_meta) if raw_meta else {}
+            except Exception:
+                meta = {}
+        elif isinstance(raw_meta, dict):
+            meta = dict(raw_meta)
+        else:
+            meta = {}
+        eff_count = event_count if event_count is not None else int(d.get("event_count") or max(int(d.get("next_seq", 1)) - 1, 0))
+        return cls(
+            execution_id=str(d["execution_id"]),
+            parent_execution_id=d.get("parent_execution_id"),
+            task_prompt=str(d.get("task_prompt", "")),
+            status=str(d.get("status", ExecutionStatus.INITIALIZED.value)),
+            verification_status=str(d.get("verification_status", VerificationStatus.NOT_VERIFIED.value)),
+            source_component=str(d.get("source_component", "runtime")),
+            caller_ring=d.get("caller_ring"),
+            task_local_scoped=bool(d.get("task_local_scoped", False)),
+            created_at=float(d.get("created_at", 0.0)),
+            updated_at=float(d.get("updated_at", 0.0)),
+            completed_at=float(d["completed_at"]) if d.get("completed_at") is not None else None,
+            final_summary=d.get("final_summary"),
+            error=d.get("error"),
+            metadata=meta,
+            redacted=bool(d.get("redacted", False)),
+            truncated=bool(d.get("truncated", False)),
+            event_count=eff_count,
+        )
+
+
+@dataclass
+class ExecutionContextToken:
+    """Trusted runtime scope describing the active task execution."""
+
+    execution_id: str
+    ledger: "CentralExecutionLedger"
+    caller_ring: Optional[int] = None
+    task_local_scoped: bool = False
+    source_component: str = "runtime"
+    correlation_id: Optional[str] = None
+    owned_by_outer: bool = False
+    telemetry_bag: Dict[str, Any] = field(default_factory=dict)
+
+
+_LEDGER_EXECUTION_CONTEXT: contextvars.ContextVar[Optional[ExecutionContextToken]] = contextvars.ContextVar(
+    "zelyr_ledger_exec_ctx",
+    default=None,
+)
+
+
+def get_active_execution_context() -> Optional[ExecutionContextToken]:
+    """Return the active trusted ledger execution context, if any."""
+    return _LEDGER_EXECUTION_CONTEXT.get()
+
+
+def attach_call_telemetry(metadata: Dict[str, Any]) -> None:
+    """Attach sanitized runtime telemetry (e.g., VLA backend, external source) to active call context."""
+    ctx = _LEDGER_EXECUTION_CONTEXT.get()
+    if ctx is None or not isinstance(metadata, dict):
+        return
+    clean_meta, _, _ = sanitize_ledger_payload(metadata, max_bytes=1024)
+    ctx.telemetry_bag.update(clean_meta)
+
+
+@contextmanager
+def execution_scope(
+    ledger: "CentralExecutionLedger",
+    execution_id: str,
+    *,
+    caller_ring: Optional[int] = None,
+    task_local_scoped: bool = False,
+    source_component: str = "runtime",
+    correlation_id: Optional[str] = None,
+    owned_by_outer: bool = False,
+) -> Iterator[ExecutionContextToken]:
+    """Bind an isolated trusted execution context across sync/async execution steps."""
+    parent = _LEDGER_EXECUTION_CONTEXT.get()
+    eff_ring = caller_ring if caller_ring is not None else (parent.caller_ring if parent else None)
+    eff_scoped = bool(task_local_scoped or (parent.task_local_scoped if parent else False))
+    token_obj = ExecutionContextToken(
+        execution_id=str(execution_id),
+        ledger=ledger,
+        caller_ring=eff_ring,
+        task_local_scoped=eff_scoped,
+        source_component=source_component,
+        correlation_id=correlation_id,
+        owned_by_outer=owned_by_outer,
+        telemetry_bag={},
+    )
+    var_token = _LEDGER_EXECUTION_CONTEXT.set(token_obj)
+    try:
+        yield token_obj
+    finally:
+        _LEDGER_EXECUTION_CONTEXT.reset(var_token)
+
+
+def resolve_execution_ledger_db_path(db_path: Optional[Union[str, Path]] = None) -> Path:
+    """Resolve persistent execution ledger SQLite path without colliding with memory.db."""
+    if db_path is not None:
+        raw_str = str(db_path)
+        if raw_str == ":memory:":
+            return Path(":memory:")
+        return Path(raw_str).expanduser()
+
+    env_ledger = os.environ.get("ZELYR_LEDGER_DB", "").strip()
+    if env_ledger:
+        if env_ledger == ":memory:":
+            return Path(":memory:")
+        return Path(env_ledger).expanduser()
+
+    try:
+        from zelyr.config import get_config_dir
+
+        return get_config_dir() / "execution_ledger.db"
+    except Exception:
+        cfg_override = os.environ.get("ZELYR_CONFIG_DIR") or os.environ.get("XDG_CONFIG_HOME")
+        if cfg_override:
+            base = Path(cfg_override).expanduser()
+            if os.environ.get("ZELYR_CONFIG_DIR"):
+                return base / "execution_ledger.db"
+            return base / "zelyr" / "execution_ledger.db"
+        return Path.home() / ".config" / "zelyr" / "execution_ledger.db"
+
+
+_EXECUTION_LEDGER_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS executions (
+    execution_id TEXT PRIMARY KEY,
+    parent_execution_id TEXT,
+    task_prompt TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'initialized',
+    verification_status TEXT NOT NULL DEFAULT 'not_verified',
+    source_component TEXT NOT NULL DEFAULT 'runtime',
+    caller_ring INTEGER,
+    task_local_scoped INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    completed_at REAL,
+    final_summary TEXT,
+    error TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    redacted INTEGER NOT NULL DEFAULT 0,
+    truncated INTEGER NOT NULL DEFAULT 0,
+    next_seq INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS execution_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL,
+    execution_id TEXT NOT NULL,
+    sequence_number INTEGER NOT NULL,
+    timestamp REAL NOT NULL,
+    event_type TEXT NOT NULL,
+    tool_id TEXT,
+    source_id TEXT,
+    source_type TEXT,
+    is_external INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'recorded',
+    correlation_id TEXT,
+    caller_ring INTEGER,
+    task_local_scoped INTEGER NOT NULL DEFAULT 0,
+    redacted INTEGER NOT NULL DEFAULT 0,
+    truncated INTEGER NOT NULL DEFAULT 0,
+    idempotency_key TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY (execution_id) REFERENCES executions(execution_id) ON DELETE CASCADE,
+    UNIQUE (execution_id, sequence_number),
+    UNIQUE (execution_id, event_id),
+    UNIQUE (execution_id, idempotency_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_exec_created ON executions(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_exec_status ON executions(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_events_exec_seq ON execution_events(execution_id, sequence_number ASC);
+CREATE INDEX IF NOT EXISTS idx_events_tool ON execution_events(tool_id);
+CREATE INDEX IF NOT EXISTS idx_events_type ON execution_events(event_type);
+"""
+
+
+class CentralExecutionLedger:
+    """Thread-safe, process-persistent centralized execution ledger backed by SQLite WAL."""
+
+    def __init__(
+        self,
+        db_path: Optional[Union[str, Path]] = None,
+        *,
+        raise_on_persistence_error: bool = False,
+        timeout: float = 5.0,
+    ) -> None:
+        self.db_path: Path = resolve_execution_ledger_db_path(db_path)
+        self.raise_on_persistence_error: bool = bool(raise_on_persistence_error)
+        self.timeout: float = float(timeout)
+        self._lock = threading.RLock()
+        self._conn: Optional[sqlite3.Connection] = None
+        self._thread_conns: Dict[int, sqlite3.Connection] = {}
+        self._initialized: bool = False
+        self._persistence_errors: List[Dict[str, Any]] = []
+        self._memory_executions: Dict[str, ExecutionRecord] = {}
+        self._memory_events: Dict[str, List[ExecutionEvent]] = {}
+        self._ensure_connection(raise_on_error=self.raise_on_persistence_error)
+
+    def _record_persistence_failure(
+        self,
+        operation: str,
+        exc: Exception,
+        *,
+        execution_id: Optional[str] = None,
+        strict: Optional[bool] = None,
+    ) -> None:
+        safe_err, _, _ = sanitize_ledger_text(str(exc), max_bytes=512)
+        entry = {
+            "timestamp": time.time(),
+            "operation": operation,
+            "execution_id": execution_id,
+            "exception_type": type(exc).__name__,
+            "error": safe_err or type(exc).__name__,
+        }
+        self._persistence_errors.append(entry)
+        logger.error(
+            "Execution ledger persistence failure during %s (execution_id=%s): %s",
+            operation,
+            execution_id or "-",
+            entry["error"],
+        )
+        should_raise = self.raise_on_persistence_error if strict is None else strict
+        if should_raise:
+            raise LedgerPersistenceError(
+                f"Execution ledger persistence failed during '{operation}': {entry['error']}"
+            ) from exc
+
+    def _open_connection(self) -> sqlite3.Connection:
+        if str(self.db_path) == ":memory:":
+            conn = sqlite3.connect(":memory:", timeout=self.timeout, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON;")
+            return conn
+        from zelyr.db.connection import get_db_connection
+
+        return get_db_connection(self.db_path, timeout=self.timeout, row_factory=True)
+
+    def _ensure_connection(self, *, raise_on_error: bool = False, execution_id: Optional[str] = None) -> Optional[sqlite3.Connection]:
+        with self._lock:
+            is_memory = str(self.db_path) == ":memory:"
+            tid = 0 if is_memory else threading.get_ident()
+            existing = self._conn if is_memory else self._thread_conns.get(tid)
+            if existing is not None and self._initialized:
+                return existing
+            try:
+                conn = existing if existing is not None else self._open_connection()
+                if is_memory:
+                    self._conn = conn
+                else:
+                    self._thread_conns[tid] = conn
+                    if self._conn is None:
+                        self._conn = conn
+                if not self._initialized:
+                    with conn:
+                        conn.executescript(_EXECUTION_LEDGER_SCHEMA_SQL)
+                    self._initialized = True
+                return conn
+            except Exception as exc:
+                if not is_memory:
+                    self._thread_conns.pop(tid, None)
+                self._conn = None
+                self._initialized = False
+                self._record_persistence_failure(
+                    "initialize",
+                    exc,
+                    execution_id=execution_id,
+                    strict=raise_on_error,
+                )
+                return None
+
+    def close(self) -> None:
+        """Checkpoint WAL and close all thread-local SQLite ledger connections cleanly."""
+        with self._lock:
+            conns: List[sqlite3.Connection] = []
+            seen_ids: Set[int] = set()
+            for conn in list(self._thread_conns.values()) + ([self._conn] if self._conn is not None else []):
+                if conn is not None and id(conn) not in seen_ids:
+                    seen_ids.add(id(conn))
+                    conns.append(conn)
+            self._thread_conns.clear()
+            self._conn = None
+            self._initialized = False
+            for idx, conn in enumerate(conns):
+                try:
+                    if str(self.db_path) == ":memory:":
+                        conn.close()
+                    elif idx == len(conns) - 1:
+                        from zelyr.db.connection import checkpoint_and_close
+
+                        checkpoint_and_close(conn)
+                    else:
+                        conn.close()
+                except Exception:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+    def get_persistence_errors(self) -> List[Dict[str, Any]]:
+        """Return structured diagnostics for any ledger persistence errors encountered."""
+        with self._lock:
+            return [dict(item) for item in self._persistence_errors]
+
+    def has_persistence_errors(self) -> bool:
+        with self._lock:
+            return len(self._persistence_errors) > 0
+
+    def _enforce_scope_isolation(self, target_execution_id: str, *, enforce_active_scope: bool) -> None:
+        if not enforce_active_scope:
+            return
+        ctx = get_active_execution_context()
+        if ctx is not None and ctx.execution_id != target_execution_id:
+            raise ExecutionIsolationError(
+                f"Execution scope isolation violation: active execution '{ctx.execution_id}' cannot mutate '{target_execution_id}'."
+            )
+
+    def create_execution(
+        self,
+        task_prompt: str = "",
+        *,
+        execution_id: Optional[str] = None,
+        parent_execution_id: Optional[str] = None,
+        source_component: str = "runtime",
+        caller_ring: Optional[int] = None,
+        task_local_scoped: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+        status: Union[ExecutionStatus, str] = ExecutionStatus.INITIALIZED,
+        emit_init_event: bool = True,
+        strict: Optional[bool] = None,
+    ) -> ExecutionRecord:
+        """Create and persist a new execution record."""
+        eff_exec_id = str(execution_id or f"exec_{uuid.uuid4().hex[:16]}")
+        now = time.time()
+        safe_prompt, prompt_red, prompt_trunc = sanitize_ledger_text(
+            task_prompt or "",
+            max_bytes=MAX_LEDGER_TEXT_BYTES,
+            strip_injection=False,
+        )
+        safe_meta, meta_red, meta_trunc = sanitize_ledger_payload(metadata)
+        was_red = bool(prompt_red or meta_red)
+        was_trunc = bool(prompt_trunc or meta_trunc)
+        status_str = status.value if isinstance(status, ExecutionStatus) else str(status)
+        if parent_execution_id is None:
+            active_ctx = get_active_execution_context()
+            if active_ctx is not None and active_ctx.execution_id != eff_exec_id:
+                parent_execution_id = active_ctx.execution_id
+
+        with self._lock:
+            conn = self._ensure_connection(
+                raise_on_error=(self.raise_on_persistence_error if strict is None else strict),
+                execution_id=eff_exec_id,
+            )
+            init_event_count = 0
+            if conn is not None:
+                try:
+                    from zelyr.db.connection import managed_transaction
+
+                    with managed_transaction(conn):
+                        existing = conn.execute(
+                            "SELECT * FROM executions WHERE execution_id = ?",
+                            (eff_exec_id,),
+                        ).fetchone()
+                        if existing is not None:
+                            return ExecutionRecord.from_row(existing)
+                        conn.execute(
+                            """
+                            INSERT INTO executions (
+                                execution_id, parent_execution_id, task_prompt, status,
+                                verification_status, source_component, caller_ring,
+                                task_local_scoped, created_at, updated_at, metadata_json,
+                                redacted, truncated, next_seq
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                eff_exec_id,
+                                parent_execution_id,
+                                safe_prompt or "",
+                                status_str,
+                                VerificationStatus.NOT_VERIFIED.value,
+                                str(source_component or "runtime"),
+                                caller_ring,
+                                1 if task_local_scoped else 0,
+                                now,
+                                now,
+                                json.dumps(safe_meta, ensure_ascii=False, separators=(",", ":"), default=str),
+                                1 if was_red else 0,
+                                1 if was_trunc else 0,
+                                1,
+                            ),
+                        )
+                        if emit_init_event:
+                            ev_id = f"evt_{uuid.uuid4().hex[:12]}"
+                            ev_meta, ev_red, ev_trunc = sanitize_ledger_payload(
+                                {"task_prompt": safe_prompt or "", **(safe_meta or {})},
+                            )
+                            conn.execute(
+                                """
+                                INSERT INTO execution_events (
+                                    event_id, execution_id, sequence_number, timestamp, event_type,
+                                    status, caller_ring, task_local_scoped, redacted, truncated,
+                                    idempotency_key, metadata_json
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    ev_id,
+                                    eff_exec_id,
+                                    1,
+                                    now,
+                                    LedgerEventType.TASK_INITIALIZED.value,
+                                    status_str,
+                                    caller_ring,
+                                    1 if task_local_scoped else 0,
+                                    1 if (ev_red or was_red) else 0,
+                                    1 if (ev_trunc or was_trunc) else 0,
+                                    f"{eff_exec_id}:task_initialized",
+                                    json.dumps(ev_meta, ensure_ascii=False, separators=(",", ":"), default=str),
+                                ),
+                            )
+                            conn.execute(
+                                "UPDATE executions SET next_seq = 2, updated_at = ? WHERE execution_id = ?",
+                                (now, eff_exec_id),
+                            )
+                            init_event_count = 1
+                except Exception as exc:
+                    self._record_persistence_failure(
+                        "create_execution",
+                        exc,
+                        execution_id=eff_exec_id,
+                        strict=strict,
+                    )
+
+            record = ExecutionRecord(
+                execution_id=eff_exec_id,
+                parent_execution_id=parent_execution_id,
+                task_prompt=safe_prompt or "",
+                status=status_str,
+                verification_status=VerificationStatus.NOT_VERIFIED.value,
+                source_component=str(source_component or "runtime"),
+                caller_ring=caller_ring,
+                task_local_scoped=bool(task_local_scoped),
+                created_at=now,
+                updated_at=now,
+                metadata=safe_meta,
+                redacted=was_red,
+                truncated=was_trunc,
+                event_count=init_event_count,
+            )
+            self._memory_executions[eff_exec_id] = record
+            self._memory_events.setdefault(eff_exec_id, [])
+            if emit_init_event and not self._memory_events[eff_exec_id]:
+                self._memory_events[eff_exec_id].append(
+                    ExecutionEvent(
+                        event_id=f"evt_{uuid.uuid4().hex[:12]}",
+                        execution_id=eff_exec_id,
+                        sequence_number=1,
+                        timestamp=now,
+                        event_type=LedgerEventType.TASK_INITIALIZED.value,
+                        status=status_str,
+                        caller_ring=caller_ring,
+                        task_local_scoped=bool(task_local_scoped),
+                        redacted=was_red,
+                        truncated=was_trunc,
+                        idempotency_key=f"{eff_exec_id}:task_initialized",
+                        metadata=safe_meta,
+                    )
+                )
+            return record
+
+    def record_event(
+        self,
+        execution_id: str,
+        event_type: Union[LedgerEventType, str],
+        *,
+        tool_id: Optional[str] = None,
+        source_id: Optional[str] = None,
+        source_type: Optional[str] = None,
+        is_external: bool = False,
+        status: str = "recorded",
+        correlation_id: Optional[str] = None,
+        caller_ring: Optional[int] = None,
+        task_local_scoped: Optional[bool] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        idempotency_key: Optional[str] = None,
+        event_id: Optional[str] = None,
+        enforce_active_scope: bool = False,
+        execution_status: Optional[Union[ExecutionStatus, str]] = None,
+        verification_status: Optional[Union[VerificationStatus, str]] = None,
+        strict: Optional[bool] = None,
+    ) -> Optional[ExecutionEvent]:
+        """Append an ordered, redacted, idempotent event to an execution record."""
+        if not execution_id:
+            raise ValueError("execution_id must be a non-empty string")
+        self._enforce_scope_isolation(execution_id, enforce_active_scope=enforce_active_scope)
+
+        ev_type = event_type.value if isinstance(event_type, LedgerEventType) else str(event_type)
+        now = time.time()
+        safe_tool = sanitize_ledger_text(tool_id, max_bytes=256, is_external=is_external)[0] if tool_id else None
+        safe_source = sanitize_ledger_text(source_id, max_bytes=256, is_external=is_external)[0] if source_id else None
+        safe_source_type = sanitize_ledger_text(source_type, max_bytes=64, is_external=is_external)[0] if source_type else None
+        safe_meta, meta_red, meta_trunc = sanitize_ledger_payload(metadata, is_external=is_external)
+        eff_event_id = str(event_id or f"evt_{uuid.uuid4().hex[:16]}")
+
+        ctx = get_active_execution_context()
+        eff_ring = caller_ring if caller_ring is not None else (ctx.caller_ring if ctx and ctx.execution_id == execution_id else None)
+        eff_scoped = (
+            bool(task_local_scoped)
+            if task_local_scoped is not None
+            else (bool(ctx.task_local_scoped) if ctx and ctx.execution_id == execution_id else False)
+        )
+
+        with self._lock:
+            conn = self._ensure_connection(
+                raise_on_error=(self.raise_on_persistence_error if strict is None else strict),
+                execution_id=execution_id,
+            )
+            if conn is not None:
+                try:
+                    from zelyr.db.connection import managed_transaction
+
+                    with managed_transaction(conn):
+                        exec_row = conn.execute(
+                            "SELECT next_seq, status, verification_status FROM executions WHERE execution_id = ?",
+                            (execution_id,),
+                        ).fetchone()
+                        if exec_row is None:
+                            raise ValueError(f"Unknown execution_id '{execution_id}'")
+
+                        if idempotency_key:
+                            dup = conn.execute(
+                                "SELECT * FROM execution_events WHERE execution_id = ? AND idempotency_key = ?",
+                                (execution_id, idempotency_key),
+                            ).fetchone()
+                            if dup is not None:
+                                return ExecutionEvent.from_row(dup)
+
+                        seq = int(exec_row["next_seq"])
+                        conn.execute(
+                            """
+                            INSERT INTO execution_events (
+                                event_id, execution_id, sequence_number, timestamp, event_type,
+                                tool_id, source_id, source_type, is_external, status,
+                                correlation_id, caller_ring, task_local_scoped,
+                                redacted, truncated, idempotency_key, metadata_json
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                eff_event_id,
+                                execution_id,
+                                seq,
+                                now,
+                                ev_type,
+                                safe_tool,
+                                safe_source,
+                                safe_source_type,
+                                1 if is_external else 0,
+                                str(status or "recorded"),
+                                correlation_id,
+                                eff_ring,
+                                1 if eff_scoped else 0,
+                                1 if meta_red else 0,
+                                1 if meta_trunc else 0,
+                                idempotency_key,
+                                json.dumps(safe_meta, ensure_ascii=False, separators=(",", ":"), default=str),
+                            ),
+                        )
+
+                        new_exec_status = (
+                            (execution_status.value if isinstance(execution_status, ExecutionStatus) else str(execution_status))
+                            if execution_status is not None
+                            else (
+                                ExecutionStatus.RUNNING.value
+                                if exec_row["status"] == ExecutionStatus.INITIALIZED.value
+                                and ev_type != LedgerEventType.TASK_INITIALIZED.value
+                                else str(exec_row["status"])
+                            )
+                        )
+                        new_ver_status = (
+                            (verification_status.value if isinstance(verification_status, VerificationStatus) else str(verification_status))
+                            if verification_status is not None
+                            else str(exec_row["verification_status"])
+                        )
+                        conn.execute(
+                            """
+                            UPDATE executions
+                            SET next_seq = ?, updated_at = ?, status = ?, verification_status = ?,
+                                redacted = MAX(redacted, ?), truncated = MAX(truncated, ?)
+                            WHERE execution_id = ?
+                            """,
+                            (
+                                seq + 1,
+                                now,
+                                new_exec_status,
+                                new_ver_status,
+                                1 if meta_red else 0,
+                                1 if meta_trunc else 0,
+                                execution_id,
+                            ),
+                        )
+                        return ExecutionEvent(
+                            event_id=eff_event_id,
+                            execution_id=execution_id,
+                            sequence_number=seq,
+                            timestamp=now,
+                            event_type=ev_type,
+                            tool_id=safe_tool,
+                            source_id=safe_source,
+                            source_type=safe_source_type,
+                            is_external=bool(is_external),
+                            status=str(status or "recorded"),
+                            correlation_id=correlation_id,
+                            caller_ring=eff_ring,
+                            task_local_scoped=bool(eff_scoped),
+                            redacted=bool(meta_red),
+                            truncated=bool(meta_trunc),
+                            idempotency_key=idempotency_key,
+                            metadata=safe_meta,
+                        )
+                except ValueError:
+                    raise
+                except Exception as exc:
+                    self._record_persistence_failure(
+                        "record_event",
+                        exc,
+                        execution_id=execution_id,
+                        strict=strict,
+                    )
+
+            mem_events = self._memory_events.setdefault(execution_id, [])
+            if idempotency_key:
+                for existing_ev in mem_events:
+                    if existing_ev.idempotency_key == idempotency_key:
+                        return existing_ev
+            seq_num = len(mem_events) + 1
+            mem_ev = ExecutionEvent(
+                event_id=eff_event_id,
+                execution_id=execution_id,
+                sequence_number=seq_num,
+                timestamp=now,
+                event_type=ev_type,
+                tool_id=safe_tool,
+                source_id=safe_source,
+                source_type=safe_source_type,
+                is_external=bool(is_external),
+                status=str(status or "recorded"),
+                correlation_id=correlation_id,
+                caller_ring=eff_ring,
+                task_local_scoped=bool(eff_scoped),
+                redacted=bool(meta_red),
+                truncated=bool(meta_trunc),
+                idempotency_key=idempotency_key,
+                metadata=safe_meta,
+            )
+            mem_events.append(mem_ev)
+            return mem_ev
+
+    def finalize_execution(
+        self,
+        execution_id: str,
+        *,
+        status: Union[ExecutionStatus, str],
+        verification_status: Optional[Union[VerificationStatus, str]] = None,
+        final_summary: Optional[str] = None,
+        error: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        emit_terminal_event: bool = True,
+        strict: Optional[bool] = None,
+    ) -> Optional[ExecutionRecord]:
+        """Finalize an execution record and emit its terminal lifecycle event."""
+        now = time.time()
+        status_str = status.value if isinstance(status, ExecutionStatus) else str(status)
+        ver_str = (
+            (verification_status.value if isinstance(verification_status, VerificationStatus) else str(verification_status))
+            if verification_status is not None
+            else None
+        )
+        safe_summary, sum_red, sum_trunc = sanitize_ledger_text(final_summary, max_bytes=MAX_LEDGER_TEXT_BYTES)
+        safe_error, err_red, err_trunc = sanitize_ledger_text(error, max_bytes=MAX_LEDGER_TEXT_BYTES)
+        safe_meta, meta_red, meta_trunc = sanitize_ledger_payload(metadata)
+        any_red = bool(sum_red or err_red or meta_red)
+        any_trunc = bool(sum_trunc or err_trunc or meta_trunc)
+
+        if emit_terminal_event:
+            term_meta = dict(safe_meta)
+            if safe_summary:
+                term_meta["summary"] = safe_summary
+            if safe_error:
+                term_meta["error"] = safe_error
+            if ver_str:
+                term_meta["verification_status"] = ver_str
+            try:
+                self.record_event(
+                    execution_id,
+                    LedgerEventType.TASK_TERMINATED,
+                    status=status_str,
+                    metadata=term_meta,
+                    idempotency_key=f"{execution_id}:terminated:{status_str}",
+                    execution_status=status_str,
+                    verification_status=ver_str,
+                    strict=strict,
+                )
+            except ValueError:
+                return None
+
+        with self._lock:
+            conn = self._ensure_connection(
+                raise_on_error=(self.raise_on_persistence_error if strict is None else strict),
+                execution_id=execution_id,
+            )
+            if conn is not None:
+                try:
+                    from zelyr.db.connection import managed_transaction
+
+                    with managed_transaction(conn):
+                        existing = conn.execute(
+                            "SELECT * FROM executions WHERE execution_id = ?",
+                            (execution_id,),
+                        ).fetchone()
+                        if existing is None:
+                            return None
+                        merged_meta = {}
+                        try:
+                            merged_meta = json.loads(existing["metadata_json"] or "{}")
+                        except Exception:
+                            merged_meta = {}
+                        merged_meta.update(safe_meta)
+                        eff_ver = ver_str or existing["verification_status"]
+                        conn.execute(
+                            """
+                            UPDATE executions
+                            SET status = ?, verification_status = ?, updated_at = ?, completed_at = ?,
+                                final_summary = COALESCE(?, final_summary),
+                                error = COALESCE(?, error),
+                                metadata_json = ?,
+                                redacted = MAX(redacted, ?),
+                                truncated = MAX(truncated, ?)
+                            WHERE execution_id = ?
+                            """,
+                            (
+                                status_str,
+                                eff_ver,
+                                now,
+                                now,
+                                safe_summary,
+                                safe_error,
+                                json.dumps(merged_meta, ensure_ascii=False, separators=(",", ":"), default=str),
+                                1 if any_red else 0,
+                                1 if any_trunc else 0,
+                                execution_id,
+                            ),
+                        )
+                        updated = conn.execute(
+                            "SELECT * FROM executions WHERE execution_id = ?",
+                            (execution_id,),
+                        ).fetchone()
+                        if updated is not None:
+                            return ExecutionRecord.from_row(updated)
+                except Exception as exc:
+                    self._record_persistence_failure(
+                        "finalize_execution",
+                        exc,
+                        execution_id=execution_id,
+                        strict=strict,
+                    )
+
+            mem_rec = self._memory_executions.get(execution_id)
+            if mem_rec is None:
+                return None
+            updated_rec = ExecutionRecord(
+                execution_id=mem_rec.execution_id,
+                parent_execution_id=mem_rec.parent_execution_id,
+                task_prompt=mem_rec.task_prompt,
+                status=status_str,
+                verification_status=ver_str or mem_rec.verification_status,
+                source_component=mem_rec.source_component,
+                caller_ring=mem_rec.caller_ring,
+                task_local_scoped=mem_rec.task_local_scoped,
+                created_at=mem_rec.created_at,
+                updated_at=now,
+                completed_at=now,
+                final_summary=safe_summary or mem_rec.final_summary,
+                error=safe_error or mem_rec.error,
+                metadata={**mem_rec.metadata, **safe_meta},
+                redacted=mem_rec.redacted or any_red,
+                truncated=mem_rec.truncated or any_trunc,
+                event_count=len(self._memory_events.get(execution_id, [])),
+            )
+            self._memory_executions[execution_id] = updated_rec
+            return updated_rec
+
+    def get_execution(self, execution_id: str) -> Optional[ExecutionRecord]:
+        """Fetch a single execution record by ID."""
+        if not execution_id:
+            return None
+        with self._lock:
+            conn = self._ensure_connection(raise_on_error=False, execution_id=execution_id)
+            if conn is not None:
+                try:
+                    row = conn.execute(
+                        "SELECT * FROM executions WHERE execution_id = ?",
+                        (execution_id,),
+                    ).fetchone()
+                    if row is not None:
+                        return ExecutionRecord.from_row(row)
+                except Exception as exc:
+                    self._record_persistence_failure("get_execution", exc, execution_id=execution_id, strict=False)
+            return self._memory_executions.get(execution_id)
+
+    def find_execution_by_prefix(self, prefix: str) -> Tuple[Optional[ExecutionRecord], List[str]]:
+        """Resolve an execution ID or unique prefix match."""
+        clean = (prefix or "").strip()
+        if not clean:
+            return None, []
+        exact = self.get_execution(clean)
+        if exact is not None:
+            return exact, [exact.execution_id]
+        with self._lock:
+            conn = self._ensure_connection(raise_on_error=False)
+            if conn is not None:
+                try:
+                    rows = conn.execute(
+                        "SELECT * FROM executions WHERE execution_id LIKE ? ORDER BY created_at DESC LIMIT 20",
+                        (f"{clean}%",),
+                    ).fetchall()
+                    ids = [str(r["execution_id"]) for r in rows]
+                    if len(rows) == 1:
+                        return ExecutionRecord.from_row(rows[0]), ids
+                    return None, ids
+                except Exception as exc:
+                    self._record_persistence_failure("find_execution_by_prefix", exc, strict=False)
+        return None, []
+
+    def get_events(
+        self,
+        execution_id: str,
+        *,
+        event_type: Optional[str] = None,
+        tool_id: Optional[str] = None,
+        correlation_id: Optional[str] = None,
+    ) -> List[ExecutionEvent]:
+        """Retrieve deterministically ordered events for an execution."""
+        if not execution_id:
+            return []
+        with self._lock:
+            conn = self._ensure_connection(raise_on_error=False, execution_id=execution_id)
+            if conn is not None:
+                try:
+                    clauses = ["execution_id = ?"]
+                    params: List[Any] = [execution_id]
+                    if event_type:
+                        clauses.append("event_type = ?")
+                        params.append(str(event_type))
+                    if tool_id:
+                        clauses.append("tool_id = ?")
+                        params.append(str(tool_id))
+                    if correlation_id:
+                        clauses.append("correlation_id = ?")
+                        params.append(str(correlation_id))
+                    where_sql = " AND ".join(clauses)
+                    rows = conn.execute(
+                        f"SELECT * FROM execution_events WHERE {where_sql} ORDER BY sequence_number ASC",
+                        params,
+                    ).fetchall()
+                    return [ExecutionEvent.from_row(r) for r in rows]
+                except Exception as exc:
+                    self._record_persistence_failure("get_events", exc, execution_id=execution_id, strict=False)
+            evs = list(self._memory_events.get(execution_id, []))
+            if event_type:
+                evs = [e for e in evs if e.event_type == str(event_type)]
+            if tool_id:
+                evs = [e for e in evs if e.tool_id == str(tool_id)]
+            if correlation_id:
+                evs = [e for e in evs if e.correlation_id == str(correlation_id)]
+            return sorted(evs, key=lambda e: e.sequence_number)
+
+    def list_executions(
+        self,
+        *,
+        limit: int = 20,
+        status: Optional[str] = None,
+        tool_id: Optional[str] = None,
+        event_type: Optional[str] = None,
+        verification_status: Optional[str] = None,
+    ) -> List[ExecutionRecord]:
+        """List recent executions ordered newest-first with optional filters."""
+        eff_limit = max(1, min(int(limit or 20), 500))
+        with self._lock:
+            conn = self._ensure_connection(raise_on_error=False)
+            if conn is not None:
+                try:
+                    clauses: List[str] = []
+                    params: List[Any] = []
+                    if status:
+                        clauses.append("e.status = ?")
+                        params.append(str(status))
+                    if verification_status:
+                        clauses.append("e.verification_status = ?")
+                        params.append(str(verification_status))
+                    if tool_id:
+                        clauses.append(
+                            "EXISTS (SELECT 1 FROM execution_events ev WHERE ev.execution_id = e.execution_id AND ev.tool_id = ?)"
+                        )
+                        params.append(str(tool_id))
+                    if event_type:
+                        clauses.append(
+                            "EXISTS (SELECT 1 FROM execution_events ev WHERE ev.execution_id = e.execution_id AND ev.event_type = ?)"
+                        )
+                        params.append(str(event_type))
+                    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+                    rows = conn.execute(
+                        f"SELECT e.* FROM executions e {where_sql} ORDER BY e.created_at DESC, e.rowid DESC LIMIT ?",
+                        (*params, eff_limit),
+                    ).fetchall()
+                    return [ExecutionRecord.from_row(r) for r in rows]
+                except Exception as exc:
+                    self._record_persistence_failure("list_executions", exc, strict=False)
+            recs = list(self._memory_executions.values())
+            if status:
+                recs = [r for r in recs if r.status == str(status)]
+            if verification_status:
+                recs = [r for r in recs if r.verification_status == str(verification_status)]
+            recs.sort(key=lambda r: r.created_at, reverse=True)
+            return recs[:eff_limit]
+
+    def get_execution_summary(
+        self,
+        execution_id: str,
+        *,
+        event_type: Optional[str] = None,
+        tool_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Assemble a complete structured diagnostic summary for an execution."""
+        record = self.get_execution(execution_id)
+        if record is None:
+            return None
+        all_events = self.get_events(execution_id)
+        filtered_events = (
+            [
+                ev
+                for ev in all_events
+                if (not event_type or ev.event_type == event_type) and (not tool_id or ev.tool_id == tool_id)
+            ]
+            if (event_type or tool_id)
+            else all_events
+        )
+        tools_used: List[str] = []
+        external_tools: List[Dict[str, Any]] = []
+        seen_ext: Set[Tuple[Optional[str], Optional[str]]] = set()
+        auth_decisions: List[Dict[str, Any]] = []
+        recovery_attempts: int = 0
+        verifications: List[Dict[str, Any]] = []
+
+        for ev in all_events:
+            if ev.tool_id and ev.tool_id not in tools_used:
+                tools_used.append(ev.tool_id)
+            if ev.is_external and (ev.tool_id, ev.source_id) not in seen_ext:
+                seen_ext.add((ev.tool_id, ev.source_id))
+                external_tools.append({
+                    "tool_id": ev.tool_id,
+                    "source_id": ev.source_id,
+                    "source_type": ev.source_type,
+                })
+            if ev.event_type == LedgerEventType.AUTHORIZATION_DECISION.value:
+                auth_decisions.append({
+                    "sequence_number": ev.sequence_number,
+                    "tool_id": ev.tool_id,
+                    "status": ev.status,
+                    "caller_ring": ev.caller_ring,
+                    "task_local_scoped": ev.task_local_scoped,
+                    "reason": ev.metadata.get("reason"),
+                })
+            elif ev.event_type == LedgerEventType.RECOVERY_ATTEMPT.value:
+                recovery_attempts += 1
+            elif ev.event_type == LedgerEventType.VERIFICATION_RECORDED.value:
+                verifications.append({
+                    "sequence_number": ev.sequence_number,
+                    "status": ev.status,
+                    "tool_id": ev.tool_id,
+                    "detail": ev.metadata.get("detail"),
+                    "target": ev.metadata.get("target"),
+                })
+
+        exec_persistence_errors = [
+            err for err in self.get_persistence_errors()
+            if err.get("execution_id") in (execution_id, None)
+        ]
+
+        return {
+            "execution": record.to_dict(),
+            "event_count": len(all_events),
+            "tools_used": tools_used,
+            "external_tools": external_tools,
+            "authorization_decisions": auth_decisions,
+            "recovery_attempts": recovery_attempts,
+            "verifications": verifications,
+            "persistence_errors": exec_persistence_errors,
+            "events": [ev.to_dict() for ev in filtered_events],
+        }
+
+
+_DEFAULT_LEDGER_LOCK = threading.RLock()
+_DEFAULT_LEDGER_INSTANCES: Dict[Path, CentralExecutionLedger] = {}
+
+
+def get_default_central_ledger(db_path: Optional[Union[str, Path]] = None) -> CentralExecutionLedger:
+    """Return a cached thread-safe CentralExecutionLedger instance for the resolved path."""
+    resolved = resolve_execution_ledger_db_path(db_path)
+    with _DEFAULT_LEDGER_LOCK:
+        existing = _DEFAULT_LEDGER_INSTANCES.get(resolved)
+        if existing is not None:
+            return existing
+        instance = CentralExecutionLedger(db_path=resolved, raise_on_persistence_error=False)
+        _DEFAULT_LEDGER_INSTANCES[resolved] = instance
+        return instance
+
+
+def reset_default_central_ledger() -> None:
+    """Close and clear all cached default CentralExecutionLedger instances (test helper)."""
+    with _DEFAULT_LEDGER_LOCK:
+        for inst in _DEFAULT_LEDGER_INSTANCES.values():
+            inst.close()
+        _DEFAULT_LEDGER_INSTANCES.clear()

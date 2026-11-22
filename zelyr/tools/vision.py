@@ -200,6 +200,153 @@ class InteractWithUITool(BaseTool):
             return None
 
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
+        """Execute UI interaction with centralized execution ledger telemetry."""
+        import uuid
+        from zelyr.engine.execution_ledger import (
+            ExecutionStatus,
+            LedgerEventType,
+            VerificationStatus,
+            attach_call_telemetry,
+            execution_scope,
+            get_active_execution_context,
+            get_default_central_ledger,
+        )
+
+        ctx = get_active_execution_context()
+        if ctx is not None and ctx.owned_by_outer:
+            res = await self._execute_impl(params)
+            if isinstance(getattr(res, "metadata", None), dict):
+                attach_call_telemetry({"tier": "tier3_vision", "actuator": "spotless_arms", **res.metadata})
+            return res
+
+        has_trusted_ctx, _, ctx_ring, _ = self._resolve_trusted_caller_context()
+        eff_ring = ctx_ring if has_trusted_ctx else None
+        ledger = (ctx.ledger if ctx is not None else None) or get_default_central_ledger()
+        own_execution = ctx is None
+        call_id = f"ui_{uuid.uuid4().hex[:12]}"
+        safe_instruction = str(params.get("instruction", ""))[:256] if isinstance(params, dict) else ""
+
+        if own_execution:
+            rec = ledger.create_execution(
+                f"tool:{self.name}: {safe_instruction}" if safe_instruction else f"tool:{self.name}",
+                source_component="interact_with_ui",
+                caller_ring=eff_ring,
+                status=ExecutionStatus.RUNNING,
+                metadata={"tool_id": self.name, "tier": "tier3_vision"},
+            )
+            exec_id = rec.execution_id
+        else:
+            exec_id = ctx.execution_id  # type: ignore[union-attr]
+
+        try:
+            ledger.record_event(
+                exec_id,
+                LedgerEventType.TOOL_SELECTED,
+                tool_id=self.name,
+                source_id="native",
+                source_type="tier3_vision",
+                is_external=False,
+                status="selected",
+                correlation_id=call_id,
+                caller_ring=eff_ring,
+                metadata={"tier": "tier3_vision", "instruction": safe_instruction},
+                idempotency_key=f"{exec_id}:{call_id}:selected",
+            )
+            ledger.record_event(
+                exec_id,
+                LedgerEventType.TOOL_EXECUTION_START,
+                tool_id=self.name,
+                source_id="native",
+                source_type="tier3_vision",
+                is_external=False,
+                status="started",
+                correlation_id=call_id,
+                caller_ring=eff_ring,
+                metadata={"tier": "tier3_vision"},
+                idempotency_key=f"{exec_id}:{call_id}:started",
+            )
+        except Exception:
+            pass
+
+        with execution_scope(
+            ledger,
+            exec_id,
+            caller_ring=eff_ring,
+            source_component="interact_with_ui",
+            correlation_id=call_id,
+            owned_by_outer=True,
+        ):
+            res = await self._execute_impl(params)
+
+        try:
+            res_meta = res.metadata if isinstance(getattr(res, "metadata", None), dict) else {}
+            ev_meta: Dict[str, Any] = {
+                "tier": "tier3_vision",
+                "actuator": "spotless_arms" if res_meta else "legacy_vlm",
+            }
+            if res_meta:
+                ev_meta.update(res_meta)
+            if not res.success and res.error:
+                ev_meta["error"] = res.error
+            if getattr(res, "error_type", None):
+                ev_meta["error_type"] = res.error_type
+            if res.success and getattr(res, "output", None):
+                ev_meta["output_preview"] = str(res.output)[:512]
+
+            if getattr(res, "error_type", None) == "AUTHORIZATION_DENIED":
+                ledger.record_event(
+                    exec_id,
+                    LedgerEventType.AUTHORIZATION_DECISION,
+                    tool_id=self.name,
+                    source_id="native",
+                    source_type="tier3_vision",
+                    status="denied",
+                    correlation_id=call_id,
+                    caller_ring=eff_ring,
+                    metadata={"reason": res.error},
+                    idempotency_key=f"{exec_id}:{call_id}:auth",
+                )
+            else:
+                ledger.record_event(
+                    exec_id,
+                    LedgerEventType.AUTHORIZATION_DECISION,
+                    tool_id=self.name,
+                    source_id="native",
+                    source_type="tier3_vision",
+                    status="allowed",
+                    correlation_id=call_id,
+                    caller_ring=eff_ring,
+                    idempotency_key=f"{exec_id}:{call_id}:auth",
+                )
+
+            status_str = "succeeded" if res.success else ("rejected" if getattr(res, "error_type", None) == "AUTHORIZATION_DENIED" else "failed")
+            ledger.record_event(
+                exec_id,
+                LedgerEventType.TOOL_EXECUTION_RESULT,
+                tool_id=self.name,
+                source_id="native",
+                source_type="tier3_vision",
+                is_external=False,
+                status=status_str,
+                correlation_id=call_id,
+                caller_ring=eff_ring,
+                metadata=ev_meta,
+                idempotency_key=f"{exec_id}:{call_id}:result",
+            )
+            if own_execution:
+                ledger.finalize_execution(
+                    exec_id,
+                    status=ExecutionStatus.COMPLETED_UNVERIFIED if res.success else ExecutionStatus.FAILED,
+                    verification_status=VerificationStatus.NOT_VERIFIED,
+                    final_summary=str(res.output)[:512] if res.success else None,
+                    error=res.error if not res.success else None,
+                    metadata=ev_meta,
+                )
+        except Exception:
+            pass
+        return res
+
+    async def _execute_impl(self, params: Dict[str, Any]) -> ToolResult:
         import asyncio
         from zelyr.tool_registry import (
             authorize_and_validate_tool_call,

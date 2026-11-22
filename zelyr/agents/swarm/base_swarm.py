@@ -104,7 +104,45 @@ Returns:
             return {'error': 'No tool registry available'}
 
         import copy
+        import uuid
+        from zelyr.engine.execution_ledger import (
+            ExecutionStatus,
+            LedgerEventType,
+            VerificationStatus,
+            execution_scope,
+            get_active_execution_context,
+            get_default_central_ledger,
+        )
         from zelyr.tool_registry import authorize_and_validate_tool_call, canonicalize_tool_invocation
+
+        ctx = get_active_execution_context()
+        ledger = (ctx.ledger if ctx is not None else None) or getattr(self, "execution_ledger", None) or get_default_central_ledger()
+        own_exec = ctx is None
+        eff_ring = getattr(self, "caller_ring", None)
+        exec_id = (
+            ctx.execution_id
+            if ctx is not None
+            else ledger.create_execution(
+                f"swarm:{self.name}:{tool_name}",
+                source_component="base_swarm",
+                caller_ring=eff_ring,
+                status=ExecutionStatus.RUNNING,
+            ).execution_id
+        )
+        call_id = f"sw_{uuid.uuid4().hex[:12]}"
+        try:
+            ledger.record_event(
+                exec_id,
+                LedgerEventType.TOOL_SELECTED,
+                tool_id=tool_name,
+                status="selected",
+                correlation_id=call_id,
+                caller_ring=eff_ring,
+                metadata={"agent": self.name, "arguments": arguments if isinstance(arguments, dict) else {}},
+                idempotency_key=f"{exec_id}:{call_id}:selected",
+            )
+        except Exception:
+            pass
 
         raw_arguments = arguments
         dict_args = dict(arguments) if isinstance(arguments, dict) else {}
@@ -115,6 +153,13 @@ Returns:
                 'error_type': 'AUTHORIZATION_DENIED',
                 'reason': 'authorization_denied',
             }
+            try:
+                ledger.record_event(exec_id, LedgerEventType.AUTHORIZATION_DECISION, tool_id=canonical_name, status="denied", correlation_id=call_id, caller_ring=eff_ring, metadata=error, idempotency_key=f"{exec_id}:{call_id}:auth")
+                ledger.record_event(exec_id, LedgerEventType.TOOL_EXECUTION_RESULT, tool_id=canonical_name, status="rejected", correlation_id=call_id, caller_ring=eff_ring, metadata=error, idempotency_key=f"{exec_id}:{call_id}:result")
+                if own_exec:
+                    ledger.finalize_execution(exec_id, status=ExecutionStatus.FAILED, verification_status=VerificationStatus.NOT_VERIFIED, error=error["error"])
+            except Exception:
+                pass
             self._write_to_blackboard(f'{canonical_name}_error', error)
             return error
 
@@ -126,15 +171,32 @@ Returns:
                 'error_type': 'AUTHORIZATION_DENIED',
                 'reason': 'authorization_denied',
             }
+            try:
+                ledger.record_event(exec_id, LedgerEventType.AUTHORIZATION_DECISION, tool_id=canonical_name, status="denied", correlation_id=call_id, caller_ring=eff_ring, metadata=error, idempotency_key=f"{exec_id}:{call_id}:auth")
+                ledger.record_event(exec_id, LedgerEventType.TOOL_EXECUTION_RESULT, tool_id=canonical_name, status="rejected", correlation_id=call_id, caller_ring=eff_ring, metadata=error, idempotency_key=f"{exec_id}:{call_id}:result")
+                if own_exec:
+                    ledger.finalize_execution(exec_id, status=ExecutionStatus.FAILED, verification_status=VerificationStatus.NOT_VERIFIED, error=error["error"])
+            except Exception:
+                pass
             self._write_to_blackboard(f'{canonical_name}_error', error)
             return error
 
         if not tool:
-            return {'error': f"Tool '{canonical_name}' not found."}
+            err = {'error': f"Tool '{canonical_name}' not found."}
+            try:
+                ledger.record_event(exec_id, LedgerEventType.TOOL_EXECUTION_RESULT, tool_id=canonical_name, status="failed", correlation_id=call_id, caller_ring=eff_ring, metadata=err, idempotency_key=f"{exec_id}:{call_id}:result")
+                if own_exec:
+                    ledger.finalize_execution(exec_id, status=ExecutionStatus.FAILED, verification_status=VerificationStatus.NOT_VERIFIED, error=err["error"])
+            except Exception:
+                pass
+            return err
 
         authorized_tool = tool
         authorized_target = getattr(authorized_tool, '_target', getattr(authorized_tool, 'target', None))
         authorized_execute = getattr(authorized_tool, 'execute', None)
+        is_ext = bool(getattr(authorized_tool, 'is_external', False))
+        src_id = getattr(authorized_tool, 'source_id', None)
+        src_type = getattr(authorized_tool, 'source_type', None)
 
         decision = authorize_and_validate_tool_call(
             canonical_name,
@@ -151,6 +213,13 @@ Returns:
                 'error_type': decision.error_type or 'AUTHORIZATION_DENIED',
                 'reason': decision.reason or 'authorization_denied',
             }
+            try:
+                ledger.record_event(exec_id, LedgerEventType.AUTHORIZATION_DECISION, tool_id=canonical_name, source_id=src_id, source_type=src_type, is_external=is_ext, status="denied", correlation_id=call_id, caller_ring=eff_ring, metadata=error, idempotency_key=f"{exec_id}:{call_id}:auth")
+                ledger.record_event(exec_id, LedgerEventType.TOOL_EXECUTION_RESULT, tool_id=canonical_name, source_id=src_id, source_type=src_type, is_external=is_ext, status="rejected", correlation_id=call_id, caller_ring=eff_ring, metadata=error, idempotency_key=f"{exec_id}:{call_id}:result")
+                if own_exec:
+                    ledger.finalize_execution(exec_id, status=ExecutionStatus.FAILED, verification_status=VerificationStatus.NOT_VERIFIED, error=error["error"])
+            except Exception:
+                pass
             self._write_to_blackboard(f'{canonical_name}_error', error)
             return error
 
@@ -181,7 +250,15 @@ Returns:
 
         if candidate_names & expanded_mutating_names:
             if not self.consensus:
-                return {'error': 'Consensus engine required for mutating tools'}
+                err = {'error': 'Consensus engine required for mutating tools'}
+                try:
+                    ledger.record_event(exec_id, LedgerEventType.AUTHORIZATION_DECISION, tool_id=tool_name, source_id=src_id, source_type=src_type, is_external=is_ext, status="denied", correlation_id=call_id, caller_ring=eff_ring, metadata={"reason": "consensus_missing"}, idempotency_key=f"{exec_id}:{call_id}:auth")
+                    ledger.record_event(exec_id, LedgerEventType.TOOL_EXECUTION_RESULT, tool_id=tool_name, source_id=src_id, source_type=src_type, is_external=is_ext, status="rejected", correlation_id=call_id, caller_ring=eff_ring, metadata=err, idempotency_key=f"{exec_id}:{call_id}:result")
+                    if own_exec:
+                        ledger.finalize_execution(exec_id, status=ExecutionStatus.FAILED, verification_status=VerificationStatus.NOT_VERIFIED, error=err["error"])
+                except Exception:
+                    pass
+                return err
             logger.info(f"[{self.name}] Tool '{tool_name}' is destructive. Proposing to swarm...")
             proposal_args = copy.deepcopy(validated_arguments)
             approved = self.consensus.propose(
@@ -200,7 +277,15 @@ Returns:
                 return error
             if not approved:
                 logger.warning(f"[{self.name}] Proposal for '{tool_name}' REJECTED or TIMED OUT.")
-                return {'error': 'Execution blocked: Swarm consensus rejected the proposal.'}
+                err = {'error': 'Execution blocked: Swarm consensus rejected the proposal.'}
+                try:
+                    ledger.record_event(exec_id, LedgerEventType.AUTHORIZATION_DECISION, tool_id=tool_name, source_id=src_id, source_type=src_type, is_external=is_ext, status="denied", correlation_id=call_id, caller_ring=eff_ring, metadata={"reason": "swarm_consensus_rejected"}, idempotency_key=f"{exec_id}:{call_id}:auth")
+                    ledger.record_event(exec_id, LedgerEventType.TOOL_EXECUTION_RESULT, tool_id=tool_name, source_id=src_id, source_type=src_type, is_external=is_ext, status="rejected", correlation_id=call_id, caller_ring=eff_ring, metadata=err, idempotency_key=f"{exec_id}:{call_id}:result")
+                    if own_exec:
+                        ledger.finalize_execution(exec_id, status=ExecutionStatus.FAILED, verification_status=VerificationStatus.NOT_VERIFIED, error=err["error"])
+                except Exception:
+                    pass
+                return err
             logger.info(f"[{self.name}] Proposal for '{tool_name}' APPROVED. Executing...")
 
         # Re-verify authorized callable identity before execution (prevents TOCTOU replacement during consensus)
@@ -219,40 +304,69 @@ Returns:
             return error
 
         try:
+            ledger.record_event(exec_id, LedgerEventType.AUTHORIZATION_DECISION, tool_id=tool_name, source_id=src_id, source_type=src_type, is_external=is_ext, status="allowed", correlation_id=call_id, caller_ring=eff_ring, idempotency_key=f"{exec_id}:{call_id}:auth")
+            ledger.record_event(exec_id, LedgerEventType.TOOL_EXECUTION_START, tool_id=tool_name, source_id=src_id, source_type=src_type, is_external=is_ext, status="started", correlation_id=call_id, caller_ring=eff_ring, metadata={"arguments": validated_arguments}, idempotency_key=f"{exec_id}:{call_id}:started")
+        except Exception:
+            pass
+
+        try:
             import inspect
             exec_args = copy.deepcopy(validated_arguments)
-            raw_res = authorized_tool(**exec_args)
-            result = await raw_res if inspect.isawaitable(raw_res) else raw_res
+            with execution_scope(ledger, exec_id, caller_ring=eff_ring, source_component="base_swarm", correlation_id=call_id, owned_by_outer=True):
+                raw_res = authorized_tool(**exec_args)
+                result = await raw_res if inspect.isawaitable(raw_res) else raw_res
+            res_ok = bool(getattr(result, "success", True)) if not isinstance(result, dict) else not bool(result.get("error"))
+            res_err = getattr(result, "error", None) if not isinstance(result, dict) else result.get("error")
+            try:
+                ledger.record_event(exec_id, LedgerEventType.TOOL_EXECUTION_RESULT, tool_id=tool_name, source_id=src_id, source_type=src_type, is_external=is_ext, status="succeeded" if res_ok else "failed", correlation_id=call_id, caller_ring=eff_ring, metadata={"error": res_err} if res_err else {"output_preview": str(result)[:512]}, idempotency_key=f"{exec_id}:{call_id}:result")
+                if own_exec:
+                    ledger.finalize_execution(exec_id, status=ExecutionStatus.COMPLETED_UNVERIFIED if res_ok else ExecutionStatus.FAILED, verification_status=VerificationStatus.NOT_VERIFIED, error=str(res_err) if res_err else None)
+            except Exception:
+                pass
             self._write_to_blackboard(f'{tool_name}_result', result)
             return result
         except Exception as e:
             logger.error(f'[{self.name}] Tool execution failed: {e}')
             error = {'error': str(e)}
+            try:
+                ledger.record_event(exec_id, LedgerEventType.TOOL_EXECUTION_RESULT, tool_id=tool_name, source_id=src_id, source_type=src_type, is_external=is_ext, status="failed", correlation_id=call_id, caller_ring=eff_ring, metadata=error, idempotency_key=f"{exec_id}:{call_id}:result")
+                if own_exec:
+                    ledger.finalize_execution(exec_id, status=ExecutionStatus.FAILED, verification_status=VerificationStatus.NOT_VERIFIED, error=str(e))
+            except Exception:
+                pass
             self._write_to_blackboard(f'{tool_name}_error', error)
             return error
 
     async def run(self, task: str, context: Optional[Dict[str, Any]]=None) -> AgentResult:
         """Run the sub-agent loop."""
-        self._emit_telemetry('swarm.agent.started', {'assigned_task': task})
+        from zelyr.engine.execution_ledger import ExecutionStatus, VerificationStatus, execution_scope, get_default_central_ledger
+
+        sw_ledger = getattr(self, "execution_ledger", None) or get_default_central_ledger()
+        sw_exec = sw_ledger.create_execution(task, source_component="base_swarm", caller_ring=getattr(self, "caller_ring", None), status=ExecutionStatus.RUNNING, metadata={"agent_name": self.name})
+        sw_exec_id = sw_exec.execution_id
+        self._emit_telemetry('swarm.agent.started', {'assigned_task': task, 'execution_id': sw_exec_id})
         try:
-            # Prepare context
-            messages = []
-            if self.system_prompt:
-                messages.append({'role': 'system', 'content': self.system_prompt})
-            if context:
-                messages.append({'role': 'system', 'content': f"[Shared Context]: {context}"})
-            messages.append({'role': 'user', 'content': task})
-            
-            # Simple run loop for subagents
-            from zelyr.engine.tool_pruner import ToolPruner
-            all_schemas = [tool.schema for tool in self.tool_registry.list_tools().values()] if self.tool_registry else []
-            
-            response = await self._call_llm_async(messages, all_schemas)
+            with execution_scope(sw_ledger, sw_exec_id, caller_ring=getattr(self, "caller_ring", None), source_component="base_swarm", owned_by_outer=False):
+                # Prepare context
+                messages = []
+                if self.system_prompt:
+                    messages.append({'role': 'system', 'content': self.system_prompt})
+                if context:
+                    messages.append({'role': 'system', 'content': f"[Shared Context]: {context}"})
+                messages.append({'role': 'user', 'content': task})
+
+                # Simple run loop for subagents
+                from zelyr.engine.tool_pruner import ToolPruner
+                all_schemas = [tool.schema for tool in self.tool_registry.list_tools().values()] if self.tool_registry else []
+
+                response = await self._call_llm_async(messages, all_schemas)
             self._emit_telemetry('swarm.agent.completed', {'result_summary': response})
+            sw_ledger.finalize_execution(sw_exec_id, status=ExecutionStatus.COMPLETED_UNVERIFIED, verification_status=VerificationStatus.NOT_VERIFIED, final_summary=str(response))
             return AgentResult(success=True, output=response)
         except Exception as e:
             logger.error(f"[{self.name}] Error running task: {e}")
             self._emit_telemetry('swarm.agent.completed', {'result_summary': f"Error: {e}"})
+            sw_ledger.finalize_execution(sw_exec_id, status=ExecutionStatus.FAILED, verification_status=VerificationStatus.INTERRUPTED, error=str(e))
             return AgentResult(success=False, error=str(e))
             
     async def _call_llm_async(self, messages: list, tool_schemas: list) -> str:
