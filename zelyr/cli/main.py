@@ -747,8 +747,12 @@ def cmd_tool_run(args: argparse.Namespace) -> None:
     asyncio.run(_run())
 
 
-def cmd_status(_args: argparse.Namespace) -> None:
+def cmd_status(args: argparse.Namespace) -> None:
     """Show system + daemon telemetry and optional extras status."""
+    if getattr(args, "manifest", False) or getattr(args, "json", False):
+        cmd_env(args)
+        return
+
     import psutil
     from zelyr.utils.optional_deps import is_extra_available
 
@@ -802,6 +806,51 @@ def cmd_status(_args: argparse.Namespace) -> None:
         _print("[green]  Daemon: ONLINE[/green] (ws://127.0.0.1:8000)")
     else:
         _print("[yellow]  Daemon: OFFLINE[/yellow]")
+
+
+def cmd_env(args: argparse.Namespace) -> None:
+    """Inspect the structured runtime environment manifest via the CLI."""
+    from zelyr.engine.environment import RuntimeEnvironmentManifest
+    from zelyr.tool_registry import ToolRegistry
+
+    caller_ring = getattr(args, "caller_ring", None)
+    allowed_raw = getattr(args, "allowed_tools", None)
+    allowed_tools = (
+        [item.strip() for item in allowed_raw.split(",") if item.strip()]
+        if isinstance(allowed_raw, str) and allowed_raw.strip()
+        else None
+    )
+    probe_services = not getattr(args, "no_probe", False)
+    probe_timeout = float(getattr(args, "timeout", 0.5) or 0.5)
+    refresh = bool(getattr(args, "refresh", False))
+
+    registry = ToolRegistry()
+    for builtin_id in registry.get_builtin_tools():
+        registry.get_tool(builtin_id)
+
+    if getattr(args, "compact", False):
+        block = RuntimeEnvironmentManifest.build_manifest_block(
+            tool_registry=registry,
+            caller_ring=caller_ring,
+            allowed_tools=allowed_tools,
+        )
+        print(block)
+        return
+
+    manifest = RuntimeEnvironmentManifest.collect_manifest(
+        tool_registry=registry,
+        caller_ring=caller_ring,
+        allowed_tools=allowed_tools,
+        probe_services=probe_services,
+        probe_timeout=probe_timeout,
+        refresh=refresh,
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(manifest, indent=2))
+        return
+
+    report = RuntimeEnvironmentManifest.format_diagnostic_report(manifest)
+    print(report)
 
 
 def cmd_test(_args: argparse.Namespace) -> None:
@@ -1248,7 +1297,70 @@ def _build_parser() -> argparse.ArgumentParser:
     p_compact = mem_sub.add_parser("compact", help="Trigger REM sleep memory compaction")
     p_compact.add_argument("--days", type=float, default=30.0, help="Retention threshold in days")
 
-    sub.add_parser("status", help="Show system + daemon status")
+    p_status = sub.add_parser("status", help="Show system + daemon status")
+    p_status.add_argument(
+        "--manifest",
+        "-m",
+        action="store_true",
+        default=False,
+        help="Display the full runtime environment manifest",
+    )
+    p_status.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="Output runtime environment manifest as JSON",
+    )
+    p_status.add_argument(
+        "--no-probe",
+        action="store_true",
+        default=False,
+        help="Skip live endpoint probes when inspecting manifest",
+    )
+
+    p_env = sub.add_parser(
+        "env",
+        aliases=["manifest"],
+        help="Inspect the structured runtime environment and capability manifest",
+    )
+    p_env.add_argument("--json", action="store_true", default=False, help="Output structured JSON manifest")
+    p_env.add_argument(
+        "--compact",
+        action="store_true",
+        default=False,
+        help="Output compact planning manifest block",
+    )
+    p_env.add_argument(
+        "--no-probe",
+        action="store_true",
+        default=False,
+        help="Skip live model endpoint health probes",
+    )
+    p_env.add_argument(
+        "--timeout",
+        type=float,
+        default=0.5,
+        help="Bounded timeout in seconds for external endpoint probes (default: 0.5)",
+    )
+    p_env.add_argument(
+        "--caller-ring",
+        type=int,
+        default=None,
+        help="Optional caller security ring (0..3) to scope tool authorization",
+    )
+    p_env.add_argument(
+        "--allowed-tools",
+        type=str,
+        default=None,
+        help="Optional comma-separated tool allowlist to scope tool authorization",
+    )
+    p_env.add_argument(
+        "--refresh",
+        action="store_true",
+        default=False,
+        help="Force-refresh cached manifest state",
+    )
+
     sub.add_parser("test",   help="Run the automated test suite")
     p_eval = sub.add_parser("eval", help="Run Zelyr evaluation benchmark suite")
     p_eval.add_argument("eval_args", nargs=argparse.REMAINDER, help="Arguments passed to evaluation runner")
@@ -1375,10 +1487,12 @@ def main() -> None:
         "ui":     cmd_ui,
         "gui":    cmd_ui,
         "server": cmd_server,
-        "run":    cmd_run,
-        "send":   cmd_send,
-        "status": cmd_status,
-        "test":   cmd_test,
+        "run":      cmd_run,
+        "send":     cmd_send,
+        "status":   cmd_status,
+        "env":      cmd_env,
+        "manifest": cmd_env,
+        "test":     cmd_test,
         "eval":   cmd_eval,
         "daemon": cmd_daemon,
         "serve":  cmd_serve,

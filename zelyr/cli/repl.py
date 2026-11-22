@@ -57,6 +57,7 @@ COMMANDS = {
     "/routine": "View active scheduled background routines and next run times",
     "/memory": "Manage persistent semantic memories (/memory list, /memory add <fact>, /memory <query>)",
     "/rules": "Display active global and local project instructions",
+    "/env": "Inspect the structured runtime environment and capability manifest",
     "/status": "Display live system, bridge, desktop, and tool telemetry",
     "/doctor": "Run diagnostic health checks across all 6 subsystems",
     "/undo": "Rollback the last modified file to its previous state",
@@ -644,6 +645,44 @@ class InlineRepl:
                 console.print(f"\n[dim italic #7982a9]▾ Last Thought Trace:\n{self.last_thought}[/]\n[dim #3b4261]───[/]\n")
             else:
                 console.print("[dim]No thought trace stored from the last response.[/dim]\n")
+            return True
+
+        elif cmd in ("/env", "/manifest"):
+            from zelyr.engine.environment import RuntimeEnvironmentManifest
+            from zelyr.tool_registry import ToolRegistry
+
+            reg = getattr(self.orchestrator, "tool_registry", None) or ToolRegistry()
+            if callable(getattr(reg, "get_builtin_tools", None)):
+                for b_id in reg.get_builtin_tools():
+                    reg.get_tool(b_id)
+
+            flags = {p.lower() for p in parts[1:]}
+            if "--compact" in flags:
+                block = RuntimeEnvironmentManifest.build_manifest_block(
+                    config=self.config,
+                    tool_registry=reg,
+                )
+                console.print(f"\n{block}\n")
+                return True
+
+            manifest = RuntimeEnvironmentManifest.collect_manifest(
+                config=self.config,
+                tool_registry=reg,
+                probe_services="--no-probe" not in flags,
+                refresh="--refresh" in flags,
+            )
+            if "--json" in flags:
+                console.print(json.dumps(manifest, indent=2))
+            else:
+                report = RuntimeEnvironmentManifest.format_diagnostic_report(manifest)
+                console.print(
+                    Panel(
+                        report,
+                        title="[title]Zelyr Runtime Environment Manifest[/title]",
+                        border_style="#7aa2f7",
+                        padding=(1, 2),
+                    )
+                )
             return True
 
         elif cmd == "/status":

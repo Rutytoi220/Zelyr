@@ -179,6 +179,79 @@ class NativeOrchestrator:
             return f'[Active Window: title="{title}", class="{w_class}", workspace={w_id}]'
         return None
 
+    def get_runtime_manifest(
+        self,
+        *,
+        refresh: bool = False,
+        probe_services: bool = False,
+        probe_timeout: float = 0.5,
+        caller_ring: Optional[int] = None,
+        allowed_tools: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Return the structured runtime environment manifest for this orchestrator context."""
+        from zelyr.engine.environment import RuntimeEnvironmentManifest
+
+        cfg = getattr(self, "config", None)
+        if cfg is None:
+            try:
+                from zelyr.config import get_config
+
+                cfg = get_config()
+            except Exception:
+                cfg = None
+        registry = getattr(self, "tool_registry", None)
+        eff_ring = caller_ring if caller_ring is not None else getattr(self, "caller_ring", None)
+        eff_allowed = allowed_tools if allowed_tools is not None else getattr(self, "allowed_tools", None)
+        return RuntimeEnvironmentManifest.collect_manifest(
+            config=cfg,
+            tool_registry=registry,
+            caller_ring=eff_ring,
+            allowed_tools=eff_allowed,
+            probe_services=probe_services,
+            probe_timeout=probe_timeout,
+            refresh=refresh,
+        )
+
+    def refresh_runtime_manifest(
+        self,
+        *,
+        probe_services: bool = False,
+        probe_timeout: float = 0.5,
+    ) -> Dict[str, Any]:
+        """Invalidate cached environment state and collect a fresh runtime manifest."""
+        return self.get_runtime_manifest(
+            refresh=True,
+            probe_services=probe_services,
+            probe_timeout=probe_timeout,
+        )
+
+    def get_planning_environment_context(
+        self,
+        *,
+        caller_ring: Optional[int] = None,
+        allowed_tools: Optional[List[str]] = None,
+    ) -> str:
+        """Return the compact (<120 token) planning environment manifest block."""
+        from zelyr.engine.environment import RuntimeEnvironmentManifest
+
+        cfg = getattr(self, "config", None)
+        if cfg is None:
+            try:
+                from zelyr.config import get_config
+
+                cfg = get_config()
+            except Exception:
+                cfg = None
+        registry = getattr(self, "tool_registry", None)
+        eff_ring = caller_ring if caller_ring is not None else getattr(self, "caller_ring", None)
+        eff_allowed = allowed_tools if allowed_tools is not None else getattr(self, "allowed_tools", None)
+        return RuntimeEnvironmentManifest.build_manifest_block(
+            config=cfg,
+            tool_registry=registry,
+            caller_ring=eff_ring,
+            allowed_tools=eff_allowed,
+        )
+
     def _build_system_prompt(
         self,
         base_directives: Optional[str] = None,
