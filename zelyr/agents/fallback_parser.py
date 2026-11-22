@@ -117,21 +117,19 @@ class FallbackToolParser:
 
         target_name = canonical_name if canonical_name in effective_known else clean_name
 
-        # Parse stringified arguments if necessary (reject non-object strings cleanly)
+        # Parse stringified arguments strictly as JSON (never eval/ast.literal_eval).
+        from zelyr.engine.normalizer import strict_json_loads
+
         args_dict: Dict[str, Any] = {}
         if isinstance(raw_args, dict):
             args_dict = dict(raw_args)
         elif isinstance(raw_args, str):
             s = raw_args.strip()
             if s:
-                parsed: Any = None
                 try:
-                    parsed = json.loads(s)
+                    parsed = strict_json_loads(s)
                 except Exception:
-                    try:
-                        parsed = ast.literal_eval(s)
-                    except Exception:
-                        return None
+                    return None
                 if not isinstance(parsed, dict):
                     return None
                 args_dict = parsed
@@ -168,6 +166,7 @@ class FallbackToolParser:
             require_registered=(known_tools is None and task_local_scope is None),
             normalize_args=False,
             validate_schema=False,
+            argument_source="model",
         )
         if not decision.allowed:
             logger.warning(
@@ -309,6 +308,8 @@ class FallbackToolParser:
         covered_spans: List[Tuple[int, int]] = []
 
         # 1. XML Pseudo-Tags (<tool_call>, <function_call>, <tool>, <action>)
+        from zelyr.engine.normalizer import strict_json_loads
+
         xml_pattern = re.compile(
             r"<(tool_call|function_call|tool|action)>\s*([\{\[][\s\S]*?[\}\]])\s*</\1>",
             re.IGNORECASE,
@@ -317,17 +318,11 @@ class FallbackToolParser:
             span = match.span()
             raw_content = match.group(2).strip()
             try:
-                parsed_json = json.loads(raw_content)
+                parsed_json = strict_json_loads(raw_content)
                 candidates.append((span, parsed_json))
                 covered_spans.append(span)
             except Exception:
-                try:
-                    parsed_ast = ast.literal_eval(raw_content)
-                    if isinstance(parsed_ast, (dict, list)):
-                        candidates.append((span, parsed_ast))
-                        covered_spans.append(span)
-                except Exception:
-                    pass
+                pass
 
         # 2. Markdown Code Fences (```json ... ``` or bare ``` ... ```)
         fence_pattern = re.compile(
@@ -340,17 +335,11 @@ class FallbackToolParser:
                 continue
             raw_content = match.group(1).strip()
             try:
-                parsed_json = json.loads(raw_content)
+                parsed_json = strict_json_loads(raw_content)
                 candidates.append((span, parsed_json))
                 covered_spans.append(span)
             except Exception:
-                try:
-                    parsed_ast = ast.literal_eval(raw_content)
-                    if isinstance(parsed_ast, (dict, list)):
-                        candidates.append((span, parsed_ast))
-                        covered_spans.append(span)
-                except Exception:
-                    pass
+                pass
 
         # 3. Raw Embedded or Trailing JSON Objects
         decoder = json.JSONDecoder()

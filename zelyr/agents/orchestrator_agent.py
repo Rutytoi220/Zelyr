@@ -1127,8 +1127,10 @@ Returns:
             match = re.search('\\{.*\\}', raw, flags=re.DOTALL)
             if match:
                 raw = match.group(0)
+        from zelyr.engine.normalizer import strict_json_loads
+
         try:
-            parsed = json.loads(raw)
+            parsed = strict_json_loads(raw)
         except Exception as e:
             raise ValueError(str(e))
         if not isinstance(parsed, dict):
@@ -1276,6 +1278,7 @@ Returns:
                 tool_registry=self.registry if (self.registry is not None and hasattr(self.registry, 'get_tool')) else None,
                 tool=None,
                 require_registered=True,
+                argument_source='model',
             )
             return self._structured_tool_result(
                 decision.tool_name or canonical_name or str(tool_name),
@@ -1296,6 +1299,7 @@ Returns:
             tool_registry=self.registry if (self.registry is not None and hasattr(self.registry, 'get_tool')) else None,
             tool=eff_tool,
             require_registered=not fast_path_eligible,
+            argument_source='model',
         )
         if not decision.allowed:
             return self._structured_tool_result(

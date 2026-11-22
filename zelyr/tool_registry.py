@@ -46,6 +46,8 @@ class ToolAuthorizationDecision:
     error_type: Optional[str] = None
     detail: Optional[str] = None
     required_ring: Optional[int] = None
+    validation_error: Optional[Dict[str, Any]] = None
+    warnings: tuple[str, ...] = ()
 
 
 def _is_valid_ring_value(val: Any) -> bool:
@@ -554,12 +556,38 @@ def authorize_and_validate_tool_call(
     require_registered: bool = True,
     normalize_args: bool = True,
     validate_schema: bool = True,
+    argument_source: str = "internal",
 ) -> ToolAuthorizationDecision:
     """Single authoritative permission, canonicalization, and schema validation gate."""
-    from zelyr.engine.normalizer import SafeArgumentNormalizer, validate_arguments
+    from zelyr.engine.normalizer import (
+        SafeArgumentNormalizer,
+        _schema_error,
+        _security_override_error,
+        _strict_json_loads_object,
+        find_reserved_authorization_key,
+        validate_arguments,
+    )
 
-    args_is_dict = isinstance(arguments, dict)
-    raw_args_dict = dict(arguments) if args_is_dict else {}
+    if argument_source not in ("model", "internal"):
+        return ToolAuthorizationDecision(
+            allowed=False,
+            tool_name=str(tool_name or ""),
+            normalized_arguments={},
+            reason="authorization_denied",
+            error_type="AUTHORIZATION_DENIED",
+            detail=f"AuthorizationError: Invalid argument_source {argument_source!r}.",
+        )
+
+    parsed_dict_args: Optional[Dict[str, Any]] = None
+    if isinstance(arguments, dict):
+        parsed_dict_args = dict(arguments)
+    elif isinstance(arguments, str) and normalize_args:
+        parsed_obj, _ = _strict_json_loads_object(arguments)
+        if parsed_obj is not None:
+            parsed_dict_args = parsed_obj
+
+    args_is_dict = parsed_dict_args is not None
+    raw_args_dict = dict(parsed_dict_args) if args_is_dict else {}
 
     canonical_name, canonical_args = canonicalize_tool_invocation(tool_name, raw_args_dict)
     if not canonical_name:
@@ -572,7 +600,22 @@ def authorize_and_validate_tool_call(
             detail="Empty tool name rejected.",
         )
 
-    # 0. Validate authorization metadata upfront (fail closed on malformed/conflicting metadata).
+    # 0. Fail closed when untrusted model arguments attempt to supply reserved auth metadata.
+    if argument_source == "model" and parsed_dict_args is not None:
+        reserved_key = find_reserved_authorization_key(parsed_dict_args)
+        if reserved_key is not None:
+            sec_err = _security_override_error(canonical_name, reserved_key)
+            return ToolAuthorizationDecision(
+                allowed=False,
+                tool_name=canonical_name,
+                normalized_arguments={},
+                reason="authorization_denied",
+                error_type="AUTHORIZATION_DENIED",
+                detail=sec_err["error"],
+                validation_error=sec_err,
+            )
+
+    # 0b. Validate authorization metadata upfront (fail closed on malformed/conflicting metadata).
     if task_local_scope is not None:
         if not isinstance(task_local_scope, TaskLocalToolScope):
             return ToolAuthorizationDecision(
@@ -890,61 +933,91 @@ def authorize_and_validate_tool_call(
             active_schemas=active_schemas_list,
         )
     if not args_is_dict:
-        val_err = validate_arguments(canonical_name, tool_schema, arguments)
+        val_err: Optional[Dict[str, Any]]
+        if normalize_args:
+            _, _, val_err = SafeArgumentNormalizer.normalize_and_validate(
+                canonical_name,
+                tool_schema if validate_schema else None,
+                arguments,
+                argument_source=argument_source,
+            )
+        else:
+            val_err = validate_arguments(canonical_name, tool_schema, arguments, argument_source=argument_source)
         return ToolAuthorizationDecision(
             allowed=False,
             tool_name=canonical_name,
             normalized_arguments={},
             reason="schema_validation_error",
-            error_type="SCHEMA_VALIDATION_ERROR",
+            error_type=(val_err.get("error_type") if isinstance(val_err, dict) else None) or "SCHEMA_VALIDATION_ERROR",
             detail=val_err.get("error") if isinstance(val_err, dict) else "Invalid non-object tool arguments.",
             required_ring=resolved_ring,
+            validation_error=val_err if isinstance(val_err, dict) else None,
         )
 
     import copy
 
     eff_args = copy.deepcopy(canonical_args)
-    if normalize_args and tool_schema is not None:
-        eff_args, norm_warnings = SafeArgumentNormalizer.normalize(
-            tool_schema,
+    norm_warnings_list: List[str] = []
+    if normalize_args:
+        eff_args, norm_warnings, err_env = SafeArgumentNormalizer.normalize_and_validate(
+            canonical_name,
+            tool_schema if validate_schema else None,
             eff_args,
-            tool_name=canonical_name,
+            argument_source=argument_source,
         )
-        if norm_warnings and "Arguments could not be parsed as a dictionary." in norm_warnings:
+        norm_warnings_list = norm_warnings
+        if err_env is not None:
+            is_sec = err_env.get("error_type") == "AUTHORIZATION_DENIED"
             return ToolAuthorizationDecision(
                 allowed=False,
                 tool_name=canonical_name,
-                normalized_arguments={},
-                reason="schema_validation_error",
-                error_type="SCHEMA_VALIDATION_ERROR",
-                detail="Invalid non-object tool arguments.",
+                normalized_arguments={} if is_sec else copy.deepcopy(eff_args),
+                reason="authorization_denied" if is_sec else "schema_validation_error",
+                error_type=err_env.get("error_type", "SCHEMA_VALIDATION_ERROR"),
+                detail=err_env.get("error", "Schema validation failed."),
                 required_ring=resolved_ring,
+                validation_error=err_env,
+                warnings=tuple(norm_warnings_list),
             )
-
-    if validate_schema and tool_schema is not None:
-        val_err = validate_arguments(canonical_name, tool_schema, eff_args)
+    elif validate_schema and tool_schema is not None:
+        val_err = validate_arguments(
+            canonical_name, tool_schema, eff_args, argument_source=argument_source
+        )
         if val_err is not None:
             return ToolAuthorizationDecision(
                 allowed=False,
                 tool_name=canonical_name,
                 normalized_arguments=copy.deepcopy(eff_args),
                 reason="schema_validation_error",
-                error_type="SCHEMA_VALIDATION_ERROR",
+                error_type=val_err.get("error_type", "SCHEMA_VALIDATION_ERROR"),
                 detail=val_err.get("error", "Schema validation failed."),
                 required_ring=resolved_ring,
+                validation_error=val_err,
             )
 
     if validate_schema and task_local_scope is None and eff_tool is not None:
         sig_err = _validate_callable_signature(canonical_name, eff_tool, eff_args)
         if sig_err is not None:
+            sig_env = _schema_error(
+                canonical_name,
+                "arguments",
+                "object",
+                "",
+                sig_err,
+                error_category="constraint_violation",
+                actual_type="dict",
+                value_category="object",
+            )
             return ToolAuthorizationDecision(
                 allowed=False,
                 tool_name=canonical_name,
                 normalized_arguments=copy.deepcopy(eff_args),
                 reason="schema_validation_error",
                 error_type="SCHEMA_VALIDATION_ERROR",
-                detail=sig_err,
+                detail=sig_env["error"],
                 required_ring=resolved_ring,
+                validation_error=sig_env,
+                warnings=tuple(norm_warnings_list),
             )
 
     return ToolAuthorizationDecision(
@@ -952,6 +1025,7 @@ def authorize_and_validate_tool_call(
         tool_name=canonical_name,
         normalized_arguments=copy.deepcopy(eff_args),
         required_ring=resolved_ring,
+        warnings=tuple(norm_warnings_list),
     )
 
 class BuiltinToolDef:
@@ -1361,45 +1435,46 @@ Returns:
         tool_id: str,
         tool: BaseTool,
         arguments: Dict[str, Any],
+        *,
+        argument_source: str = "internal",
     ) -> tuple[Optional[Dict[str, Any]], Optional[ToolResult]]:
         """Normalize unambiguous types and validate arguments via one shared authoritative path."""
-        from zelyr.engine.normalizer import SafeArgumentNormalizer, validate_arguments
+        from zelyr.engine.normalizer import SafeArgumentNormalizer, _schema_error
 
         tool_schema = getattr(tool, "schema", None) or getattr(tool, "tool_schema", None)
-        normalized_args, norm_warnings = SafeArgumentNormalizer.normalize(
+        normalized_args, _, val_envelope = SafeArgumentNormalizer.normalize_and_validate(
+            tool_id,
             tool_schema,
             arguments,
-            tool_name=tool_id,
+            argument_source=argument_source,
         )
-        if not isinstance(arguments, dict) or (
-            norm_warnings and "Arguments could not be parsed as a dictionary." in norm_warnings
-        ):
-            val_envelope = validate_arguments(tool_id, tool_schema, arguments)
-            return None, ToolResult(
-                success=False,
-                error=val_envelope["error"] if val_envelope else "Invalid non-object tool arguments.",
-                output=val_envelope,
-                error_type="SCHEMA_VALIDATION_ERROR",
-                remedy_hint=val_envelope.get("remedy_hint") if val_envelope else None,
-                allowed_actions=[tool_id],
-            )
-        val_envelope = validate_arguments(tool_id, tool_schema, normalized_args)
         if val_envelope is not None:
             return None, ToolResult(
                 success=False,
                 error=val_envelope["error"],
                 output=val_envelope,
-                error_type="SCHEMA_VALIDATION_ERROR",
+                error_type=val_envelope.get("error_type", "SCHEMA_VALIDATION_ERROR"),
                 remedy_hint=val_envelope.get("remedy_hint"),
                 allowed_actions=[tool_id],
             )
         sig_err = _validate_callable_signature(tool_id, tool, normalized_args)
         if sig_err is not None:
+            sig_env = _schema_error(
+                tool_id,
+                "arguments",
+                "object",
+                "",
+                sig_err,
+                error_category="constraint_violation",
+                actual_type="dict",
+                value_category="object",
+            )
             return None, ToolResult(
                 success=False,
-                error=sig_err,
-                output={"tool": tool_id, "status": "error", "error_type": "SCHEMA_VALIDATION_ERROR", "error": sig_err},
+                error=sig_env["error"],
+                output=sig_env,
                 error_type="SCHEMA_VALIDATION_ERROR",
+                remedy_hint=sig_env.get("remedy_hint"),
                 allowed_actions=[tool_id],
             )
         return normalized_args, None

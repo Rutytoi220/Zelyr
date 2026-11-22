@@ -1854,7 +1854,9 @@ class NativeOrchestrator:
                     for tc in delta["tool_calls"]:
                         idx = tc.get("index", 0)
                         while len(pending_tool_calls) <= idx:
-                            pending_tool_calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                            pending_tool_calls.append(
+                                {"id": "", "type": "function", "function": {"name": "", "arguments": ""}, "_has_arguments": False}
+                            )
                         if "id" in tc and tc["id"]:
                             pending_tool_calls[idx]["id"] = tc["id"]
                         if "function" in tc and isinstance(tc["function"], dict):
@@ -1865,11 +1867,14 @@ class NativeOrchestrator:
                                     raw_fn_name, active_schemas=eff_tool_schemas
                                 )
                             if "arguments" in tc["function"] and tc["function"]["arguments"] is not None:
+                                pending_tool_calls[idx]["_has_arguments"] = True
                                 incoming_args = tc["function"]["arguments"]
                                 if isinstance(incoming_args, dict):
                                     pending_tool_calls[idx]["function"]["arguments"] = json.dumps(incoming_args)
+                                elif isinstance(incoming_args, str):
+                                    pending_tool_calls[idx]["function"]["arguments"] += incoming_args
                                 else:
-                                    pending_tool_calls[idx]["function"]["arguments"] += str(incoming_args)
+                                    pending_tool_calls[idx]["function"]["arguments"] = json.dumps(incoming_args)
                         elif "name" in tc and tc["name"]:
                             raw_fn_name = tc["name"]
                             pending_tool_calls[idx]["raw_name"] = raw_fn_name
@@ -1877,11 +1882,14 @@ class NativeOrchestrator:
                                 raw_fn_name, active_schemas=eff_tool_schemas
                             )
                             if "arguments" in tc and tc["arguments"] is not None:
+                                pending_tool_calls[idx]["_has_arguments"] = True
                                 incoming_args = tc["arguments"]
                                 if isinstance(incoming_args, dict):
                                     pending_tool_calls[idx]["function"]["arguments"] = json.dumps(incoming_args)
+                                elif isinstance(incoming_args, str):
+                                    pending_tool_calls[idx]["function"]["arguments"] += incoming_args
                                 else:
-                                    pending_tool_calls[idx]["function"]["arguments"] += str(incoming_args)
+                                    pending_tool_calls[idx]["function"]["arguments"] = json.dumps(incoming_args)
 
                 if buffering:
                     if "tool_calls" in delta or pending_tool_calls:
@@ -2512,6 +2520,7 @@ class NativeOrchestrator:
             buffered_chunks.clear()
 
         if pending_tool_calls:
+            from zelyr.engine.normalizer import strict_json_loads
             from zelyr.tool_registry import (
                 activate_task_local_scope,
                 authorize_and_validate_tool_call,
@@ -2528,46 +2537,53 @@ class NativeOrchestrator:
                     active_schemas=eff_tool_schemas,
                     task_local_scope=eff_task_local_scope,
                 )
-                fn_args_raw = tc.get("function", {}).get("arguments") or tc.get("arguments", {})
+                tc_fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                has_explicit_args = tc.get("_has_arguments", None)
+                if "arguments" in tc_fn and tc_fn["arguments"] is not None:
+                    if has_explicit_args is False and tc_fn["arguments"] == "":
+                        fn_args_raw = {}
+                    else:
+                        fn_args_raw = tc_fn["arguments"]
+                elif "arguments" in tc and tc["arguments"] is not None:
+                    fn_args_raw = tc["arguments"]
+                else:
+                    fn_args_raw = {}
+
                 raw_tc_id = tc.get("id") or f"call_native_{idx}_{uuid.uuid4().hex[:6]}"
                 tc_id = self._unique_ledger_call_id(eff_ledger, raw_tc_id, reserved_ids=reserved_turn_ids)
                 reserved_turn_ids.add(tc_id)
 
-                args_parse_error: Optional[str] = None
+                raw_for_auth: Any = fn_args_raw
+                parsed_dict_ok = False
                 if isinstance(fn_args_raw, dict):
                     fn_args = fn_args_raw
+                    parsed_dict_ok = True
                 elif isinstance(fn_args_raw, str):
                     raw_str = fn_args_raw.strip()
                     if not raw_str:
                         fn_args = {}
                     else:
-                        parsed_raw: Any = None
-                        parsed_ok = False
                         try:
-                            parsed_raw = json.loads(raw_str)
-                            parsed_ok = True
+                            parsed_raw = strict_json_loads(raw_str)
+                            if isinstance(parsed_raw, dict):
+                                fn_args = parsed_raw
+                                parsed_dict_ok = True
+                                raw_for_auth = parsed_raw
+                            else:
+                                fn_args = {}
                         except Exception:
-                            try:
-                                import ast
-                                parsed_raw = ast.literal_eval(raw_str)
-                                parsed_ok = True
-                            except Exception:
-                                parsed_ok = False
-                        if not parsed_ok or not isinstance(parsed_raw, dict):
                             fn_args = {}
-                            args_parse_error = "Tool arguments must be a valid JSON object/dictionary."
-                        else:
-                            fn_args = parsed_raw
                 else:
                     fn_args = {}
-                    args_parse_error = f"Tool arguments must be a JSON object/dictionary, received {type(fn_args_raw).__name__}."
 
                 # Canonicalize alias rewrites (e.g., interact_with_ui + element_id -> interact_with_browser)
                 # BEFORE argument normalization against the canonical schema and BEFORE permission checks.
-                fn_name, fn_args = canonicalize_tool_invocation(fn_name, fn_args)
-                fn_args = self.normalize_tool_arguments(
-                    fn_name, fn_args, original_name=raw_fn_name, active_schemas=eff_tool_schemas
-                )
+                if parsed_dict_ok:
+                    fn_name, fn_args = canonicalize_tool_invocation(fn_name, fn_args)
+                    fn_args = self.normalize_tool_arguments(
+                        fn_name, fn_args, original_name=raw_fn_name, active_schemas=eff_tool_schemas
+                    )
+                    raw_for_auth = fn_args
 
                 tc_entry: Dict[str, Any] = {
                     "id": tc_id,
@@ -2576,12 +2592,11 @@ class NativeOrchestrator:
                         "name": fn_name,
                         "arguments": fn_args,
                     },
+                    "_raw_arguments": raw_for_auth,
                     "from_pending_proposal": bool(
                         tc.get("from_pending_proposal", False) or tc.get("source") == "pending_queue"
                     ),
                 }
-                if args_parse_error:
-                    tc_entry["_args_parse_error"] = args_parse_error
                 normalized_tool_calls.append(tc_entry)
 
             wire_assistant_tool_calls = [
@@ -2622,11 +2637,9 @@ class NativeOrchestrator:
                 # applied identically to native, pending, and fallback tool calls before execution.
                 rejection_reason = None
                 rejection_detail = None
+                decision = None
 
-                if tc.get("_args_parse_error"):
-                    rejection_reason = "schema_validation_error"
-                    rejection_detail = str(tc["_args_parse_error"])
-                elif eff_task_local_scope is not None and eff_tool_executor is None:
+                if eff_task_local_scope is not None and eff_tool_executor is None:
                     rejection_reason = "authorization_denied"
                     rejection_detail = (
                         "AuthorizationError: TaskLocalToolScope requires an isolated custom "
@@ -2639,9 +2652,10 @@ class NativeOrchestrator:
                         if (eff_tool_schemas is not None and has_valid_schemas_list and eff_task_local_scope is None)
                         else None
                     )
+                    raw_auth_args = tc["_raw_arguments"] if "_raw_arguments" in tc else func_args
                     decision = authorize_and_validate_tool_call(
                         func_name,
-                        func_args,
+                        raw_auth_args,
                         caller_ring=eff_caller_ring,
                         allowed_tools=eff_allowed_tools,
                         active_schemas=auth_schemas,
@@ -2651,6 +2665,7 @@ class NativeOrchestrator:
                         require_registered=True,
                         normalize_args=True,
                         validate_schema=True,
+                        argument_source="model",
                     )
                     if not decision.allowed:
                         rejection_reason = decision.reason or "authorization_denied"
@@ -2835,12 +2850,22 @@ class NativeOrchestrator:
                     if actual_step_count >= eff_step_limit:
                         force_disable_next = True
                     synth_call_id = tool_call_id or f"call_synth_{uuid.uuid4().hex[:8]}"
-                    synth_content = json.dumps({
+                    err_payload = {
                         "tool": func_name,
                         "status": "rejected",
                         "reason": rejection_reason,
                         "detail": rejection_detail,
-                    })
+                        "error_type": (
+                            decision.error_type
+                            if (decision is not None and not decision.allowed)
+                            else ("AUTHORIZATION_DENIED" if decision is None else rejection_reason.upper())
+                        ),
+                    }
+                    if decision is not None and not decision.allowed and isinstance(getattr(decision, "validation_error", None), dict):
+                        for k, v in decision.validation_error.items():
+                            if k not in err_payload:
+                                err_payload[k] = v
+                    synth_content = json.dumps(err_payload)
                     tool_msg = {
                         "role": "tool",
                         "tool_call_id": synth_call_id,

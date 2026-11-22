@@ -1059,6 +1059,7 @@ class InlineRepl:
                 active_schemas=payload.get("tools"),
                 tool_registry=getattr(nat_orch, "tool_registry", None),
                 validate_schema=False,
+                argument_source="model",
             )
             if not decision.allowed:
                 return json.dumps({

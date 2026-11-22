@@ -178,85 +178,86 @@ class ZelyrMCPServerGateway:
             return result
 
         # ── 2. Tool Execution: tools/call ────────────────────────────────────
-        @self.server.call_tool()
+        @self.server.call_tool(validate_input=False)
         async def call_tool(
             name: str, arguments: Optional[Dict[str, Any]] = None
         ) -> types.CallToolResult:
-            args = arguments or {}
+            from zelyr.engine.normalizer import _redact_sensitive_text
+            from zelyr.tool_registry import authorize_and_validate_tool_call
 
-            # Check if tool is allowed
-            if self.allowed_tools is not None and name not in self.allowed_tools:
+            raw_args: Any = {} if arguments is None else arguments
+            tool_inst = self.registry.get_tool(name) if isinstance(name, str) else None
+            fallback_schemas = None
+            if (
+                tool_inst is not None
+                and getattr(tool_inst, "schema", None) is None
+                and getattr(tool_inst, "tool_schema", None) is None
+            ):
+                mcp_tool = _convert_tool_to_mcp_schema(name, tool_inst)
+                fallback_schemas = [
+                    {
+                        "type": "function",
+                        "function": {"name": name, "parameters": mcp_tool.inputSchema},
+                    }
+                ]
+
+            decision = authorize_and_validate_tool_call(
+                name,
+                raw_args,
+                caller_ring=self.caller_ring,
+                allowed_tools=self.allowed_tools,
+                active_schemas=fallback_schemas,
+                tool_registry=self.registry,
+                tool=tool_inst,
+                require_registered=True,
+                normalize_args=True,
+                validate_schema=True,
+                argument_source="model",
+            )
+            if not decision.allowed:
+                if decision.reason == "tool_unavailable":
+                    err_text = f"ToolNotFound: Tool '{name}' is not registered in Zelyr."
+                elif decision.error_type == "SCHEMA_VALIDATION_ERROR":
+                    err_text = f"InvalidArguments: {decision.detail or 'Invalid tool arguments.'}"
+                elif (
+                    decision.error_type == "AUTHORIZATION_DENIED"
+                    and decision.required_ring is not None
+                    and "requires ring" in (decision.detail or "")
+                ):
+                    err_text = (
+                        f"AuthorizationError: Tool '{decision.tool_name or name}' requires security ring "
+                        f"{decision.required_ring}, but caller operates at ring {self.caller_ring}."
+                    )
+                else:
+                    err_text = decision.detail or f"AuthorizationError: Tool '{name}' execution denied."
                 return types.CallToolResult(
                     content=[
                         types.TextContent(
                             type="text",
-                            text=f"AuthorizationError: Tool '{name}' is not in allowed tools list.",
+                            text=_redact_sensitive_text(err_text),
                         )
                     ],
                     isError=True,
                 )
 
-            tool_inst = self.registry.get_tool(name)
-            if tool_inst is None:
-                return types.CallToolResult(
-                    content=[
-                        types.TextContent(
-                            type="text",
-                            text=f"ToolNotFound: Tool '{name}' is not registered in Zelyr.",
-                        )
-                    ],
-                    isError=True,
-                )
-
-            # Security ring check
-            required_ring = self.registry._get_tool_ring(name, tool_inst)
-            if self.caller_ring > required_ring:
-                return types.CallToolResult(
-                    content=[
-                        types.TextContent(
-                            type="text",
-                            text=(
-                                f"AuthorizationError: Tool '{name}' requires security ring {required_ring}, "
-                                f"but caller operates at ring {self.caller_ring}."
-                            ),
-                        )
-                    ],
-                    isError=True,
-                )
-
-            # Argument validation against required schema fields
-            mcp_tool = _convert_tool_to_mcp_schema(name, tool_inst)
-            required_fields = mcp_tool.inputSchema.get("required", [])
-            missing_fields = [f for f in required_fields if f not in args]
-            if missing_fields:
-                return types.CallToolResult(
-                    content=[
-                        types.TextContent(
-                            type="text",
-                            text=(
-                                f"InvalidArguments: Missing required argument(s) for tool '{name}': "
-                                f"{', '.join(missing_fields)}"
-                            ),
-                        )
-                    ],
-                    isError=True,
-                )
+            target_name = decision.tool_name
+            validated_args = decision.normalized_arguments
 
             # Execute tool through Zelyr registry (preserving process isolation for sandboxed plugins)
             try:
                 result: ToolResult = await self.registry.execute_async(
-                    name,
+                    target_name,
                     caller_ring=self.caller_ring,
                     allowed_tools=self.allowed_tools,
-                    **args,
+                    **validated_args,
                 )
             except Exception as exc:
-                logger.error("Unhandled exception executing tool '%s': %s", name, exc, exc_info=True)
+                logger.error("Unhandled exception executing tool '%s': %s", target_name, exc, exc_info=True)
                 return types.CallToolResult(
                     content=[
                         types.TextContent(
                             type="text",
-                            text=f"ToolExecutionError: Unhandled exception during tool invocation: {exc}",
+                            text=f"ToolExecutionError: Unhandled exception during tool invocation: {_redact_sensitive_text(str(exc))}",
                         )
                     ],
                     isError=True,

@@ -143,6 +143,7 @@ Returns:
             allowed_tools=getattr(self, 'allowed_tools', None),
             tool_registry=self.tool_registry,
             tool=authorized_tool,
+            argument_source='model',
         )
         if not decision.allowed:
             error = {

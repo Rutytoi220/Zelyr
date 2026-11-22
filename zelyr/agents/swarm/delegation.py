@@ -329,6 +329,7 @@ class DelegatedSubagent(BaseSubagent):
             allowed_tools=self.profile.allowed_tools,
             tool_registry=self.tool_registry if hasattr(self.tool_registry, "get_tool") else None,
             tool=tool_obj,
+            argument_source="model",
         )
         if not decision.allowed:
             return decision.detail or f"AuthorizationError: Tool '{tool_name}' execution denied."

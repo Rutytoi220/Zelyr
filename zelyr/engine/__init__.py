@@ -17,7 +17,13 @@ from zelyr.engine.execution_ledger import (
     targets_match,
     extract_prohibited_targets,
 )
-from zelyr.engine.normalizer import SafeArgumentNormalizer, validate_arguments
+from zelyr.engine.normalizer import (
+    APPROVED_CANONICAL_ALIASES,
+    RESERVED_AUTHORIZATION_KEYS,
+    SafeArgumentNormalizer,
+    strict_json_loads,
+    validate_arguments,
+)
 from zelyr.engine.observation_framing import ObservationFramingEngine
 from zelyr.engine.schema_compact import CompactSchemaGenerator
 
@@ -32,7 +38,10 @@ __all__ = [
     "ActionState",
     "InvalidStateTransitionError",
     "TurnExecutionLedger",
+    "APPROVED_CANONICAL_ALIASES",
+    "RESERVED_AUTHORIZATION_KEYS",
     "SafeArgumentNormalizer",
+    "strict_json_loads",
     "validate_arguments",
     "ObservationFramingEngine",
     "CompactSchemaGenerator",

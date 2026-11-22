@@ -307,6 +307,7 @@ async def _execute_headless_run(
             active_schemas=dynamic_tools,
             tool_registry=getattr(orch, "tool_registry", None),
             validate_schema=False,
+            argument_source="model",
         )
         if not decision.allowed:
             return json.dumps({
