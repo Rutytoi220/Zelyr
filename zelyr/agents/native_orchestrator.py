@@ -1375,6 +1375,7 @@ class NativeOrchestrator:
             or get_default_central_ledger()
         )
         exec_id = getattr(eff_ledger, "_execution_id", None)
+        is_resumed_root = bool(payload.get("_resumed_from_checkpoint") and depth == 0 and not is_retry)
         owns_root_exec = False
         user_prompt = ""
         for msg in reversed(payload.get("messages", [])):
@@ -1409,19 +1410,52 @@ class NativeOrchestrator:
             task_local_scoped=bool(eff_task_local_scope),
             source_component="native_orchestrator",
         )
-        eff_ledger._root_meta = {"cancelled": False, "timed_out": False, "error": None, "connection_error": False}
+        eff_ledger._root_meta = {
+            "cancelled": False,
+            "timed_out": False,
+            "error": None,
+            "connection_error": False,
+            "provider_error": None,
+            "checkpoint_failed": False,
+            "acceptance_criteria": acceptance_spec,
+            "model": payload.get("model"),
+            "task_prompt": user_prompt,
+        }
         central_ledger.record_event(
             exec_id,
             LedgerEventType.PLANNING_DECISION,
-            status="planned",
+            status="planned" if not is_resumed_root else "resumed_plan",
             caller_ring=eff_caller_ring,
             task_local_scoped=bool(eff_task_local_scope),
             metadata={
                 "max_steps": getattr(self, "max_steps", 5),
                 "has_acceptance_criteria": bool(acceptance_spec),
             },
-            idempotency_key=f"{exec_id}:plan:root",
+            idempotency_key=f"{exec_id}:plan:{'resume' if is_resumed_root else 'root'}:{actual_step_count}",
         )
+        if owns_root_exec:
+            from zelyr.engine.checkpoint import CheckpointManager
+
+            cp_init = CheckpointManager.capture_checkpoint(
+                central_ledger,
+                exec_id,
+                turn_ledger=eff_ledger,
+                status=ExecutionStatus.RUNNING,
+                verification_status=VerificationStatus.NOT_VERIFIED,
+                task_prompt=user_prompt,
+                planning_state={
+                    "depth": depth,
+                    "actual_step_count": actual_step_count,
+                    "replanning_attempts": replanning_attempts,
+                    "max_steps": getattr(self, "max_steps", 5),
+                    "acceptance_criteria": acceptance_spec,
+                    "model": payload.get("model"),
+                },
+                emit_event=False,
+                strict=None,
+            )
+            if cp_init is None and central_ledger.has_persistence_errors():
+                eff_ledger._root_meta["checkpoint_failed"] = True
 
         collected_out: List[str] = []
         caught_exc: Optional[Exception] = None
@@ -1459,10 +1493,11 @@ class NativeOrchestrator:
             caught_exc = exc
             raise
         finally:
-            if owns_root_exec and getattr(eff_ledger, "_execution_id", None) == exec_id:
+            if (owns_root_exec or is_resumed_root) and getattr(eff_ledger, "_execution_id", None) == exec_id:
                 existing_rec = central_ledger.get_execution(exec_id)
                 already_finalized = (
                     existing_rec is not None
+                    and not is_resumed_root
                     and existing_rec.status
                     in (
                         ExecutionStatus.COMPLETED.value,
@@ -1470,6 +1505,8 @@ class NativeOrchestrator:
                         ExecutionStatus.FAILED.value,
                         ExecutionStatus.CANCELLED.value,
                         ExecutionStatus.TIMED_OUT.value,
+                        ExecutionStatus.INTERRUPTED.value,
+                        ExecutionStatus.ABANDONED.value,
                     )
                 )
                 if not already_finalized:
@@ -1480,6 +1517,7 @@ class NativeOrchestrator:
                     has_unresolved = eff_ledger.has_unresolved_failures()
                     has_verified = bool(eff_ledger.verified_actions() or eff_ledger.get_verified_targets())
                     total_acts = eff_ledger.total_actions()
+                    interruption_reason: Optional[str] = None
 
                     if (
                         was_cancelled
@@ -1490,18 +1528,27 @@ class NativeOrchestrator:
                         final_status = ExecutionStatus.CANCELLED
                         ver_status = VerificationStatus.INTERRUPTED
                         err_msg = "Task cancelled"
-                    elif root_meta.get("timed_out") and has_unresolved:
+                        interruption_reason = "user_cancelled"
+                    elif (root_meta.get("timed_out") and has_unresolved) or isinstance(caught_exc, (TimeoutError, asyncio.TimeoutError)):
                         final_status = ExecutionStatus.TIMED_OUT
                         ver_status = VerificationStatus.INTERRUPTED
-                        err_msg = root_meta.get("error") or "Tool execution timed out"
-                    elif caught_exc is not None or root_meta.get("connection_error"):
-                        final_status = ExecutionStatus.FAILED
+                        err_msg = str(caught_exc) if isinstance(caught_exc, (TimeoutError, asyncio.TimeoutError)) else (root_meta.get("error") or "Tool execution timed out")
+                        interruption_reason = "task_timeout" if isinstance(caught_exc, (TimeoutError, asyncio.TimeoutError)) else "tool_timeout"
+                    elif root_meta.get("connection_error") or root_meta.get("provider_error"):
+                        final_status = ExecutionStatus.INTERRUPTED
                         ver_status = VerificationStatus.INTERRUPTED
-                        err_msg = str(caught_exc) if caught_exc else (root_meta.get("error") or "Orchestration error")
+                        err_msg = str(root_meta.get("provider_error") or root_meta.get("error") or "Model provider failure")
+                        interruption_reason = "provider_failure"
+                    elif caught_exc is not None:
+                        final_status = ExecutionStatus.INTERRUPTED
+                        ver_status = VerificationStatus.INTERRUPTED
+                        err_msg = str(caught_exc) or type(caught_exc).__name__
+                        interruption_reason = f"exception:{type(caught_exc).__name__}"
                     elif has_ver_fail:
                         final_status = ExecutionStatus.FAILED
                         ver_status = VerificationStatus.VERIFICATION_FAILED
                         err_msg = "Outcome verification failed"
+                        interruption_reason = "verification_failed"
                     elif has_unresolved:
                         ver_status = (
                             VerificationStatus.CLAIMED_UNVERIFIED
@@ -1511,6 +1558,7 @@ class NativeOrchestrator:
                         final_status = ExecutionStatus.FAILED
                         unresolved = eff_ledger.unresolved_failures()
                         err_msg = unresolved[-1].error if unresolved else "Unresolved action failure"
+                        interruption_reason = "unresolved_failure"
                     elif has_verified:
                         final_status = ExecutionStatus.COMPLETED
                         ver_status = VerificationStatus.VERIFIED
@@ -1527,19 +1575,69 @@ class NativeOrchestrator:
                             final_status = ExecutionStatus.FAILED
                             ver_status = VerificationStatus.NOT_VERIFIED
                             err_msg = "Task ended without executing or verifying required acceptance criteria"
+                            interruption_reason = "unfulfilled_criteria"
                         else:
                             final_status = ExecutionStatus.COMPLETED
                             ver_status = VerificationStatus.NOT_VERIFIED
                             err_msg = None
 
                     eff_ledger.set_verification_status(ver_status)
+                    from zelyr.engine.checkpoint import CheckpointManager
+
+                    cp_err: Optional[str] = None
+                    try:
+                        cp_saved = CheckpointManager.capture_checkpoint(
+                            central_ledger,
+                            exec_id,
+                            turn_ledger=eff_ledger,
+                            status=final_status,
+                            verification_status=ver_status,
+                            task_prompt=user_prompt,
+                            planning_state={
+                                "depth": depth,
+                                "actual_step_count": actual_step_count,
+                                "replanning_attempts": replanning_attempts,
+                                "max_steps": getattr(self, "max_steps", 5),
+                                "acceptance_criteria": acceptance_spec,
+                                "model": payload.get("model"),
+                                "interruption_reason": interruption_reason,
+                                "last_assistant_text": final_text[:512] if final_text else None,
+                            },
+                            emit_event=False,
+                            strict=None,
+                        )
+                        if cp_saved is None and central_ledger.has_persistence_errors():
+                            cp_err = "Checkpoint persistence failed; state could not be durably saved."
+                    except Exception as exc:
+                        cp_err = f"Checkpoint persistence failed: {exc}"
+                        if central_ledger.raise_on_persistence_error:
+                            central_ledger.finalize_execution(
+                                exec_id,
+                                status=final_status,
+                                verification_status=ver_status,
+                                final_summary=final_text[:1024] if final_text else None,
+                                error=err_msg,
+                                metadata={"total_actions": total_acts, "verified_targets": eff_ledger.get_verified_targets(), "checkpoint_saved": False},
+                            )
+                            raise
+
+                    if cp_err:
+                        root_meta["checkpoint_failed"] = True
+                        root_meta["checkpoint_error"] = cp_err
+
                     central_ledger.finalize_execution(
                         exec_id,
                         status=final_status,
                         verification_status=ver_status,
                         final_summary=final_text[:1024] if final_text else None,
                         error=err_msg,
-                        metadata={"total_actions": total_acts, "verified_targets": eff_ledger.get_verified_targets()},
+                        metadata={
+                            "total_actions": total_acts,
+                            "verified_targets": eff_ledger.get_verified_targets(),
+                            "checkpoint_saved": not bool(root_meta.get("checkpoint_failed")),
+                            **({"interruption_reason": interruption_reason} if interruption_reason else {}),
+                            **({"checkpoint_error": cp_err} if cp_err else {}),
+                        },
                     )
 
     async def _generate_stream_core(
@@ -2106,6 +2204,9 @@ class NativeOrchestrator:
         try:
             async for data in self._stream_model_events(payload, base_url, stream_provider=eff_stream_provider):
                 if "_api_error" in data:
+                    if hasattr(eff_ledger, "_root_meta") and isinstance(eff_ledger._root_meta, dict):
+                        eff_ledger._root_meta["provider_error"] = str(data["_api_error"])
+                        eff_ledger._root_meta["error"] = str(data["_api_error"])
                     if eff_ledger.has_pending_proposals():
                         eff_ledger.discard_pending_proposals(reason="api_error")
                     yield {"choices": [{"delta": {"content": f"\n⚠️ [API Error] {data['_api_error']}\n"}}]}
@@ -3184,6 +3285,27 @@ class NativeOrchestrator:
                             )
                             if not has_remaining_explicit_steps(all_user_prompts, eff_ledger, current_target=verified_target_hit):
                                 force_disable_next = True
+                    elif (
+                        not is_explicit_repeat
+                        and not is_read_tool
+                        and not getattr(eff_ledger, "_allow_unverified_retry", False)
+                        and fingerprint in (getattr(eff_ledger, "_ambiguous_fingerprints", None) or ())
+                    ):
+                        rejection_reason = "ambiguous_in_flight_operation"
+                        rejection_detail = (
+                            f"Action '{func_name}' was previously dispatched before interruption without a persisted result. "
+                            "Do not blindly replay ambiguous mutating actions; inspect or verify host state first."
+                        )
+                    elif (
+                        not is_explicit_repeat
+                        and not is_read_tool
+                        and fingerprint in (getattr(eff_ledger, "_resumed_verified_fingerprints", None) or ())
+                    ):
+                        rejection_reason = "outcome_already_verified"
+                        rejection_detail = (
+                            f"Action '{func_name}' was already completed and verified prior to interruption; "
+                            "skip repeating this verified operation."
+                        )
                     elif has_prior_success and not is_explicit_repeat and not is_read_tool:
                         rejection_reason = "redundant_action"
                         rejection_detail = (
@@ -3839,6 +3961,29 @@ class NativeOrchestrator:
             if force_disable_next and curr_pending_proposals:
                 eff_ledger.discard_pending_proposals(reason="step_limit_reached" if actual_step_count >= eff_step_limit else "task_completed")
                 curr_pending_proposals.clear()
+
+            if getattr(eff_ledger, "_central_ledger", None) and getattr(eff_ledger, "_execution_id", None):
+                from zelyr.engine.checkpoint import CheckpointManager
+                from zelyr.engine.execution_ledger import ExecutionStatus
+
+                CheckpointManager.capture_checkpoint(
+                    eff_ledger._central_ledger,
+                    eff_ledger._execution_id,
+                    turn_ledger=eff_ledger,
+                    status=ExecutionStatus.RUNNING,
+                    verification_status=eff_ledger._verification_status_override or "not_verified",
+                    planning_state={
+                        "depth": depth + 1,
+                        "actual_step_count": actual_step_count,
+                        "replanning_attempts": replanning_attempts,
+                        "max_steps": getattr(self, "max_steps", 5),
+                        "acceptance_criteria": acceptance_spec,
+                        "model": payload.get("model"),
+                    },
+                    pending_proposals=curr_pending_proposals,
+                    emit_event=False,
+                    strict=None,
+                )
 
             if depth < eff_max_depth:
                 async for chunk in self.generate_stream(

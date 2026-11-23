@@ -925,11 +925,55 @@ def _open_cli_ledger(db_path: Optional[str]) -> tuple[Any, bool]:
 
 
 def cmd_executions(args: argparse.Namespace) -> None:
-    """List recent persistent execution ledger records."""
+    """List recent persistent execution ledger records (or interrupted/resumable tasks)."""
     import datetime
 
     ledger, owns_conn = _open_cli_ledger(getattr(args, "db_path", None))
     try:
+        only_resumable = bool(getattr(args, "resumable", False))
+        if only_resumable:
+            from zelyr.engine.checkpoint import CheckpointManager
+
+            records = ledger.list_resumable_executions(limit=int(getattr(args, "limit", 20) or 20))
+            assessed = []
+            for r in records:
+                a = CheckpointManager.assess_resume(ledger, r.execution_id, verify_outcomes=False)
+                assessed.append((r, a))
+            if getattr(args, "json", False):
+                payload = {
+                    "count": len(assessed),
+                    "db_path": str(ledger.db_path),
+                    "persistence_errors": ledger.get_persistence_errors(),
+                    "resumable_tasks": [
+                        {
+                            **r.to_dict(),
+                            "checkpoint_id": a.checkpoint_id,
+                            "checkpoint_version": a.checkpoint_version,
+                            "resumability_status": a.resumability_status,
+                            "can_resume": a.can_resume,
+                            "requires_explicit_resume": a.requires_explicit_resume,
+                            "blocking_reasons": a.blocking_reasons,
+                            "warnings": a.warnings,
+                        }
+                        for r, a in assessed
+                    ],
+                }
+                print(json.dumps(payload, indent=2))
+                return
+            if not assessed:
+                print("No interrupted or resumable tasks found.")
+                return
+            print(f"Interrupted / Resumable Tasks ({ledger.db_path}) — {len(assessed)} record(s):")
+            for r, a in assessed:
+                ts_str = datetime.datetime.fromtimestamp(r.updated_at).strftime("%Y-%m-%d %H:%M:%S")
+                reason = (a.blocking_reasons[0] if a.blocking_reasons else (a.warnings[0] if a.warnings else "ready"))[:70]
+                prompt_snip = (r.task_prompt or "").replace("\n", " ")[:48]
+                print(
+                    f"  {r.execution_id}  status={r.status}  resume={a.resumability_status}  "
+                    f"cp={a.checkpoint_id or 'none'}  at={ts_str}  note={reason}  {prompt_snip}"
+                )
+            return
+
         records = ledger.list_executions(
             limit=int(getattr(args, "limit", 20) or 20),
             status=getattr(args, "status", None),
@@ -969,7 +1013,7 @@ def cmd_executions(args: argparse.Namespace) -> None:
 
 
 def cmd_execution(args: argparse.Namespace) -> None:
-    """Inspect a single execution record and its ordered timeline of events."""
+    """Inspect a single execution record, ordered timeline, and optional checkpoint details."""
     import datetime
 
     exec_query = getattr(args, "execution_id", "")
@@ -985,6 +1029,10 @@ def cmd_execution(args: argparse.Namespace) -> None:
                 sys.stderr.write(f"Execution '{exec_query}' not found.\n")
             sys.stderr.flush()
             sys.exit(1)
+
+        if getattr(args, "checkpoint", False):
+            _print_checkpoint_assessment(ledger, record.execution_id, output_json=bool(getattr(args, "json", False)))
+            return
 
         summary = ledger.get_execution_summary(
             record.execution_id,
@@ -1043,6 +1091,254 @@ def cmd_execution(args: argparse.Namespace) -> None:
                 f"  #{ev['sequence_number']:03d} [{t_str}] {ev['event_type']} "
                 f"status={ev['status']}{tool_part}{ext_tag}{flag_str}"
             )
+    finally:
+        if owns_conn:
+            ledger.close()
+
+
+def _print_checkpoint_assessment(
+    ledger: Any,
+    execution_id: str,
+    *,
+    output_json: bool = False,
+    explicit_resume: bool = False,
+) -> Any:
+    """Inspect a task's checkpoint & resume safety assessment and render human or JSON output."""
+    from zelyr.engine.checkpoint import CheckpointManager
+    from zelyr.tool_registry import ToolRegistry
+
+    assessment = CheckpointManager.assess_resume(
+        ledger,
+        execution_id,
+        tool_registry=ToolRegistry(),
+        explicit_resume=explicit_resume,
+        verify_outcomes=True,
+    )
+    if output_json:
+        print(json.dumps(assessment.to_dict(), indent=2))
+        return assessment
+
+    print(f"Execution:           {assessment.execution_id}")
+    print(f"Checkpoint ID:       {assessment.checkpoint_id or 'reconstructed'}")
+    print(f"Checkpoint Version:  {assessment.checkpoint_version or 'N/A'}")
+    print(f"Task Status:         {assessment.task_status}")
+    print(f"Verification Status: {assessment.verification_status}")
+    print(f"Resumability:        {assessment.resumability_status} (can_resume={assessment.can_resume})")
+    print(
+        f"Operations:          verified={len(assessment.completed_verified_ops)} "
+        f"unverified={len(assessment.completed_unverified_ops)} "
+        f"in_flight={len(assessment.in_flight_ambiguous_ops)} "
+        f"failed={len(assessment.failed_ops)} "
+        f"contradictory={len(assessment.contradictory_ops)} "
+        f"pending={len(assessment.pending_ops)}"
+    )
+    if assessment.blocking_reasons:
+        print("Blocking Reasons:")
+        for reason in assessment.blocking_reasons:
+            print(f"  - {reason}")
+    if assessment.warnings:
+        print("Warnings / Safety Notes:")
+        for warn in assessment.warnings:
+            print(f"  - {warn}")
+    if assessment.environment_diff.get("changed"):
+        print(f"Environment Drift:   {json.dumps(assessment.environment_diff.get('changes', []))}")
+    return assessment
+
+
+def cmd_checkpoint(args: argparse.Namespace) -> None:
+    """Manage and inspect task continuity checkpoints (`list`, `inspect`, `abandon`)."""
+    subcmd = getattr(args, "checkpoint_cmd", None)
+    if subcmd == "list":
+        setattr(args, "resumable", not bool(getattr(args, "all", False)))
+        cmd_executions(args)
+        return
+
+    exec_query = getattr(args, "execution_id", "")
+    ledger, owns_conn = _open_cli_ledger(getattr(args, "db_path", None))
+    try:
+        record, matches = ledger.find_execution_by_prefix(exec_query)
+        if record is None:
+            msg = (
+                f"Ambiguous execution ID prefix '{exec_query}': matched {', '.join(matches[:5])}"
+                if len(matches) > 1
+                else f"Execution '{exec_query}' not found."
+            )
+            if getattr(args, "json", False):
+                print(json.dumps({"error": msg}))
+            else:
+                sys.stderr.write(msg + "\n")
+                sys.stderr.flush()
+            sys.exit(1)
+
+        if subcmd == "inspect":
+            _print_checkpoint_assessment(ledger, record.execution_id, output_json=bool(getattr(args, "json", False)))
+            return
+
+        if subcmd == "abandon":
+            from zelyr.engine.checkpoint import CheckpointError, CheckpointManager
+
+            try:
+                updated = CheckpointManager.abandon_task(
+                    ledger,
+                    record.execution_id,
+                    reason=str(getattr(args, "reason", None) or "Abandoned via CLI"),
+                    strict=True,
+                )
+            except (CheckpointError, Exception) as exc:
+                if getattr(args, "json", False):
+                    print(json.dumps({"error": str(exc), "execution_id": record.execution_id}))
+                else:
+                    sys.stderr.write(f"Error abandoning task '{record.execution_id}': {exc}\n")
+                    sys.stderr.flush()
+                sys.exit(1)
+            if getattr(args, "json", False):
+                print(json.dumps({"status": "abandoned", "execution": updated.to_dict() if updated else None}, indent=2))
+            else:
+                print(f"Abandoned execution '{record.execution_id}'.")
+            return
+
+        sys.stderr.write("Usage: zelyr checkpoint {list|inspect|abandon} ...\n")
+        sys.stderr.flush()
+        sys.exit(1)
+    finally:
+        if owns_conn:
+            ledger.close()
+
+
+def cmd_resume(args: argparse.Namespace) -> None:
+    """List resumable tasks, explain resume blocks, or resume an eligible checkpointed task."""
+    if getattr(args, "list", False) or not getattr(args, "execution_id", None):
+        setattr(args, "resumable", True)
+        cmd_executions(args)
+        return
+
+    exec_query = str(getattr(args, "execution_id") or "")
+    ledger, owns_conn = _open_cli_ledger(getattr(args, "db_path", None))
+    try:
+        record, matches = ledger.find_execution_by_prefix(exec_query)
+        if record is None:
+            msg = (
+                f"Ambiguous execution ID prefix '{exec_query}': matched {', '.join(matches[:5])}"
+                if len(matches) > 1
+                else f"Execution '{exec_query}' not found."
+            )
+            if getattr(args, "json", False):
+                print(json.dumps({"error": msg}))
+            else:
+                sys.stderr.write(msg + "\n")
+                sys.stderr.flush()
+            sys.exit(1)
+
+        if getattr(args, "abandon", False):
+            setattr(args, "checkpoint_cmd", "abandon")
+            cmd_checkpoint(args)
+            return
+
+        explicit_resume = bool(getattr(args, "confirm", False))
+        allow_unverified_retry = bool(getattr(args, "allow_unverified_retry", False))
+        output_json = bool(getattr(args, "json", False))
+
+        if getattr(args, "inspect", False):
+            assessment = _print_checkpoint_assessment(
+                ledger,
+                record.execution_id,
+                output_json=output_json,
+                explicit_resume=explicit_resume,
+            )
+            if not assessment.can_resume:
+                sys.exit(2)
+            return
+
+        from zelyr.agents.native_orchestrator import NativeOrchestrator
+        from zelyr.config import ZelyrConfig, get_config
+        from zelyr.core.plugins import get_tool_schemas, load_plugins
+        from zelyr.engine.checkpoint import CheckpointError, CheckpointManager
+        from zelyr.tool_registry import ToolRegistry
+
+        load_plugins()
+        base_cfg = get_config()
+        base_url_override = getattr(args, "base_url", None)
+        run_cfg = None
+        if base_url_override:
+            run_cfg = ZelyrConfig.from_dict(base_cfg.to_dict()) if hasattr(base_cfg, "to_dict") else ZelyrConfig()
+            run_cfg.ollama_base_url = (
+                base_cfg.get_effective_ollama_base_url(base_url_override)
+                if hasattr(base_cfg, "get_effective_ollama_base_url")
+                else base_url_override.rstrip("/")
+            )
+
+        orch = NativeOrchestrator(config=run_cfg, tool_registry=ToolRegistry(), central_ledger=ledger)
+        schemas = get_tool_schemas(0)
+        pre_assess = CheckpointManager.assess_resume(
+            ledger,
+            record.execution_id,
+            tool_registry=orch.tool_registry,
+            active_schemas=schemas,
+            explicit_resume=explicit_resume,
+            allow_unverified_retry=allow_unverified_retry,
+            verify_outcomes=True,
+        )
+        if not pre_assess.can_resume:
+            if output_json:
+                print(json.dumps(pre_assess.to_dict(), indent=2))
+            else:
+                sys.stderr.write(
+                    f"Cannot safely resume '{record.execution_id}' ({pre_assess.resumability_status}):\n"
+                    + "\n".join(f"  - {r}" for r in pre_assess.blocking_reasons)
+                    + "\n"
+                )
+                sys.stderr.flush()
+            sys.exit(2)
+
+        try:
+            extra_payload = {}
+            if getattr(args, "verify", None):
+                extra_payload["acceptance_criteria"] = args.verify
+            _, chunks = asyncio.run(
+                CheckpointManager.resume_execution(
+                    orch,
+                    ledger,
+                    record.execution_id,
+                    explicit_resume=explicit_resume,
+                    allow_unverified_retry=allow_unverified_retry,
+                    tool_schemas=schemas,
+                    model=getattr(args, "model", None),
+                    extra_payload=extra_payload or None,
+                )
+            )
+        except CheckpointError as exc:
+            if output_json:
+                print(json.dumps({"error": str(exc), "execution_id": record.execution_id}))
+            else:
+                sys.stderr.write(f"Resume blocked for '{record.execution_id}': {exc}\n")
+                sys.stderr.flush()
+            sys.exit(2)
+
+        text_parts = []
+        for ch in chunks:
+            for choice in ch.get("choices", []) if isinstance(ch, dict) else []:
+                c_txt = (choice.get("delta") or {}).get("content")
+                if isinstance(c_txt, str):
+                    text_parts.append(c_txt)
+        final_text = "".join(text_parts).strip()
+        updated_rec = ledger.get_execution(record.execution_id)
+        if output_json:
+            print(
+                json.dumps(
+                    {
+                        "execution_id": record.execution_id,
+                        "assessment": pre_assess.to_dict(),
+                        "execution": updated_rec.to_dict() if updated_rec else None,
+                        "response": final_text,
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            if final_text:
+                print(final_text)
+            if updated_rec:
+                print(f"[{record.execution_id}] final status={updated_rec.status} verification={updated_rec.verification_status}")
     finally:
         if owns_conn:
             ledger.close()
@@ -1564,6 +1860,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_execs.add_argument("--status", type=str, default=None, help="Filter executions by status")
     p_execs.add_argument("--tool", type=str, default=None, help="Filter executions involving a tool ID")
     p_execs.add_argument("--event-type", type=str, default=None, help="Filter executions containing an event type")
+    p_execs.add_argument(
+        "--resumable",
+        action="store_true",
+        default=False,
+        help="Show only interrupted or incomplete tasks and their resume eligibility",
+    )
     p_execs.add_argument("--json", action="store_true", default=False, help="Output structured JSON")
     p_execs.add_argument("--db-path", type=str, default=None, help="Override execution ledger SQLite DB path")
 
@@ -1574,8 +1876,54 @@ def _build_parser() -> argparse.ArgumentParser:
     p_exec.add_argument("execution_id", type=str, help="Execution ID or unique prefix to inspect")
     p_exec.add_argument("--event-type", type=str, default=None, help="Filter timeline events by event type")
     p_exec.add_argument("--tool", type=str, default=None, help="Filter timeline events by tool ID")
+    p_exec.add_argument(
+        "--checkpoint",
+        action="store_true",
+        default=False,
+        help="Display latest durable checkpoint and resume safety assessment",
+    )
     p_exec.add_argument("--json", action="store_true", default=False, help="Output structured JSON summary")
     p_exec.add_argument("--db-path", type=str, default=None, help="Override execution ledger SQLite DB path")
+
+    p_cp = sub.add_parser(
+        "checkpoint",
+        help="List, inspect, or abandon task continuity checkpoints",
+    )
+    cp_sub = p_cp.add_subparsers(dest="checkpoint_cmd")
+    p_cp_list = cp_sub.add_parser("list", aliases=["ls"], help="List interrupted and resumable tasks")
+    p_cp_list.add_argument("--limit", "-n", type=int, default=20, help="Maximum tasks to list")
+    p_cp_list.add_argument("--all", "-a", action="store_true", default=False, help="Include completed/abandoned records")
+    p_cp_list.add_argument("--json", action="store_true", default=False, help="Output structured JSON")
+    p_cp_list.add_argument("--db-path", type=str, default=None, help="Override execution ledger SQLite DB path")
+
+    p_cp_inspect = cp_sub.add_parser("inspect", help="Inspect a task checkpoint and explain resume eligibility")
+    p_cp_inspect.add_argument("execution_id", type=str, help="Execution ID or unique prefix")
+    p_cp_inspect.add_argument("--json", action="store_true", default=False, help="Output structured JSON")
+    p_cp_inspect.add_argument("--db-path", type=str, default=None, help="Override execution ledger SQLite DB path")
+
+    p_cp_abandon = cp_sub.add_parser("abandon", help="Mark an interrupted task as abandoned")
+    p_cp_abandon.add_argument("execution_id", type=str, help="Execution ID or unique prefix")
+    p_cp_abandon.add_argument("--reason", type=str, default="Abandoned via CLI", help="Reason recorded in execution ledger")
+    p_cp_abandon.add_argument("--json", action="store_true", default=False, help="Output structured JSON")
+    p_cp_abandon.add_argument("--db-path", type=str, default=None, help="Override execution ledger SQLite DB path")
+
+    p_resume = sub.add_parser(
+        "resume",
+        help="List interrupted tasks, explain resume blocks, or explicitly resume a task",
+    )
+    p_resume.add_argument("execution_id", nargs="?", default=None, help="Execution ID or unique prefix to resume")
+    p_resume.add_argument("--list", "-l", action="store_true", default=False, help="List interrupted and resumable tasks")
+    p_resume.add_argument("--inspect", "-i", action="store_true", default=False, help="Inspect checkpoint and explain why task can/cannot resume")
+    p_resume.add_argument("--abandon", action="store_true", default=False, help="Abandon the specified task")
+    p_resume.add_argument("--confirm", "--yes", "-y", action="store_true", default=False, help="Explicitly confirm resuming a cancelled or flagged task")
+    p_resume.add_argument("--allow-unverified-retry", action="store_true", default=False, help="Allow retrying previously ambiguous unverified operations")
+    p_resume.add_argument("--verify", type=str, default=None, help="Optional OutcomeVerifier criteria string")
+    p_resume.add_argument("--model", "-m", type=str, default=None, help="Override Ollama model when resuming")
+    p_resume.add_argument("--base-url", type=str, default=None, help="Override Ollama base URL when resuming")
+    p_resume.add_argument("--reason", type=str, default="Abandoned via CLI", help="Reason when --abandon is used")
+    p_resume.add_argument("--limit", "-n", type=int, default=20, help="Maximum tasks when listing")
+    p_resume.add_argument("--json", action="store_true", default=False, help="Output structured JSON")
+    p_resume.add_argument("--db-path", type=str, default=None, help="Override execution ledger SQLite DB path")
 
     sub.add_parser("test",   help="Run the automated test suite")
     p_eval = sub.add_parser("eval", help="Run Zelyr evaluation benchmark suite")
@@ -1710,6 +2058,8 @@ def main() -> None:
         "manifest": cmd_env,
         "executions": cmd_executions,
         "execution":  cmd_execution,
+        "checkpoint": cmd_checkpoint,
+        "resume":     cmd_resume,
         "test":     cmd_test,
         "eval":   cmd_eval,
         "daemon": cmd_daemon,

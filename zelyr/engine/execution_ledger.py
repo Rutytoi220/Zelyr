@@ -11,6 +11,7 @@ from contextlib import contextmanager
 import contextvars
 from dataclasses import asdict, dataclass, field
 from enum import Enum
+import hashlib
 import json
 import logging
 import os
@@ -2888,11 +2889,13 @@ class ExecutionStatus(str, Enum):
 
     INITIALIZED = "initialized"
     RUNNING = "running"
+    INTERRUPTED = "interrupted"
     COMPLETED = "completed"
     COMPLETED_UNVERIFIED = "completed_unverified"
     FAILED = "failed"
     CANCELLED = "cancelled"
     TIMED_OUT = "timed_out"
+    ABANDONED = "abandoned"
 
 
 class VerificationStatus(str, Enum):
@@ -2918,7 +2921,22 @@ class LedgerEventType(str, Enum):
     RECOVERY_ATTEMPT = "recovery_attempt"
     OBSERVATION_UPDATED = "observation_updated"
     VERIFICATION_RECORDED = "verification_recorded"
+    TASK_CHECKPOINTED = "task_checkpointed"
+    TASK_RESUMED = "task_resumed"
+    TASK_ABANDONED = "task_abandoned"
     TASK_TERMINATED = "task_terminated"
+
+
+class StaleCheckpointError(LedgerPersistenceError):
+    """Raised when a concurrent operation tries to overwrite a newer checkpoint."""
+
+
+class CorruptedCheckpointError(LedgerPersistenceError):
+    """Raised when persisted checkpoint data is malformed or fails integrity verification."""
+
+
+class UnsupportedCheckpointVersionError(LedgerPersistenceError):
+    """Raised when a persisted checkpoint uses an unsupported schema version."""
 
 
 _PROMPT_INJECTION_PATTERNS = (
@@ -3418,7 +3436,8 @@ CREATE TABLE IF NOT EXISTS executions (
     metadata_json TEXT NOT NULL DEFAULT '{}',
     redacted INTEGER NOT NULL DEFAULT 0,
     truncated INTEGER NOT NULL DEFAULT 0,
-    next_seq INTEGER NOT NULL DEFAULT 1
+    next_seq INTEGER NOT NULL DEFAULT 1,
+    latest_checkpoint_seq INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS execution_events (
@@ -3446,11 +3465,36 @@ CREATE TABLE IF NOT EXISTS execution_events (
     UNIQUE (execution_id, idempotency_key)
 );
 
+CREATE TABLE IF NOT EXISTS task_checkpoints (
+    checkpoint_id TEXT PRIMARY KEY,
+    execution_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    checkpoint_version INTEGER NOT NULL DEFAULT 1,
+    sequence_number INTEGER NOT NULL,
+    last_event_id TEXT,
+    last_event_seq INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL,
+    verification_status TEXT NOT NULL,
+    task_prompt TEXT NOT NULL DEFAULT '',
+    planning_json TEXT NOT NULL DEFAULT '{}',
+    environment_json TEXT NOT NULL DEFAULT '{}',
+    external_tools_json TEXT NOT NULL DEFAULT '[]',
+    verified_targets_json TEXT NOT NULL DEFAULT '[]',
+    recovery_summary_json TEXT NOT NULL DEFAULT '{}',
+    checkpoint_digest TEXT NOT NULL,
+    redacted INTEGER NOT NULL DEFAULT 0,
+    truncated INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    FOREIGN KEY (execution_id) REFERENCES executions(execution_id) ON DELETE CASCADE,
+    UNIQUE (execution_id, sequence_number)
+);
+
 CREATE INDEX IF NOT EXISTS idx_exec_created ON executions(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_exec_status ON executions(status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_events_exec_seq ON execution_events(execution_id, sequence_number ASC);
 CREATE INDEX IF NOT EXISTS idx_events_tool ON execution_events(tool_id);
 CREATE INDEX IF NOT EXISTS idx_events_type ON execution_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_exec_seq ON task_checkpoints(execution_id, sequence_number DESC);
 """
 
 
@@ -3474,6 +3518,7 @@ class CentralExecutionLedger:
         self._persistence_errors: List[Dict[str, Any]] = []
         self._memory_executions: Dict[str, ExecutionRecord] = {}
         self._memory_events: Dict[str, List[ExecutionEvent]] = {}
+        self._memory_checkpoints: Dict[str, List[Dict[str, Any]]] = {}
         self._ensure_connection(raise_on_error=self.raise_on_persistence_error)
 
     def _record_persistence_failure(
@@ -3533,6 +3578,11 @@ class CentralExecutionLedger:
                 if not self._initialized:
                     with conn:
                         conn.executescript(_EXECUTION_LEDGER_SCHEMA_SQL)
+                        cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(executions)").fetchall()}
+                        if "latest_checkpoint_seq" not in cols:
+                            conn.execute(
+                                "ALTER TABLE executions ADD COLUMN latest_checkpoint_seq INTEGER NOT NULL DEFAULT 0"
+                            )
                     self._initialized = True
                 return conn
             except Exception as exc:
@@ -4413,6 +4463,406 @@ class CentralExecutionLedger:
                 "metadata": meta,
             })
         return out
+
+    @staticmethod
+    def _compute_checkpoint_digest(payload: Dict[str, Any]) -> str:
+        """Compute deterministic SHA-256 digest for checkpoint integrity verification."""
+        canonical = {
+            "checkpoint_version": int(payload.get("checkpoint_version", 1)),
+            "checkpoint_id": str(payload.get("checkpoint_id") or ""),
+            "execution_id": str(payload.get("execution_id") or ""),
+            "task_id": str(payload.get("task_id") or ""),
+            "sequence_number": int(payload.get("sequence_number", 0)),
+            "last_event_id": payload.get("last_event_id"),
+            "last_event_seq": int(payload.get("last_event_seq", 0)),
+            "status": str(payload.get("status") or ""),
+            "verification_status": str(payload.get("verification_status") or ""),
+            "task_prompt": str(payload.get("task_prompt") or ""),
+            "planning_state": payload.get("planning_state") or {},
+            "environment_snapshot": payload.get("environment_snapshot") or {},
+            "external_tools_used": payload.get("external_tools_used") or [],
+            "verified_targets": payload.get("verified_targets") or [],
+            "recovery_summary": payload.get("recovery_summary") or {},
+        }
+        raw = json.dumps(canonical, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str).encode(
+            "utf-8", errors="replace"
+        )
+        return hashlib.sha256(raw).hexdigest()
+
+    @classmethod
+    def _row_to_checkpoint_dict(cls, row: Union[sqlite3.Row, Dict[str, Any]], *, verify_integrity: bool = True) -> Dict[str, Any]:
+        """Deserialize and validate a persisted task_checkpoints row."""
+        d = dict(row)
+        raw_ver = d.get("checkpoint_version")
+        if not isinstance(raw_ver, int) or isinstance(raw_ver, bool):
+            raise CorruptedCheckpointError(f"Malformed checkpoint_version: {raw_ver!r}")
+        if raw_ver != 1:
+            raise UnsupportedCheckpointVersionError(f"Unsupported checkpoint version: {raw_ver}")
+
+        def _parse_json_field(raw_val: Any, expected_type: type, field_name: str) -> Any:
+            if isinstance(raw_val, expected_type):
+                return raw_val
+            if not isinstance(raw_val, str) or not raw_val.strip():
+                raise CorruptedCheckpointError(f"Checkpoint field '{field_name}' is empty or missing.")
+            try:
+                parsed = json.loads(raw_val)
+            except Exception as exc:
+                raise CorruptedCheckpointError(f"Checkpoint field '{field_name}' contains invalid JSON: {exc}") from exc
+            if not isinstance(parsed, expected_type):
+                raise CorruptedCheckpointError(
+                    f"Checkpoint field '{field_name}' has wrong type {type(parsed).__name__}."
+                )
+            return parsed
+
+        cp_dict: Dict[str, Any] = {
+            "checkpoint_id": str(d.get("checkpoint_id") or ""),
+            "execution_id": str(d.get("execution_id") or ""),
+            "task_id": str(d.get("task_id") or ""),
+            "checkpoint_version": raw_ver,
+            "sequence_number": int(d.get("sequence_number") or 0),
+            "last_event_id": d.get("last_event_id"),
+            "last_event_seq": int(d.get("last_event_seq") or 0),
+            "status": str(d.get("status") or ""),
+            "verification_status": str(d.get("verification_status") or ""),
+            "task_prompt": str(d.get("task_prompt") or ""),
+            "planning_state": _parse_json_field(d.get("planning_json"), dict, "planning_json"),
+            "environment_snapshot": _parse_json_field(d.get("environment_json"), dict, "environment_json"),
+            "external_tools_used": _parse_json_field(d.get("external_tools_json"), list, "external_tools_json"),
+            "verified_targets": _parse_json_field(d.get("verified_targets_json"), list, "verified_targets_json"),
+            "recovery_summary": _parse_json_field(d.get("recovery_summary_json"), dict, "recovery_summary_json"),
+            "checkpoint_digest": str(d.get("checkpoint_digest") or ""),
+            "redacted": bool(d.get("redacted", False)),
+            "truncated": bool(d.get("truncated", False)),
+            "timestamp": float(d.get("created_at") or 0.0),
+        }
+        if not cp_dict["checkpoint_id"] or not cp_dict["execution_id"] or cp_dict["sequence_number"] < 1:
+            raise CorruptedCheckpointError("Checkpoint record missing mandatory identity/sequence metadata.")
+        if verify_integrity:
+            expected_digest = cls._compute_checkpoint_digest(cp_dict)
+            if not cp_dict["checkpoint_digest"] or cp_dict["checkpoint_digest"] != expected_digest:
+                raise CorruptedCheckpointError(
+                    f"Checkpoint '{cp_dict['checkpoint_id']}' failed digest verification."
+                )
+        return cp_dict
+
+    def save_checkpoint(
+        self,
+        execution_id: str,
+        *,
+        checkpoint_version: int = 1,
+        task_id: Optional[str] = None,
+        last_event_id: Optional[str] = None,
+        last_event_seq: Optional[int] = None,
+        status: Optional[Union[ExecutionStatus, str]] = None,
+        verification_status: Optional[Union[VerificationStatus, str]] = None,
+        task_prompt: Optional[str] = None,
+        planning_state: Optional[Dict[str, Any]] = None,
+        environment_snapshot: Optional[Dict[str, Any]] = None,
+        external_tools_used: Optional[List[Dict[str, Any]]] = None,
+        verified_targets: Optional[List[str]] = None,
+        recovery_summary: Optional[Dict[str, Any]] = None,
+        expected_checkpoint_seq: Optional[int] = None,
+        emit_event: bool = True,
+        strict: Optional[bool] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Atomically persist a versioned task checkpoint with stale-overwrite protection."""
+        if not execution_id:
+            raise ValueError("execution_id must be non-empty")
+        if checkpoint_version != 1:
+            raise UnsupportedCheckpointVersionError(f"Unsupported checkpoint version: {checkpoint_version}")
+
+        now = time.time()
+        cp_id = f"cp_{uuid.uuid4().hex[:14]}"
+        eff_task_id = str(task_id or execution_id)
+
+        safe_prompt, prompt_red, prompt_trunc = sanitize_ledger_text(
+            task_prompt or "",
+            max_bytes=MAX_LEDGER_TEXT_BYTES,
+            strip_injection=True,
+        )
+        safe_plan, p_red, p_trunc = sanitize_ledger_payload(planning_state, max_bytes=MAX_LEDGER_METADATA_BYTES)
+        safe_env, e_red, e_trunc = sanitize_ledger_payload(environment_snapshot, max_bytes=4096)
+        safe_ext_list_wrap, x_red, x_trunc = sanitize_ledger_payload({"items": external_tools_used or []}, max_bytes=4096)
+        safe_ext = list(safe_ext_list_wrap.get("items") or []) if isinstance(safe_ext_list_wrap.get("items"), list) else []
+        safe_vt_wrap, v_red, v_trunc = sanitize_ledger_payload({"targets": verified_targets or []}, max_bytes=4096)
+        safe_vt = [str(x) for x in (safe_vt_wrap.get("targets") or [])] if isinstance(safe_vt_wrap.get("targets"), list) else []
+        safe_rec, r_red, r_trunc = sanitize_ledger_payload(recovery_summary, max_bytes=4096)
+
+        any_red = bool(prompt_red or p_red or e_red or x_red or v_red or r_red)
+        any_trunc = bool(prompt_trunc or p_trunc or e_trunc or x_trunc or v_trunc or r_trunc)
+
+        with self._lock:
+            eff_strict = self.raise_on_persistence_error if strict is None else strict
+            conn = self._ensure_connection(raise_on_error=eff_strict, execution_id=execution_id)
+            if conn is not None:
+                try:
+                    from zelyr.db.connection import managed_transaction
+
+                    with managed_transaction(conn):
+                        exec_row = conn.execute(
+                            "SELECT * FROM executions WHERE execution_id = ?",
+                            (execution_id,),
+                        ).fetchone()
+                        if exec_row is None:
+                            raise ValueError(f"Unknown execution_id '{execution_id}' for save_checkpoint")
+
+                        latest_row = conn.execute(
+                            "SELECT COALESCE(MAX(sequence_number), 0) AS max_cp_seq, COALESCE(MAX(last_event_seq), 0) AS max_ev_seq "
+                            "FROM task_checkpoints WHERE execution_id = ?",
+                            (execution_id,),
+                        ).fetchone()
+                        max_cp_seq = int(latest_row["max_cp_seq"]) if latest_row else 0
+                        max_ev_seq = int(latest_row["max_ev_seq"]) if latest_row else 0
+
+                        if expected_checkpoint_seq is not None and max_cp_seq != expected_checkpoint_seq:
+                            raise StaleCheckpointError(
+                                f"Concurrent checkpoint conflict for '{execution_id}': expected seq {expected_checkpoint_seq}, latest is {max_cp_seq}."
+                            )
+
+                        eff_last_ev_seq = int(last_event_seq) if last_event_seq is not None else max(0, int(exec_row["next_seq"]) - 1)
+                        if eff_last_ev_seq < max_ev_seq:
+                            raise StaleCheckpointError(
+                                f"Stale checkpoint rejected for '{execution_id}': event cursor {eff_last_ev_seq} precedes persisted {max_ev_seq}."
+                            )
+
+                        eff_last_ev_id = last_event_id
+                        if eff_last_ev_id is None and eff_last_ev_seq > 0:
+                            ev_r = conn.execute(
+                                "SELECT event_id FROM execution_events WHERE execution_id = ? AND sequence_number = ?",
+                                (execution_id, eff_last_ev_seq),
+                            ).fetchone()
+                            if ev_r is not None:
+                                eff_last_ev_id = str(ev_r["event_id"])
+
+                        cp_seq = max_cp_seq + 1
+                        eff_status = (
+                            (status.value if isinstance(status, ExecutionStatus) else str(status))
+                            if status is not None
+                            else str(exec_row["status"])
+                        )
+                        eff_ver = (
+                            (verification_status.value if isinstance(verification_status, VerificationStatus) else str(verification_status))
+                            if verification_status is not None
+                            else str(exec_row["verification_status"])
+                        )
+                        eff_prompt = safe_prompt if (task_prompt is not None and task_prompt != "") else str(exec_row["task_prompt"] or "")
+
+                        cp_payload: Dict[str, Any] = {
+                            "checkpoint_id": cp_id,
+                            "execution_id": execution_id,
+                            "task_id": eff_task_id,
+                            "checkpoint_version": checkpoint_version,
+                            "sequence_number": cp_seq,
+                            "last_event_id": eff_last_ev_id,
+                            "last_event_seq": eff_last_ev_seq,
+                            "status": eff_status,
+                            "verification_status": eff_ver,
+                            "task_prompt": eff_prompt,
+                            "planning_state": safe_plan,
+                            "environment_snapshot": safe_env,
+                            "external_tools_used": safe_ext,
+                            "verified_targets": safe_vt,
+                            "recovery_summary": safe_rec,
+                            "redacted": any_red,
+                            "truncated": any_trunc,
+                            "timestamp": now,
+                        }
+                        cp_digest = self._compute_checkpoint_digest(cp_payload)
+                        cp_payload["checkpoint_digest"] = cp_digest
+
+                        conn.execute(
+                            """
+                            INSERT INTO task_checkpoints (
+                                checkpoint_id, execution_id, task_id, checkpoint_version,
+                                sequence_number, last_event_id, last_event_seq, status,
+                                verification_status, task_prompt, planning_json, environment_json,
+                                external_tools_json, verified_targets_json, recovery_summary_json,
+                                checkpoint_digest, redacted, truncated, created_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                cp_id,
+                                execution_id,
+                                eff_task_id,
+                                checkpoint_version,
+                                cp_seq,
+                                eff_last_ev_id,
+                                eff_last_ev_seq,
+                                eff_status,
+                                eff_ver,
+                                eff_prompt,
+                                json.dumps(safe_plan, ensure_ascii=False, separators=(",", ":"), default=str),
+                                json.dumps(safe_env, ensure_ascii=False, separators=(",", ":"), default=str),
+                                json.dumps(safe_ext, ensure_ascii=False, separators=(",", ":"), default=str),
+                                json.dumps(safe_vt, ensure_ascii=False, separators=(",", ":"), default=str),
+                                json.dumps(safe_rec, ensure_ascii=False, separators=(",", ":"), default=str),
+                                cp_digest,
+                                1 if any_red else 0,
+                                1 if any_trunc else 0,
+                                now,
+                            ),
+                        )
+
+                        next_seq = int(exec_row["next_seq"])
+                        if emit_event:
+                            ev_id = f"evt_{uuid.uuid4().hex[:12]}"
+                            ev_meta = {
+                                "checkpoint_id": cp_id,
+                                "checkpoint_seq": cp_seq,
+                                "checkpoint_version": checkpoint_version,
+                                "last_event_seq": eff_last_ev_seq,
+                                "checkpoint_digest": cp_digest[:16],
+                            }
+                            conn.execute(
+                                """
+                                INSERT INTO execution_events (
+                                    event_id, execution_id, sequence_number, timestamp, event_type,
+                                    status, caller_ring, task_local_scoped, redacted, truncated,
+                                    idempotency_key, metadata_json
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    ev_id,
+                                    execution_id,
+                                    next_seq,
+                                    now,
+                                    LedgerEventType.TASK_CHECKPOINTED.value,
+                                    eff_status,
+                                    exec_row["caller_ring"],
+                                    exec_row["task_local_scoped"],
+                                    1 if any_red else 0,
+                                    1 if any_trunc else 0,
+                                    f"{execution_id}:cp:{cp_seq}",
+                                    json.dumps(ev_meta, ensure_ascii=False, separators=(",", ":"), default=str),
+                                ),
+                            )
+                            next_seq += 1
+
+                        # Never accidentally promote interrupted tasks to COMPLETED on checkpoint
+                        conn.execute(
+                            """
+                            UPDATE executions
+                            SET next_seq = ?, latest_checkpoint_seq = ?, updated_at = ?,
+                                status = ?, verification_status = ?,
+                                redacted = MAX(redacted, ?), truncated = MAX(truncated, ?)
+                            WHERE execution_id = ?
+                            """,
+                            (
+                                next_seq,
+                                cp_seq,
+                                now,
+                                eff_status,
+                                eff_ver,
+                                1 if any_red else 0,
+                                1 if any_trunc else 0,
+                                execution_id,
+                            ),
+                        )
+                        return cp_payload
+                except (ValueError, StaleCheckpointError, UnsupportedCheckpointVersionError):
+                    raise
+                except Exception as exc:
+                    self._record_persistence_failure(
+                        "save_checkpoint",
+                        exc,
+                        execution_id=execution_id,
+                        strict=strict,
+                    )
+                    return None
+
+            # Only reach here if _ensure_connection returned None without raising (strict=False DB failure)
+            return None
+
+    def get_latest_checkpoint(
+        self,
+        execution_id: str,
+        *,
+        verify_integrity: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch and validate the latest persisted checkpoint for an execution."""
+        if not execution_id:
+            return None
+        with self._lock:
+            conn = self._ensure_connection(raise_on_error=False, execution_id=execution_id)
+            if conn is not None:
+                try:
+                    row = conn.execute(
+                        "SELECT * FROM task_checkpoints WHERE execution_id = ? ORDER BY sequence_number DESC LIMIT 1",
+                        (execution_id,),
+                    ).fetchone()
+                    if row is None:
+                        return None
+                    return self._row_to_checkpoint_dict(row, verify_integrity=verify_integrity)
+                except (CorruptedCheckpointError, UnsupportedCheckpointVersionError):
+                    raise
+                except Exception as exc:
+                    self._record_persistence_failure(
+                        "get_latest_checkpoint",
+                        exc,
+                        execution_id=execution_id,
+                        strict=False,
+                    )
+            return None
+
+    def list_checkpoints(
+        self,
+        execution_id: str,
+        *,
+        verify_integrity: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """List all persisted checkpoints for an execution in ascending order."""
+        if not execution_id:
+            return []
+        with self._lock:
+            conn = self._ensure_connection(raise_on_error=False, execution_id=execution_id)
+            if conn is not None:
+                try:
+                    rows = conn.execute(
+                        "SELECT * FROM task_checkpoints WHERE execution_id = ? ORDER BY sequence_number ASC",
+                        (execution_id,),
+                    ).fetchall()
+                    return [self._row_to_checkpoint_dict(r, verify_integrity=verify_integrity) for r in rows]
+                except (CorruptedCheckpointError, UnsupportedCheckpointVersionError):
+                    raise
+                except Exception as exc:
+                    self._record_persistence_failure("list_checkpoints", exc, execution_id=execution_id, strict=False)
+            return []
+
+    def list_resumable_executions(
+        self,
+        *,
+        limit: int = 50,
+        include_cancelled: bool = True,
+        include_failed: bool = True,
+    ) -> List[ExecutionRecord]:
+        """List interrupted or incomplete executions ordered most-recently-updated first."""
+        allowed = [
+            ExecutionStatus.INITIALIZED.value,
+            ExecutionStatus.RUNNING.value,
+            ExecutionStatus.INTERRUPTED.value,
+            ExecutionStatus.TIMED_OUT.value,
+        ]
+        if include_failed:
+            allowed.append(ExecutionStatus.FAILED.value)
+        if include_cancelled:
+            allowed.append(ExecutionStatus.CANCELLED.value)
+
+        eff_limit = max(1, min(int(limit or 50), 500))
+        with self._lock:
+            conn = self._ensure_connection(raise_on_error=False)
+            if conn is not None:
+                try:
+                    placeholders = ",".join("?" for _ in allowed)
+                    rows = conn.execute(
+                        f"SELECT * FROM executions WHERE status IN ({placeholders}) ORDER BY updated_at DESC, rowid DESC LIMIT ?",
+                        (*allowed, eff_limit),
+                    ).fetchall()
+                    return [ExecutionRecord.from_row(r) for r in rows]
+                except Exception as exc:
+                    self._record_persistence_failure("list_resumable_executions", exc, strict=False)
+            recs = [r for r in self._memory_executions.values() if r.status in allowed]
+            recs.sort(key=lambda r: r.updated_at, reverse=True)
+            return recs[:eff_limit]
 
 
 _DEFAULT_LEDGER_LOCK = threading.RLock()
