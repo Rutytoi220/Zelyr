@@ -952,6 +952,8 @@ def cmd_executions(args: argparse.Namespace) -> None:
                             "resumability_status": a.resumability_status,
                             "can_resume": a.can_resume,
                             "requires_explicit_resume": a.requires_explicit_resume,
+                            "pending_proposal_count": a.to_dict()["pending_proposal_count"],
+                            "pending_actions": [p.to_dict() for p in a.pending_actions],
                             "blocking_reasons": a.blocking_reasons,
                             "warnings": a.warnings,
                         }
@@ -968,9 +970,10 @@ def cmd_executions(args: argparse.Namespace) -> None:
                 ts_str = datetime.datetime.fromtimestamp(r.updated_at).strftime("%Y-%m-%d %H:%M:%S")
                 reason = (a.blocking_reasons[0] if a.blocking_reasons else (a.warnings[0] if a.warnings else "ready"))[:70]
                 prompt_snip = (r.task_prompt or "").replace("\n", " ")[:48]
+                pending_cnt = a.to_dict()["pending_proposal_count"]
                 print(
                     f"  {r.execution_id}  status={r.status}  resume={a.resumability_status}  "
-                    f"cp={a.checkpoint_id or 'none'}  at={ts_str}  note={reason}  {prompt_snip}"
+                    f"pending={pending_cnt}  cp={a.checkpoint_id or 'none'}  at={ts_str}  note={reason}  {prompt_snip}"
                 )
             return
 
@@ -1132,6 +1135,17 @@ def _print_checkpoint_assessment(
         f"contradictory={len(assessment.contradictory_ops)} "
         f"pending={len(assessment.pending_ops)}"
     )
+    active_pa_cnt = assessment.to_dict()["pending_proposal_count"]
+    print(f"Pending Proposals:   {active_pa_cnt} active ({len(assessment.pending_actions)} total)")
+    if assessment.pending_actions:
+        for pa in assessment.pending_actions:
+            deps_str = ",".join(pa.depends_on) if pa.depends_on else "-"
+            blk_str = f" reason={pa.blocked_reason}" if pa.blocked_reason else ""
+            print(
+                f"  - [{pa.proposal_order}] {pa.proposal_id} tool={pa.tool_id} status={pa.status} "
+                f"auth={pa.authorization_status} dep={pa.dependency_status} depends_on=[{deps_str}] "
+                f"dispatched={pa.dispatch_attempted}{blk_str}"
+            )
     if assessment.blocking_reasons:
         print("Blocking Reasons:")
         for reason in assessment.blocking_reasons:

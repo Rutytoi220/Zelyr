@@ -681,3 +681,814 @@ class TestPendingProposalAuthorizationAudit:
         assert len(turns_execution_counts) == 3
         for turn_idx, count in turns_execution_counts.items():
             assert count == 1, f"Turn {turn_idx} executed {count} tools; expected exactly 1!"
+
+
+class TestPendingActionContinuity:
+    """Offline end-to-end suite verifying durable pending proposal persistence and resume continuity."""
+
+    def test_pending_action_lifecycle_state_machine_and_tamper_detection(self, tmp_path: Path):
+        from zelyr.engine import (
+            CentralExecutionLedger,
+            CheckpointManager,
+            CorruptedCheckpointError,
+            CorruptedProposalError,
+            ExecutionStatus,
+            InvalidProposalTransitionError,
+            PendingActionProposal,
+            ProposalStatus,
+        )
+
+        # 1. Explicit transition enforcement & duplicate-dispatch rejection
+        prop = PendingActionProposal(
+            proposal_id="prop_1",
+            execution_id="exec_1",
+            original_call_id="c1",
+            tool_id="execute_command",
+            normalized_arguments={"command": "echo hi"},
+        )
+        assert prop.can_transition_to(ProposalStatus.VALIDATED)
+        prop.transition(ProposalStatus.VALIDATED)
+        assert prop.status == ProposalStatus.VALIDATED.value
+
+        prop.transition(ProposalStatus.DISPATCHED)
+        assert prop.dispatch_attempted is True
+        assert not prop.can_transition_to(ProposalStatus.DISPATCHED)
+        with pytest.raises(InvalidProposalTransitionError):
+            prop.transition(ProposalStatus.DISPATCHED)
+        prop.transition(ProposalStatus.COMPLETED)
+        assert prop.has_result is True
+        with pytest.raises(InvalidProposalTransitionError):
+            prop.transition(ProposalStatus.PENDING)
+
+        for term_st in (ProposalStatus.CANCELLED, ProposalStatus.EXPIRED):
+            tp = PendingActionProposal(
+                proposal_id=f"prop_{term_st.value}",
+                execution_id="exec_1",
+                original_call_id=f"c_{term_st.value}",
+                tool_id="execute_command",
+            )
+            tp.transition(term_st, blocked_reason="stopped")
+            with pytest.raises(InvalidProposalTransitionError):
+                tp.transition(ProposalStatus.DISPATCHED)
+
+        # FAILED requires DISPATCHED first; direct PENDING -> FAILED is invalid
+        fp = PendingActionProposal(
+            proposal_id="prop_failed",
+            execution_id="exec_1",
+            original_call_id="c_failed",
+            tool_id="execute_command",
+        )
+        with pytest.raises(InvalidProposalTransitionError):
+            fp.transition(ProposalStatus.FAILED)
+        fp.transition(ProposalStatus.DISPATCHED)
+        fp.transition(ProposalStatus.FAILED, blocked_reason="command_error")
+        with pytest.raises(InvalidProposalTransitionError):
+            fp.transition(ProposalStatus.DISPATCHED)
+
+        blk = PendingActionProposal(
+            proposal_id="prop_blk",
+            execution_id="exec_1",
+            original_call_id="c_blk",
+            tool_id="execute_command",
+        )
+        blk.transition(ProposalStatus.BLOCKED, blocked_reason="waiting")
+        with pytest.raises(InvalidProposalTransitionError):
+            blk.transition(ProposalStatus.DISPATCHED)
+
+        # 2. Corrupt proposal payload fails closed
+        with pytest.raises(CorruptedProposalError):
+            PendingActionProposal.from_dict({"proposal_id": "bad", "original_call_id": "c", "tool_id": "x"})
+        with pytest.raises(CorruptedProposalError):
+            PendingActionProposal.from_dict(
+                {
+                    "proposal_id": "bad2",
+                    "execution_id": "exec_1",
+                    "original_call_id": "c",
+                    "tool_id": "x",
+                    "status": "completed",
+                    "normalized_arguments": "not_a_dict",
+                }
+            )
+
+        # 3. Durable SQLite round-trip in existing execution_ledger.db + tamper failure
+        import sqlite3
+
+        db_path = tmp_path / "ledger.db"
+        ledger = CentralExecutionLedger(db_path=db_path, raise_on_persistence_error=True)
+        try:
+            rec = ledger.create_execution("Persist pending queue", status=ExecutionStatus.INTERRUPTED)
+            cp = CheckpointManager.capture_checkpoint(
+                ledger,
+                rec.execution_id,
+                status=ExecutionStatus.INTERRUPTED,
+                pending_actions=[
+                    {
+                        "proposal_id": "prop_a",
+                        "execution_id": rec.execution_id,
+                        "original_call_id": "ca",
+                        "tool_id": "execute_command",
+                        "normalized_arguments": {"command": "echo A", "token": "sk-secret-value-123"},
+                        "proposal_order": 0,
+                        "status": "pending",
+                    }
+                ],
+            )
+            assert cp is not None
+            assert len(cp.pending_actions) == 1
+            assert cp.pending_actions[0]["normalized_arguments"].get("token") != "sk-secret-value-123"
+        finally:
+            ledger.close()
+
+        # Tamper pending_actions_json in SQLite without recomputing digest -> must fail closed
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute(
+                "UPDATE task_checkpoints SET pending_actions_json = '[]' WHERE execution_id = ?",
+                (rec.execution_id,),
+            )
+        ledger2 = CentralExecutionLedger(db_path=db_path, raise_on_persistence_error=True)
+        try:
+            with pytest.raises(CorruptedCheckpointError):
+                ledger2.get_latest_checkpoint(rec.execution_id, verify_integrity=True)
+        finally:
+            ledger2.close()
+
+    def test_interrupted_provider_error_preserves_queue_and_resumes_in_order(self, tmp_path: Path):
+        import asyncio
+        import httpx
+        from zelyr.engine import CentralExecutionLedger, CheckpointManager, ProposalStatus
+
+        db_path = tmp_path / "resume_queue.db"
+        ledger = CentralExecutionLedger(db_path=db_path, raise_on_persistence_error=True)
+        executed: List[str] = []
+
+        async def _run():
+            orch1 = NativeOrchestrator(max_steps=5, central_ledger=ledger)
+            turn1 = {"n": 0}
+
+            async def prov_interrupt(payload):
+                turn1["n"] += 1
+                if turn1["n"] == 1:
+                    yield {
+                        "choices": [{
+                            "delta": {
+                                "tool_calls": [
+                                    {"index": 0, "id": "c1", "type": "function", "function": {"name": "execute_command", "arguments": json.dumps({"command": "step1"})}},
+                                    {"index": 1, "id": "c2", "type": "function", "function": {"name": "execute_command", "arguments": json.dumps({"command": "step2"})}},
+                                    {"index": 2, "id": "c3", "type": "function", "function": {"name": "execute_command", "arguments": json.dumps({"command": "step3"})}},
+                                ]
+                            },
+                            "finish_reason": "tool_calls",
+                        }]
+                    }
+                else:
+                    raise httpx.ConnectError("Connection lost to provider")
+
+            async def exec_ok(name, **kwargs):
+                executed.append(kwargs.get("command"))
+                return {"status": "success", "output": f"ran {kwargs.get('command')}"}
+
+            async for _ in orch1.generate_stream(
+                {"messages": [{"role": "user", "content": "Run step1, then step2, then step3"}]},
+                stream_provider=prov_interrupt,
+                tool_executor=exec_ok,
+            ):
+                pass
+
+            assert executed == ["step1"]
+            exec_id = orch1.current_ledger._execution_id
+
+            # Open fresh ledger instance (simulating process restart)
+            ledger.close()
+            restarted_ledger = CentralExecutionLedger(db_path=db_path, raise_on_persistence_error=True)
+            try:
+                assess = CheckpointManager.assess_resume(restarted_ledger, exec_id)
+                assert assess.can_resume is True
+                by_cid = {p.original_call_id: p for p in assess.pending_actions}
+                assert by_cid["c1"].status == ProposalStatus.COMPLETED.value
+                assert by_cid["c1"].dispatch_attempted is True
+                assert by_cid["c2"].status == ProposalStatus.VALIDATED.value
+                assert by_cid["c3"].status == ProposalStatus.VALIDATED.value
+                assert by_cid["c2"].proposal_order < by_cid["c3"].proposal_order
+
+                # Resume execution and verify one-tool-per-step execution continues c2 -> c3 in order without repeating c1
+                orch2 = NativeOrchestrator(max_steps=6, central_ledger=restarted_ledger)
+
+                async def prov_resume(payload):
+                    msgs = payload.get("messages", [])
+                    tool_msgs = [m for m in msgs if m.get("role") == "tool"]
+                    if len(tool_msgs) == 0:
+                        yield {
+                            "choices": [{
+                                "delta": {
+                                    "tool_calls": [
+                                        {"index": 0, "id": "c2_resumed", "type": "function", "function": {"name": "execute_command", "arguments": json.dumps({"command": "step2"})}},
+                                    ]
+                                },
+                                "finish_reason": "tool_calls",
+                            }]
+                        }
+                    elif len(tool_msgs) == 1:
+                        yield {
+                            "choices": [{
+                                "delta": {
+                                    "tool_calls": [
+                                        {"index": 0, "id": "c3_resumed", "type": "function", "function": {"name": "execute_command", "arguments": json.dumps({"command": "step3"})}},
+                                    ]
+                                },
+                                "finish_reason": "tool_calls",
+                            }]
+                        }
+                    else:
+                        yield {"choices": [{"delta": {"content": "Finished remaining steps."}}]}
+
+                resumed_assess, _ = await CheckpointManager.resume_execution(
+                    orch2,
+                    restarted_ledger,
+                    exec_id,
+                    stream_provider=prov_resume,
+                    tool_executor=exec_ok,
+                )
+                assert len(resumed_assess.pending_actions) >= 2
+                assert executed == ["step1", "step2", "step3"]
+            finally:
+                restarted_ledger.close()
+
+        asyncio.run(_run())
+
+    def test_dependency_ordering_failure_blocking_and_runtime_enforcement(self, tmp_path: Path):
+        import asyncio
+        from zelyr.engine import CentralExecutionLedger, CheckpointManager, ExecutionStatus, ProposalStatus
+
+        db_path = tmp_path / "deps.db"
+        ledger = CentralExecutionLedger(db_path=db_path, raise_on_persistence_error=True)
+
+        async def _run():
+            # A: Dep waiting on pending prerequisite, and runtime blocking out-of-order dispatch
+            rec_a = ledger.create_execution("Dep chain task", status=ExecutionStatus.INTERRUPTED)
+            CheckpointManager.capture_checkpoint(
+                ledger,
+                rec_a.execution_id,
+                status=ExecutionStatus.INTERRUPTED,
+                pending_actions=[
+                    {
+                        "proposal_id": "prop_prereq",
+                        "execution_id": rec_a.execution_id,
+                        "original_call_id": "c_pre",
+                        "tool_id": "execute_command",
+                        "normalized_arguments": {"command": "echo first"},
+                        "proposal_order": 0,
+                        "status": "pending",
+                    },
+                    {
+                        "proposal_id": "prop_child",
+                        "execution_id": rec_a.execution_id,
+                        "original_call_id": "c_child",
+                        "tool_id": "execute_command",
+                        "normalized_arguments": {"command": "echo second"},
+                        "proposal_order": 1,
+                        "depends_on": ["prop_prereq"],
+                        "status": "pending",
+                    },
+                ],
+            )
+            assess_a = CheckpointManager.assess_resume(ledger, rec_a.execution_id)
+            by_pid_a = {p.proposal_id: p for p in assess_a.pending_actions}
+            assert by_pid_a["prop_prereq"].status == ProposalStatus.VALIDATED.value
+            assert by_pid_a["prop_child"].status == ProposalStatus.PENDING.value
+            assert by_pid_a["prop_child"].dependency_status == "waiting"
+            assert CheckpointManager.get_next_dispatchable_proposal(assess_a).proposal_id == "prop_prereq"
+
+            # Attempt out-of-order child dispatch inside orchestrator before prerequisite completes -> rejected
+            orch = NativeOrchestrator(max_steps=4, central_ledger=ledger)
+            executed_ooo = []
+
+            async def exec_track(name, **kwargs):
+                executed_ooo.append(kwargs.get("command"))
+                return {"status": "success"}
+
+            turn_ooo = {"n": 0}
+
+            async def prov_ooo(payload):
+                turn_ooo["n"] += 1
+                if turn_ooo["n"] == 1:
+                    yield {
+                        "choices": [{
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "id": "try_child_early",
+                                    "proposal_id": "prop_child",
+                                    "depends_on": ["prop_prereq"],
+                                    "type": "function",
+                                    "function": {"name": "execute_command", "arguments": json.dumps({"command": "echo second"})},
+                                }]
+                            }
+                        }]
+                    }
+                else:
+                    yield {"choices": [{"delta": {"content": "Will run prerequisite first."}}]}
+
+            turn_ledger = TurnExecutionLedger()
+            turn_ledger.record_proposed("c_pre", "execute_command", {"command": "echo first"}, proposal_id="prop_prereq")
+            async for _ in orch.generate_stream(
+                {"messages": [{"role": "user", "content": "Run"}]},
+                stream_provider=prov_ooo,
+                tool_executor=exec_track,
+                ledger=turn_ledger,
+            ):
+                pass
+            assert executed_ooo == []
+            assert "dependency_not_satisfied" in str(turn_ledger._records["try_child_early"].rejection_reason)
+
+            # B: Failed prerequisite permanently blocks dependent child proposal
+            rec_b = ledger.create_execution("Failed dep chain", status=ExecutionStatus.FAILED)
+            ledger.record_event(rec_b.execution_id, "tool_selected", tool_id="execute_command", correlation_id="c_fail", status="proposed", metadata={"arguments": {"command": "bad"}})
+            ledger.record_event(rec_b.execution_id, "tool_execution_start", tool_id="execute_command", correlation_id="c_fail", status="started")
+            ledger.record_event(rec_b.execution_id, "tool_execution_result", tool_id="execute_command", correlation_id="c_fail", status="failed", metadata={"error": "boom", "exit_code": 1})
+            CheckpointManager.capture_checkpoint(
+                ledger,
+                rec_b.execution_id,
+                status=ExecutionStatus.FAILED,
+                pending_actions=[
+                    {
+                        "proposal_id": "prop_fail_dep",
+                        "execution_id": rec_b.execution_id,
+                        "original_call_id": "c_fail",
+                        "tool_id": "execute_command",
+                        "normalized_arguments": {"command": "bad"},
+                        "proposal_order": 0,
+                        "status": "pending",
+                    },
+                    {
+                        "proposal_id": "prop_blocked_child",
+                        "execution_id": rec_b.execution_id,
+                        "original_call_id": "c_blk_child",
+                        "tool_id": "execute_command",
+                        "normalized_arguments": {"command": "echo after_bad"},
+                        "proposal_order": 1,
+                        "depends_on": ["prop_fail_dep"],
+                        "status": "pending",
+                    },
+                ],
+            )
+            assess_b = CheckpointManager.assess_resume(ledger, rec_b.execution_id)
+            by_pid_b = {p.proposal_id: p for p in assess_b.pending_actions}
+            assert by_pid_b["prop_fail_dep"].status == ProposalStatus.FAILED.value
+            assert by_pid_b["prop_blocked_child"].status == ProposalStatus.BLOCKED.value
+            assert by_pid_b["prop_blocked_child"].dependency_status == "failed"
+
+        try:
+            asyncio.run(_run())
+        finally:
+            ledger.close()
+    def test_security_ttl_revocation_invalid_args_and_in_flight_ambiguity(self, tmp_path: Path):
+        import time as _time
+        from zelyr.engine import CentralExecutionLedger, CheckpointManager, ExecutionStatus, ProposalStatus
+        from zelyr.tool_registry import ToolRegistry
+
+        db_path = tmp_path / "sec_ttl.db"
+        ledger = CentralExecutionLedger(db_path=db_path, raise_on_persistence_error=True)
+
+        class _RevokedRegistry(ToolRegistry):
+            def __init__(self, allow_ext: bool = True):
+                super().__init__()
+                self._allow_ext = allow_ext
+
+            def get_external_tool_entry(self, tool_name: str):
+                if tool_name == "mcp_ext_tool" and self._allow_ext:
+                    return type("Ext", (), {"source_id": "srv1", "source_type": "mcp", "authorized": True, "external_tool_name": "mcp_ext_tool"})()
+                if tool_name == "mcp_ext_tool":
+                    return type("Ext", (), {"source_id": "srv1", "source_type": "mcp", "authorized": False, "external_tool_name": "mcp_ext_tool"})()
+                return None
+
+        try:
+            # 1. Expired TTL + invalid arguments + in-flight ambiguous op never dispatched
+            rec = ledger.create_execution("Mixed queue guards", status=ExecutionStatus.INTERRUPTED)
+            ledger.record_event(
+                rec.execution_id,
+                "tool_selected",
+                tool_id="execute_command",
+                correlation_id="c_inflight",
+                status="proposed",
+                metadata={"arguments": {"command": "rm -rf temp_build"}},
+            )
+            ledger.record_event(
+                rec.execution_id,
+                "tool_execution_start",
+                tool_id="execute_command",
+                correlation_id="c_inflight",
+                status="started",
+            )
+            CheckpointManager.capture_checkpoint(
+                ledger,
+                rec.execution_id,
+                status=ExecutionStatus.INTERRUPTED,
+                pending_actions=[
+                    {
+                        "proposal_id": "p_inflight",
+                        "execution_id": rec.execution_id,
+                        "original_call_id": "c_inflight",
+                        "tool_id": "execute_command",
+                        "normalized_arguments": {"command": "rm -rf temp_build"},
+                        "proposal_order": 0,
+                        "status": "pending",
+                    },
+                    {
+                        "proposal_id": "p_expired",
+                        "execution_id": rec.execution_id,
+                        "original_call_id": "c_exp",
+                        "tool_id": "execute_command",
+                        "normalized_arguments": {"command": "echo late"},
+                        "proposal_order": 1,
+                        "expires_at": _time.time() - 60.0,
+                        "status": "pending",
+                    },
+                    {
+                        "proposal_id": "p_bad_args",
+                        "execution_id": rec.execution_id,
+                        "original_call_id": "c_bad",
+                        "tool_id": "execute_command",
+                        "normalized_arguments": {"caller_ring_grant": 0},  # invalid schema + stripped auth grant!
+                        "proposal_order": 2,
+                        "status": "pending",
+                    },
+                    {
+                        "proposal_id": "p_good",
+                        "execution_id": rec.execution_id,
+                        "original_call_id": "c_good",
+                        "tool_id": "execute_command",
+                        "normalized_arguments": {"command": "echo safe"},
+                        "proposal_order": 3,
+                        "status": "pending",
+                    },
+                ],
+            )
+            schemas = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "execute_command",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"command": {"type": "string"}},
+                            "required": ["command"],
+                        },
+                    },
+                }
+            ]
+            assess = CheckpointManager.assess_resume(
+                ledger,
+                rec.execution_id,
+                tool_registry=ToolRegistry(),
+                active_schemas=schemas,
+                caller_ring=0,
+            )
+            by_pid = {p.proposal_id: p for p in assess.pending_actions}
+            # In-flight ledger reconciliation overrides stale checkpoint status to DISPATCHED
+            assert by_pid["p_inflight"].status == ProposalStatus.DISPATCHED.value
+            assert by_pid["p_inflight"].dispatch_attempted is True
+            # Expired proposal marked EXPIRED
+            assert by_pid["p_expired"].status == ProposalStatus.EXPIRED.value
+            # Invalid args marked BLOCKED and stripped checkpoint grant key
+            assert by_pid["p_bad_args"].status == ProposalStatus.BLOCKED.value
+            assert by_pid["p_bad_args"].authorization_status == "invalid_arguments"
+            assert "caller_ring_grant" not in by_pid["p_bad_args"].normalized_arguments
+            # Valid proposal remains VALIDATED and only dispatchable item
+            assert by_pid["p_good"].status == ProposalStatus.VALIDATED.value
+            assert by_pid["p_good"].authorization_status == "authorized"
+            payload = CheckpointManager.prepare_resumed_payload(assess, tools=schemas)
+            assert [p["proposal_id"] for p in payload.get("_pending_proposals", [])] == ["p_good"]
+            assert "p_inflight" in payload.get("_guarded_pending_proposals", {})
+            assert "p_expired" in payload.get("_guarded_pending_proposals", {})
+
+            # 2. Revoked external tool blocks resume cleanly
+            rec_ext = ledger.create_execution("External pending", status=ExecutionStatus.INTERRUPTED)
+            CheckpointManager.capture_checkpoint(
+                ledger,
+                rec_ext.execution_id,
+                status=ExecutionStatus.INTERRUPTED,
+                pending_actions=[
+                    {
+                        "proposal_id": "p_ext",
+                        "execution_id": rec_ext.execution_id,
+                        "original_call_id": "c_ext",
+                        "tool_id": "mcp_ext_tool",
+                        "normalized_arguments": {},
+                        "external_source": {"is_external": True, "source_id": "srv1", "source_type": "mcp"},
+                        "status": "pending",
+                    }
+                ],
+            )
+            assess_revoked = CheckpointManager.assess_resume(
+                ledger,
+                rec_ext.execution_id,
+                tool_registry=_RevokedRegistry(allow_ext=False),
+            )
+            assert assess_revoked.can_resume is False
+            assert assess_revoked.pending_actions[0].status == ProposalStatus.BLOCKED.value
+            assert assess_revoked.pending_actions[0].authorization_status == "denied"
+        finally:
+            ledger.close()
+
+    def test_legacy_checkpoint_migration_and_cli_visibility(self, tmp_path: Path, capsys, monkeypatch):
+        import sqlite3
+        import sys
+        from zelyr.cli.main import main
+        from zelyr.engine import CentralExecutionLedger, CheckpointManager, ProposalStatus
+
+        db_path = tmp_path / "legacy_cp.db"
+        # Simulate v1 checkpoint table created BEFORE pending_actions_json column existed
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE executions (
+                    execution_id TEXT PRIMARY KEY,
+                    parent_execution_id TEXT,
+                    task_prompt TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'initialized',
+                    verification_status TEXT NOT NULL DEFAULT 'not_verified',
+                    source_component TEXT NOT NULL DEFAULT 'runtime',
+                    caller_ring INTEGER,
+                    task_local_scoped INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    completed_at REAL,
+                    final_summary TEXT,
+                    error TEXT,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    redacted INTEGER NOT NULL DEFAULT 0,
+                    truncated INTEGER NOT NULL DEFAULT 0,
+                    next_seq INTEGER NOT NULL DEFAULT 1,
+                    latest_checkpoint_seq INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE execution_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL,
+                    execution_id TEXT NOT NULL,
+                    sequence_number INTEGER NOT NULL,
+                    timestamp REAL NOT NULL,
+                    event_type TEXT NOT NULL,
+                    tool_id TEXT,
+                    source_id TEXT,
+                    source_type TEXT,
+                    is_external INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'recorded',
+                    correlation_id TEXT,
+                    caller_ring INTEGER,
+                    task_local_scoped INTEGER NOT NULL DEFAULT 0,
+                    redacted INTEGER NOT NULL DEFAULT 0,
+                    truncated INTEGER NOT NULL DEFAULT 0,
+                    idempotency_key TEXT,
+                    metadata_json TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE TABLE task_checkpoints (
+                    checkpoint_id TEXT PRIMARY KEY,
+                    execution_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    checkpoint_version INTEGER NOT NULL DEFAULT 1,
+                    sequence_number INTEGER NOT NULL,
+                    last_event_id TEXT,
+                    last_event_seq INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL,
+                    verification_status TEXT NOT NULL,
+                    task_prompt TEXT NOT NULL DEFAULT '',
+                    planning_json TEXT NOT NULL DEFAULT '{}',
+                    environment_json TEXT NOT NULL DEFAULT '{}',
+                    external_tools_json TEXT NOT NULL DEFAULT '[]',
+                    verified_targets_json TEXT NOT NULL DEFAULT '[]',
+                    recovery_summary_json TEXT NOT NULL DEFAULT '{}',
+                    checkpoint_digest TEXT NOT NULL,
+                    redacted INTEGER NOT NULL DEFAULT 0,
+                    truncated INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL
+                );
+                """
+            )
+            plan_legacy = {"pending_proposals": [{"call_id": "leg_c2", "tool_name": "execute_command", "arguments": {"command": "echo leg"}}]}
+            cp_digest = CentralExecutionLedger._compute_checkpoint_digest({
+                "checkpoint_version": 1,
+                "checkpoint_id": "cp_legacy_1",
+                "execution_id": "exec_leg_cp",
+                "task_id": "exec_leg_cp",
+                "sequence_number": 1,
+                "last_event_id": None,
+                "last_event_seq": 0,
+                "status": "interrupted",
+                "verification_status": "interrupted",
+                "task_prompt": "Legacy queued task",
+                "planning_state": plan_legacy,
+                "environment_snapshot": {},
+                "external_tools_used": [],
+                "verified_targets": [],
+                "recovery_summary": {},
+            })
+            conn.execute(
+                "INSERT INTO executions (execution_id, task_prompt, status, verification_status, created_at, updated_at, next_seq, latest_checkpoint_seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("exec_leg_cp", "Legacy queued task", "interrupted", "interrupted", 10.0, 10.0, 1, 1),
+            )
+            conn.execute(
+                """
+                INSERT INTO task_checkpoints (
+                    checkpoint_id, execution_id, task_id, checkpoint_version, sequence_number,
+                    last_event_id, last_event_seq, status, verification_status, task_prompt,
+                    planning_json, environment_json, external_tools_json, verified_targets_json,
+                    recovery_summary_json, checkpoint_digest, redacted, truncated, created_at
+                ) VALUES (?, ?, ?, 1, 1, NULL, 0, 'interrupted', 'interrupted', 'Legacy queued task', ?, '{}', '[]', '[]', '{}', ?, 0, 0, 10.0)
+                """,
+                ("cp_legacy_1", "exec_leg_cp", "exec_leg_cp", json.dumps(plan_legacy, sort_keys=True, separators=(",", ":")), cp_digest),
+            )
+
+        ledger = CentralExecutionLedger(db_path=db_path, raise_on_persistence_error=True)
+        try:
+            assess = CheckpointManager.assess_resume(ledger, "exec_leg_cp")
+            assert assess.can_resume is True
+            assert len(assess.pending_actions) == 1
+            assert assess.pending_actions[0].original_call_id == "leg_c2"
+            assert assess.pending_actions[0].status == ProposalStatus.VALIDATED.value
+        finally:
+            ledger.close()
+
+        # Verify CLI JSON & human inspection include pending_proposal_count and pending_actions details
+        monkeypatch.setattr(sys, "argv", ["zelyr", "executions", "--resumable", "--db-path", str(db_path), "--json"])
+        main()
+        list_json = json.loads(capsys.readouterr().out)
+        assert list_json["resumable_tasks"][0]["pending_proposal_count"] == 1
+        assert list_json["resumable_tasks"][0]["pending_actions"][0]["original_call_id"] == "leg_c2"
+
+        monkeypatch.setattr(sys, "argv", ["zelyr", "execution", "exec_leg_cp", "--checkpoint", "--db-path", str(db_path)])
+        main()
+        insp_text = capsys.readouterr().out
+        assert "Pending Proposals:" in insp_text
+        assert "prop_leg_c2" in insp_text
+
+        monkeypatch.setattr(sys, "argv", ["zelyr", "checkpoint", "abandon", "exec_leg_cp", "--db-path", str(db_path), "--json"])
+        main()
+        capsys.readouterr()
+
+        ledger3 = CentralExecutionLedger(db_path=db_path, raise_on_persistence_error=True)
+        try:
+            after_abandon = CheckpointManager.assess_resume(ledger3, "exec_leg_cp")
+            assert after_abandon.can_resume is False
+            assert after_abandon.pending_actions[0].status == ProposalStatus.CANCELLED.value
+            assert after_abandon.pending_actions[0].blocked_reason
+        finally:
+            ledger3.close()
+
+    def test_verified_dep_resume_cancellation_env_drift_and_persistence_errors(self, tmp_path: Path, monkeypatch):
+        import asyncio
+        import sqlite3
+        from zelyr.engine import (
+            CentralExecutionLedger,
+            CheckpointManager,
+            CorruptedCheckpointError,
+            ExecutionStatus,
+            LedgerPersistenceError,
+            ProposalStatus,
+        )
+
+        db_path = tmp_path / "edge_cases.db"
+        ledger = CentralExecutionLedger(db_path=db_path, raise_on_persistence_error=True)
+
+        async def _run():
+            # 1. Dependency already verified before interruption -> child becomes VALIDATED without repeating parent
+            rec_dep = ledger.create_execution(
+                "Create dep.txt then echo done",
+                status=ExecutionStatus.INTERRUPTED,
+            )
+            ledger.record_event(
+                rec_dep.execution_id,
+                "tool_selected",
+                tool_id="execute_command",
+                correlation_id="c_done",
+                status="proposed",
+                metadata={"arguments": {"command": "touch dep.txt"}, "proposal_id": "prop_done"},
+            )
+            ledger.record_event(rec_dep.execution_id, "tool_execution_start", tool_id="execute_command", correlation_id="c_done", status="started")
+            ledger.record_event(rec_dep.execution_id, "tool_execution_result", tool_id="execute_command", correlation_id="c_done", status="succeeded", metadata={"verified": True, "exit_code": 0})
+            CheckpointManager.capture_checkpoint(
+                ledger,
+                rec_dep.execution_id,
+                status=ExecutionStatus.INTERRUPTED,
+                pending_actions=[
+                    {
+                        "proposal_id": "prop_done",
+                        "execution_id": rec_dep.execution_id,
+                        "original_call_id": "c_done",
+                        "tool_id": "execute_command",
+                        "normalized_arguments": {"command": "touch dep.txt"},
+                        "proposal_order": 0,
+                        "status": "pending",
+                    },
+                    {
+                        "proposal_id": "prop_after_done",
+                        "execution_id": rec_dep.execution_id,
+                        "original_call_id": "c_after",
+                        "tool_id": "execute_command",
+                        "normalized_arguments": {"command": "echo done"},
+                        "proposal_order": 1,
+                        "depends_on": ["prop_done"],
+                        "status": "pending",
+                    },
+                ],
+            )
+            assess_dep = CheckpointManager.assess_resume(ledger, rec_dep.execution_id)
+            by_pid = {p.proposal_id: p for p in assess_dep.pending_actions}
+            assert by_pid["prop_done"].status == ProposalStatus.COMPLETED.value
+            assert by_pid["prop_after_done"].status == ProposalStatus.VALIDATED.value
+            assert by_pid["prop_after_done"].dependency_status == "satisfied"
+            assert CheckpointManager.get_next_dispatchable_proposal(assess_dep).proposal_id == "prop_after_done"
+
+            # 2. User cancellation transitions queued proposals to CANCELLED with blocked_reason & does not auto-dispatch on --confirm
+            orch_can = NativeOrchestrator(max_steps=4, central_ledger=ledger)
+
+            async def prov_can(payload):
+                yield {
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [
+                                {"index": 0, "id": "cc1", "type": "function", "function": {"name": "execute_command", "arguments": json.dumps({"command": "first"})}},
+                                {"index": 1, "id": "cc2", "type": "function", "function": {"name": "execute_command", "arguments": json.dumps({"command": "second"})}},
+                            ]
+                        }
+                    }]
+                }
+
+            async def exec_cancel(name, **kwargs):
+                orch_can.cancel(reason="user_cancelled")
+                return {"status": "success"}
+
+            async for _ in orch_can.generate_stream(
+                {"messages": [{"role": "user", "content": "Run two steps"}]},
+                stream_provider=prov_can,
+                tool_executor=exec_cancel,
+            ):
+                pass
+            can_exec_id = orch_can.current_ledger._execution_id
+            assess_can = CheckpointManager.assess_resume(ledger, can_exec_id, explicit_resume=True)
+            assert assess_can.can_resume is True
+            can_by_cid = {p.original_call_id: p for p in assess_can.pending_actions}
+            assert can_by_cid["cc2"].status == ProposalStatus.CANCELLED.value
+            assert can_by_cid["cc2"].blocked_reason
+            payload_can = CheckpointManager.prepare_resumed_payload(assess_can)
+            assert payload_can.get("_pending_proposals") in (None, [])
+
+            # 3. Environment capability loss blocks affected queued pending proposal
+            rec_ui = ledger.create_execution("Click button", status=ExecutionStatus.INTERRUPTED)
+            CheckpointManager.capture_checkpoint(
+                ledger,
+                rec_ui.execution_id,
+                status=ExecutionStatus.INTERRUPTED,
+                environment_snapshot={"os": "Linux", "desktop_available": True},
+                pending_actions=[
+                    {
+                        "proposal_id": "prop_ui",
+                        "execution_id": rec_ui.execution_id,
+                        "original_call_id": "c_ui",
+                        "tool_id": "interact_with_ui",
+                        "normalized_arguments": {"target": "Save"},
+                        "proposal_order": 0,
+                        "status": "pending",
+                    }
+                ],
+            )
+            assess_ui = CheckpointManager.assess_resume(
+                ledger,
+                rec_ui.execution_id,
+                current_environment={"os": "Linux", "desktop_available": False},
+            )
+            assert assess_ui.pending_actions[0].status == ProposalStatus.BLOCKED.value
+            assert "unavailable" in str(assess_ui.pending_actions[0].blocked_reason).lower()
+
+            # 4. Corrupted pending_actions_json fails closed on retrieval
+            rec_bad = ledger.create_execution("Bad json prop", status=ExecutionStatus.INTERRUPTED)
+            CheckpointManager.capture_checkpoint(ledger, rec_bad.execution_id, status=ExecutionStatus.INTERRUPTED)
+            with sqlite3.connect(str(db_path)) as conn:
+                conn.execute(
+                    "UPDATE task_checkpoints SET pending_actions_json = '{not-json' WHERE execution_id = ?",
+                    (rec_bad.execution_id,),
+                )
+            with pytest.raises(CorruptedCheckpointError):
+                ledger.get_latest_checkpoint(rec_bad.execution_id, verify_integrity=True)
+            assess_bad = CheckpointManager.assess_resume(ledger, rec_bad.execution_id)
+            assert assess_bad.can_resume is False
+            assert any("corrupted checkpoint" in r.lower() for r in assess_bad.blocking_reasons)
+
+            # 5. Persistence failure is explicitly raised when raise_on_persistence_error=True
+            rec_pf = ledger.create_execution("Fail save", status=ExecutionStatus.INTERRUPTED)
+
+            def _boom(*_a, **_kw):
+                raise RuntimeError("disk full")
+
+            monkeypatch.setattr(ledger, "_ensure_connection", _boom)
+            with pytest.raises((LedgerPersistenceError, RuntimeError)):
+                CheckpointManager.capture_checkpoint(
+                    ledger,
+                    rec_pf.execution_id,
+                    status=ExecutionStatus.INTERRUPTED,
+                    strict=True,
+                )
+
+        try:
+            asyncio.run(_run())
+        finally:
+            ledger.close()

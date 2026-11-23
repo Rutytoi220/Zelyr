@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import time
 import uuid
 from pathlib import Path
 import httpx
@@ -1603,6 +1604,7 @@ class NativeOrchestrator:
                                 "interruption_reason": interruption_reason,
                                 "last_assistant_text": final_text[:512] if final_text else None,
                             },
+                            pending_proposals=getattr(eff_ledger, "_active_pending_queue", None),
                             emit_event=False,
                             strict=None,
                         )
@@ -1707,12 +1709,13 @@ class NativeOrchestrator:
 
         if pending_proposals is not None:
             curr_pending_proposals = list(pending_proposals)
-        elif depth == 0:
+        elif depth == 0 and not payload.get("_resumed_from_checkpoint"):
             curr_pending_proposals = []
         else:
             curr_pending_proposals = list(payload.get("_pending_proposals") or [])
         proposals_before_turn = list(curr_pending_proposals)
         payload["_pending_proposals"] = curr_pending_proposals
+        eff_ledger._active_pending_queue = curr_pending_proposals
 
         if getattr(self, "_cancelled", False) or payload.get("cancelled", False):
             if hasattr(eff_ledger, "_root_meta") and isinstance(eff_ledger._root_meta, dict):
@@ -2207,8 +2210,7 @@ class NativeOrchestrator:
                     if hasattr(eff_ledger, "_root_meta") and isinstance(eff_ledger._root_meta, dict):
                         eff_ledger._root_meta["provider_error"] = str(data["_api_error"])
                         eff_ledger._root_meta["error"] = str(data["_api_error"])
-                    if eff_ledger.has_pending_proposals():
-                        eff_ledger.discard_pending_proposals(reason="api_error")
+                    eff_ledger._active_pending_queue = list(curr_pending_proposals)
                     yield {"choices": [{"delta": {"content": f"\n⚠️ [API Error] {data['_api_error']}\n"}}]}
                     return
 
@@ -2256,6 +2258,9 @@ class NativeOrchestrator:
                             )
                         if "id" in tc and tc["id"]:
                             pending_tool_calls[idx]["id"] = tc["id"]
+                        for opt_k in ("proposal_id", "depends_on", "expires_at", "external_source"):
+                            if opt_k in tc and tc[opt_k] is not None:
+                                pending_tool_calls[idx][opt_k] = tc[opt_k]
                         if "function" in tc and isinstance(tc["function"], dict):
                             if "name" in tc["function"] and tc["function"]["name"]:
                                 raw_fn_name = tc["function"]["name"]
@@ -2349,16 +2354,14 @@ class NativeOrchestrator:
             if hasattr(eff_ledger, "_root_meta") and isinstance(eff_ledger._root_meta, dict):
                 eff_ledger._root_meta["connection_error"] = True
                 eff_ledger._root_meta["error"] = str(exc)
-            if eff_ledger.has_pending_proposals():
-                eff_ledger.discard_pending_proposals(reason="connection_error")
+            eff_ledger._active_pending_queue = list(curr_pending_proposals)
             yield {"choices": [{"delta": {"content": f"\n⚠️ [Connection Error] Could not connect to local AI engine at {base_url}: {exc}. Ensure Ollama is running.\n"}}]}
             return
         except httpx.RequestError as exc:
             if hasattr(eff_ledger, "_root_meta") and isinstance(eff_ledger._root_meta, dict):
                 eff_ledger._root_meta["connection_error"] = True
                 eff_ledger._root_meta["error"] = str(exc)
-            if eff_ledger.has_pending_proposals():
-                eff_ledger.discard_pending_proposals(reason="request_error")
+            eff_ledger._active_pending_queue = list(curr_pending_proposals)
             err_detail = str(exc).strip()
             err_label = f"{type(exc).__name__}: {err_detail}" if err_detail else type(exc).__name__
             yield {"choices": [{"delta": {"content": f"\n⚠️ [Request Error] Communication failure with {base_url}: {err_label}\n"}}]}
@@ -2434,20 +2437,52 @@ class NativeOrchestrator:
                         anc_args = {}
                 raw_anc_id = anc.get("id") or f"call_native_rem_{depth}_{idx_rem}_{uuid.uuid4().hex[:6]}"
                 anc_id = self._unique_ledger_call_id(eff_ledger, raw_anc_id)
+                anc_deps = anc.get("depends_on") if isinstance(anc.get("depends_on"), list) else None
+                anc_exp = anc.get("expires_at")
+                anc_pid = anc.get("proposal_id")
+                anc_ext = anc.get("external_source") if isinstance(anc.get("external_source"), dict) else None
+                if anc_ext is None and self.tool_registry is not None:
+                    try:
+                        ext_e = (
+                            self.tool_registry.get_external_tool_entry(anc_name)
+                            if callable(getattr(self.tool_registry, "get_external_tool_entry", None))
+                            else None
+                        )
+                        if ext_e is not None:
+                            anc_ext = {
+                                "is_external": True,
+                                "source_id": getattr(ext_e, "source_id", None) or "external",
+                                "source_type": getattr(ext_e, "source_type", None) or "external",
+                                "external_tool_name": getattr(ext_e, "external_tool_name", None) or anc_name,
+                            }
+                    except Exception:
+                        anc_ext = None
                 eff_ledger.record_proposed(
                     anc_id,
                     anc_name,
                     anc_args if isinstance(anc_args, dict) else {},
                     turn=depth,
                     raw_name=anc_raw,
+                    proposal_id=anc_pid,
+                    depends_on=anc_deps,
+                    expires_at=anc_exp,
+                    external_source=anc_ext,
                 )
+                p_meta = eff_ledger.get_proposal_metadata(anc_id) if hasattr(eff_ledger, "get_proposal_metadata") else None
                 new_pending_proposals.append({
                     "id": anc_id,
+                    "proposal_id": (p_meta or {}).get("proposal_id") or anc_pid or f"prop_{anc_id}",
                     "tool_name": anc_name,
                     "raw_name": anc_raw,
                     "arguments": anc_args if isinstance(anc_args, dict) else {},
                     "turn": depth,
                     "source": "native",
+                    "depends_on": list(anc_deps or []),
+                    "expires_at": anc_exp,
+                    "external_source": anc_ext,
+                    "creation_event_id": (p_meta or {}).get("creation_event_id"),
+                    "creation_seq": (p_meta or {}).get("creation_seq", 0),
+                    "proposal_order": (p_meta or {}).get("proposal_order", idx_rem),
                 })
 
         if not disable_tools and not pending_tool_calls and collected_assistant_text:
@@ -2529,6 +2564,20 @@ class NativeOrchestrator:
                 cleaned_text = fc.cleaned_text
                 collected_assistant_text = [cleaned_text] if cleaned_text else []
 
+        # Prune any TTL-expired proposals before reconciliation
+        if proposals_before_turn:
+            now_check = time.time()
+            unexpired_before: List[Dict[str, Any]] = []
+            for p in proposals_before_turn:
+                p_exp = p.get("expires_at")
+                if p_exp is not None and not isinstance(p_exp, bool) and now_check >= float(p_exp):
+                    eff_ledger.cancel_pending_proposal(p["id"], reason="proposal_expired")
+                    if hasattr(eff_ledger, "_update_proposal_lifecycle"):
+                        eff_ledger._update_proposal_lifecycle(p["id"], "expired", blocked_reason="Proposal TTL expired.")
+                else:
+                    unexpired_before.append(p)
+            proposals_before_turn = unexpired_before
+
         # Reconcile new turn output with pre-existing pending proposals (proposals_before_turn)
         if pending_tool_calls and proposals_before_turn:
             p0 = proposals_before_turn[0]
@@ -2557,6 +2606,14 @@ class NativeOrchestrator:
             if norm_new_name == p0["tool_name"] and new_args_canon == p0_args_canon:
                 # Exact match: model explicitly re-emitted/confirmed the proposal
                 eff_ledger.cancel_pending_proposal(p0["id"], reason="reconfirmed_and_dispatched")
+                if p0.get("depends_on") and not pending_tool_calls[0].get("depends_on"):
+                    pending_tool_calls[0]["depends_on"] = list(p0["depends_on"])
+                if p0.get("expires_at") is not None and pending_tool_calls[0].get("expires_at") is None:
+                    pending_tool_calls[0]["expires_at"] = p0["expires_at"]
+                if p0.get("proposal_id") and not pending_tool_calls[0].get("proposal_id"):
+                    pending_tool_calls[0]["proposal_id"] = p0["proposal_id"]
+                if isinstance(p0.get("external_source"), dict) and not pending_tool_calls[0].get("external_source"):
+                    pending_tool_calls[0]["external_source"] = dict(p0["external_source"])
                 proposals_before_turn.pop(0)
                 curr_pending_proposals = proposals_before_turn + new_pending_proposals
             else:
@@ -2581,6 +2638,7 @@ class NativeOrchestrator:
             curr_pending_proposals = new_pending_proposals
         else:
             curr_pending_proposals = proposals_before_turn + new_pending_proposals
+        eff_ledger._active_pending_queue = list(curr_pending_proposals)
 
         # Check model terminal text if no tools were called
         if not pending_tool_calls:
@@ -3117,11 +3175,42 @@ class NativeOrchestrator:
                             )
                         except Exception:
                             pass
+                    extra_tc_meta: Dict[str, Any] = {}
+                    for cand_ptc in pending_tool_calls:
+                        if cand_ptc.get("id") and cand_ptc.get("id") == tc["id"]:
+                            extra_tc_meta = cand_ptc
+                            break
+                    if not extra_tc_meta and len(pending_tool_calls) == 1 and len(normalized_tool_calls) == 1:
+                        extra_tc_meta = pending_tool_calls[0]
+                    eff_prop_id = tc.get("proposal_id") or extra_tc_meta.get("proposal_id")
+                    eff_deps = (
+                        tc.get("depends_on")
+                        if isinstance(tc.get("depends_on"), list)
+                        else (extra_tc_meta.get("depends_on") if isinstance(extra_tc_meta.get("depends_on"), list) else None)
+                    )
+                    eff_exp = tc.get("expires_at") if tc.get("expires_at") is not None else extra_tc_meta.get("expires_at")
+                    eff_ext = (
+                        tc.get("external_source")
+                        if isinstance(tc.get("external_source"), dict)
+                        else (extra_tc_meta.get("external_source") if isinstance(extra_tc_meta.get("external_source"), dict) else None)
+                    )
+                    if eff_prop_id:
+                        tc["proposal_id"] = eff_prop_id
+                    if eff_deps is not None:
+                        tc["depends_on"] = list(eff_deps)
+                    if eff_exp is not None:
+                        tc["expires_at"] = eff_exp
+                    if eff_ext is not None:
+                        tc["external_source"] = dict(eff_ext)
                     eff_ledger.record_proposed(
                         tc["id"],
                         tc["function"]["name"],
                         tc["function"]["arguments"],
                         turn=depth,
+                        proposal_id=eff_prop_id,
+                        depends_on=eff_deps,
+                        expires_at=eff_exp,
+                        external_source=eff_ext,
                     )
 
             force_disable_next = False
@@ -3335,6 +3424,89 @@ class NativeOrchestrator:
                         ):
                             rejection_reason = "cycle_detected"
                             rejection_detail = "Alternating failure cycle detected (A -> B -> A -> B). Alter approach or explain limitation."
+
+                # Enforce durable pending-proposal runtime guards (expiration, blocked/completed state, dependencies)
+                if rejection_reason is None:
+                    tc_exp = tc.get("expires_at")
+                    if tc_exp is not None and not isinstance(tc_exp, bool) and time.time() >= float(tc_exp):
+                        rejection_reason = "proposal_expired"
+                        rejection_detail = f"Pending proposal '{tool_call_id}' ({func_name}) expired prior to dispatch."
+                        if hasattr(eff_ledger, "_update_proposal_lifecycle"):
+                            eff_ledger._update_proposal_lifecycle(tool_call_id, "expired", blocked_reason=rejection_detail)
+                    else:
+                        guarded_map = payload.get("_guarded_pending_proposals") if isinstance(payload.get("_guarded_pending_proposals"), dict) else {}
+                        g_entry = guarded_map.get(tool_call_id) or guarded_map.get(tc.get("proposal_id") or "")
+                        if isinstance(g_entry, dict):
+                            g_st = str(g_entry.get("status") or "")
+                            if g_st == "dispatched" and not getattr(eff_ledger, "_allow_unverified_retry", False):
+                                rejection_reason = "ambiguous_in_flight_operation"
+                                rejection_detail = (
+                                    f"Proposal '{g_entry.get('proposal_id') or tool_call_id}' ({func_name}) is already dispatched without result; inspect host state before retrying."
+                                )
+                            elif g_st == "completed" and not is_read_tool:
+                                rejection_reason = "outcome_already_verified"
+                                rejection_detail = f"Proposal '{g_entry.get('proposal_id') or tool_call_id}' ({func_name}) already completed prior to resume."
+                            elif g_st in ("expired", "blocked", "cancelled", "failed"):
+                                rejection_reason = f"proposal_{g_st}"
+                                rejection_detail = str(g_entry.get("blocked_reason") or f"Proposal is {g_st} and cannot dispatch.")
+
+                if rejection_reason is None:
+                    tc_deps = tc.get("depends_on") if isinstance(tc.get("depends_on"), list) else []
+                    if not tc_deps and hasattr(eff_ledger, "get_proposal_metadata"):
+                        pm = eff_ledger.get_proposal_metadata(tool_call_id)
+                        if isinstance(pm, dict) and isinstance(pm.get("depends_on"), list):
+                            tc_deps = list(pm["depends_on"])
+                    if tc_deps:
+                        tracked_props = eff_ledger.get_tracked_proposals() if hasattr(eff_ledger, "get_tracked_proposals") else []
+                        for dep_ref in tc_deps:
+                            dep_matches = [
+                                tp
+                                for tp in tracked_props
+                                if str(dep_ref) in (str(tp.get("proposal_id") or ""), str(tp.get("original_call_id") or ""))
+                            ]
+                            dep_rec = eff_ledger._records.get(dep_ref)
+                            if dep_rec is None:
+                                for tp in dep_matches:
+                                    cand_rec = eff_ledger._records.get(str(tp.get("original_call_id") or ""))
+                                    if cand_rec is not None:
+                                        dep_rec = cand_rec
+                                        if cand_rec.state in (
+                                            ActionState.VERIFIED,
+                                            ActionState.SUCCESS,
+                                            ActionState.OBSERVED,
+                                            ActionState.UNVERIFIED,
+                                        ):
+                                            break
+                            dep_ok = (
+                                dep_rec is not None
+                                and dep_rec.state in (
+                                    ActionState.VERIFIED,
+                                    ActionState.SUCCESS,
+                                    ActionState.OBSERVED,
+                                    ActionState.UNVERIFIED,
+                                )
+                            ) or any(tp.get("status") == "completed" for tp in dep_matches)
+                            if dep_ok:
+                                continue
+                            has_failed_match = (
+                                dep_rec is not None
+                                and dep_rec.state in (ActionState.FAILED, ActionState.REJECTED)
+                            ) or (
+                                dep_rec is not None
+                                and dep_rec.state == ActionState.CANCELLED
+                                and "reconfirmed_and_dispatched" not in str(dep_rec.error or "")
+                            ) or any(
+                                tp.get("status") in ("failed", "blocked", "cancelled", "expired")
+                                and "reconfirmed_and_dispatched" not in str(tp.get("blocked_reason") or "")
+                                for tp in dep_matches
+                            )
+                            if has_failed_match:
+                                rejection_reason = "dependency_blocked"
+                                rejection_detail = f"Prerequisite '{dep_ref}' failed/blocked; dependent call '{func_name}' cannot execute."
+                            else:
+                                rejection_reason = "dependency_not_satisfied"
+                                rejection_detail = f"Prerequisite '{dep_ref}' has not completed yet; execute/verify prerequisite before '{func_name}'."
+                            break
 
                 # Runtime-enforced user prohibitions: an explicit "do not create/write/delete <path>"
                 # in the user's own request cannot be overridden by model-proposed tool calls.
@@ -3961,6 +4133,7 @@ class NativeOrchestrator:
             if force_disable_next and curr_pending_proposals:
                 eff_ledger.discard_pending_proposals(reason="step_limit_reached" if actual_step_count >= eff_step_limit else "task_completed")
                 curr_pending_proposals.clear()
+            eff_ledger._active_pending_queue = list(curr_pending_proposals)
 
             if getattr(eff_ledger, "_central_ledger", None) and getattr(eff_ledger, "_execution_id", None):
                 from zelyr.engine.checkpoint import CheckpointManager

@@ -20,7 +20,7 @@ import re
 import sqlite3
 import threading
 import time
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 import uuid
 
 
@@ -928,6 +928,9 @@ class TurnExecutionLedger:
         self._call_source_meta: Dict[str, Dict[str, Any]] = {}
         self._structured_observations: Dict[str, Any] = {}
         self._verification_status_override: Optional[str] = None
+        self._proposal_meta: Dict[str, Dict[str, Any]] = {}
+        self._interrupted_proposal_snapshots: List[Dict[str, Any]] = []
+        self._next_proposal_order: int = 0
 
     def attach_central_ledger(
         self,
@@ -974,9 +977,9 @@ class TurnExecutionLedger:
         status: str = "recorded",
         metadata: Optional[Dict[str, Any]] = None,
         idempotency_suffix: Optional[str] = None,
-    ) -> None:
+    ) -> Optional[ExecutionEvent]:
         if self._central_ledger is None or not self._execution_id:
-            return
+            return None
         src_meta = self._call_source_meta.get(call_id or "", {})
         eff_tool = tool_id or (self._records[call_id].tool_name if call_id and call_id in self._records else None)
         merged_meta = dict(src_meta.get("extra", {})) if isinstance(src_meta.get("extra"), dict) else {}
@@ -988,7 +991,7 @@ class TurnExecutionLedger:
             else (f"{self._execution_id}:{idempotency_suffix}" if idempotency_suffix else None)
         )
         try:
-            self._central_ledger.record_event(
+            return self._central_ledger.record_event(
                 self._execution_id,
                 event_type,
                 tool_id=eff_tool,
@@ -1004,6 +1007,7 @@ class TurnExecutionLedger:
             )
         except Exception as exc:
             logger.debug("Non-fatal central event hook error (%s): %s", event_type.value, exc)
+            return None
 
     def record_target_verified(
         self,
@@ -1106,6 +1110,112 @@ class TurnExecutionLedger:
             )
         return old
 
+    def _update_proposal_lifecycle(
+        self,
+        call_id: str,
+        status: str,
+        *,
+        dispatch_attempted: Optional[bool] = None,
+        has_result: Optional[bool] = None,
+        blocked_reason: Optional[str] = None,
+    ) -> None:
+        meta = self._proposal_meta.get(call_id)
+        if meta is None:
+            return
+        meta["status"] = status
+        meta["updated_at"] = time.time()
+        if dispatch_attempted is not None:
+            meta["dispatch_attempted"] = bool(dispatch_attempted)
+        if has_result is not None:
+            meta["has_result"] = bool(has_result)
+        if blocked_reason is not None:
+            meta["blocked_reason"] = blocked_reason
+        elif status in ("validated", "dispatched", "completed"):
+            meta["blocked_reason"] = None
+
+    def get_proposal_metadata(self, call_id: str) -> Optional[Dict[str, Any]]:
+        """Return durable proposal metadata tracked for call_id, if present."""
+        meta = self._proposal_meta.get(call_id)
+        return dict(meta) if isinstance(meta, dict) else None
+
+    def get_tracked_proposals(self) -> List[Dict[str, Any]]:
+        """Return ordered proposal metadata snapshots synchronized with current ledger states."""
+        state_map = {
+            ActionState.PROPOSED: "pending",
+            ActionState.VALIDATED: "validated",
+            ActionState.AUTHORIZED: "validated",
+            ActionState.DISPATCHED: "dispatched",
+            ActionState.EXECUTED: "dispatched",
+            ActionState.PARTIALLY_COMPLETED: "dispatched",
+            ActionState.VERIFIED: "completed",
+            ActionState.SUCCESS: "completed",
+            ActionState.OBSERVED: "completed",
+            ActionState.UNVERIFIED: "completed",
+            ActionState.FAILED: "failed",
+            ActionState.REJECTED: "blocked",
+            ActionState.CANCELLED: "cancelled",
+        }
+        items: List[Dict[str, Any]] = []
+        seen_cids: Set[str] = set()
+        for cid, raw_meta in self._proposal_meta.items():
+            seen_cids.add(cid)
+            entry = dict(raw_meta)
+            rec = self._records.get(cid)
+            if rec is not None:
+                entry["tool_id"] = rec.tool_name or entry.get("tool_id") or ""
+                entry["normalized_arguments"] = dict(rec.arguments)
+                if entry.get("status") not in ("expired", "blocked"):
+                    entry["status"] = state_map.get(rec.state, entry.get("status") or "pending")
+                elif entry.get("status") == "blocked" and rec.state in (
+                    ActionState.DISPATCHED,
+                    ActionState.VERIFIED,
+                    ActionState.SUCCESS,
+                    ActionState.FAILED,
+                ):
+                    entry["status"] = state_map.get(rec.state, entry["status"])
+                if rec.state in (
+                    ActionState.DISPATCHED,
+                    ActionState.EXECUTED,
+                    ActionState.PARTIALLY_COMPLETED,
+                    ActionState.VERIFIED,
+                    ActionState.SUCCESS,
+                    ActionState.OBSERVED,
+                    ActionState.UNVERIFIED,
+                    ActionState.FAILED,
+                ):
+                    entry["dispatch_attempted"] = True
+                if rec.state in (
+                    ActionState.VERIFIED,
+                    ActionState.SUCCESS,
+                    ActionState.OBSERVED,
+                    ActionState.UNVERIFIED,
+                    ActionState.FAILED,
+                    ActionState.REJECTED,
+                ):
+                    entry["has_result"] = True
+                if rec.state == ActionState.REJECTED and rec.rejection_reason:
+                    entry["blocked_reason"] = rec.rejection_reason
+                elif rec.state == ActionState.CANCELLED and rec.error and not entry.get("blocked_reason"):
+                    entry["blocked_reason"] = rec.error
+            items.append(entry)
+        # Deduplicate reconfirmed placeholders when a newer execution entry shares the same proposal_id
+        dedup_by_pid: Dict[str, Dict[str, Any]] = {}
+        for item in items:
+            pid = str(item.get("proposal_id") or "")
+            if not pid:
+                continue
+            prev = dedup_by_pid.get(pid)
+            if prev is None:
+                dedup_by_pid[pid] = item
+                continue
+            prev_reconf = prev.get("status") == "cancelled" and "reconfirmed_and_dispatched" in str(prev.get("blocked_reason") or "")
+            cur_reconf = item.get("status") == "cancelled" and "reconfirmed_and_dispatched" in str(item.get("blocked_reason") or "")
+            if prev_reconf and not cur_reconf:
+                dedup_by_pid[pid] = item
+        result_items = list(dedup_by_pid.values()) + [i for i in items if not i.get("proposal_id")]
+        result_items.sort(key=lambda x: (int(x.get("proposal_order", 0)), float(x.get("created_at", 0.0))))
+        return result_items
+
     def record_proposed(
         self,
         call_id: str,
@@ -1113,16 +1223,36 @@ class TurnExecutionLedger:
         arguments: Dict[str, Any],
         turn: Optional[int] = None,
         raw_name: Optional[str] = None,
+        *,
+        proposal_id: Optional[str] = None,
+        proposal_order: Optional[int] = None,
+        depends_on: Optional[Sequence[str]] = None,
+        expires_at: Optional[float] = None,
+        external_source: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Record an action proposal."""
         if call_id in self._records and self._records[call_id].state != ActionState.PROPOSED:
             raise InvalidStateTransitionError(
                 f"Cannot re-propose action '{call_id}' already in state '{self._records[call_id].state.value}'."
             )
+        if isinstance(external_source, dict) and external_source:
+            self.set_call_source_metadata(
+                call_id,
+                is_external=bool(external_source.get("is_external", True)),
+                source_id=external_source.get("source_id"),
+                source_type=external_source.get("source_type"),
+                extra=(
+                    {"external_tool_name": external_source.get("external_tool_name")}
+                    if external_source.get("external_tool_name")
+                    else None
+                ),
+            )
+        now = time.time()
+        clean_args = dict(arguments) if isinstance(arguments, dict) else {}
         rec = ActionRecord(
             call_id=call_id,
             tool_name=tool_name,
-            arguments=dict(arguments) if isinstance(arguments, dict) else {},
+            arguments=clean_args,
             state=ActionState.PROPOSED,
             turn=turn,
             raw_name=raw_name or tool_name,
@@ -1132,14 +1262,73 @@ class TurnExecutionLedger:
             self._order.append(call_id)
         if call_id not in self._pending_call_ids:
             self._pending_call_ids.append(call_id)
-        self._emit_central_event(
+
+        existing_meta = self._proposal_meta.get(call_id)
+        eff_order = (
+            int(proposal_order)
+            if proposal_order is not None
+            else (int(existing_meta["proposal_order"]) if isinstance(existing_meta, dict) and "proposal_order" in existing_meta else self._next_proposal_order)
+        )
+        if eff_order >= self._next_proposal_order:
+            self._next_proposal_order = eff_order + 1
+        eff_prop_id = str(
+            proposal_id
+            or (existing_meta.get("proposal_id") if isinstance(existing_meta, dict) else None)
+            or f"prop_{call_id}"
+        )
+        eff_depends = [str(d).strip() for d in (depends_on if depends_on is not None else (existing_meta.get("depends_on") if isinstance(existing_meta, dict) else []) or []) if str(d).strip()]
+        src_meta = self._call_source_meta.get(call_id, {})
+        eff_ext_src = dict(external_source) if isinstance(external_source, dict) and external_source else (
+            {
+                "is_external": True,
+                "source_id": src_meta.get("source_id") or "external",
+                "source_type": src_meta.get("source_type") or "external",
+                "external_tool_name": (src_meta.get("extra") or {}).get("external_tool_name") or tool_name,
+            }
+            if src_meta.get("is_external")
+            else None
+        )
+
+        ev_meta: Dict[str, Any] = {
+            "turn": turn,
+            "raw_name": raw_name or tool_name,
+            "arguments": rec.arguments,
+            "proposal_id": eff_prop_id,
+            "proposal_order": eff_order,
+        }
+        if eff_depends:
+            ev_meta["depends_on"] = eff_depends
+        if expires_at is not None:
+            ev_meta["expires_at"] = float(expires_at)
+        ev = self._emit_central_event(
             LedgerEventType.TOOL_SELECTED,
             call_id=call_id,
             tool_id=tool_name,
             status="proposed",
-            metadata={"turn": turn, "raw_name": raw_name or tool_name, "arguments": rec.arguments},
+            metadata=ev_meta,
             idempotency_suffix="selected",
         )
+        self._proposal_meta[call_id] = {
+            "proposal_id": eff_prop_id,
+            "execution_id": self._execution_id or "",
+            "original_call_id": call_id,
+            "tool_id": tool_name,
+            "raw_name": raw_name or tool_name,
+            "normalized_arguments": clean_args,
+            "proposal_order": eff_order,
+            "creation_event_id": (ev.event_id if ev is not None else (existing_meta.get("creation_event_id") if isinstance(existing_meta, dict) else None)),
+            "creation_seq": (int(ev.sequence_number) if ev is not None else int(existing_meta.get("creation_seq", 0)) if isinstance(existing_meta, dict) else 0),
+            "status": "pending",
+            "depends_on": eff_depends,
+            "external_source": eff_ext_src,
+            "turn": turn,
+            "dispatch_attempted": False,
+            "has_result": False,
+            "expires_at": float(expires_at) if expires_at is not None else (existing_meta.get("expires_at") if isinstance(existing_meta, dict) else None),
+            "blocked_reason": None,
+            "created_at": existing_meta.get("created_at", now) if isinstance(existing_meta, dict) else now,
+            "updated_at": now,
+        }
 
     def get_pending_proposals(self) -> List[ActionRecord]:
         """Return list of proposed actions awaiting validation and dispatch."""
@@ -1175,6 +1364,14 @@ class TurnExecutionLedger:
         self._pending_call_ids.clear()
         for cid in pending_cids:
             if cid in self._records and self._records[cid].state == ActionState.PROPOSED:
+                meta = self._proposal_meta.get(cid)
+                if isinstance(meta, dict):
+                    snap = dict(meta)
+                    snap["status"] = "cancelled"
+                    snap["blocked_reason"] = reason
+                    snap["updated_at"] = time.time()
+                    self._interrupted_proposal_snapshots.append(snap)
+                self._update_proposal_lifecycle(cid, "cancelled", blocked_reason=reason)
                 self.record_cancelled(cid, reason=f"Pending call discarded: {reason}")
                 discarded.append(cid)
         return discarded
@@ -1184,6 +1381,7 @@ class TurnExecutionLedger:
         if call_id in self._pending_call_ids:
             self._pending_call_ids.remove(call_id)
         if call_id in self._records and self._records[call_id].state == ActionState.PROPOSED:
+            self._update_proposal_lifecycle(call_id, "cancelled", blocked_reason=reason)
             self.record_cancelled(call_id, reason=reason)
 
     def record_validated(self, call_id: str) -> None:
@@ -1209,6 +1407,7 @@ class TurnExecutionLedger:
                 rejection_reason=old.rejection_reason,
                 verification_failed=old.verification_failed,
             )
+            self._update_proposal_lifecycle(call_id, "validated")
             self._emit_central_event(
                 LedgerEventType.ARGUMENT_VALIDATED,
                 call_id=call_id,
@@ -1228,6 +1427,7 @@ class TurnExecutionLedger:
         )
         if call_id in self._pending_call_ids:
             self._pending_call_ids.remove(call_id)
+        self._update_proposal_lifecycle(call_id, "dispatched", dispatch_attempted=True)
         if old is not None:
             self._records[call_id] = ActionRecord(
                 call_id=old.call_id,
@@ -1360,6 +1560,7 @@ class TurnExecutionLedger:
         )
         if call_id not in self._order:
             self._order.append(call_id)
+        self._update_proposal_lifecycle(call_id, "blocked", has_result=True, blocked_reason=safe_reason)
         self._emit_central_event(
             LedgerEventType.AUTHORIZATION_DECISION,
             call_id=call_id,
@@ -1399,6 +1600,7 @@ class TurnExecutionLedger:
         )
         if call_id not in self._order:
             self._order.append(call_id)
+        self._update_proposal_lifecycle(call_id, "cancelled", blocked_reason=safe_reason or "Action cancelled")
         self._emit_central_event(
             LedgerEventType.TOOL_EXECUTION_RESULT,
             call_id=call_id,
@@ -1733,6 +1935,16 @@ class TurnExecutionLedger:
         )
         if call_id not in self._order:
             self._order.append(call_id)
+        if final_state == ActionState.FAILED:
+            self._update_proposal_lifecycle(
+                call_id,
+                "blocked" if effective_rejection_reason else "failed",
+                dispatch_attempted=False if (status == "rejected" or effective_rejection_reason) else True,
+                has_result=True,
+                blocked_reason=effective_rejection_reason or _redact_sensitive_text(effective_error),
+            )
+        else:
+            self._update_proposal_lifecycle(call_id, "completed", dispatch_attempted=True, has_result=True)
         if status == "timed_out" or (
             isinstance(effective_error, str) and "timed out" in effective_error.lower() and is_failure
         ):
@@ -3481,6 +3693,7 @@ CREATE TABLE IF NOT EXISTS task_checkpoints (
     external_tools_json TEXT NOT NULL DEFAULT '[]',
     verified_targets_json TEXT NOT NULL DEFAULT '[]',
     recovery_summary_json TEXT NOT NULL DEFAULT '{}',
+    pending_actions_json TEXT NOT NULL DEFAULT '[]',
     checkpoint_digest TEXT NOT NULL,
     redacted INTEGER NOT NULL DEFAULT 0,
     truncated INTEGER NOT NULL DEFAULT 0,
@@ -3582,6 +3795,11 @@ class CentralExecutionLedger:
                         if "latest_checkpoint_seq" not in cols:
                             conn.execute(
                                 "ALTER TABLE executions ADD COLUMN latest_checkpoint_seq INTEGER NOT NULL DEFAULT 0"
+                            )
+                        cp_cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(task_checkpoints)").fetchall()}
+                        if "pending_actions_json" not in cp_cols:
+                            conn.execute(
+                                "ALTER TABLE task_checkpoints ADD COLUMN pending_actions_json TEXT NOT NULL DEFAULT '[]'"
                             )
                     self._initialized = True
                 return conn
@@ -4484,6 +4702,9 @@ class CentralExecutionLedger:
             "verified_targets": payload.get("verified_targets") or [],
             "recovery_summary": payload.get("recovery_summary") or {},
         }
+        pending_actions = payload.get("pending_actions") or []
+        if pending_actions:
+            canonical["pending_actions"] = list(pending_actions)
         raw = json.dumps(canonical, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str).encode(
             "utf-8", errors="replace"
         )
@@ -4514,6 +4735,7 @@ class CentralExecutionLedger:
                 )
             return parsed
 
+        raw_pa_field = d.get("pending_actions_json") if "pending_actions_json" in d else "[]"
         cp_dict: Dict[str, Any] = {
             "checkpoint_id": str(d.get("checkpoint_id") or ""),
             "execution_id": str(d.get("execution_id") or ""),
@@ -4530,6 +4752,7 @@ class CentralExecutionLedger:
             "external_tools_used": _parse_json_field(d.get("external_tools_json"), list, "external_tools_json"),
             "verified_targets": _parse_json_field(d.get("verified_targets_json"), list, "verified_targets_json"),
             "recovery_summary": _parse_json_field(d.get("recovery_summary_json"), dict, "recovery_summary_json"),
+            "pending_actions": _parse_json_field(raw_pa_field, list, "pending_actions_json"),
             "checkpoint_digest": str(d.get("checkpoint_digest") or ""),
             "redacted": bool(d.get("redacted", False)),
             "truncated": bool(d.get("truncated", False)),
@@ -4561,6 +4784,7 @@ class CentralExecutionLedger:
         external_tools_used: Optional[List[Dict[str, Any]]] = None,
         verified_targets: Optional[List[str]] = None,
         recovery_summary: Optional[Dict[str, Any]] = None,
+        pending_actions: Optional[List[Dict[str, Any]]] = None,
         expected_checkpoint_seq: Optional[int] = None,
         emit_event: bool = True,
         strict: Optional[bool] = None,
@@ -4587,9 +4811,11 @@ class CentralExecutionLedger:
         safe_vt_wrap, v_red, v_trunc = sanitize_ledger_payload({"targets": verified_targets or []}, max_bytes=4096)
         safe_vt = [str(x) for x in (safe_vt_wrap.get("targets") or [])] if isinstance(safe_vt_wrap.get("targets"), list) else []
         safe_rec, r_red, r_trunc = sanitize_ledger_payload(recovery_summary, max_bytes=4096)
+        safe_pa_wrap, pa_red, pa_trunc = sanitize_ledger_payload({"items": pending_actions or []}, max_bytes=16384)
+        safe_pa = list(safe_pa_wrap.get("items") or []) if isinstance(safe_pa_wrap.get("items"), list) else []
 
-        any_red = bool(prompt_red or p_red or e_red or x_red or v_red or r_red)
-        any_trunc = bool(prompt_trunc or p_trunc or e_trunc or x_trunc or v_trunc or r_trunc)
+        any_red = bool(prompt_red or p_red or e_red or x_red or v_red or r_red or pa_red)
+        any_trunc = bool(prompt_trunc or p_trunc or e_trunc or x_trunc or v_trunc or r_trunc or pa_trunc)
 
         with self._lock:
             eff_strict = self.raise_on_persistence_error if strict is None else strict
@@ -4663,6 +4889,7 @@ class CentralExecutionLedger:
                             "external_tools_used": safe_ext,
                             "verified_targets": safe_vt,
                             "recovery_summary": safe_rec,
+                            "pending_actions": safe_pa,
                             "redacted": any_red,
                             "truncated": any_trunc,
                             "timestamp": now,
@@ -4677,8 +4904,8 @@ class CentralExecutionLedger:
                                 sequence_number, last_event_id, last_event_seq, status,
                                 verification_status, task_prompt, planning_json, environment_json,
                                 external_tools_json, verified_targets_json, recovery_summary_json,
-                                checkpoint_digest, redacted, truncated, created_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                pending_actions_json, checkpoint_digest, redacted, truncated, created_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                             (
                                 cp_id,
@@ -4696,6 +4923,7 @@ class CentralExecutionLedger:
                                 json.dumps(safe_ext, ensure_ascii=False, separators=(",", ":"), default=str),
                                 json.dumps(safe_vt, ensure_ascii=False, separators=(",", ":"), default=str),
                                 json.dumps(safe_rec, ensure_ascii=False, separators=(",", ":"), default=str),
+                                json.dumps(safe_pa, ensure_ascii=False, separators=(",", ":"), default=str),
                                 cp_digest,
                                 1 if any_red else 0,
                                 1 if any_trunc else 0,
@@ -4712,6 +4940,7 @@ class CentralExecutionLedger:
                                 "checkpoint_version": checkpoint_version,
                                 "last_event_seq": eff_last_ev_seq,
                                 "checkpoint_digest": cp_digest[:16],
+                                "pending_action_count": len(safe_pa),
                             }
                             conn.execute(
                                 """
