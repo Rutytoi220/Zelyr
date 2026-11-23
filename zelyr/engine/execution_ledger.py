@@ -11,6 +11,7 @@ from contextlib import contextmanager
 import contextvars
 from dataclasses import asdict, dataclass, field
 from enum import Enum
+import functools
 import hashlib
 import json
 import logging
@@ -904,8 +905,37 @@ def _is_action_resolved_by_later(failed: ActionRecord, later: ActionRecord) -> b
     return False
 
 
+_LEDGER_INIT_LOCK = threading.Lock()
+
+
+def _synchronized(fn: Any) -> Any:
+    """Serialize access to TurnExecutionLedger state using its re-entrant lock."""
+
+    @functools.wraps(fn)
+    def wrapper(self: "TurnExecutionLedger", *args: Any, **kwargs: Any) -> Any:
+        with self._sync_lock():
+            return fn(self, *args, **kwargs)
+
+    return wrapper
+
+
 class TurnExecutionLedger:
     """Authoritative ledger recording all proposed, dispatched, and observed actions."""
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> "TurnExecutionLedger":
+        instance = super().__new__(cls)
+        instance._lock = threading.RLock()
+        return instance
+
+    def _sync_lock(self) -> threading.RLock:
+        lock = getattr(self, "_lock", None)
+        if lock is None:
+            with _LEDGER_INIT_LOCK:
+                lock = getattr(self, "_lock", None)
+                if lock is None:
+                    lock = threading.RLock()
+                    self._lock = lock
+        return lock
 
     def __init__(
         self,
@@ -916,6 +946,7 @@ class TurnExecutionLedger:
         task_local_scoped: bool = False,
         source_component: Optional[str] = None,
     ) -> None:
+        self._lock = getattr(self, "_lock", None) or threading.RLock()
         self._records: Dict[str, ActionRecord] = {}
         self._order: List[str] = []
         self._verified_targets: Set[str] = set()
@@ -2420,6 +2451,50 @@ class TurnExecutionLedger:
                 else []
             )
         return out
+
+    @_synchronized
+    def record_node_reservation_event(
+        self,
+        event_kind: str,
+        *,
+        node_id: str,
+        owner_id: str,
+        reservation_id: Optional[str] = None,
+        call_id: Optional[str] = None,
+        tool_id: Optional[str] = None,
+        resources: Optional[Sequence[str]] = None,
+        status: Optional[str] = None,
+        detail: Optional[str] = None,
+        idempotency_suffix: Optional[str] = None,
+    ) -> Optional[ExecutionEvent]:
+        """Record an unambiguous node reservation, release, or conflict event in the ledger."""
+        meta: Dict[str, Any] = {
+            "node_id": node_id,
+            "owner_id": owner_id,
+            "reservation_event": event_kind,
+        }
+        if reservation_id:
+            meta["reservation_id"] = reservation_id
+        if resources:
+            meta["resources"] = list(resources)
+        if detail:
+            meta["detail"] = _redact_sensitive_text(detail)
+        return self._emit_central_event(
+            LedgerEventType.PLANNING_DECISION,
+            call_id=call_id,
+            tool_id=tool_id,
+            status=status or event_kind,
+            metadata=meta,
+            idempotency_suffix=idempotency_suffix,
+        )
+
+
+for _meth_name, _meth_obj in list(vars(TurnExecutionLedger).items()):
+    if _meth_name.startswith("__") or _meth_name in ("_sync_lock", "record_node_reservation_event"):
+        continue
+    if callable(_meth_obj) and not isinstance(_meth_obj, (staticmethod, classmethod, property, type)):
+        setattr(TurnExecutionLedger, _meth_name, _synchronized(_meth_obj))
+del _meth_name, _meth_obj
 
 
 # False-success and non-actuation detection rules

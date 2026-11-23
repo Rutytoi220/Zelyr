@@ -1142,7 +1142,19 @@ def _print_task_graph_view(assessment: Any, *, empty_notice: Optional[str] = Non
         return
     g_sum = tg.summary or {}
     next_node = tg.get_next_eligible_node() if hasattr(tg, "get_next_eligible_node") else None
+    max_conc = getattr(tg, "max_concurrency", 1)
+    running_nodes = (
+        tg.get_running_nodes()
+        if hasattr(tg, "get_running_nodes")
+        else [n for n in tg.nodes if n.execution_status == "running"]
+    )
+    ready_nodes = (
+        tg.get_ready_nodes()
+        if hasattr(tg, "get_ready_nodes")
+        else [n for n in tg.nodes if n.execution_status == "ready" and getattr(n, "reserved_by", None) is None]
+    )
     print(f"Task Graph:          {tg.graph_id} (v{tg.graph_version}, status={tg.status})")
+    print(f"Max Concurrency:     {max_conc}")
     if tg.objective:
         print(f"Graph Objective:     {tg.objective}")
     print(
@@ -1152,17 +1164,37 @@ def _print_task_graph_view(assessment: Any, *, empty_notice: Optional[str] = Non
         f"running={g_sum.get('running_count', 0)} failed={g_sum.get('failed_count', 0)} "
         f"blocked={g_sum.get('blocked_count', 0)} cancelled={g_sum.get('cancelled_count', 0)}"
     )
+    running_desc = (
+        ", ".join(f"{n.node_id}(owner={getattr(n, 'reserved_by', None) or 'unowned'})" for n in running_nodes)
+        if running_nodes
+        else "none"
+    )
+    ready_desc = ", ".join(n.node_id for n in ready_nodes) if ready_nodes else "none"
+    print(f"Running Nodes:       {running_desc}")
+    print(f"Ready Nodes:         {ready_desc}")
     print(f"Next Eligible Node:  {next_node.node_id if next_node is not None else 'none'}")
+    active_res = getattr(tg, "active_reservations", None) or {}
+    if active_res:
+        print(f"Active Reservations ({len(active_res)}):")
+        for rnid, rinfo in sorted(active_res.items()):
+            r_owner = rinfo.get("owner_id", "-") if isinstance(rinfo, dict) else "-"
+            r_id = rinfo.get("reservation_id", "-") if isinstance(rinfo, dict) else "-"
+            r_locks = ",".join(rinfo.get("resources") or []) if isinstance(rinfo, dict) else ""
+            lock_s = f" locks=[{r_locks}]" if r_locks else ""
+            print(f"  - {rnid}: owner={r_owner} reservation={r_id}{lock_s}")
     if tg.nodes:
         print(f"Nodes ({len(tg.nodes)}):")
         for node in tg.nodes:
             deps = ",".join(node.dependency_ids) if node.dependency_ids else "-"
             props = ",".join(node.proposal_ids) if node.proposal_ids else "-"
+            owner_s = f" owner={node.reserved_by}" if getattr(node, "reserved_by", None) else ""
+            c_res = getattr(node, "conflict_resources", None) or []
+            locks_s = f" locks=[{','.join(c_res)}]" if c_res else ""
             blk = f" reason={node.blocked_reason}" if node.blocked_reason else ""
             fail = f" err={(node.failure_info or {}).get('error')}" if node.failure_info and not blk else ""
             print(
                 f"  - [{node.order_index}] {node.node_id} exec={node.execution_status} "
-                f"verify={node.verification_status} proposals=[{props}] deps=[{deps}] "
+                f"verify={node.verification_status}{owner_s}{locks_s} proposals=[{props}] deps=[{deps}] "
                 f"desc={node.description!r}{blk}{fail}"
             )
     blocked_nodes = tg.get_blocked_nodes() if hasattr(tg, "get_blocked_nodes") else []

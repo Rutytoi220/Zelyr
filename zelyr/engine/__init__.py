@@ -65,7 +65,9 @@ from zelyr.engine.schema_compact import CompactSchemaGenerator
 from zelyr.engine.task_graph import (
     TASK_GRAPH_VERSION,
     CorruptedTaskGraphError,
+    NodeConflictProfile,
     TaskGraph,
+    TaskGraphConflictError,
     TaskGraphEdge,
     TaskGraphError,
     TaskGraphStatus,
@@ -74,6 +76,8 @@ from zelyr.engine.task_graph import (
     TaskNodeStatus,
     UnsupportedTaskGraphVersionError,
     compute_task_graph_digest,
+    extract_node_conflict_profile,
+    profiles_conflict,
     reconstruct_task_graph_from_records,
 )
 
@@ -115,7 +119,9 @@ __all__ = [
     "TaskCheckpoint",
     "TASK_GRAPH_VERSION",
     "CorruptedTaskGraphError",
+    "NodeConflictProfile",
     "TaskGraph",
+    "TaskGraphConflictError",
     "TaskGraphEdge",
     "TaskGraphError",
     "TaskGraphStatus",
@@ -124,6 +130,8 @@ __all__ = [
     "TaskNodeStatus",
     "UnsupportedTaskGraphVersionError",
     "compute_task_graph_digest",
+    "extract_node_conflict_profile",
+    "profiles_conflict",
     "reconstruct_task_graph_from_records",
     "TurnExecutionLedger",
     "UnsupportedCheckpointVersionError",

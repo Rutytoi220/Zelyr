@@ -7,7 +7,7 @@ from enum import Enum
 import hashlib
 import json
 import time
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 import uuid
 
 from zelyr.engine.execution_ledger import (
@@ -89,6 +89,8 @@ class TaskGraphStatus(str, Enum):
     INVALID = "invalid"
 
 
+import threading as _threading
+
 _VALID_NODE_STATUSES: frozenset[str] = frozenset(s.value for s in TaskNodeStatus)
 _VALID_GRAPH_STATUSES: frozenset[str] = frozenset(s.value for s in TaskGraphStatus)
 _VALID_VERIFICATION_STATUSES: frozenset[str] = frozenset(
@@ -162,10 +164,277 @@ def compute_task_graph_digest(payload: Dict[str, Any]) -> str:
         ],
         "summary": payload.get("summary") or {},
     }
+    raw_mc = payload.get("max_concurrency", 1)
+    if isinstance(raw_mc, int) and not isinstance(raw_mc, bool) and raw_mc != 1:
+        canonical["max_concurrency"] = raw_mc
+    if payload.get("active_reservations"):
+        canonical["active_reservations"] = payload.get("active_reservations")
+    node_res_meta: Dict[str, Dict[str, Any]] = {}
+    for n in payload.get("nodes") or []:
+        if not isinstance(n, dict):
+            continue
+        nid = str(n.get("node_id") or "")
+        extra_n = {}
+        for k in ("reserved_by", "reservation_id", "reserved_at", "conflict_resources", "exclusive_resource"):
+            val = n.get(k)
+            if val:
+                extra_n[k] = val
+        if nid and extra_n:
+            node_res_meta[nid] = extra_n
+    if node_res_meta:
+        canonical["node_reservations"] = node_res_meta
     raw = json.dumps(canonical, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str).encode(
         "utf-8", errors="replace"
     )
     return hashlib.sha256(raw).hexdigest()
+
+
+class TaskGraphConflictError(TaskGraphValidationError):
+    """Raised when a TaskGraph node reservation or concurrent schedule conflicts on a resource."""
+
+
+@dataclass(frozen=True)
+class NodeConflictProfile:
+    """Conservative resource and side-effect conflict footprint for a TaskNode."""
+
+    lock_keys: Tuple[str, ...] = ()
+    read_targets: Tuple[str, ...] = ()
+    write_targets: Tuple[str, ...] = ()
+    exclusive_resource: Optional[str] = None
+    operation_fingerprint: Optional[str] = None
+    read_only: bool = False
+
+
+_READ_ONLY_TOOLS = frozenset(
+    {
+        "read_file",
+        "list_files",
+        "search_files",
+        "system_info",
+        "inspect_network",
+        "query_system_journal",
+        "verify_outcome",
+        "echo",
+    }
+)
+_READ_FILE_ACTIONS = frozenset({"read", "list", "stat", "exists", "search", "inspect", "grep", "glob"})
+_FILE_MUTATION_TOOLS = frozenset(
+    {
+        "manage_workspace_file",
+        "write_file",
+        "edit_file",
+        "patch_file",
+        "delete_file",
+        "create_file",
+        "append_file",
+        "file_write",
+        "file_tool",
+    }
+)
+_GUI_EXCLUSIVE_TOOLS = frozenset(
+    {"interact_with_ui", "gui_actuate", "gui_inspect", "take_screenshot", "mouse_click", "type_text"}
+)
+_BROWSER_EXCLUSIVE_TOOLS = frozenset({"interact_with_browser", "playwright_web"})
+_HOST_IPC_EXCLUSIVE_TOOLS = frozenset(
+    {"manage_desktop_window", "manage_system_clipboard", "manage_media_playback", "manage_system_process"}
+)
+_SHELL_EXCLUSIVE_TOOLS = frozenset(
+    {"execute_command", "bash", "sh", "shell", "shell_command", "run_command", "python_exec", "exec_code"}
+)
+_TARGET_ARG_KEYS = (
+    "path",
+    "file_path",
+    "filepath",
+    "target",
+    "filename",
+    "dest",
+    "destination",
+    "dest_path",
+    "new_path",
+    "output_path",
+    "src",
+    "source",
+    "url",
+    "resource",
+    "item_id",
+    "bucket",
+    "table",
+    "database",
+)
+
+
+def _canon_conflict_path(raw: Any) -> Optional[str]:
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    from zelyr.engine.execution_ledger import canonicalize_target
+
+    return canonicalize_target(raw.strip(), check_type="file_exists") or raw.strip()
+
+
+def extract_node_conflict_profile(
+    tool_name: str = "",
+    arguments: Optional[Dict[str, Any]] = None,
+    *,
+    node: Optional["TaskNode"] = None,
+    external_source: Optional[Dict[str, Any]] = None,
+    tool_schema: Optional[Dict[str, Any]] = None,
+    tool_obj: Optional[Any] = None,
+) -> NodeConflictProfile:
+    """Compute conservative conflict locks and targets for a TaskNode + proposed tool invocation."""
+    from zelyr.engine.execution_ledger import _canonicalize_args, _extract_action_target
+
+    tname = str(tool_name or "").strip()
+    args = dict(arguments) if isinstance(arguments, dict) else {}
+    lock_keys: Set[str] = set()
+    read_targets: Set[str] = set()
+    write_targets: Set[str] = set()
+    excl: Optional[str] = None
+
+    if node is not None:
+        if node.exclusive_resource:
+            excl = str(node.exclusive_resource).strip()
+        for kr in node.conflict_resources or ():
+            k_str = str(kr).strip()
+            if k_str:
+                lock_keys.add(k_str)
+
+    # Schema / object read_only markers
+    schema_ro = False
+    if isinstance(tool_schema, dict):
+        fn_meta = tool_schema.get("function") if isinstance(tool_schema.get("function"), dict) else tool_schema
+        schema_ro = bool(tool_schema.get("read_only") is True or fn_meta.get("read_only") is True)
+    obj_ro = bool(getattr(tool_obj, "read_only", False) is True) if tool_obj is not None else False
+
+    action_val = str(args.get("action") or args.get("operation") or "").strip().lower()
+    is_read_only = bool(
+        tname in _READ_ONLY_TOOLS
+        or (tname == "manage_workspace_file" and action_val in _READ_FILE_ACTIONS)
+        or (schema_ro or obj_ro)
+    )
+    if tname in _GUI_EXCLUSIVE_TOOLS | _BROWSER_EXCLUSIVE_TOOLS | _HOST_IPC_EXCLUSIVE_TOOLS | _SHELL_EXCLUSIVE_TOOLS:
+        is_read_only = False
+
+    # Collect explicit targets from action extractor and target keys
+    extracted_targets: List[str] = []
+    primary_t = _extract_action_target(tname, args) if tname else None
+    if primary_t:
+        cp = _canon_conflict_path(primary_t)
+        if cp:
+            extracted_targets.append(cp)
+    for k in _TARGET_ARG_KEYS:
+        val = args.get(k)
+        if isinstance(val, str) and val.strip():
+            cp = _canon_conflict_path(val)
+            if cp and cp not in extracted_targets:
+                extracted_targets.append(cp)
+
+    if tname in _GUI_EXCLUSIVE_TOOLS:
+        excl = excl or "exclusive:desktop_gui"
+    elif tname in _BROWSER_EXCLUSIVE_TOOLS:
+        excl = excl or "exclusive:browser_session"
+    elif tname in _HOST_IPC_EXCLUSIVE_TOOLS:
+        excl = excl or "exclusive:host_desktop_ipc"
+    elif tname in _SHELL_EXCLUSIVE_TOOLS:
+        excl = excl or "exclusive:opaque_shell"
+        for et in extracted_targets:
+            write_targets.add(et)
+            lock_keys.add(f"target:{et}")
+    elif tname == "manage_workspace_file" or tname in _FILE_MUTATION_TOOLS:
+        if is_read_only:
+            for et in extracted_targets:
+                read_targets.add(et)
+        elif extracted_targets:
+            for et in extracted_targets:
+                write_targets.add(et)
+                lock_keys.add(f"target:{et}")
+        else:
+            excl = excl or "exclusive:unscoped_filesystem"
+    elif tname:
+        eff_ext = external_source if isinstance(external_source, dict) else (node.external_source if node else None)
+        is_ext = bool(eff_ext and eff_ext.get("is_external", True))
+        if is_read_only:
+            for et in extracted_targets:
+                read_targets.add(et)
+        elif extracted_targets or lock_keys:
+            for et in extracted_targets:
+                lock_keys.add(f"target:{et}")
+                if "/" in et or "\\" in et or "." in et or tname != "echo":
+                    write_targets.add(et)
+            if is_ext and not extracted_targets:
+                src_id = str((eff_ext or {}).get("source_id") or "external")
+                excl = excl or f"exclusive:external:{src_id}"
+        else:
+            # Tools whose conflict footprint cannot be reliably disproved serialize conservatively
+            if is_ext:
+                src_id = str((eff_ext or {}).get("source_id") or "external")
+                excl = excl or f"exclusive:external:{src_id}"
+            elif not args and not node_has_explicit_resources(node):
+                excl = excl or "exclusive:opaque_side_effect"
+            elif args:
+                # Non-target scalar arguments on an unknown mutator: lock opaque side-effect unless read_only
+                excl = excl or "exclusive:opaque_side_effect"
+
+    if excl:
+        lock_keys.add(excl)
+
+    op_fp: Optional[str] = None
+    if tname and not is_read_only:
+        canon_args = _canonicalize_args(args)
+        fp_digest = hashlib.sha256(f"{tname}:{canon_args}".encode("utf-8", errors="replace")).hexdigest()[:24]
+        op_fp = f"op:{tname}:{fp_digest}"
+        lock_keys.add(op_fp)
+
+    return NodeConflictProfile(
+        lock_keys=tuple(sorted(lock_keys)),
+        read_targets=tuple(sorted(read_targets)),
+        write_targets=tuple(sorted(write_targets)),
+        exclusive_resource=excl,
+        operation_fingerprint=op_fp,
+        read_only=is_read_only,
+    )
+
+
+def node_has_explicit_resources(node: Optional["TaskNode"]) -> bool:
+    return bool(node is not None and (node.conflict_resources or node.exclusive_resource))
+
+
+def profiles_conflict(p1: NodeConflictProfile, p2: NodeConflictProfile) -> Optional[str]:
+    """Return a human-readable reason if two conflict profiles cannot safely run concurrently."""
+    from zelyr.engine.execution_ledger import targets_match
+
+    if p1.operation_fingerprint and p1.operation_fingerprint == p2.operation_fingerprint and not (p1.read_only and p2.read_only):
+        return f"duplicate or identical mutating operation '{p1.operation_fingerprint}'"
+
+    if p1.exclusive_resource and p2.exclusive_resource:
+        if p1.exclusive_resource == p2.exclusive_resource:
+            return f"shared exclusive resource '{p1.exclusive_resource}'"
+
+    for excl_p, other_p in ((p1, p2), (p2, p1)):
+        if excl_p.exclusive_resource in ("exclusive:opaque_shell", "exclusive:opaque_side_effect", "exclusive:unscoped_filesystem"):
+            if not other_p.read_only or other_p.read_targets:
+                return f"conservative serialization for '{excl_p.exclusive_resource}'"
+
+    shared_locks = set(p1.lock_keys) & set(p2.lock_keys)
+    if shared_locks:
+        return f"overlapping lock resource '{sorted(shared_locks)[0]}'"
+
+    def _targets_overlap(a: str, b: str) -> bool:
+        return a == b or targets_match(a, b, allow_dir_containment=True) or targets_match(b, a, allow_dir_containment=True)
+
+    for w1 in p1.write_targets:
+        for w2 in p2.write_targets:
+            if _targets_overlap(w1, w2):
+                return f"conflicting write targets '{w1}' and '{w2}'"
+        for r2 in p2.read_targets:
+            if _targets_overlap(w1, r2):
+                return f"read/write hazard between write '{w1}' and read '{r2}'"
+
+    for w2 in p2.write_targets:
+        for r1 in p1.read_targets:
+            if _targets_overlap(w2, r1):
+                return f"read/write hazard between read '{r1}' and write '{w2}'"
+
+    return None
 
 
 @dataclass
@@ -222,6 +491,11 @@ class TaskNode:
     blocked_reason: Optional[str] = None
     order_index: int = 0
     external_source: Optional[Dict[str, Any]] = None
+    reserved_by: Optional[str] = None
+    reservation_id: Optional[str] = None
+    reserved_at: Optional[float] = None
+    conflict_resources: List[str] = field(default_factory=list)
+    exclusive_resource: Optional[str] = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -229,7 +503,7 @@ class TaskNode:
         safe_fail, _, _ = sanitize_ledger_payload(_strip_forbidden_graph_keys(self.failure_info), max_bytes=1024) if self.failure_info else ({}, False, False)
         safe_obs_wrap, _, _ = sanitize_ledger_payload({"refs": list(self.observation_refs)[-16:]}, max_bytes=4096)
         safe_obs = list(safe_obs_wrap.get("refs") or []) if isinstance(safe_obs_wrap.get("refs"), list) else []
-        return {
+        out: Dict[str, Any] = {
             "node_id": self.node_id,
             "description": _sanitize_graph_text(self.description, max_bytes=512),
             "proposal_ids": list(self.proposal_ids),
@@ -247,6 +521,17 @@ class TaskNode:
             "created_at": float(self.created_at),
             "updated_at": float(self.updated_at),
         }
+        if self.reserved_by is not None:
+            out["reserved_by"] = _sanitize_graph_text(self.reserved_by, max_bytes=128)
+        if self.reservation_id is not None:
+            out["reservation_id"] = _sanitize_graph_text(self.reservation_id, max_bytes=128)
+        if self.reserved_at is not None:
+            out["reserved_at"] = float(self.reserved_at)
+        if self.conflict_resources:
+            out["conflict_resources"] = [str(r) for r in self.conflict_resources if str(r).strip()]
+        if self.exclusive_resource is not None:
+            out["exclusive_resource"] = _sanitize_graph_text(self.exclusive_resource, max_bytes=128)
+        return out
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "TaskNode":
@@ -284,6 +569,22 @@ class TaskNode:
         if not isinstance(order_idx, int) or isinstance(order_idx, bool) or order_idx < 0:
             raise CorruptedTaskGraphError(f"TaskNode '{nid}' has invalid order_index: {order_idx!r}.")
 
+        res_by = data.get("reserved_by")
+        if res_by is not None and (not isinstance(res_by, str) or not res_by.strip()):
+            raise CorruptedTaskGraphError(f"TaskNode '{nid}' has invalid reserved_by: {res_by!r}.")
+        res_id = data.get("reservation_id")
+        if res_id is not None and (not isinstance(res_id, str) or not res_id.strip()):
+            raise CorruptedTaskGraphError(f"TaskNode '{nid}' has invalid reservation_id: {res_id!r}.")
+        res_at = data.get("reserved_at")
+        if res_at is not None and (not isinstance(res_at, (int, float)) or isinstance(res_at, bool)):
+            raise CorruptedTaskGraphError(f"TaskNode '{nid}' has invalid reserved_at: {res_at!r}.")
+        raw_cres = data.get("conflict_resources", [])
+        if not isinstance(raw_cres, list) or any(not isinstance(c, str) or not c.strip() for c in raw_cres):
+            raise CorruptedTaskGraphError(f"TaskNode '{nid}' conflict_resources must be a list of non-empty strings.")
+        excl_res = data.get("exclusive_resource")
+        if excl_res is not None and (not isinstance(excl_res, str) or not excl_res.strip()):
+            raise CorruptedTaskGraphError(f"TaskNode '{nid}' has invalid exclusive_resource: {excl_res!r}.")
+
         now = time.time()
         return cls(
             node_id=nid.strip(),
@@ -300,6 +601,11 @@ class TaskNode:
             blocked_reason=_sanitize_graph_text(data["blocked_reason"], max_bytes=256) if data.get("blocked_reason") else None,
             order_index=order_idx,
             external_source=_strip_forbidden_graph_keys(dict(ext_src)) if isinstance(ext_src, dict) else None,
+            reserved_by=_sanitize_graph_text(res_by, max_bytes=128) if res_by else None,
+            reservation_id=_sanitize_graph_text(res_id, max_bytes=128) if res_id else None,
+            reserved_at=float(res_at) if res_at is not None else None,
+            conflict_resources=[str(c).strip() for c in raw_cres],
+            exclusive_resource=_sanitize_graph_text(excl_res, max_bytes=128) if excl_res else None,
             created_at=float(data.get("created_at") or now),
             updated_at=float(data.get("updated_at") or now),
         )
@@ -320,8 +626,17 @@ class TaskGraph:
     updated_at: float = field(default_factory=time.time)
     summary: Dict[str, Any] = field(default_factory=dict)
     graph_digest: str = ""
+    max_concurrency: int = 1
+    active_reservations: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    _lock: _threading.RLock = field(default_factory=_threading.RLock, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.max_concurrency, int) or isinstance(self.max_concurrency, bool) or self.max_concurrency < 1:
+            raise TaskGraphValidationError(
+                f"TaskGraph.max_concurrency must be a positive integer >= 1, got {self.max_concurrency!r}."
+            )
+        if not isinstance(self.active_reservations, dict):
+            raise TaskGraphValidationError("TaskGraph.active_reservations must be a dictionary.")
         if not self.graph_id:
             self.graph_id = f"tg_{uuid.uuid4().hex[:12]}"
         self.objective = _sanitize_graph_text(self.objective, max_bytes=1024)
@@ -383,6 +698,12 @@ class TaskGraph:
             raise TaskGraphValidationError("TaskGraph must define a non-empty execution_id.")
         if self.status not in _VALID_GRAPH_STATUSES:
             raise TaskGraphValidationError(f"Invalid TaskGraph status: {self.status!r}")
+        if not isinstance(self.max_concurrency, int) or isinstance(self.max_concurrency, bool) or self.max_concurrency < 1:
+            raise TaskGraphValidationError(
+                f"TaskGraph max_concurrency must be a positive integer >= 1, got {self.max_concurrency!r}."
+            )
+        if not isinstance(self.active_reservations, dict):
+            raise TaskGraphValidationError("TaskGraph active_reservations must be a dictionary.")
 
         # Build proposal lookup & enforce single-execution isolation boundary
         prop_map: Dict[str, Any] = {}
@@ -778,10 +1099,341 @@ class TaskGraph:
 
     def get_next_eligible_node(self) -> Optional[TaskNode]:
         """Return the single highest-priority READY node respecting sequential execution order."""
-        for node in self.topological_order():
-            if node.execution_status == TaskNodeStatus.READY.value:
-                return node
-        return None
+        with self._lock:
+            for node in self.topological_order():
+                if node.execution_status == TaskNodeStatus.READY.value and node.reserved_by is None:
+                    return node
+            return None
+
+    def configure_max_concurrency(self, max_concurrency: int) -> "TaskGraph":
+        """Validate and update bounded parallel execution concurrency at runtime."""
+        if not isinstance(max_concurrency, int) or isinstance(max_concurrency, bool) or max_concurrency < 1:
+            raise TaskGraphValidationError(
+                f"TaskGraph.max_concurrency must be a positive integer >= 1, got {max_concurrency!r}."
+            )
+        with self._lock:
+            self.max_concurrency = int(max_concurrency)
+            self._refresh_summary_and_digest()
+            return self
+
+    def get_running_nodes(self) -> List[TaskNode]:
+        """Return nodes currently executing or holding active execution reservations."""
+        with self._lock:
+            return [
+                n
+                for n in sorted(self.nodes, key=lambda x: (x.order_index, x.node_id))
+                if n.execution_status == TaskNodeStatus.RUNNING.value or n.reserved_by is not None
+            ]
+
+    def get_ready_nodes(
+        self,
+        *,
+        limit: Optional[int] = None,
+        exclude_conflicting: bool = False,
+        profile_fn: Optional[Callable[[TaskNode], NodeConflictProfile]] = None,
+    ) -> List[TaskNode]:
+        """Return deterministically ordered READY nodes eligible for scheduling."""
+        with self._lock:
+            if limit is not None and limit <= 0:
+                return []
+            node_map = {n.node_id: n for n in self.nodes}
+            candidates: List[TaskNode] = []
+            for node in self.topological_order():
+                if node.execution_status != TaskNodeStatus.READY.value:
+                    continue
+                if node.reserved_by is not None or node.node_id in self.active_reservations:
+                    continue
+                if not all(
+                    d in node_map and self._is_prerequisite_satisfied(node_map[d], node.requires_verified_dependencies)
+                    for d in node.dependency_ids
+                ):
+                    continue
+                candidates.append(node)
+
+            if not exclude_conflicting:
+                return candidates[:limit] if limit is not None else candidates
+
+            active_profiles: List[NodeConflictProfile] = []
+            for r_entry in self.active_reservations.values():
+                if isinstance(r_entry, dict):
+                    active_profiles.append(self._profile_from_reservation_entry(r_entry))
+            for rn in self.nodes:
+                if rn.execution_status == TaskNodeStatus.RUNNING.value and rn.node_id not in self.active_reservations:
+                    active_profiles.append(
+                        NodeConflictProfile(
+                            lock_keys=tuple(rn.conflict_resources or ()),
+                            exclusive_resource=rn.exclusive_resource,
+                            read_only=False,
+                        )
+                    )
+
+            selected: List[TaskNode] = []
+            for cand in candidates:
+                c_prof = (
+                    profile_fn(cand)
+                    if profile_fn is not None
+                    else extract_node_conflict_profile(node=cand, external_source=cand.external_source)
+                )
+                if any(profiles_conflict(c_prof, ap) is not None for ap in active_profiles):
+                    continue
+                selected.append(cand)
+                active_profiles.append(c_prof)
+                if limit is not None and len(selected) >= limit:
+                    break
+            return selected
+
+    @staticmethod
+    def _profile_from_reservation_entry(entry: Dict[str, Any]) -> NodeConflictProfile:
+        return NodeConflictProfile(
+            lock_keys=tuple(str(x) for x in (entry.get("resources") or []) if str(x).strip()),
+            read_targets=tuple(str(x) for x in (entry.get("read_targets") or []) if str(x).strip()),
+            write_targets=tuple(str(x) for x in (entry.get("write_targets") or []) if str(x).strip()),
+            exclusive_resource=str(entry["exclusive_resource"]) if entry.get("exclusive_resource") else None,
+            operation_fingerprint=str(entry["operation_fingerprint"]) if entry.get("operation_fingerprint") else None,
+            read_only=bool(entry.get("read_only", False)),
+        )
+
+    def _active_profiles_excluding(self, exclude_node_id: Optional[str] = None) -> List[Tuple[str, NodeConflictProfile]]:
+        active: List[Tuple[str, NodeConflictProfile]] = []
+        for nid, r_entry in self.active_reservations.items():
+            if nid == exclude_node_id or not isinstance(r_entry, dict):
+                continue
+            active.append((nid, self._profile_from_reservation_entry(r_entry)))
+        for n in self.nodes:
+            if n.node_id == exclude_node_id or n.node_id in self.active_reservations:
+                continue
+            if n.execution_status == TaskNodeStatus.RUNNING.value or n.reserved_by is not None:
+                active.append(
+                    (
+                        n.node_id,
+                        NodeConflictProfile(
+                            lock_keys=tuple(n.conflict_resources or ()),
+                            exclusive_resource=n.exclusive_resource,
+                            read_only=False,
+                        ),
+                    )
+                )
+        return active
+
+    def can_nodes_run_concurrently(
+        self,
+        node_a_id: str,
+        node_b_id: str,
+        *,
+        profile_a: Optional[NodeConflictProfile] = None,
+        profile_b: Optional[NodeConflictProfile] = None,
+    ) -> Tuple[bool, Optional[str]]:
+        """Check whether two nodes are independent and conflict-free for parallel execution."""
+        with self._lock:
+            na = self.get_node(node_a_id)
+            nb = self.get_node(node_b_id)
+            if na is None or nb is None:
+                return False, "unknown_node"
+            if na.node_id == nb.node_id:
+                return False, "identical_node"
+            if nb.node_id in na.dependency_ids or na.node_id in nb.dependency_ids:
+                return False, "direct_dependency"
+            # Check transitive reachability so ancestor/descendant nodes never run together
+            node_map = {n.node_id: n for n in self.nodes}
+
+            def _ancestors(start: TaskNode) -> Set[str]:
+                seen: Set[str] = set()
+                stack = list(start.dependency_ids)
+                while stack:
+                    cur = stack.pop()
+                    if cur in seen:
+                        continue
+                    seen.add(cur)
+                    cn = node_map.get(cur)
+                    if cn is not None:
+                        stack.extend(cn.dependency_ids)
+                return seen
+
+            if na.node_id in _ancestors(nb) or nb.node_id in _ancestors(na):
+                return False, "transitive_dependency"
+
+            pa = profile_a or extract_node_conflict_profile(node=na, external_source=na.external_source)
+            pb = profile_b or extract_node_conflict_profile(node=nb, external_source=nb.external_source)
+            conflict = profiles_conflict(pa, pb)
+            if conflict is not None:
+                return False, conflict
+            return True, None
+
+    def reserve_node(
+        self,
+        node_id: str,
+        *,
+        owner_id: str,
+        reservation_id: Optional[str] = None,
+        conflict_profile: Optional[NodeConflictProfile] = None,
+        resources: Optional[Sequence[str]] = None,
+        exclusive_resource: Optional[str] = None,
+        enforce_concurrency_cap: bool = True,
+        max_concurrency: Optional[int] = None,
+    ) -> str:
+        """Atomically claim exclusive ownership and canonical sorted resource locks for a READY node."""
+        if not isinstance(owner_id, str) or not owner_id.strip():
+            raise TaskGraphValidationError("Node reservation requires a non-empty owner_id.")
+        eff_owner = owner_id.strip()
+
+        with self._lock:
+            eff_cap = max_concurrency if max_concurrency is not None else self.max_concurrency
+            if not isinstance(eff_cap, int) or isinstance(eff_cap, bool) or eff_cap < 1:
+                raise TaskGraphValidationError(f"Invalid max_concurrency cap: {eff_cap!r}.")
+
+            node_map = {n.node_id: n for n in self.nodes}
+            node = node_map.get(node_id)
+            if node is None:
+                raise TaskGraphValidationError(f"Cannot reserve unknown task node '{node_id}'.")
+
+            if node.reserved_by is not None or node_id in self.active_reservations:
+                holder = node.reserved_by or (self.active_reservations.get(node_id) or {}).get("owner_id")
+                raise TaskGraphConflictError(f"Node '{node_id}' is already reserved by '{holder}'.")
+
+            if node.execution_status != TaskNodeStatus.READY.value:
+                raise TaskGraphConflictError(
+                    f"Node '{node_id}' is in status '{node.execution_status}' and cannot be reserved for dispatch."
+                )
+
+            for dep_id in node.dependency_ids:
+                dep = node_map.get(dep_id)
+                if dep is None or not self._is_prerequisite_satisfied(dep, node.requires_verified_dependencies):
+                    raise TaskGraphValidationError(
+                        f"Node '{node_id}' cannot be reserved while prerequisite '{dep_id}' is unsatisfied."
+                    )
+
+            if enforce_concurrency_cap and len(self.active_reservations) >= eff_cap:
+                raise TaskGraphConflictError(
+                    f"Bounded concurrency limit ({eff_cap}) reached; cannot reserve node '{node_id}'."
+                )
+
+            base_prof = conflict_profile or extract_node_conflict_profile(node=node, external_source=node.external_source)
+            merged_locks = sorted(
+                {str(r).strip() for r in list(base_prof.lock_keys) + list(resources or ()) if str(r).strip()}
+                | ({str(exclusive_resource).strip()} if exclusive_resource else set())
+            )
+            eff_excl = exclusive_resource or base_prof.exclusive_resource
+            eff_prof = NodeConflictProfile(
+                lock_keys=tuple(merged_locks),
+                read_targets=base_prof.read_targets,
+                write_targets=base_prof.write_targets,
+                exclusive_resource=eff_excl,
+                operation_fingerprint=base_prof.operation_fingerprint,
+                read_only=base_prof.read_only,
+            )
+
+            for active_nid, active_prof in self._active_profiles_excluding(node_id):
+                conflict_reason = profiles_conflict(eff_prof, active_prof)
+                if conflict_reason is not None:
+                    raise TaskGraphConflictError(
+                        f"Node '{node_id}' conflicts with active node '{active_nid}': {conflict_reason}."
+                    )
+
+            rid = (reservation_id or f"res_{uuid.uuid4().hex[:12]}").strip()
+            now = time.time()
+            node.reserved_by = eff_owner
+            node.reservation_id = rid
+            node.reserved_at = now
+            node.conflict_resources = list(merged_locks)
+            node.exclusive_resource = eff_excl
+            node.execution_status = TaskNodeStatus.RUNNING.value
+            node.blocked_reason = None
+            node.updated_at = now
+            self.active_reservations[node_id] = {
+                "node_id": node_id,
+                "owner_id": eff_owner,
+                "reservation_id": rid,
+                "resources": list(merged_locks),
+                "read_targets": list(eff_prof.read_targets),
+                "write_targets": list(eff_prof.write_targets),
+                "exclusive_resource": eff_excl,
+                "operation_fingerprint": eff_prof.operation_fingerprint,
+                "read_only": bool(eff_prof.read_only),
+                "reserved_at": now,
+            }
+            self._refresh_summary_and_digest()
+            return rid
+
+    def release_reservation(
+        self,
+        node_id: str,
+        *,
+        owner_id: str,
+        reservation_id: str,
+        final_status: Optional[str] = None,
+        blocked_reason: Optional[str] = None,
+        known_proposals: Optional[Union[Dict[str, Any], Iterable[Any]]] = None,
+    ) -> TaskNode:
+        """Release an active node reservation only if caller holds matching owner_id and reservation_id."""
+        with self._lock:
+            node = self.get_node(node_id)
+            if node is None:
+                raise TaskGraphValidationError(f"Cannot release unknown task node '{node_id}'.")
+
+            entry = self.active_reservations.get(node_id)
+            cur_owner = node.reserved_by or (entry.get("owner_id") if isinstance(entry, dict) else None)
+            cur_rid = node.reservation_id or (entry.get("reservation_id") if isinstance(entry, dict) else None)
+            if cur_owner is None and entry is None:
+                raise TaskGraphValidationError(f"Node '{node_id}' has no active reservation to release.")
+            if cur_owner != owner_id or cur_rid != reservation_id:
+                raise TaskGraphValidationError(
+                    f"Non-owner '{owner_id}' (reservation='{reservation_id}') cannot release lock held by '{cur_owner}' on '{node_id}'."
+                )
+
+            now = time.time()
+            node.reserved_by = None
+            node.reservation_id = None
+            node.reserved_at = None
+            self.active_reservations.pop(node_id, None)
+            if final_status is not None:
+                if final_status not in _VALID_NODE_STATUSES:
+                    raise TaskGraphValidationError(f"Invalid final_status on release: {final_status!r}.")
+                node.execution_status = final_status
+            if blocked_reason is not None:
+                node.blocked_reason = _sanitize_graph_text(blocked_reason, max_bytes=256)
+            node.updated_at = now
+            self.recompute_schedule(known_proposals=known_proposals)
+            return node
+
+    def reconcile_interrupted_reservations(self, *, release_stale_unstarted: bool = False) -> List[Dict[str, Any]]:
+        """Inspect and safely reconcile persisted reservations from a previous interrupted process."""
+        with self._lock:
+            notes: List[Dict[str, Any]] = []
+            node_map = {n.node_id: n for n in self.nodes}
+            for nid, entry in list(self.active_reservations.items()):
+                node = node_map.get(nid)
+                owner = entry.get("owner_id") if isinstance(entry, dict) else None
+                if node is None:
+                    self.active_reservations.pop(nid, None)
+                    notes.append({"node_id": nid, "owner_id": owner, "action": "dropped_orphan_reservation"})
+                    continue
+                if node.execution_status in (
+                    TaskNodeStatus.COMPLETED_VERIFIED.value,
+                    TaskNodeStatus.CANCELLED.value,
+                    TaskNodeStatus.FAILED.value,
+                    TaskNodeStatus.COMPLETED_UNVERIFIED.value,
+                ):
+                    node.reserved_by = None
+                    node.reservation_id = None
+                    node.reserved_at = None
+                    self.active_reservations.pop(nid, None)
+                    notes.append({"node_id": nid, "owner_id": owner, "action": "cleared_terminal_reservation"})
+                elif release_stale_unstarted and node.execution_status != TaskNodeStatus.RUNNING.value:
+                    node.reserved_by = None
+                    node.reservation_id = None
+                    node.reserved_at = None
+                    self.active_reservations.pop(nid, None)
+                    notes.append({"node_id": nid, "owner_id": owner, "action": "cleared_stale_pre_dispatch_reservation"})
+                else:
+                    notes.append({
+                        "node_id": nid,
+                        "owner_id": owner or node.reserved_by,
+                        "reservation_id": node.reservation_id or (entry.get("reservation_id") if isinstance(entry, dict) else None),
+                        "status": node.execution_status,
+                        "action": "preserved_interrupted_reservation",
+                    })
+            self._refresh_summary_and_digest()
+            return notes
 
     def get_blocked_nodes(self) -> List[TaskNode]:
         return [n for n in self.nodes if n.execution_status == TaskNodeStatus.BLOCKED.value]
@@ -1032,6 +1684,8 @@ class TaskGraph:
         self.summary = restored.summary
         self.updated_at = restored.updated_at
         self.graph_digest = restored.graph_digest
+        self.max_concurrency = restored.max_concurrency
+        self.active_reservations = dict(restored.active_reservations)
 
     def _refresh_summary_and_digest(self) -> None:
         counts = {st.value: 0 for st in TaskNodeStatus}
@@ -1041,7 +1695,7 @@ class TaskGraph:
         total = len(self.nodes)
         next_node = None
         for n in sorted(self.nodes, key=lambda x: (x.order_index, x.node_id)):
-            if n.execution_status == TaskNodeStatus.READY.value:
+            if n.execution_status == TaskNodeStatus.READY.value and n.reserved_by is None:
                 next_node = n.node_id
                 break
 
@@ -1080,7 +1734,7 @@ class TaskGraph:
         self.graph_digest = compute_task_graph_digest(self._raw_payload())
 
     def _raw_payload(self) -> Dict[str, Any]:
-        return _strip_forbidden_graph_keys({
+        raw: Dict[str, Any] = {
             "graph_id": self.graph_id,
             "execution_id": self.execution_id,
             "objective": _sanitize_graph_text(self.objective, max_bytes=1024),
@@ -1091,21 +1745,30 @@ class TaskGraph:
             "summary": dict(self.summary),
             "created_at": float(self.created_at),
             "updated_at": float(self.updated_at),
-        })
+        }
+        if self.max_concurrency != 1:
+            raw["max_concurrency"] = int(self.max_concurrency)
+        if self.active_reservations:
+            raw["active_reservations"] = {
+                str(k): dict(v) for k, v in self.active_reservations.items() if isinstance(v, dict)
+            }
+        return _strip_forbidden_graph_keys(raw)
 
     def to_dict(self) -> Dict[str, Any]:
-        if not self.graph_digest:
-            self._refresh_summary_and_digest()
-        payload = self._raw_payload()
-        payload["graph_digest"] = self.graph_digest
-        return payload
+        with self._lock:
+            if not self.graph_digest:
+                self._refresh_summary_and_digest()
+            payload = self._raw_payload()
+            payload["graph_digest"] = self.graph_digest
+            return payload
 
     def to_checkpoint_dict(self) -> Dict[str, Any]:
         """Serialize cleanly for task_checkpoints persistence without any auth grants or raw secrets."""
-        self._refresh_summary_and_digest()
-        payload = self._raw_payload()
-        payload["graph_digest"] = self.graph_digest
-        return _strip_forbidden_graph_keys(payload)
+        with self._lock:
+            self._refresh_summary_and_digest()
+            payload = self._raw_payload()
+            payload["graph_digest"] = self.graph_digest
+            return _strip_forbidden_graph_keys(payload)
 
     @classmethod
     def from_dict(
@@ -1132,6 +1795,18 @@ class TaskGraph:
         status = data.get("status", TaskGraphStatus.INITIALIZED.value)
         if not isinstance(status, str) or status not in _VALID_GRAPH_STATUSES:
             raise CorruptedTaskGraphError(f"TaskGraph '{gid}' has invalid status: {status!r}.")
+
+        raw_mc = data.get("max_concurrency", 1)
+        if not isinstance(raw_mc, int) or isinstance(raw_mc, bool) or raw_mc < 1:
+            raise CorruptedTaskGraphError(f"TaskGraph '{gid}' has invalid max_concurrency: {raw_mc!r}.")
+        raw_res = data.get("active_reservations", {})
+        if not isinstance(raw_res, dict):
+            raise CorruptedTaskGraphError(f"TaskGraph '{gid}' active_reservations must be a dictionary.")
+        clean_res: Dict[str, Dict[str, Any]] = {}
+        for rk, rv in raw_res.items():
+            if not isinstance(rk, str) or not rk.strip() or not isinstance(rv, dict):
+                raise CorruptedTaskGraphError(f"TaskGraph '{gid}' has malformed reservation entry '{rk}'.")
+            clean_res[rk.strip()] = _strip_forbidden_graph_keys(dict(rv))
 
         raw_nodes = data.get("nodes")
         raw_edges = data.get("edges", [])
@@ -1172,8 +1847,41 @@ class TaskGraph:
             updated_at=float(data.get("updated_at") or now),
             summary=dict(summary),
             graph_digest=stored_digest,
+            max_concurrency=raw_mc,
+            active_reservations=clean_res,
         )
         return graph
+
+
+def _sync_graph_method(fn: Any) -> Any:
+    def wrapper(self: "TaskGraph", *args: Any, **kwargs: Any) -> Any:
+        with self._lock:
+            return fn(self, *args, **kwargs)
+    return wrapper
+
+
+for _tg_meth_name in (
+    "validate",
+    "topological_order",
+    "recompute_schedule",
+    "apply_observation",
+    "add_node",
+    "replace_failed_node",
+    "update_dependencies",
+    "cancel_node",
+    "get_node",
+    "find_nodes_for_call",
+    "get_blocked_nodes",
+    "get_failed_nodes",
+    "get_unverified_nodes",
+):
+    _orig_tg_fn = getattr(TaskGraph, _tg_meth_name, None)
+    if callable(_orig_tg_fn):
+        _wrapped_tg = _sync_graph_method(_orig_tg_fn)
+        _wrapped_tg.__name__ = _orig_tg_fn.__name__
+        _wrapped_tg.__doc__ = _orig_tg_fn.__doc__
+        setattr(TaskGraph, _tg_meth_name, _wrapped_tg)
+del _tg_meth_name, _orig_tg_fn
 
 
 def reconstruct_task_graph_from_records(

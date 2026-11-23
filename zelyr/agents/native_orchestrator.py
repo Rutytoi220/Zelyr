@@ -8,7 +8,7 @@ import time
 import uuid
 from pathlib import Path
 import httpx
-from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optional
+from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 from zelyr.core.plugins import get_tool_schemas, execute_tool, get_tier_timeout
 
 REFUSAL_PHRASES = [
@@ -38,7 +38,10 @@ class NativeOrchestrator:
         allowed_tools: Optional[List[str]] = None,
         task_local_scope: Optional[Any] = None,
         central_ledger: Optional[Any] = None,
+        max_concurrency: int = 1,
     ):
+        if not isinstance(max_concurrency, int) or isinstance(max_concurrency, bool) or max_concurrency < 1:
+            raise ValueError(f"max_concurrency must be a positive integer >= 1, got {max_concurrency!r}.")
         self._explicit_max_context_tokens = max_context_tokens
         self._max_steps = max_depth if max_depth is not None else max_steps
         self._max_depth = self._max_steps
@@ -55,6 +58,7 @@ class NativeOrchestrator:
         self.allowed_tools = allowed_tools
         self.task_local_scope = task_local_scope
         self.central_ledger = central_ledger
+        self.max_concurrency = int(max_concurrency)
         self.current_ledger: Optional[Any] = None
         self.last_finish_reason: Optional[str] = None
 
@@ -1501,6 +1505,33 @@ class NativeOrchestrator:
         caught_exc: Optional[Exception] = None
         was_cancelled = False
         try:
+            active_tg_root = eff_ledger.get_task_graph() if hasattr(eff_ledger, "get_task_graph") else None
+            if active_tg_root is not None and payload.get("execute_task_graph_parallel"):
+                tg_res = await self.execute_task_graph(
+                    active_tg_root,
+                    proposals=(
+                        payload.get("graph_proposals")
+                        or (eff_ledger.get_tracked_proposals() if hasattr(eff_ledger, "get_tracked_proposals") else None)
+                        or payload.get("_pending_proposals")
+                    ),
+                    max_concurrency=payload.get("max_concurrency"),
+                    execution_id=exec_id,
+                    central_ledger=central_ledger,
+                    turn_ledger=eff_ledger,
+                    tool_schemas=tool_schemas,
+                    tool_executor=tool_executor,
+                    caller_ring=eff_caller_ring,
+                    allowed_tools=getattr(self, "allowed_tools", None),
+                    task_local_scope=eff_task_local_scope,
+                    acceptance_criteria=acceptance_spec,
+                    allow_unverified_retry=bool(payload.get("allow_unverified_retry", False)),
+                    finalize_execution=is_resumed_root,
+                    task_prompt=user_prompt,
+                )
+                summary_txt = f"TaskGraph '{tg_res['graph_id']}' execution finished ({tg_res['graph_status']})."
+                collected_out.append(summary_txt)
+                yield {"choices": [{"delta": {"content": summary_txt}, "finish_reason": "stop"}]}
+                return
             async for chunk in self._generate_stream_core(
                 payload,
                 depth=depth,
@@ -4411,4 +4442,1172 @@ class NativeOrchestrator:
             "tier3_vision": "interact_with_ui",
         }
         return tier_map.get(tier, "interact_with_ui")
+
+    @staticmethod
+    def _normalize_graph_proposal(item: Any, execution_id: str, fallback_order: int = 0) -> Dict[str, Any]:
+        """Normalize a PendingActionProposal or dict into a canonical proposal descriptor."""
+        if hasattr(item, "to_dict") and not isinstance(item, dict):
+            d = item.to_dict()
+        elif isinstance(item, dict):
+            d = dict(item)
+        else:
+            raise ValueError(f"Unsupported graph proposal entry: {type(item).__name__}")
+
+        prop_exec = d.get("execution_id")
+        if prop_exec and str(prop_exec) != execution_id:
+            from zelyr.engine.task_graph import TaskGraphValidationError
+
+            raise TaskGraphValidationError(
+                f"Cross-execution proposal '{d.get('proposal_id') or d.get('original_call_id')}' "
+                f"belongs to '{prop_exec}', not '{execution_id}'."
+            )
+
+        pid = str(d.get("proposal_id") or "").strip()
+        cid = str(d.get("original_call_id") or d.get("id") or "").strip()
+        if not cid and pid:
+            cid = f"call_{pid}"
+        if not pid and cid:
+            pid = f"prop_{cid}"
+        if not pid and not cid:
+            raise ValueError("Graph proposal entry must define 'proposal_id' or 'original_call_id'.")
+
+        tool_id = str(d.get("tool_id") or d.get("tool_name") or "").strip()
+        raw_args = d.get("normalized_arguments") if "normalized_arguments" in d else d.get("arguments", {})
+        if isinstance(raw_args, str):
+            try:
+                parsed_a = json.loads(raw_args)
+                args_val: Any = parsed_a if isinstance(parsed_a, dict) else raw_args
+            except Exception:
+                args_val = raw_args
+        elif isinstance(raw_args, dict):
+            args_val = dict(raw_args)
+        else:
+            args_val = raw_args
+
+        return {
+            "proposal_id": pid,
+            "original_call_id": cid,
+            "execution_id": execution_id,
+            "tool_id": tool_id,
+            "raw_name": str(d.get("raw_name") or tool_id),
+            "arguments": args_val,
+            "normalized_arguments": dict(args_val) if isinstance(args_val, dict) else {},
+            "status": str(d.get("status") or "pending"),
+            "depends_on": list(d.get("depends_on") or []),
+            "external_source": dict(d["external_source"]) if isinstance(d.get("external_source"), dict) else None,
+            "expires_at": d.get("expires_at"),
+            "proposal_order": int(d.get("proposal_order", fallback_order) or 0),
+            "node_id": d.get("node_id"),
+            "acceptance_criteria": d.get("acceptance_criteria"),
+        }
+
+    def _check_live_external_provenance(self, tool_name: str, ext_source: Optional[Dict[str, Any]]) -> Optional[str]:
+        """Revalidate external/fallback tool provenance and availability against live registry."""
+        reg = getattr(self, "tool_registry", None)
+        ext_entry = None
+        if reg is not None and callable(getattr(reg, "get_external_tool_entry", None)):
+            try:
+                ext_entry = reg.get_external_tool_entry(tool_name)
+            except Exception:
+                ext_entry = None
+        is_ext = bool((ext_source and ext_source.get("is_external", True)) or ext_entry is not None)
+        if not is_ext or reg is None:
+            return None
+        if ext_entry is None:
+            return f"External tool '{tool_name}' is no longer registered or available in runtime registry."
+        if getattr(ext_entry, "authorized", True) is False:
+            return f"External tool '{tool_name}' authorization has been revoked."
+        if callable(getattr(reg, "get_tool", None)) and reg.get_tool(tool_name) is None:
+            return f"External tool '{tool_name}' adapter is unavailable."
+        return None
+
+    async def _run_reserved_graph_node(
+        self,
+        *,
+        graph: Any,
+        node_id: str,
+        call_id: str,
+        proposal: Dict[str, Any],
+        owner_id: str,
+        reservation_id: str,
+        central_ledger: Any,
+        turn_ledger: Any,
+        prop_by_ref: Dict[str, Dict[str, Any]],
+        eff_exec_id: str,
+        eff_caller_ring: Optional[int],
+        eff_allowed_tools: Optional[List[str]],
+        eff_task_local_scope: Optional[Any],
+        auth_schemas: Optional[List[Dict[str, Any]]],
+        known_for_auth: Optional[set],
+        eff_tool_executor: Optional[Callable[[str, dict], Awaitable[Any]]],
+        parsed_criteria: List[Dict[str, Any]],
+        node_timeout: float,
+    ) -> Dict[str, Any]:
+        """Execute a single reserved TaskNode inside an isolated task-local & ledger execution scope."""
+        from zelyr.engine.execution_ledger import (
+            ActionState,
+            LedgerEventType,
+            _extract_action_target,
+            criterion_applies_to_target,
+            execution_scope,
+            parse_acceptance_criteria,
+        )
+        from zelyr.engine.observation_framing import ObservationFramingEngine
+        from zelyr.engine.task_graph import TaskNodeStatus
+        from zelyr.engine.verifier import OutcomeVerifier
+        from zelyr.tool_registry import activate_task_local_scope, authorize_and_validate_tool_call
+
+        func_name = proposal["tool_id"]
+        func_args = dict(proposal.get("normalized_arguments") or {})
+        ext_src = proposal.get("external_source")
+        did_dispatch = False
+        was_timed_out = False
+        was_cancelled = False
+        structured_obs: Any = None
+        outcome_passed: Optional[bool] = None
+        is_failed = False
+        is_verified = False
+
+        try:
+            # Verify live ownership before executing
+            node_cur = graph.get_node(node_id)
+            if (
+                node_cur is None
+                or node_cur.reserved_by != owner_id
+                or node_cur.reservation_id != reservation_id
+            ):
+                raise PermissionError(
+                    f"Node '{node_id}' reservation ownership mismatch for '{owner_id}'."
+                )
+
+            # Live pre-dispatch re-authorization inside isolated worker right before execution
+            ext_err = self._check_live_external_provenance(func_name, ext_src)
+            if ext_err is not None:
+                err_payload = {
+                    "tool": func_name,
+                    "status": "rejected",
+                    "reason": "authorization_denied",
+                    "detail": ext_err,
+                    "error_type": "AUTHORIZATION_DENIED",
+                }
+                structured_obs = ObservationFramingEngine.frame_structured(
+                    func_name,
+                    err_payload,
+                    requested_tool=func_name,
+                    requested_args=func_args,
+                    executed_args=func_args,
+                    dispatched=False,
+                    execution_id=eff_exec_id,
+                    correlation_id=call_id,
+                    external_source=ext_src,
+                )
+                turn_ledger.record_rejected(call_id, reason=ext_err)
+                turn_ledger.record_observation(
+                    call_id,
+                    status="rejected",
+                    output=json.dumps(err_payload),
+                    error=ext_err,
+                    rejection_reason="authorization_denied",
+                    structured_observation=structured_obs,
+                )
+                is_failed = True
+                return {"node_id": node_id, "call_id": call_id, "status": "rejected", "error": ext_err}
+
+            if eff_task_local_scope is not None and eff_tool_executor is None:
+                rej_detail = (
+                    "AuthorizationError: TaskLocalToolScope requires an isolated custom "
+                    "tool_executor and cannot dispatch to production execute_tool."
+                )
+                err_payload = {
+                    "tool": func_name,
+                    "status": "rejected",
+                    "reason": "authorization_denied",
+                    "detail": rej_detail,
+                    "error_type": "AUTHORIZATION_DENIED",
+                }
+                structured_obs = ObservationFramingEngine.frame_structured(
+                    func_name,
+                    err_payload,
+                    requested_tool=func_name,
+                    requested_args=func_args,
+                    executed_args=func_args,
+                    dispatched=False,
+                    execution_id=eff_exec_id,
+                    correlation_id=call_id,
+                    external_source=ext_src,
+                )
+                turn_ledger.record_rejected(call_id, reason=rej_detail)
+                turn_ledger.record_observation(
+                    call_id,
+                    status="rejected",
+                    output=json.dumps(err_payload),
+                    error=rej_detail,
+                    rejection_reason="authorization_denied",
+                    structured_observation=structured_obs,
+                )
+                is_failed = True
+                return {"node_id": node_id, "call_id": call_id, "status": "rejected", "error": rej_detail}
+
+            decision = authorize_and_validate_tool_call(
+                func_name,
+                proposal.get("arguments", func_args),
+                caller_ring=eff_caller_ring,
+                allowed_tools=eff_allowed_tools,
+                active_schemas=auth_schemas,
+                tool_registry=self.tool_registry,
+                known_tools=known_for_auth,
+                task_local_scope=eff_task_local_scope,
+                require_registered=True,
+                normalize_args=True,
+                validate_schema=True,
+                argument_source="internal",
+            )
+            if not decision.allowed:
+                rej_reason = decision.reason or "authorization_denied"
+                rej_detail = decision.detail or "Tool invocation denied at worker dispatch."
+                err_type = decision.error_type or "AUTHORIZATION_DENIED"
+                err_payload = {
+                    "tool": func_name,
+                    "status": "rejected",
+                    "reason": rej_reason,
+                    "detail": rej_detail,
+                    "error_type": err_type,
+                }
+                if isinstance(getattr(decision, "validation_error", None), dict):
+                    for k, v in decision.validation_error.items():
+                        err_payload.setdefault(k, v)
+                structured_obs = ObservationFramingEngine.frame_structured(
+                    func_name,
+                    err_payload,
+                    requested_tool=func_name,
+                    requested_args=func_args,
+                    executed_args=func_args,
+                    dispatched=False,
+                    execution_id=eff_exec_id,
+                    correlation_id=call_id,
+                    external_source=ext_src,
+                )
+                turn_ledger.record_rejected(call_id, reason=rej_detail)
+                turn_ledger.record_observation(
+                    call_id,
+                    status="rejected",
+                    output=json.dumps(err_payload),
+                    error=rej_detail,
+                    rejection_reason=rej_reason,
+                    structured_observation=structured_obs,
+                )
+                is_failed = True
+                return {"node_id": node_id, "call_id": call_id, "status": "rejected", "error": rej_detail}
+
+            func_name = decision.tool_name
+            func_args = dict(decision.normalized_arguments)
+
+            cur_rec = turn_ledger.get_record(call_id)
+            if cur_rec is None:
+                turn_ledger.record_proposed(
+                    call_id,
+                    func_name,
+                    func_args,
+                    proposal_id=proposal["proposal_id"],
+                    depends_on=proposal.get("depends_on"),
+                    external_source=ext_src,
+                )
+            cur_rec = turn_ledger.get_record(call_id)
+            if cur_rec is not None and cur_rec.state == ActionState.PROPOSED:
+                turn_ledger.record_validated(call_id)
+                turn_ledger.record_authorized(call_id)
+            elif cur_rec is not None and cur_rec.state == ActionState.VALIDATED:
+                turn_ledger.record_authorized(call_id)
+
+            turn_ledger.record_dispatched(call_id, emit_event=True)
+            did_dispatch = True
+
+            raw_res: Any = None
+            with execution_scope(
+                central_ledger,
+                eff_exec_id,
+                caller_ring=eff_caller_ring,
+                task_local_scoped=bool(eff_task_local_scope is not None),
+                source_component="graph_parallel",
+                correlation_id=call_id,
+                owned_by_outer=True,
+            ):
+                with activate_task_local_scope(eff_task_local_scope):
+                    if eff_tool_executor is not None:
+                        call_obj = eff_tool_executor(func_name, func_args)
+                        if inspect.isawaitable(call_obj):
+                            raw_res = await asyncio.wait_for(call_obj, timeout=node_timeout)
+                        else:
+                            raw_res = call_obj
+                    else:
+                        exec_fn = self.execute_tool
+                        dispatched_via_reg = False
+                        if (
+                            exec_fn is execute_tool
+                            and self.tool_registry is not None
+                            and callable(getattr(self.tool_registry, "execute_async", None))
+                        ):
+                            try:
+                                from zelyr.core.plugins import _executors as _plugin_executors
+
+                                reg_tool = (
+                                    self.tool_registry.get_tool(func_name)
+                                    if callable(getattr(self.tool_registry, "get_tool", None))
+                                    else None
+                                )
+                                if reg_tool is not None and (
+                                    getattr(reg_tool, "is_external", False) or func_name not in _plugin_executors
+                                ):
+                                    dispatched_via_reg = True
+                            except Exception:
+                                reg_tool = None
+                        if dispatched_via_reg:
+                            coro = self.tool_registry.execute_async(
+                                func_name,
+                                caller_ring=eff_caller_ring,
+                                allowed_tools=eff_allowed_tools,
+                                **func_args,
+                            )
+                        else:
+                            coro = exec_fn(func_name, func_args)
+                        if inspect.isawaitable(coro):
+                            raw_res = await asyncio.wait_for(coro, timeout=node_timeout)
+                        else:
+                            raw_res = coro
+
+            # Normalize tool output payload
+            if raw_res is not None and hasattr(raw_res, "success") and not isinstance(raw_res, dict):
+                res_ok = bool(getattr(raw_res, "success", False))
+                raw_payload: Dict[str, Any] = {
+                    "status": "success" if res_ok else "error",
+                    "success": res_ok,
+                    "output": getattr(raw_res, "output", ""),
+                }
+                if getattr(raw_res, "error", None):
+                    raw_payload["error"] = getattr(raw_res, "error")
+                if getattr(raw_res, "error_type", None):
+                    raw_payload["error_type"] = getattr(raw_res, "error_type")
+            elif isinstance(raw_res, dict):
+                raw_payload = dict(raw_res)
+            elif isinstance(raw_res, str):
+                trimmed = raw_res.strip()
+                parsed_d = None
+                if trimmed.startswith("{") and trimmed.endswith("}"):
+                    try:
+                        cand = json.loads(trimmed)
+                        if isinstance(cand, dict):
+                            parsed_d = cand
+                    except Exception:
+                        parsed_d = None
+                raw_payload = parsed_d if parsed_d is not None else {"status": "success", "output": raw_res}
+            else:
+                raw_payload = {"status": "success", "output": str(raw_res) if raw_res is not None else ""}
+
+            exit_code = raw_payload.get("exit_code")
+            err_msg = raw_payload.get("error")
+            is_failed = (
+                raw_payload.get("status") in ("error", "failed", "rejected", "tool_execution_failed")
+                or raw_payload.get("success") is False
+                or (exit_code is not None and not isinstance(exit_code, bool) and exit_code != 0)
+            )
+            if is_failed and not err_msg:
+                err_msg = str(raw_payload.get("detail") or raw_payload.get("output") or "Tool execution failed")
+
+            # Outcome verification matching node acceptance criteria or target
+            node_spec = proposal.get("acceptance_criteria")
+            node_criteria = list(parse_acceptance_criteria(str(node_spec))) if node_spec else []
+            tool_target = _extract_action_target(func_name, func_args) or (
+                str(raw_payload.get("target")) if isinstance(raw_payload.get("target"), str) else None
+            )
+            applicable_criteria = list(node_criteria)
+            if parsed_criteria and tool_target:
+                for crit in parsed_criteria:
+                    if criterion_applies_to_target(crit, tool_target) and crit not in applicable_criteria:
+                        applicable_criteria.append(crit)
+
+            criteria_failed = False
+            ver_meta: Optional[Dict[str, Any]] = None
+            verified_targets_for_obs: List[str] = []
+            failed_targets_for_obs: List[str] = []
+            verification_detail: Optional[str] = None
+
+            if not is_failed:
+                if applicable_criteria:
+                    c_results = []
+                    for crit in applicable_criteria:
+                        vr = OutcomeVerifier.verify(
+                            check=crit["check"],
+                            target=crit["target"],
+                            expected=crit.get("expected"),
+                        )
+                        c_results.append((crit, vr))
+                    failed_c = [
+                        (c, r) for c, r in c_results if not getattr(r, "success", False)
+                    ]
+                    if failed_c:
+                        criteria_failed = True
+                        is_verified = False
+                        outcome_passed = False
+                        first_c, first_r = failed_c[0]
+                        verification_detail = getattr(first_r, "error", None) or "Outcome verification failed."
+                        ver_meta = {
+                            "verified": False,
+                            "passed": False,
+                            "failed_criterion": f"{first_c['check']}:{first_c['target']}",
+                            "target": str(first_c.get("target") or ""),
+                            "error": verification_detail,
+                        }
+                        for fc, _ in failed_c:
+                            tgt_s = str(fc.get("target") or "")
+                            if tgt_s and tgt_s not in failed_targets_for_obs:
+                                failed_targets_for_obs.append(tgt_s)
+                            if tgt_s:
+                                turn_ledger.invalidate_target_verification(tgt_s, check_type=fc.get("check"))
+                    else:
+                        is_verified = True
+                        outcome_passed = True
+                        verification_detail = "All matching acceptance criteria independently verified."
+                        ver_meta = {"verified": True, "passed": True, "detail": verification_detail}
+                        for vc, _ in c_results:
+                            tgt_s = str(vc.get("target") or "")
+                            if tgt_s:
+                                if tgt_s not in verified_targets_for_obs:
+                                    verified_targets_for_obs.append(tgt_s)
+                                turn_ledger.record_target_verified(
+                                    tgt_s,
+                                    detail=verification_detail,
+                                    check_type=vc.get("check"),
+                                )
+                elif raw_payload.get("verified") is True:
+                    is_verified = True
+                    outcome_passed = True
+                    verification_detail = str(raw_payload.get("verification_detail") or "Verified")
+                    ver_meta = {"verified": True, "passed": True, "detail": verification_detail}
+                    if tool_target:
+                        verified_targets_for_obs.append(tool_target)
+                        turn_ledger.record_target_verified(tool_target, detail=verification_detail)
+                elif raw_payload.get("verified") is False and raw_payload.get("verification_failed") is True:
+                    criteria_failed = True
+                    is_verified = False
+                    outcome_passed = False
+                    verification_detail = str(raw_payload.get("verifier_reason") or raw_payload.get("verification_detail") or "Verification failed")
+                    ver_meta = {
+                        "verified": False,
+                        "passed": False,
+                        "error": verification_detail,
+                        "target": tool_target or "",
+                    }
+                    if tool_target:
+                        failed_targets_for_obs.append(tool_target)
+                        turn_ledger.invalidate_target_verification(tool_target)
+            else:
+                if tool_target:
+                    turn_ledger.invalidate_target_verification(tool_target)
+
+            structured_obs = ObservationFramingEngine.frame_structured(
+                func_name,
+                raw_payload,
+                requested_tool=func_name,
+                requested_args=func_args,
+                executed_args=func_args,
+                dispatched=True,
+                timed_out=False,
+                cancelled=False,
+                execution_id=eff_exec_id,
+                correlation_id=call_id,
+                external_source=ext_src,
+                independent_verification=ver_meta,
+            )
+            turn_ledger.record_observation(
+                call_id,
+                status="error" if is_failed else "success",
+                output=raw_payload.get("output") if raw_payload.get("output") is not None else raw_payload,
+                error=str(err_msg) if is_failed else (verification_detail if criteria_failed else None),
+                exit_code=exit_code if not isinstance(exit_code, bool) else None,
+                verified=is_verified,
+                verification_detail=verification_detail,
+                verification_failed=bool(criteria_failed and not is_failed),
+                failed_targets=failed_targets_for_obs,
+                verified_targets=verified_targets_for_obs,
+                structured_observation=structured_obs,
+            )
+            return {
+                "node_id": node_id,
+                "call_id": call_id,
+                "tool_name": func_name,
+                "status": "error" if is_failed else ("verified" if is_verified else "unverified"),
+                "verified": is_verified,
+                "error": str(err_msg) if is_failed else None,
+                "output": raw_payload.get("output"),
+            }
+        except asyncio.TimeoutError:
+            was_timed_out = True
+            is_failed = True
+            timeout_err = f"Node '{node_id}' tool '{func_name}' timed out after {node_timeout}s."
+            structured_obs = ObservationFramingEngine.frame_structured(
+                func_name,
+                {"status": "error", "error": timeout_err, "error_type": "TIMEOUT_ERROR"},
+                requested_tool=func_name,
+                requested_args=func_args,
+                executed_args=func_args,
+                dispatched=did_dispatch,
+                timed_out=True,
+                cancelled=False,
+                execution_id=eff_exec_id,
+                correlation_id=call_id,
+                external_source=ext_src,
+            )
+            turn_ledger.record_observation(
+                call_id,
+                status="timed_out",
+                output="",
+                error=timeout_err,
+                verified=False,
+                structured_observation=structured_obs,
+            )
+            return {"node_id": node_id, "call_id": call_id, "status": "timed_out", "error": timeout_err}
+        except asyncio.CancelledError:
+            was_cancelled = True
+            cancel_err = f"Node '{node_id}' execution cancelled while {'running' if did_dispatch else 'pending'}."
+            if turn_ledger.get_record(call_id) is None:
+                turn_ledger.record_proposed(call_id, func_name, func_args, proposal_id=proposal["proposal_id"], external_source=ext_src)
+            turn_ledger.record_cancelled(call_id, reason=cancel_err)
+            structured_obs = ObservationFramingEngine.frame_structured(
+                func_name,
+                {"status": "cancelled", "error": cancel_err},
+                requested_tool=func_name,
+                requested_args=func_args,
+                executed_args=func_args,
+                dispatched=did_dispatch,
+                timed_out=False,
+                cancelled=True,
+                execution_id=eff_exec_id,
+                correlation_id=call_id,
+                external_source=ext_src,
+            )
+            turn_ledger._structured_observations[call_id] = structured_obs
+            raise
+        except Exception as exc:
+            is_failed = True
+            exc_err = f"{type(exc).__name__}: {exc}"
+            structured_obs = ObservationFramingEngine.frame_structured(
+                func_name,
+                {"status": "error", "error": exc_err},
+                requested_tool=func_name,
+                requested_args=func_args,
+                executed_args=func_args,
+                dispatched=did_dispatch,
+                timed_out=False,
+                cancelled=False,
+                execution_id=eff_exec_id,
+                correlation_id=call_id,
+                external_source=ext_src,
+            )
+            if turn_ledger.get_record(call_id) is None:
+                turn_ledger.record_proposed(call_id, func_name, func_args, proposal_id=proposal["proposal_id"], external_source=ext_src)
+            turn_ledger.record_observation(
+                call_id,
+                status="error",
+                output="",
+                error=exc_err,
+                verified=False,
+                structured_observation=structured_obs,
+            )
+            return {"node_id": node_id, "call_id": call_id, "status": "error", "error": exc_err}
+        finally:
+            # Always release only OUR reservation & transition graph atomically under graph._lock
+            with graph._lock:
+                node_chk = graph.get_node(node_id)
+                if (
+                    node_chk is not None
+                    and node_chk.reserved_by == owner_id
+                    and node_chk.reservation_id == reservation_id
+                ):
+                    temp_status = (
+                        TaskNodeStatus.CANCELLED.value
+                        if was_cancelled
+                        else (TaskNodeStatus.FAILED.value if (is_failed or was_timed_out) else TaskNodeStatus.PENDING.value)
+                    )
+                    graph.release_reservation(
+                        node_id,
+                        owner_id=owner_id,
+                        reservation_id=reservation_id,
+                        final_status=temp_status,
+                        known_proposals=prop_by_ref,
+                    )
+                    turn_ledger.record_node_reservation_event(
+                        "reservation_released",
+                        node_id=node_id,
+                        owner_id=owner_id,
+                        reservation_id=reservation_id,
+                        call_id=call_id,
+                        tool_id=func_name,
+                        status="released",
+                        idempotency_suffix=f"release:{reservation_id}",
+                    )
+                if structured_obs is not None:
+                    graph.apply_observation(
+                        node_id,
+                        structured_obs,
+                        action_record=turn_ledger.get_record(call_id),
+                        outcome_verifier_passed=outcome_passed,
+                        known_proposals=prop_by_ref,
+                    )
+
+    async def execute_task_graph(
+        self,
+        graph: Any,
+        proposals: Optional[Union[Dict[str, Any], Sequence[Any]]] = None,
+        *,
+        max_concurrency: Optional[int] = None,
+        execution_id: Optional[str] = None,
+        central_ledger: Optional[Any] = None,
+        turn_ledger: Optional[Any] = None,
+        tool_schemas: Optional[List[Dict[str, Any]]] = None,
+        tool_executor: Optional[Callable[[str, dict], Awaitable[Any]]] = None,
+        caller_ring: Optional[int] = None,
+        allowed_tools: Optional[Iterable[str]] = None,
+        task_local_scope: Optional[Any] = None,
+        acceptance_criteria: Optional[str] = None,
+        node_timeouts: Optional[Dict[str, float]] = None,
+        default_node_timeout: Optional[float] = None,
+        max_steps: Optional[int] = None,
+        allow_unverified_retry: bool = False,
+        finalize_execution: bool = True,
+        task_prompt: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Execute READY independent nodes in a validated TaskGraph with bounded parallelism."""
+        from zelyr.engine.checkpoint import CheckpointManager
+        from zelyr.engine.execution_ledger import (
+            ActionState,
+            ExecutionStatus,
+            LedgerEventType,
+            TurnExecutionLedger,
+            VerificationStatus,
+            get_default_central_ledger,
+            parse_acceptance_criteria,
+        )
+        from zelyr.engine.observation_framing import ObservationFramingEngine
+        from zelyr.engine.task_graph import (
+            TaskGraph,
+            TaskGraphConflictError,
+            TaskGraphStatus,
+            TaskGraphValidationError,
+            TaskNodeStatus,
+            extract_node_conflict_profile,
+            profiles_conflict,
+        )
+        from zelyr.tool_registry import authorize_and_validate_tool_call
+
+        if not isinstance(graph, TaskGraph):
+            raise TaskGraphValidationError("execute_task_graph requires a TaskGraph instance.")
+
+        eff_exec_id = str(execution_id or graph.execution_id or "").strip()
+        if not eff_exec_id:
+            raise TaskGraphValidationError("execute_task_graph requires a non-empty execution_id.")
+        if graph.execution_id and graph.execution_id != eff_exec_id:
+            raise TaskGraphValidationError(
+                f"Cross-execution isolation violation: TaskGraph '{graph.graph_id}' belongs to '{graph.execution_id}', not '{eff_exec_id}'."
+            )
+        graph.execution_id = eff_exec_id
+
+        eff_max_conc = (
+            max_concurrency
+            if max_concurrency is not None
+            else (graph.max_concurrency if getattr(graph, "max_concurrency", 1) > 1 else getattr(self, "max_concurrency", 1))
+        )
+        if not isinstance(eff_max_conc, int) or isinstance(eff_max_conc, bool) or eff_max_conc < 1:
+            raise TaskGraphValidationError(
+                f"max_concurrency must be a positive integer >= 1, got {eff_max_conc!r}."
+            )
+        graph.configure_max_concurrency(eff_max_conc)
+
+        eff_caller_ring = caller_ring if caller_ring is not None else getattr(self, "caller_ring", None)
+        eff_allowed_raw = allowed_tools if allowed_tools is not None else getattr(self, "allowed_tools", None)
+        eff_allowed_tools = list(eff_allowed_raw) if eff_allowed_raw is not None else None
+        eff_tool_executor = tool_executor or getattr(self, "tool_executor", None)
+        eff_task_local_scope = task_local_scope if task_local_scope is not None else getattr(self, "task_local_scope", None)
+        if eff_task_local_scope is None and eff_tool_executor is not None:
+            eff_task_local_scope = getattr(eff_tool_executor, "_task_local_tool_scope", None)
+        eff_tool_schemas = tool_schemas if tool_schemas is not None else getattr(self, "tool_schemas", None)
+
+        eff_central = (
+            central_ledger
+            or getattr(self, "central_ledger", None)
+            or (getattr(turn_ledger, "_central_ledger", None) if turn_ledger is not None else None)
+            or get_default_central_ledger()
+        )
+        eff_central.create_execution(
+            task_prompt=task_prompt or graph.objective or "",
+            execution_id=eff_exec_id,
+            source_component="graph_parallel",
+            caller_ring=eff_caller_ring,
+            task_local_scoped=bool(eff_task_local_scope is not None),
+            status=ExecutionStatus.RUNNING,
+        )
+        eff_ledger = turn_ledger if turn_ledger is not None else TurnExecutionLedger(
+            execution_id=eff_exec_id,
+            central_ledger=eff_central,
+            caller_ring=eff_caller_ring,
+            task_local_scoped=bool(eff_task_local_scope is not None),
+            source_component="graph_parallel",
+        )
+        if getattr(eff_ledger, "_central_ledger", None) is None or getattr(eff_ledger, "_execution_id", None) != eff_exec_id:
+            eff_ledger.attach_central_ledger(
+                eff_central,
+                eff_exec_id,
+                caller_ring=eff_caller_ring,
+                task_local_scoped=bool(eff_task_local_scope is not None),
+                source_component="graph_parallel",
+            )
+        eff_ledger.attach_task_graph(graph)
+        self.current_ledger = eff_ledger
+
+        # Build normalized proposal lookup preserving execution isolation
+        prop_by_ref: Dict[str, Dict[str, Any]] = {}
+        raw_prop_list: List[Any] = []
+        if isinstance(proposals, dict):
+            raw_prop_list = list(proposals.values())
+        elif proposals is not None:
+            raw_prop_list = list(proposals)
+        elif hasattr(eff_ledger, "get_tracked_proposals"):
+            raw_prop_list = eff_ledger.get_tracked_proposals()
+
+        for idx, p_item in enumerate(raw_prop_list):
+            p_norm = self._normalize_graph_proposal(p_item, eff_exec_id, fallback_order=idx)
+            prop_by_ref[p_norm["proposal_id"]] = p_norm
+            prop_by_ref[p_norm["original_call_id"]] = p_norm
+
+        graph.validate(known_proposals=prop_by_ref, allow_blocked=True)
+        graph.recompute_schedule(known_proposals=prop_by_ref)
+
+        parsed_criteria = parse_acceptance_criteria(acceptance_criteria) if acceptance_criteria else []
+        eff_default_timeout = float(default_node_timeout if default_node_timeout is not None else 60.0)
+        eff_node_timeouts = dict(node_timeouts or {})
+        eff_max_steps = (
+            int(max_steps)
+            if max_steps is not None
+            else max(int(getattr(self, "max_steps", 5)), len(graph.nodes) * 2)
+        )
+
+        auth_schemas = eff_tool_schemas
+        known_for_auth = (
+            self.get_known_tool_names(list(eff_tool_schemas))
+            if (eff_tool_schemas is not None and eff_task_local_scope is None)
+            else None
+        )
+        schema_by_name: Dict[str, Dict[str, Any]] = {}
+        if isinstance(eff_tool_schemas, list):
+            for s in eff_tool_schemas:
+                if not isinstance(s, dict):
+                    continue
+                fn = s.get("function") if isinstance(s.get("function"), dict) else {}
+                sname = str(fn.get("name") or s.get("name") or "").strip()
+                if sname:
+                    schema_by_name[sname] = s
+
+        def _capture_cp(status_val: Any) -> None:
+            ver_st = (
+                VerificationStatus.VERIFIED
+                if graph.status == TaskGraphStatus.COMPLETED_VERIFIED.value
+                else VerificationStatus.NOT_VERIFIED
+            )
+            CheckpointManager.capture_checkpoint(
+                eff_central,
+                eff_exec_id,
+                turn_ledger=eff_ledger,
+                status=status_val,
+                verification_status=ver_st,
+                task_prompt=task_prompt or graph.objective or "",
+                planning_state={
+                    "max_concurrency": eff_max_conc,
+                    "acceptance_criteria": acceptance_criteria,
+                    "executed_steps": executed_steps,
+                    "graph_status": graph.status,
+                },
+                task_graph=graph,
+                emit_event=False,
+                strict=None,
+            )
+
+        active_tasks: Dict[asyncio.Task[Dict[str, Any]], Tuple[str, str, str, str]] = {}
+        node_results: List[Dict[str, Any]] = []
+        dispatched_node_ids: set[str] = set()
+        executed_steps = 0
+        was_cancelled = False
+
+        _capture_cp(ExecutionStatus.RUNNING)
+
+        try:
+            while executed_steps < eff_max_steps or active_tasks:
+                if getattr(self, "_cancelled", False):
+                    raise asyncio.CancelledError("Orchestrator execution cancelled.")
+
+                graph.recompute_schedule(known_proposals=prop_by_ref)
+                ready_nodes = graph.get_ready_nodes()
+                active_profiles = [
+                    ap for _, ap in graph._active_profiles_excluding(None)
+                ]
+
+                if executed_steps < eff_max_steps and len(active_tasks) < eff_max_conc and ready_nodes:
+                    for node in ready_nodes:
+                        if len(active_tasks) >= eff_max_conc or executed_steps + len(active_tasks) >= eff_max_steps:
+                            break
+                        if node.node_id in dispatched_node_ids or node.reserved_by is not None:
+                            continue
+
+                        # Resolve runnable proposal for this node
+                        prop_info: Optional[Dict[str, Any]] = None
+                        for pid in node.proposal_ids:
+                            if pid in prop_by_ref:
+                                prop_info = prop_by_ref[pid]
+                                break
+                        if prop_info is None and node.node_id in prop_by_ref:
+                            prop_info = prop_by_ref[node.node_id]
+
+                        if prop_info is None:
+                            fail_obs = ObservationFramingEngine.frame_structured(
+                                "task_graph",
+                                {"status": "error", "error": f"No proposal bound for node '{node.node_id}'."},
+                                dispatched=False,
+                                execution_id=eff_exec_id,
+                                correlation_id=f"missing_{node.node_id}",
+                            )
+                            graph.apply_observation(node.node_id, fail_obs, outcome_verifier_passed=False, known_proposals=prop_by_ref)
+                            node_results.append({"node_id": node.node_id, "status": "failed", "error": "missing_proposal"})
+                            continue
+
+                        if prop_info.get("expires_at") is not None and float(prop_info["expires_at"]) <= time.time():
+                            exp_call_id = prop_info["original_call_id"]
+                            exp_err = f"Proposal '{prop_info['proposal_id']}' for node '{node.node_id}' has expired."
+                            prop_info["status"] = "expired"
+                            if eff_ledger.get_record(exp_call_id) is None:
+                                eff_ledger.record_proposed(
+                                    exp_call_id,
+                                    prop_info["tool_id"],
+                                    dict(prop_info.get("normalized_arguments") or {}),
+                                    proposal_id=prop_info["proposal_id"],
+                                    external_source=prop_info.get("external_source") or node.external_source,
+                                )
+                            eff_ledger.record_rejected(exp_call_id, reason=exp_err)
+                            exp_obs = ObservationFramingEngine.frame_structured(
+                                prop_info["tool_id"] or "task_graph",
+                                {"status": "rejected", "error": exp_err, "error_type": "PROPOSAL_EXPIRED"},
+                                dispatched=False,
+                                execution_id=eff_exec_id,
+                                correlation_id=exp_call_id,
+                            )
+                            eff_ledger.record_observation(
+                                exp_call_id,
+                                status="rejected",
+                                output="",
+                                error=exp_err,
+                                rejection_reason="proposal_expired",
+                                structured_observation=exp_obs,
+                            )
+                            graph.apply_observation(node.node_id, exp_obs, action_record=eff_ledger.get_record(exp_call_id), known_proposals=prop_by_ref)
+                            node_results.append({"node_id": node.node_id, "call_id": exp_call_id, "status": "expired", "error": exp_err})
+                            continue
+
+                        call_id = prop_info["original_call_id"]
+                        func_name = prop_info["tool_id"]
+                        ext_src = prop_info.get("external_source") or node.external_source
+                        existing_rec = eff_ledger.get_record(call_id)
+
+                        # Guard against re-executing already completed or ambiguous in-flight operations
+                        if existing_rec is not None:
+                            if existing_rec.state == ActionState.VERIFIED:
+                                node.execution_status = TaskNodeStatus.COMPLETED_VERIFIED.value
+                                node.verification_status = VerificationStatus.VERIFIED.value
+                                graph.recompute_schedule(known_proposals=prop_by_ref)
+                                continue
+                            if existing_rec.state in (ActionState.DISPATCHED, ActionState.EXECUTED) and not allow_unverified_retry:
+                                node.execution_status = TaskNodeStatus.RUNNING.value
+                                node.verification_status = VerificationStatus.INTERRUPTED.value
+                                node.blocked_reason = "Ambiguous in-flight operation requires verification before replay."
+                                graph.recompute_schedule(known_proposals=prop_by_ref)
+                                continue
+
+                        # Build conservative conflict profile and check against running reservations
+                        reg_tool_obj = (
+                            self.tool_registry.get_tool(func_name)
+                            if (self.tool_registry is not None and callable(getattr(self.tool_registry, "get_tool", None)))
+                            else None
+                        )
+                        cand_args_dict = dict(prop_info.get("normalized_arguments") or {})
+                        cand_profile = extract_node_conflict_profile(
+                            func_name,
+                            cand_args_dict,
+                            node=node,
+                            external_source=ext_src,
+                            tool_schema=schema_by_name.get(func_name),
+                            tool_obj=reg_tool_obj,
+                        )
+                        if any(profiles_conflict(cand_profile, ap) is not None for ap in active_profiles):
+                            continue
+
+                        # Pre-dispatch validation, external provenance & live authorization check
+                        ext_err = self._check_live_external_provenance(func_name, ext_src)
+                        if ext_err is not None:
+                            if eff_ledger.get_record(call_id) is None:
+                                eff_ledger.record_proposed(
+                                    call_id, func_name, cand_args_dict,
+                                    proposal_id=prop_info["proposal_id"],
+                                    depends_on=prop_info.get("depends_on"),
+                                    external_source=ext_src,
+                                )
+                            eff_ledger.record_rejected(call_id, reason=ext_err)
+                            eff_central.record_event(
+                                eff_exec_id,
+                                LedgerEventType.AUTHORIZATION_DECISION,
+                                tool_id=func_name,
+                                status="denied",
+                                correlation_id=call_id,
+                                caller_ring=eff_caller_ring,
+                                task_local_scoped=bool(eff_task_local_scope is not None),
+                                metadata={"reason": "authorization_denied", "detail": ext_err, "node_id": node.node_id},
+                                idempotency_key=f"{eff_exec_id}:{call_id}:auth",
+                            )
+                            rej_obs = ObservationFramingEngine.frame_structured(
+                                func_name,
+                                {"status": "rejected", "error": ext_err, "error_type": "AUTHORIZATION_DENIED"},
+                                requested_tool=func_name,
+                                requested_args=cand_args_dict,
+                                executed_args=cand_args_dict,
+                                dispatched=False,
+                                execution_id=eff_exec_id,
+                                correlation_id=call_id,
+                                external_source=ext_src,
+                            )
+                            eff_ledger.record_observation(
+                                call_id, status="rejected", output="", error=ext_err,
+                                rejection_reason="authorization_denied", structured_observation=rej_obs,
+                            )
+                            graph.apply_observation(node.node_id, rej_obs, action_record=eff_ledger.get_record(call_id), known_proposals=prop_by_ref)
+                            node_results.append({"node_id": node.node_id, "call_id": call_id, "status": "rejected", "error": ext_err})
+                            continue
+
+                        pre_dec = authorize_and_validate_tool_call(
+                            func_name,
+                            prop_info.get("arguments", cand_args_dict),
+                            caller_ring=eff_caller_ring,
+                            allowed_tools=eff_allowed_tools,
+                            active_schemas=auth_schemas,
+                            tool_registry=self.tool_registry,
+                            known_tools=known_for_auth,
+                            task_local_scope=eff_task_local_scope,
+                            require_registered=True,
+                            normalize_args=True,
+                            validate_schema=True,
+                            argument_source="internal",
+                        )
+                        if not pre_dec.allowed:
+                            rej_reason = pre_dec.reason or "authorization_denied"
+                            rej_detail = pre_dec.detail or "Authorization denied."
+                            err_t = pre_dec.error_type or "AUTHORIZATION_DENIED"
+                            if eff_ledger.get_record(call_id) is None:
+                                eff_ledger.record_proposed(
+                                    call_id, func_name, cand_args_dict,
+                                    proposal_id=prop_info["proposal_id"],
+                                    depends_on=prop_info.get("depends_on"),
+                                    external_source=ext_src,
+                                )
+                            eff_ledger.record_rejected(call_id, reason=rej_detail)
+                            is_schema_err = err_t == "SCHEMA_VALIDATION_ERROR"
+                            eff_central.record_event(
+                                eff_exec_id,
+                                LedgerEventType.ARGUMENT_VALIDATED if is_schema_err else LedgerEventType.AUTHORIZATION_DECISION,
+                                tool_id=func_name,
+                                status="invalid" if is_schema_err else "denied",
+                                correlation_id=call_id,
+                                caller_ring=eff_caller_ring,
+                                task_local_scoped=bool(eff_task_local_scope is not None),
+                                metadata={"reason": rej_reason, "detail": rej_detail, "node_id": node.node_id},
+                                idempotency_key=f"{eff_exec_id}:{call_id}:{'validated' if is_schema_err else 'auth'}",
+                            )
+                            rej_obs = ObservationFramingEngine.frame_structured(
+                                func_name,
+                                {"status": "rejected", "reason": rej_reason, "detail": rej_detail, "error_type": err_t},
+                                requested_tool=func_name,
+                                requested_args=cand_args_dict,
+                                executed_args=cand_args_dict,
+                                dispatched=False,
+                                execution_id=eff_exec_id,
+                                correlation_id=call_id,
+                                external_source=ext_src,
+                            )
+                            eff_ledger.record_observation(
+                                call_id, status="rejected", output="", error=rej_detail,
+                                rejection_reason=rej_reason, structured_observation=rej_obs,
+                            )
+                            graph.apply_observation(node.node_id, rej_obs, action_record=eff_ledger.get_record(call_id), known_proposals=prop_by_ref)
+                            node_results.append({"node_id": node.node_id, "call_id": call_id, "status": "rejected", "error": rej_detail})
+                            continue
+
+                        # Update normalized tool & args cleanly before reservation
+                        func_name = pre_dec.tool_name
+                        norm_args = dict(pre_dec.normalized_arguments)
+                        prop_info["tool_id"] = func_name
+                        prop_info["normalized_arguments"] = norm_args
+                        norm_profile = extract_node_conflict_profile(
+                            func_name,
+                            norm_args,
+                            node=node,
+                            external_source=ext_src,
+                            tool_schema=schema_by_name.get(func_name),
+                            tool_obj=reg_tool_obj,
+                        )
+                        if any(profiles_conflict(norm_profile, ap) is not None for ap in active_profiles):
+                            continue
+
+                        # Atomically reserve node & sorted resource locks
+                        owner_id = f"worker:{node.node_id}:{uuid.uuid4().hex[:8]}"
+                        try:
+                            rid = graph.reserve_node(
+                                node.node_id,
+                                owner_id=owner_id,
+                                conflict_profile=norm_profile,
+                                max_concurrency=eff_max_conc,
+                            )
+                        except TaskGraphConflictError:
+                            continue
+
+                        dispatched_node_ids.add(node.node_id)
+                        active_profiles.append(norm_profile)
+
+                        if isinstance(ext_src, dict) and ext_src:
+                            eff_ledger.set_call_source_metadata(
+                                call_id,
+                                is_external=bool(ext_src.get("is_external", True)),
+                                source_id=ext_src.get("source_id"),
+                                source_type=ext_src.get("source_type"),
+                                extra={"external_tool_name": ext_src.get("external_tool_name")} if ext_src.get("external_tool_name") else None,
+                            )
+                        if eff_ledger.get_record(call_id) is None:
+                            eff_ledger.record_proposed(
+                                call_id,
+                                func_name,
+                                norm_args,
+                                proposal_id=prop_info["proposal_id"],
+                                depends_on=prop_info.get("depends_on"),
+                                external_source=ext_src,
+                            )
+                        eff_ledger.record_node_reservation_event(
+                            "node_reserved",
+                            node_id=node.node_id,
+                            owner_id=owner_id,
+                            reservation_id=rid,
+                            call_id=call_id,
+                            tool_id=func_name,
+                            resources=norm_profile.lock_keys,
+                            status="reserved",
+                            idempotency_suffix=f"reserve:{rid}",
+                        )
+
+                        eff_timeout = float(eff_node_timeouts.get(node.node_id, eff_default_timeout))
+                        worker_coro = self._run_reserved_graph_node(
+                            graph=graph,
+                            node_id=node.node_id,
+                            call_id=call_id,
+                            proposal=prop_info,
+                            owner_id=owner_id,
+                            reservation_id=rid,
+                            central_ledger=eff_central,
+                            turn_ledger=eff_ledger,
+                            prop_by_ref=prop_by_ref,
+                            eff_exec_id=eff_exec_id,
+                            eff_caller_ring=eff_caller_ring,
+                            eff_allowed_tools=eff_allowed_tools,
+                            eff_task_local_scope=eff_task_local_scope,
+                            auth_schemas=auth_schemas,
+                            known_for_auth=known_for_auth,
+                            eff_tool_executor=eff_tool_executor,
+                            parsed_criteria=parsed_criteria,
+                            node_timeout=eff_timeout,
+                        )
+                        task = asyncio.create_task(worker_coro, name=f"graph_node_{node.node_id}_{owner_id}")
+                        active_tasks[task] = (node.node_id, call_id, owner_id, rid)
+
+                if not active_tasks:
+                    break
+
+                # Persist active concurrent reservations + RUNNING state before awaiting wave
+                _capture_cp(ExecutionStatus.RUNNING)
+
+                done, _ = await asyncio.wait(active_tasks.keys(), return_when=asyncio.FIRST_COMPLETED)
+                for d_task in done:
+                    nid_d, cid_d, owner_d, rid_d = active_tasks.pop(d_task)
+                    executed_steps += 1
+                    try:
+                        res_item = d_task.result()
+                        if isinstance(res_item, dict):
+                            node_results.append(res_item)
+                    except asyncio.CancelledError:
+                        node_results.append({"node_id": nid_d, "call_id": cid_d, "status": "cancelled"})
+                    except Exception as task_exc:
+                        node_results.append({"node_id": nid_d, "call_id": cid_d, "status": "error", "error": str(task_exc)})
+
+                _capture_cp(ExecutionStatus.RUNNING)
+        except asyncio.CancelledError:
+            was_cancelled = True
+            for pending_t in list(active_tasks.keys()):
+                if not pending_t.done():
+                    pending_t.cancel()
+            if active_tasks:
+                await asyncio.gather(*list(active_tasks.keys()), return_exceptions=True)
+                active_tasks.clear()
+            raise
+        finally:
+            if active_tasks:
+                for leftover_t in list(active_tasks.keys()):
+                    if not leftover_t.done():
+                        leftover_t.cancel()
+                await asyncio.gather(*list(active_tasks.keys()), return_exceptions=True)
+                active_tasks.clear()
+
+            graph.recompute_schedule(known_proposals=prop_by_ref)
+            if was_cancelled or getattr(self, "_cancelled", False):
+                fin_exec_status = ExecutionStatus.CANCELLED
+                fin_ver_status = VerificationStatus.INTERRUPTED
+            elif graph.status == TaskGraphStatus.COMPLETED_VERIFIED.value:
+                fin_exec_status = ExecutionStatus.COMPLETED
+                fin_ver_status = VerificationStatus.VERIFIED
+            elif graph.status == TaskGraphStatus.COMPLETED_UNVERIFIED.value:
+                fin_exec_status = ExecutionStatus.COMPLETED_UNVERIFIED
+                fin_ver_status = VerificationStatus.NOT_VERIFIED
+            elif graph.status in (TaskGraphStatus.FAILED.value, TaskGraphStatus.BLOCKED.value):
+                fin_exec_status = ExecutionStatus.FAILED
+                fin_ver_status = VerificationStatus.NOT_VERIFIED
+            elif graph.status == TaskGraphStatus.CANCELLED.value:
+                fin_exec_status = ExecutionStatus.CANCELLED
+                fin_ver_status = VerificationStatus.INTERRUPTED
+            else:
+                fin_exec_status = ExecutionStatus.INTERRUPTED if was_cancelled else ExecutionStatus.FAILED
+                fin_ver_status = VerificationStatus.NOT_VERIFIED
+
+            _capture_cp(fin_exec_status)
+            if finalize_execution:
+                eff_central.finalize_execution(
+                    eff_exec_id,
+                    status=fin_exec_status,
+                    verification_status=fin_ver_status,
+                    final_summary=f"TaskGraph '{graph.graph_id}' finished with status={graph.status}",
+                    error=(
+                        f"TaskGraph cancelled"
+                        if fin_exec_status == ExecutionStatus.CANCELLED
+                        else (f"TaskGraph ended in status '{graph.status}'" if fin_exec_status == ExecutionStatus.FAILED else None)
+                    ),
+                )
+
+        return {
+            "execution_id": eff_exec_id,
+            "graph_id": graph.graph_id,
+            "graph_status": graph.status,
+            "max_concurrency": graph.max_concurrency,
+            "summary": dict(graph.summary),
+            "executed_steps": executed_steps,
+            "results": node_results,
+            "task_graph": graph,
+            "turn_ledger": eff_ledger,
+        }
 

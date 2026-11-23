@@ -1071,9 +1071,17 @@ class CheckpointManager:
                         node.contradictory = False
                         node.failure_info = None
                         node.blocked_reason = None
+                        node.reserved_by = None
+                        node.reservation_id = None
+                        node.reserved_at = None
+                        graph.active_reservations.pop(node.node_id, None)
                     elif st == "completed_unverified" and node.execution_status != TaskNodeStatus.COMPLETED_VERIFIED.value:
                         node.execution_status = TaskNodeStatus.COMPLETED_UNVERIFIED.value
                         node.verification_status = VerificationStatus.NOT_VERIFIED.value
+                        node.reserved_by = None
+                        node.reservation_id = None
+                        node.reserved_at = None
+                        graph.active_reservations.pop(node.node_id, None)
                     elif st in ("failed_non_recoverable", "failed_recoverable"):
                         node.execution_status = TaskNodeStatus.FAILED.value
                         node.verification_status = VerificationStatus.NOT_VERIFIED.value
@@ -1084,19 +1092,34 @@ class CheckpointManager:
                             "recoverable": node.recoverable,
                         }
                         node.blocked_reason = op.error or op.error_type
+                        node.reserved_by = None
+                        node.reservation_id = None
+                        node.reserved_at = None
+                        graph.active_reservations.pop(node.node_id, None)
                     elif st == "contradictory":
                         node.contradictory = True
                         node.execution_status = TaskNodeStatus.BLOCKED.value
                         node.verification_status = VerificationStatus.VERIFICATION_FAILED.value
                         node.blocked_reason = "Contradictory observation evidence requires reconciliation."
+                        node.reserved_by = None
+                        node.reservation_id = None
+                        node.reserved_at = None
+                        graph.active_reservations.pop(node.node_id, None)
                     elif st in ("interrupted_in_flight", "timed_out"):
+                        prior_owner = node.reserved_by or (graph.active_reservations.get(node.node_id) or {}).get("owner_id")
                         node.execution_status = TaskNodeStatus.RUNNING.value
                         node.verification_status = VerificationStatus.INTERRUPTED.value
-                        node.blocked_reason = op.notes
+                        node.blocked_reason = op.notes or (
+                            f"Interrupted in-flight prior to completion (owner={prior_owner})." if prior_owner else op.notes
+                        )
                     elif st == "cancelled":
                         node.execution_status = TaskNodeStatus.CANCELLED.value
                         node.verification_status = VerificationStatus.INTERRUPTED.value
                         node.blocked_reason = op.error or "cancelled"
+                        node.reserved_by = None
+                        node.reservation_id = None
+                        node.reserved_at = None
+                        graph.active_reservations.pop(node.node_id, None)
 
                 if not matched_ops and matched_pas:
                     if all(p.status == ProposalStatus.COMPLETED.value for p in matched_pas):
@@ -1106,6 +1129,40 @@ class CheckpointManager:
                     elif any(p.status == ProposalStatus.DISPATCHED.value for p in matched_pas):
                         node.execution_status = TaskNodeStatus.RUNNING.value
                         node.verification_status = VerificationStatus.INTERRUPTED.value
+                    elif node.reserved_by is not None or node.node_id in graph.active_reservations:
+                        # Prior process reserved node but crashed before dispatching tool
+                        node.reserved_by = None
+                        node.reservation_id = None
+                        node.reserved_at = None
+                        graph.active_reservations.pop(node.node_id, None)
+                        if node.execution_status == TaskNodeStatus.RUNNING.value:
+                            node.execution_status = TaskNodeStatus.PENDING.value
+                elif matched_ops:
+                    any_op_active_or_done = any(
+                        op.dispatched
+                        or op.has_result
+                        or op.lifecycle_state
+                        in (
+                            "completed_verified",
+                            "completed_unverified",
+                            "failed_non_recoverable",
+                            "failed_recoverable",
+                            "contradictory",
+                            "interrupted_in_flight",
+                            "timed_out",
+                            "cancelled",
+                        )
+                        for op in matched_ops
+                    )
+                    any_pa_dispatched = any(p.status == ProposalStatus.DISPATCHED.value for p in matched_pas)
+                    if not any_op_active_or_done and not any_pa_dispatched:
+                        if node.reserved_by is not None or node.node_id in graph.active_reservations:
+                            node.reserved_by = None
+                            node.reservation_id = None
+                            node.reserved_at = None
+                            graph.active_reservations.pop(node.node_id, None)
+                        if node.execution_status == TaskNodeStatus.RUNNING.value:
+                            node.execution_status = TaskNodeStatus.PENDING.value
 
                 if eff_rec is not None and node.execution_status not in (
                     TaskNodeStatus.COMPLETED_VERIFIED.value,
@@ -1116,9 +1173,20 @@ class CheckpointManager:
                     if eff_rec.status == ExecutionStatus.ABANDONED.value:
                         node.execution_status = TaskNodeStatus.CANCELLED.value
                         node.blocked_reason = "task_abandoned"
+                        node.reserved_by = None
+                        node.reservation_id = None
+                        node.reserved_at = None
+                        graph.active_reservations.pop(node.node_id, None)
                     elif eff_rec.status == ExecutionStatus.CANCELLED.value:
                         node.execution_status = TaskNodeStatus.CANCELLED.value
                         node.blocked_reason = node.blocked_reason or "task_cancelled"
+                        node.reserved_by = None
+                        node.reservation_id = None
+                        node.reserved_at = None
+                        graph.active_reservations.pop(node.node_id, None)
+
+            if hasattr(graph, "reconcile_interrupted_reservations"):
+                graph.reconcile_interrupted_reservations(release_stale_unstarted=True)
 
             try:
                 graph.recompute_schedule(known_proposals=pa_by_ref)
@@ -2398,6 +2466,18 @@ class CheckpointManager:
                         gnode.contradictory = False
                         gnode.failure_info = None
                         gnode.blocked_reason = None
+                        gnode.reserved_by = None
+                        gnode.reservation_id = None
+                        gnode.reserved_at = None
+                        task_graph.active_reservations.pop(gnode.node_id, None)
+            if hasattr(task_graph, "reconcile_interrupted_reservations"):
+                res_notes = task_graph.reconcile_interrupted_reservations(release_stale_unstarted=True)
+                for rn in res_notes:
+                    if rn.get("action") == "preserved_interrupted_reservation":
+                        warnings.append(
+                            f"Preserved interrupted in-flight reservation on node '{rn.get('node_id')}' "
+                            f"(prior_owner={rn.get('owner_id')}); verify host state before re-dispatch."
+                        )
             try:
                 task_graph.recompute_schedule(known_proposals=pending_actions)
                 for gnode in task_graph.nodes:
@@ -2876,6 +2956,26 @@ class CheckpointManager:
         plan = assessment.planning_state
         start_step_count = int(plan.get("actual_step_count") or 0)
         start_replan = int(plan.get("replanning_attempts") or 0)
+
+        if assessment.task_graph is not None and payload.get("execute_task_graph_parallel"):
+            res_summary = await orchestrator.execute_task_graph(
+                assessment.task_graph,
+                proposals=(payload.get("graph_proposals") or assessment.pending_actions or turn_ledger.get_tracked_proposals()),
+                max_concurrency=payload.get("max_concurrency"),
+                execution_id=execution_id,
+                central_ledger=central_ledger,
+                turn_ledger=turn_ledger,
+                tool_schemas=eff_schemas,
+                tool_executor=tool_executor,
+                caller_ring=eff_ring,
+                allowed_tools=eff_allowed,
+                task_local_scope=eff_scope,
+                acceptance_criteria=payload.get("acceptance_criteria") or plan.get("acceptance_criteria"),
+                allow_unverified_retry=allow_unverified_retry,
+                finalize_execution=True,
+                task_prompt=rec.task_prompt if rec is not None else None,
+            )
+            return assessment, [{"choices": [{"delta": {"content": f"Graph execution finished: {res_summary.get('graph_status')}"}, "finish_reason": "stop"}]}]
 
         chunks: List[Dict[str, Any]] = []
         async for chunk in orchestrator.generate_stream(
