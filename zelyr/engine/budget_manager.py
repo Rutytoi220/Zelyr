@@ -547,9 +547,9 @@ class ContextBudgetEngine:
 
         # Check if text is framed tool observation
         if text.startswith("[TOOL OBSERVATION:"):
-            # 1. Check for [Output]: section
+            # 1. Check for [Output]: section (preserve Verification / Error Diagnostic sections)
             out_section = re.search(
-                r"(\[Output\]:\n)([\s\S]*?)(\n\n\[(?:Informational Diagnostic Stream|Machine State Verified|Error Diagnostic|Error Output|Output Trace|Tool Error)|$)",
+                r"(\[Output\]:\n)([\s\S]*?)(\n\n\[(?:Informational Diagnostic Stream|Machine State Verified|Outcome Verification Failed|Error Diagnostic|Error Output|Output Trace|Tool Error)|$)",
                 text,
             )
             if out_section:
@@ -586,6 +586,39 @@ class ContextBudgetEngine:
                             f"... [OUTPUT TRUNCATED FOR CONTEXT BUDGET] ...\n\n{tail}"
                         )
                         return text[:start_idx] + compacted_body + text[end_idx:]
+
+            # 3. Check oversized [Error Output (stderr)] or [Informational Diagnostic Stream] while keeping headers intact
+            for sec_pat in (
+                r"(\[Error Output \(stderr\)\]:\n)([\s\S]*?)(\n\n\[(?:Output Trace|Tool Error)|$)",
+                r"(\[Informational Diagnostic Stream \(stderr\)\]:\n)([\s\S]*?)(\n\(Note:|\n\n\[|$)",
+            ):
+                sec_match = re.search(sec_pat, text)
+                if sec_match:
+                    body = sec_match.group(2)
+                    if len(body) > 1000 or estimate_tokens(body) > token_limit:
+                        head = body[:keep_head_chars]
+                        tail = body[-keep_tail_chars:] if keep_tail_chars > 0 else ""
+                        omitted = len(body) - len(head) - len(tail)
+                        if omitted > 0:
+                            compacted_body = (
+                                f"{head}\n\n[... output truncated: {omitted} chars omitted ...]\n"
+                                f"... [OUTPUT TRUNCATED FOR CONTEXT BUDGET] ...\n\n{tail}"
+                            )
+                            return text[: sec_match.start(2)] + compacted_body + text[sec_match.end(2) :]
+
+        # Compact structured planner observation blocks while preserving error, uncertainty & refs
+        if text.startswith("[OBSERVATION "):
+            kept_lines: List[str] = []
+            for ln in text.splitlines():
+                if ln.startswith("- Result Preview:") and len(ln) > max(120, keep_head_chars):
+                    kept_lines.append(ln[: max(80, keep_head_chars // 2)] + "... [TRUNCATED FOR CONTEXT BUDGET]")
+                elif ln.startswith("- Reported:") and len(ln) > 260:
+                    kept_lines.append(ln[:220] + "... [TRUNCATED]")
+                else:
+                    kept_lines.append(ln)
+            candidate = "\n".join(kept_lines)
+            if len(candidate) <= len(text):
+                return candidate
 
         # Check if text is JSON string with status/result structure
         try:

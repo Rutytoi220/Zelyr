@@ -925,6 +925,7 @@ class TurnExecutionLedger:
         self._task_local_scoped: bool = bool(task_local_scoped)
         self._source_component: Optional[str] = source_component
         self._call_source_meta: Dict[str, Dict[str, Any]] = {}
+        self._structured_observations: Dict[str, Any] = {}
         self._verification_status_override: Optional[str] = None
 
     def attach_central_ledger(
@@ -1593,6 +1594,18 @@ class TurnExecutionLedger:
             idempotency_suffix="verified",
         )
 
+    def get_structured_observation(self, call_id: str) -> Optional[Any]:
+        """Return the StructuredObservation recorded for call_id, if present."""
+        store = getattr(self, "_structured_observations", None)
+        return store.get(call_id) if isinstance(store, dict) else None
+
+    def get_structured_observations(self) -> List[Any]:
+        """Return ordered StructuredObservation instances recorded during this turn."""
+        store = getattr(self, "_structured_observations", None)
+        if not isinstance(store, dict):
+            return []
+        return [store[cid] for cid in self._order if cid in store]
+
     def record_observation(
         self,
         call_id: str,
@@ -1606,6 +1619,7 @@ class TurnExecutionLedger:
         failed_targets: Optional[List[str]] = None,
         verified_targets: Optional[List[str]] = None,
         rejection_reason: Optional[str] = None,
+        structured_observation: Optional[Any] = None,
     ) -> None:
         """Record host observation and final state for an action."""
         old = self._records.get(call_id)
@@ -1743,20 +1757,38 @@ class TurnExecutionLedger:
             },
             idempotency_suffix="result",
         )
-        self._emit_central_event(
-            LedgerEventType.OBSERVATION_UPDATED,
-            call_id=call_id,
-            tool_id=tool_name or None,
-            status=final_state.value,
-            metadata={
-                "output_preview": str(output)[:512] if output is not None else None,
-                "verification_detail": effective_detail,
-                "verification_failed": effective_verification_failed,
-                "verified_targets": eff_verified_targets,
-                "failed_targets": eff_failed_targets,
-            },
-            idempotency_suffix="observed",
-        )
+        if structured_observation is not None:
+            store = getattr(self, "_structured_observations", None)
+            if not isinstance(store, dict):
+                store = {}
+                self._structured_observations = store
+            store[call_id] = structured_observation
+
+        if (
+            structured_observation is not None
+            and getattr(self, "_central_ledger", None) is not None
+            and getattr(self, "_execution_id", None)
+        ):
+            self._central_ledger.record_observation_event(
+                self._execution_id,
+                structured_observation,
+                correlation_id=call_id,
+            )
+        else:
+            self._emit_central_event(
+                LedgerEventType.OBSERVATION_UPDATED,
+                call_id=call_id,
+                tool_id=tool_name or None,
+                status=final_state.value,
+                metadata={
+                    "output_preview": str(output)[:512] if output is not None else None,
+                    "verification_detail": effective_detail,
+                    "verification_failed": effective_verification_failed,
+                    "verified_targets": eff_verified_targets,
+                    "failed_targets": eff_failed_targets,
+                },
+                idempotency_suffix="observed",
+            )
         if effective_verified:
             self._emit_central_event(
                 LedgerEventType.VERIFICATION_RECORDED,
@@ -4243,6 +4275,144 @@ class CentralExecutionLedger:
             "persistence_errors": exec_persistence_errors,
             "events": [ev.to_dict() for ev in filtered_events],
         }
+
+    def record_observation_event(
+        self,
+        execution_id: str,
+        observation: Any,
+        *,
+        correlation_id: Optional[str] = None,
+        strict: Optional[bool] = None,
+    ) -> Optional[ExecutionEvent]:
+        """Persist an ObservationFramingEngine StructuredObservation into execution_events.
+
+        Uses content digest inside idempotency_key so duplicate recordings deduplicate while
+        updated verification evidence appends a new ordered event.
+        """
+        if not execution_id:
+            return None
+
+        if hasattr(observation, "to_dict"):
+            obs_dict = observation.to_dict()
+        elif isinstance(observation, dict):
+            obs_dict = dict(observation)
+        else:
+            obs_dict = {"structured_result": {"summary": str(observation)}}
+
+        if hasattr(observation, "content_digest"):
+            obs_digest = str(observation.content_digest())
+        else:
+            import hashlib
+
+            raw_json = json.dumps(obs_dict, sort_keys=True, default=str).encode("utf-8", errors="replace")
+            obs_digest = hashlib.sha256(raw_json).hexdigest()[:16]
+
+        eff_corr = correlation_id or obs_dict.get("correlation_id")
+        tool_id = obs_dict.get("source_tool_id") or obs_dict.get("tool")
+        ext = obs_dict.get("external_source") if isinstance(obs_dict.get("external_source"), dict) else None
+        is_ext = bool(ext and ext.get("is_external", True))
+        src_id = ext.get("source_id") if ext else None
+        src_type = ext.get("source_type") if ext else None
+
+        ver_status_raw = str(obs_dict.get("verification_status") or "").lower()
+        mapped_ver: Optional[VerificationStatus] = None
+        if ver_status_raw == "verified":
+            mapped_ver = VerificationStatus.VERIFIED
+        elif ver_status_raw in ("verification_failed", "contradicted"):
+            mapped_ver = VerificationStatus.VERIFICATION_FAILED
+        elif ver_status_raw == "claimed_unverified":
+            mapped_ver = VerificationStatus.CLAIMED_UNVERIFIED
+        elif ver_status_raw == "not_verified":
+            mapped_ver = VerificationStatus.NOT_VERIFIED
+
+        compact_obs = (
+            observation.to_compact_dict(max_chars=1600)
+            if hasattr(observation, "to_compact_dict")
+            else dict(obs_dict)
+        )
+        # Keep key structured fields accessible directly in event metadata
+        obs_meta: Dict[str, Any] = {
+            "observation_id": obs_dict.get("observation_id"),
+            "evidence_level": obs_dict.get("evidence_level"),
+            "execution_status": obs_dict.get("execution_status"),
+            "verification_status": obs_dict.get("verification_status"),
+            "remaining_uncertainty": obs_dict.get("remaining_uncertainty"),
+            "suggested_next_action": obs_dict.get("suggested_next_action"),
+            "state_changes": list(obs_dict.get("state_changes") or [])[:6],
+            "independent_verification": obs_dict.get("independent_verification"),
+            "error_classification": obs_dict.get("error_classification"),
+            "recovery_guidance": obs_dict.get("recovery_guidance"),
+            "redacted": bool(obs_dict.get("redacted", False)),
+            "truncated": bool(obs_dict.get("truncated", False)),
+            "observation": compact_obs,
+        }
+
+        ev = self.record_event(
+            execution_id,
+            LedgerEventType.OBSERVATION_UPDATED,
+            tool_id=str(tool_id) if tool_id else None,
+            source_id=str(src_id) if src_id else None,
+            source_type=str(src_type) if src_type else None,
+            is_external=is_ext,
+            status=str(obs_dict.get("execution_status") or "recorded"),
+            correlation_id=eff_corr,
+            metadata=obs_meta,
+            idempotency_key=f"{execution_id}:{eff_corr or 'obs'}:obs:{obs_digest}",
+            verification_status=mapped_ver,
+            strict=strict,
+        )
+        if ev is not None and hasattr(observation, "ledger_refs") and isinstance(observation.ledger_refs, dict):
+            refs = observation.ledger_refs
+            refs["execution_id"] = execution_id
+            if eff_corr:
+                refs["correlation_id"] = eff_corr
+            ev_ids = list(refs.get("event_ids") or [])
+            if ev.event_id not in ev_ids:
+                ev_ids.append(ev.event_id)
+            refs["event_ids"] = ev_ids
+            seqs = list(refs.get("sequence_numbers") or [])
+            if ev.sequence_number not in seqs:
+                seqs.append(ev.sequence_number)
+            refs["sequence_numbers"] = seqs
+        return ev
+
+    def get_observations(
+        self,
+        execution_id: str,
+        *,
+        correlation_id: Optional[str] = None,
+        tool_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve deterministically ordered structured observation events for an execution."""
+        events = self.get_events(
+            execution_id,
+            event_type=LedgerEventType.OBSERVATION_UPDATED.value,
+            tool_id=tool_id,
+            correlation_id=correlation_id,
+        )
+        out: List[Dict[str, Any]] = []
+        for ev in events:
+            meta = dict(ev.metadata or {})
+            out.append({
+                "event_id": ev.event_id,
+                "execution_id": ev.execution_id,
+                "sequence_number": ev.sequence_number,
+                "timestamp": ev.timestamp,
+                "tool_id": ev.tool_id,
+                "correlation_id": ev.correlation_id,
+                "is_external": ev.is_external,
+                "source_id": ev.source_id,
+                "source_type": ev.source_type,
+                "status": ev.status,
+                "evidence_level": meta.get("evidence_level"),
+                "execution_status": meta.get("execution_status") or ev.status,
+                "verification_status": meta.get("verification_status"),
+                "remaining_uncertainty": meta.get("remaining_uncertainty"),
+                "redacted": bool(ev.redacted or meta.get("redacted")),
+                "truncated": bool(ev.truncated or meta.get("truncated")),
+                "metadata": meta,
+            })
+        return out
 
 
 _DEFAULT_LEDGER_LOCK = threading.RLock()

@@ -2509,8 +2509,25 @@ class NativeOrchestrator:
                 r for r in eff_ledger.unresolved_failures()
                 if not getattr(r, "verification_failed", False)
             ]
-            if unresolved_exec_for_gate and depth < min(4, eff_max_depth - 1):
-                if detect_false_success(clean_text, has_unresolved=True):
+            structured_for_gate = (
+                [
+                    ob
+                    for ob in eff_ledger.get_structured_observations()
+                    if getattr(ob, "verification_status", None) != "verification_failed"
+                ]
+                if hasattr(eff_ledger, "get_structured_observations")
+                else []
+            )
+            claim_contradicted = False
+            if structured_for_gate:
+                from zelyr.engine.observation_framing import ObservationFramingEngine
+
+                claim_check = ObservationFramingEngine.reconcile_model_claim(clean_text, structured_for_gate)
+                if not claim_check.get("consistent") and claim_check.get("claim_status") == "contradicted":
+                    claim_contradicted = True
+
+            if (unresolved_exec_for_gate or claim_contradicted) and depth < min(4, eff_max_depth - 1):
+                if claim_contradicted or detect_false_success(clean_text, has_unresolved=True):
                     if getattr(eff_ledger, "_central_ledger", None) and getattr(eff_ledger, "_execution_id", None):
                         from zelyr.engine.execution_ledger import VerificationStatus as _VS
 
@@ -2531,12 +2548,12 @@ class NativeOrchestrator:
                     buffered_chunks.clear()
                     collected_assistant_text.clear()
 
-                    last_failed = unresolved_exec_for_gate[-1]
-                    failed_tool = last_failed.tool_name or "unknown_action"
-                    failed_error = last_failed.error or (
+                    last_failed = unresolved_exec_for_gate[-1] if unresolved_exec_for_gate else None
+                    failed_tool = (last_failed.tool_name if last_failed else None) or "unknown_action"
+                    failed_error = (last_failed.error if last_failed else None) or (
                         f"exit code {last_failed.exit_code}"
-                        if last_failed.exit_code is not None
-                        else "action failed"
+                        if last_failed and last_failed.exit_code is not None
+                        else "action failed or verification contradicted"
                     )
 
                     override_msg = {
@@ -2605,6 +2622,15 @@ class NativeOrchestrator:
                 allowed_act = classification.allowed_actions or allowed_recovery_actions or ["execute_command", "manage_workspace_file"]
                 allowed_act_str = ", ".join(allowed_act) if isinstance(allowed_act, (list, tuple, set)) else str(allowed_act)
 
+                failed_so = (
+                    eff_ledger.get_structured_observation(last_failed.call_id)
+                    if (last_failed and hasattr(eff_ledger, "get_structured_observation"))
+                    else None
+                )
+                so_guidance = getattr(failed_so, "recovery_guidance", {}) if failed_so is not None else {}
+                so_recoverable = bool(so_guidance.get("is_recoverable", True)) if isinstance(so_guidance, dict) else True
+                so_side_effect = bool(so_guidance.get("may_have_side_effect", False)) if isinstance(so_guidance, dict) else False
+
                 is_unresolvable = is_unresolvable_terminal_blocker(
                     error_type=err_type,
                     error_message=failed_error,
@@ -2616,6 +2642,7 @@ class NativeOrchestrator:
                 if (
                     is_unresolvable
                     or not getattr(classification, "is_recoverable", True)
+                    or not so_recoverable
                     or current_attempts >= 2
                     or is_terminal
                 ):
@@ -2634,6 +2661,11 @@ class NativeOrchestrator:
                         buffered_chunks.clear()
                         collected_assistant_text.clear()
 
+                        side_effect_caution = (
+                            f"\nSide-Effect Caution: {so_guidance.get('next_step') or 'Prior execution was dispatched and may already have modified host state; inspect host state before repeating.'}"
+                            if so_side_effect
+                            else ""
+                        )
                         directive_msg = {
                             "role": "user",
                             "content": (
@@ -2645,7 +2677,7 @@ class NativeOrchestrator:
                                 f"You possess full host capabilities to inspect and resolve this state.\n"
                                 f"Remedy Hint: {remedy}\n"
                                 f"Allowed Actions: {allowed_act_str}\n"
-                                f"You must invoke an authorized tool to diagnose or fix this failure now."
+                                f"You must invoke an authorized tool to diagnose or fix this failure now.{side_effect_caution}"
                             ),
                         }
                         payload.setdefault("messages", []).append(directive_msg)
@@ -3258,6 +3290,20 @@ class NativeOrchestrator:
                             metadata={"reason": rejection_reason, "detail": rejection_detail},
                             idempotency_key=f"{c_id}:{tool_call_id}:{'validated' if is_schema_err else 'auth'}",
                         )
+                    from zelyr.engine.observation_framing import ObservationFramingEngine
+
+                    rej_obs = ObservationFramingEngine.frame_structured(
+                        func_name,
+                        err_payload,
+                        requested_tool=func_name,
+                        requested_args=func_args,
+                        executed_args=func_args,
+                        dispatched=False,
+                        execution_id=getattr(eff_ledger, "_execution_id", None),
+                        correlation_id=tool_call_id,
+                    )
+                    tool_msg["evidence_level"] = rej_obs.evidence_level
+                    tool_msg["execution_status"] = rej_obs.execution_status
                     eff_ledger.record_dispatched(tool_call_id, emit_event=False)
                     eff_ledger.record_observation(
                         tool_call_id,
@@ -3265,6 +3311,7 @@ class NativeOrchestrator:
                         output=synth_content,
                         error=f"[{rejection_reason}] {rejection_detail}",
                         rejection_reason=rejection_reason,
+                        structured_observation=rej_obs,
                     )
                     continue
 
@@ -3304,6 +3351,10 @@ class NativeOrchestrator:
                     if (getattr(eff_ledger, "_central_ledger", None) and getattr(eff_ledger, "_execution_id", None))
                     else nullcontext(None)
                 )
+                was_timed_out = False
+                was_cancelled = False
+                raw_tool_payload: Any = None
+                ext_src_for_frame: Optional[Dict[str, Any]] = None
                 try:
                     with ledger_scope_cm as call_ctx:
                         if eff_tool_executor is not None:
@@ -3363,6 +3414,13 @@ class NativeOrchestrator:
                     bag = getattr(call_ctx, "telemetry_bag", None)
                     if isinstance(bag, dict) and bag:
                         extra_telemetry.update(bag)
+                    if extra_telemetry.get("is_external") or extra_telemetry.get("external") or extra_telemetry.get("source_id"):
+                        ext_src_for_frame = {
+                            "is_external": True,
+                            "source_id": extra_telemetry.get("source_id") or "external",
+                            "source_type": extra_telemetry.get("source_type") or "external",
+                            "external_tool_name": extra_telemetry.get("external_tool_name") or func_name,
+                        }
                     if extra_telemetry and hasattr(eff_ledger, "set_call_source_metadata"):
                         eff_ledger.set_call_source_metadata(
                             tool_call_id,
@@ -3374,35 +3432,100 @@ class NativeOrchestrator:
 
                     if hasattr(tool_result, "to_dict"):
                         tool_dict = tool_result.to_dict(tool=func_name, arguments=func_args)
+                        raw_tool_payload = tool_dict
                         tool_result = json.dumps(tool_dict, indent=2)
                     elif not isinstance(tool_result, str):
+                        raw_tool_payload = tool_result
                         tool_result = json.dumps(tool_result, indent=2)
+                    else:
+                        raw_tool_payload = tool_result
                     res_str = tool_result
+                except asyncio.CancelledError:
+                    was_cancelled = True
+                    from zelyr.engine.observation_framing import ObservationFramingEngine
+
+                    cancel_payload = {
+                        "success": False,
+                        "status": "cancelled",
+                        "error": f"Tool '{func_name}' execution was cancelled.",
+                        "error_type": "CANCELLED",
+                    }
+                    cancel_obs = ObservationFramingEngine.frame_structured(
+                        func_name,
+                        cancel_payload,
+                        requested_tool=func_name,
+                        requested_args=func_args,
+                        executed_args=func_args,
+                        dispatched=True,
+                        cancelled=True,
+                        execution_id=getattr(eff_ledger, "_execution_id", None),
+                        correlation_id=tool_call_id,
+                        external_source=ext_src_for_frame,
+                    )
+                    eff_ledger.record_observation(
+                        tool_call_id,
+                        status="error",
+                        output="",
+                        error=cancel_payload["error"],
+                        exit_code=1,
+                        structured_observation=cancel_obs,
+                    )
+                    raise
                 except (TimeoutError, asyncio.TimeoutError):
+                    was_timed_out = True
                     if hasattr(eff_ledger, "_root_meta") and isinstance(eff_ledger._root_meta, dict):
                         eff_ledger._root_meta["timed_out"] = True
                         eff_ledger._root_meta["error"] = f"Tool execution timed out after {timeout_int}s"
                     if hasattr(eff_ledger, "set_call_source_metadata"):
                         eff_ledger.set_call_source_metadata(tool_call_id, extra={"timed_out": True, "timeout_s": timeout_int})
-                    res_str = json.dumps({
+                    raw_tool_payload = {
                         "success": False,
+                        "status": "timed_out",
                         "error": f"Tool execution timed out after {timeout_int}s. Try a faster Tier 1 command or verify active window.",
+                        "error_type": "COMMAND_TIMEOUT",
                         "remedy_hint": "Try a faster Tier 1 command or verify active window.",
                         "allowed_actions": ["execute_command", "manage_desktop_window"],
-                    })
+                    }
+                    res_str = json.dumps(raw_tool_payload)
                 except Exception as e:
-                    res_str = json.dumps({
+                    raw_tool_payload = {
                         "success": False,
                         "error": str(e),
                         "status": "tool_execution_failed",
                         "remedy_hint": "Inspect error or try alternative action.",
                         "allowed_actions": [],
-                    })
-
-                # Format tool output with structured status metadata and remediation hints
-                content_for_msg = self.format_tool_observation(func_name, res_str)
+                    }
+                    res_str = json.dumps(raw_tool_payload)
 
                 from zelyr.engine.observation_framing import ObservationFramingEngine
+
+                structured_obs = ObservationFramingEngine.frame_structured(
+                    func_name,
+                    raw_tool_payload if raw_tool_payload is not None else res_str,
+                    requested_tool=func_name,
+                    requested_args=func_args,
+                    executed_args=func_args,
+                    dispatched=True,
+                    timed_out=was_timed_out,
+                    cancelled=was_cancelled,
+                    execution_id=getattr(eff_ledger, "_execution_id", None),
+                    correlation_id=tool_call_id,
+                    external_source=ext_src_for_frame,
+                )
+
+                # Format tool output with structured status metadata and remediation hints
+                fmt_fn = self.format_tool_observation
+                if getattr(fmt_fn, "__func__", None) is getattr(NativeOrchestrator.format_tool_observation, "__func__", None):
+                    content_for_msg = ObservationFramingEngine.frame_observation(
+                        func_name,
+                        res_str,
+                        structured=structured_obs,
+                        execution_id=getattr(eff_ledger, "_execution_id", None),
+                        correlation_id=tool_call_id,
+                        external_source=ext_src_for_frame,
+                    )
+                else:
+                    content_for_msg = fmt_fn(func_name, res_str)
 
                 obs_dict = ObservationFramingEngine.parse_observation(content_for_msg)
 
@@ -3569,6 +3692,34 @@ class NativeOrchestrator:
                             eff_ledger.invalidate_target_verification(mt)
 
                 if is_verified and not is_failed:
+                    ver_meta_ok = {
+                        "passed": True,
+                        "check": (
+                            str(c_results[-1][0].get("check", "outcome"))
+                            if (acceptance_spec and c_results)
+                            else ("verify_outcome" if func_name == "verify_outcome" else "outcome")
+                        ),
+                        "target": (
+                            str(c_results[-1][0].get("target", ""))
+                            if (acceptance_spec and c_results)
+                            else str(tool_target or "")
+                        ),
+                        "observed": verification_detail or "Acceptance criteria satisfied",
+                    }
+                    structured_obs = ObservationFramingEngine.frame_structured(
+                        func_name,
+                        raw_tool_payload if raw_tool_payload is not None else res_str,
+                        requested_tool=func_name,
+                        requested_args=func_args,
+                        executed_args=func_args,
+                        dispatched=True,
+                        timed_out=was_timed_out,
+                        cancelled=was_cancelled,
+                        execution_id=getattr(eff_ledger, "_execution_id", None),
+                        correlation_id=tool_call_id,
+                        external_source=ext_src_for_frame,
+                        independent_verification=ver_meta_ok,
+                    )
                     content_for_msg = ObservationFramingEngine.frame_observation(
                         func_name,
                         {
@@ -3577,12 +3728,36 @@ class NativeOrchestrator:
                             "verified": True,
                             "verification_detail": verification_detail or "Acceptance criteria satisfied",
                         },
+                        structured=structured_obs,
+                        execution_id=getattr(eff_ledger, "_execution_id", None),
+                        correlation_id=tool_call_id,
+                        external_source=ext_src_for_frame,
                     )
                 elif criteria_failed and not is_failed and failed_criteria_records:
                     first_fc = failed_criteria_records[0]
                     all_crit_str = "; ".join(fc["criterion"] for fc in failed_criteria_records)
                     all_reason_str = "; ".join(fc["reason"] for fc in failed_criteria_records)
                     all_req_str = "; ".join(fc["requirement"] for fc in failed_criteria_records)
+                    ver_meta_fail = {
+                        "passed": False,
+                        "check": str(first_fc.get("criterion") or "outcome"),
+                        "target": str(first_fc.get("target") or ""),
+                        "error": all_reason_str,
+                    }
+                    structured_obs = ObservationFramingEngine.frame_structured(
+                        func_name,
+                        raw_tool_payload if raw_tool_payload is not None else res_str,
+                        requested_tool=func_name,
+                        requested_args=func_args,
+                        executed_args=func_args,
+                        dispatched=True,
+                        timed_out=was_timed_out,
+                        cancelled=was_cancelled,
+                        execution_id=getattr(eff_ledger, "_execution_id", None),
+                        correlation_id=tool_call_id,
+                        external_source=ext_src_for_frame,
+                        independent_verification=ver_meta_fail,
+                    )
                     content_for_msg = ObservationFramingEngine.frame_observation(
                         func_name,
                         {
@@ -3597,6 +3772,10 @@ class NativeOrchestrator:
                             ),
                             "verification_detail": verification_detail,
                         },
+                        structured=structured_obs,
+                        execution_id=getattr(eff_ledger, "_execution_id", None),
+                        correlation_id=tool_call_id,
+                        external_source=ext_src_for_frame,
                     )
 
                 tool_msg = {
@@ -3605,7 +3784,11 @@ class NativeOrchestrator:
                     "name": func_name,
                     "content": content_for_msg,
                     "status": "error" if is_failed else "success",
+                    "evidence_level": structured_obs.evidence_level,
+                    "execution_status": structured_obs.execution_status,
                 }
+                if structured_obs.remaining_uncertainty:
+                    tool_msg["remaining_uncertainty"] = structured_obs.remaining_uncertainty
                 if is_failed:
                     if remedy_hint_out:
                         tool_msg["remedy_hint"] = remedy_hint_out
@@ -3627,6 +3810,7 @@ class NativeOrchestrator:
                     verification_failed=bool(criteria_failed and not is_failed),
                     failed_targets=failed_targets_for_obs,
                     verified_targets=verified_targets_for_obs,
+                    structured_observation=structured_obs,
                 )
 
                 if acceptance_spec and not is_failed and c_results and all(r.success for _, r in c_results):

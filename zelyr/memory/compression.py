@@ -61,6 +61,7 @@ class ObservationCompressor:
             truncated_out = out_data[:cls.MAX_CHARS] + warning_msg
 
         result['result']['output'] = truncated_out
+        result['result']['truncated'] = True
         logger.info(f"ObservationCompressor: Truncated {tool_name} output from {len(out_data)} to {len(truncated_out)} characters.")
         
         return result
@@ -69,8 +70,8 @@ class ObservationCompressor:
     def compress_observations_buffer(cls, observations: list, max_total_chars: int = 30000, iterations: int = 0) -> list:
         """Guard the cumulative observation buffer before context assembly.
 
-        Applies a semantic filter to strip heavy metadata from older logs,
-        and if still over budget, hard-prunes the oldest entries.
+        Applies a semantic filter to strip heavy metadata from older logs while preserving
+        failures, evidence levels, remaining uncertainty, and ledger references.
         """
         import json as _json
 
@@ -83,7 +84,7 @@ class ObservationCompressor:
                     continue
                 
                 if 'result' in obs and isinstance(obs['result'], dict):
-                    # Strip heavy metadata while preserving core facts
+                    # Strip heavy metadata while preserving core facts and structured evidence anchors
                     obs['result'].pop('metadata', None)
                     obs['result'].pop('debug_info', None)
                     obs['result'].pop('trace', None)
@@ -92,6 +93,7 @@ class ObservationCompressor:
                     out = obs['result'].get('output')
                     if isinstance(out, str) and len(out) > 500:
                         obs['result']['output'] = out[:500] + "...[TRUNCATED FOR CONTEXT]"
+                        obs['result']['truncated'] = True
                         
                 if 'arguments' in obs and isinstance(obs['arguments'], dict):
                     for k, v in list(obs['arguments'].items()):
@@ -118,19 +120,24 @@ class ObservationCompressor:
         # 3. Fallback to hard pruning if we're STILL over budget
         pruned_count = budget_exceeded_at + 1
         pruned_tools = []
+        pruned_errors = 0
         for obs in observations[:pruned_count]:
             if isinstance(obs, dict):
-                pruned_tools.append(obs.get('tool', 'unknown'))
+                pruned_tools.append(str(obs.get('tool', 'unknown')))
+                if obs.get('success') is False or (isinstance(obs.get('result'), dict) and obs['result'].get('error')):
+                    pruned_errors += 1
 
+        err_note = f" Failures in pruned steps: {pruned_errors}." if pruned_errors else ""
         summary = {
             'tool': 'system',
             'success': True,
             'result': {
                 'output': (
                     f"[SYSTEM: {pruned_count} earlier observation(s) hard-pruned to protect "
-                    f"context window. Pruned tools: {', '.join(pruned_tools)}. "
-                    f"Use targeted search/grep if you need data from those earlier steps.]"
-                )
+                    f"context window. Pruned tools: {', '.join(pruned_tools)}.{err_note} "
+                    f"Use targeted search/grep or ledger query if you need data from those earlier steps.]"
+                ),
+                'truncated': True,
             }
         }
         compressed = [summary] + observations[pruned_count:]

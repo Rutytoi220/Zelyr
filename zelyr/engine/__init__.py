@@ -38,7 +38,12 @@ from zelyr.engine.normalizer import (
     strict_json_loads,
     validate_arguments,
 )
-from zelyr.engine.observation_framing import ObservationFramingEngine
+from zelyr.engine.observation_framing import (
+    EvidenceLevel,
+    ObservationExecutionStatus,
+    ObservationFramingEngine,
+    StructuredObservation,
+)
 from zelyr.engine.schema_compact import CompactSchemaGenerator
 
 __all__ = [
@@ -56,9 +61,13 @@ __all__ = [
     "ExecutionIsolationError",
     "ExecutionRecord",
     "ExecutionStatus",
+    "EvidenceLevel",
     "InvalidStateTransitionError",
     "LedgerEventType",
     "LedgerPersistenceError",
+    "ObservationExecutionStatus",
+    "ObservationFramingEngine",
+    "StructuredObservation",
     "TurnExecutionLedger",
     "VerificationStatus",
     "attach_call_telemetry",

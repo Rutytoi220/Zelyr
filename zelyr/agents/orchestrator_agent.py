@@ -1347,6 +1347,34 @@ Returns:
                     metadata={"error": err, "error_type": err_type, "output_preview": str(res_inner.get("output", ""))[:512] if ok else None},
                     idempotency_key=f"{exec_id}:{call_id}:result",
                 )
+                if hasattr(ledger, "record_observation_event"):
+                    from zelyr.engine.observation_framing import ObservationFramingEngine
+
+                    dispatched_flag = False if (auth_status == "denied" or err_type in ("AUTHORIZATION_DENIED", "TOOL_NOT_FOUND", "SCHEMA_VALIDATION_ERROR")) else True
+                    ext_meta_oa = (
+                        {
+                            "is_external": True,
+                            "source_id": src_id or "external",
+                            "source_type": src_type or "external",
+                            "external_tool_name": t_id,
+                        }
+                        if is_ext
+                        else None
+                    )
+                    oa_req_args = dict(arguments) if isinstance(arguments, dict) else {}
+                    oa_struct = ObservationFramingEngine.frame_structured(
+                        t_id,
+                        result_dict,
+                        requested_tool=str(tool_name),
+                        requested_args=oa_req_args,
+                        executed_args=result_dict.get("arguments") if isinstance(result_dict.get("arguments"), dict) else oa_req_args,
+                        dispatched=dispatched_flag,
+                        timed_out=timed_out,
+                        execution_id=exec_id,
+                        correlation_id=call_id,
+                        external_source=ext_meta_oa,
+                    )
+                    ledger.record_observation_event(exec_id, oa_struct, correlation_id=call_id)
                 if own_exec:
                     ledger.finalize_execution(
                         exec_id,
@@ -1828,24 +1856,31 @@ Returns:
         return record_outcome(result_dict, t_id=tool_name, src_id=src_id, src_type=src_type, is_ext=is_ext, timed_out=timed_out_exec)
 
     def _format_observation_response(self, observation: Dict[str, Any]) -> str:
-        """Render a tool result without masking empty document extraction failures."""
+        """Render a tool result cleanly while preserving document notices and scrubbing untrusted text."""
+        from zelyr.engine.observation_framing import _sanitize_untrusted_text
+
         tool_name = str(observation.get('tool') or 'unknown')
         arguments: dict[Any, Any] = observation.get('arguments') if isinstance(observation.get('arguments'), dict) else {}
         result: dict[Any, Any] = observation.get('result') if isinstance(observation.get('result'), dict) else {}
+        meta = result.get('metadata') if isinstance(result.get('metadata'), dict) else {}
+        is_ext = bool(meta.get('external') or meta.get('is_external') or observation.get('is_external'))
         error = result.get('error')
         output = result.get('output')
         if error:
-            text = str(error).strip()
+            text, _, _ = _sanitize_untrusted_text(str(error).strip(), is_external=is_ext, escape_anchors=True, max_chars=4096)
         else:
-            text = output.get('content') if isinstance(output, dict) and 'content' in output else output
-            if text is None or (isinstance(text, str) and (not text.strip())):
+            raw_text = output.get('content') if isinstance(output, dict) and 'content' in output else output
+            if raw_text is None or (isinstance(raw_text, str) and (not raw_text.strip())):
                 if tool_name in {'read_document_content', 'file_read'}:
                     file_path = arguments.get('file_path') or arguments.get('path') or arguments.get('file') or '<unknown file>'
                     text = DOCUMENT_EXTRACTION_NOTICE.format(file_path=file_path)
                 else:
                     text = f"[Tool Result Notice]: '{tool_name}' completed without a displayable result."
-            elif not isinstance(text, str):
-                text = json.dumps(text, default=str)
+            elif not isinstance(raw_text, str):
+                dumped = json.dumps(raw_text, default=str)
+                text, _, _ = _sanitize_untrusted_text(dumped, is_external=is_ext, escape_anchors=True, max_chars=8192)
+            else:
+                text, _, _ = _sanitize_untrusted_text(raw_text, is_external=is_ext, escape_anchors=True, max_chars=8192)
         return f'[Observation Result]:\n\n{text}'
 
     def _format_latest_observation_response(self, observations: List[Dict[str, Any]]) -> str:

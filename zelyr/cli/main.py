@@ -452,6 +452,30 @@ async def _execute_headless_run(
                         orch.current_ledger.record_proposed(call_id, fn_name, fn_args)
                         orch.current_ledger.record_validated(call_id)
                         orch.current_ledger.record_dispatched(call_id)
+                        fb_ind_ver = None
+                        if verify_spec and fb_ver_failed:
+                            fb_ind_ver = {
+                                "passed": False,
+                                "check": verify_spec.split(":", 1)[0] if ":" in str(verify_spec) else "outcome",
+                                "target": str(fb_failed_targets[0]) if fb_failed_targets else "",
+                                "error": fb_ver_detail,
+                            }
+                        elif verify_spec and fb_verified:
+                            fb_ind_ver = {
+                                "passed": True,
+                                "check": verify_spec.split(":", 1)[0] if ":" in str(verify_spec) else "outcome",
+                                "target": str(fb_verified_targets[0]) if fb_verified_targets else "",
+                            }
+                        fb_struct = ObservationFramingEngine.frame_structured(
+                            fn_name,
+                            obs,
+                            requested_tool=fn_name,
+                            requested_args=fn_args if isinstance(fn_args, dict) else {},
+                            dispatched=True,
+                            execution_id=getattr(orch.current_ledger, "_execution_id", None),
+                            correlation_id=call_id,
+                            independent_verification=fb_ind_ver,
+                        )
                         orch.current_ledger.record_observation(
                             call_id,
                             status=fb_status,
@@ -463,6 +487,7 @@ async def _execute_headless_run(
                             verification_failed=fb_ver_failed,
                             failed_targets=fb_failed_targets,
                             verified_targets=fb_verified_targets,
+                            structured_observation=fb_struct,
                         )
                         if verify_spec and fb_verified and not fb_ver_failed:
                             from zelyr.engine.execution_ledger import has_remaining_explicit_steps
