@@ -1033,6 +1033,32 @@ def cmd_execution(args: argparse.Namespace) -> None:
             sys.stderr.flush()
             sys.exit(1)
 
+        if getattr(args, "graph", False):
+            from zelyr.engine.checkpoint import CheckpointManager
+            from zelyr.tool_registry import ToolRegistry
+
+            assess_g = CheckpointManager.assess_resume(
+                ledger,
+                record.execution_id,
+                tool_registry=ToolRegistry(),
+                verify_outcomes=True,
+            )
+            if getattr(args, "json", False):
+                print(
+                    json.dumps(
+                        {
+                            "execution_id": record.execution_id,
+                            "resumability_status": assess_g.resumability_status,
+                            "can_resume": assess_g.can_resume,
+                            "task_graph": assess_g.task_graph.to_dict() if assess_g.task_graph is not None else None,
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                _print_task_graph_view(assess_g, empty_notice=f"No task dependency graph recorded for execution '{record.execution_id}'.")
+            return
+
         if getattr(args, "checkpoint", False):
             _print_checkpoint_assessment(ledger, record.execution_id, output_json=bool(getattr(args, "json", False)))
             return
@@ -1048,6 +1074,14 @@ def cmd_execution(args: argparse.Namespace) -> None:
             sys.exit(1)
 
         if getattr(args, "json", False):
+            try:
+                from zelyr.engine.checkpoint import CheckpointManager
+
+                assess_sum = CheckpointManager.assess_resume(ledger, record.execution_id, verify_outcomes=False)
+                if assess_sum.task_graph is not None:
+                    summary["task_graph"] = assess_sum.task_graph.to_dict()
+            except Exception:
+                pass
             print(json.dumps(summary, indent=2))
             return
 
@@ -1099,6 +1133,51 @@ def cmd_execution(args: argparse.Namespace) -> None:
             ledger.close()
 
 
+def _print_task_graph_view(assessment: Any, *, empty_notice: Optional[str] = None) -> None:
+    """Render readable dependency-aware task graph summary, nodes, edges, and blockers."""
+    tg = getattr(assessment, "task_graph", None)
+    if tg is None:
+        if empty_notice:
+            print(empty_notice)
+        return
+    g_sum = tg.summary or {}
+    next_node = tg.get_next_eligible_node() if hasattr(tg, "get_next_eligible_node") else None
+    print(f"Task Graph:          {tg.graph_id} (v{tg.graph_version}, status={tg.status})")
+    if tg.objective:
+        print(f"Graph Objective:     {tg.objective}")
+    print(
+        f"Graph Summary:       verified={g_sum.get('completed_verified_count', 0)}/{g_sum.get('total_nodes', len(tg.nodes))} "
+        f"unverified={g_sum.get('completed_unverified_count', 0)} "
+        f"ready={g_sum.get('ready_count', 0)} pending={g_sum.get('pending_count', 0)} "
+        f"running={g_sum.get('running_count', 0)} failed={g_sum.get('failed_count', 0)} "
+        f"blocked={g_sum.get('blocked_count', 0)} cancelled={g_sum.get('cancelled_count', 0)}"
+    )
+    print(f"Next Eligible Node:  {next_node.node_id if next_node is not None else 'none'}")
+    if tg.nodes:
+        print(f"Nodes ({len(tg.nodes)}):")
+        for node in tg.nodes:
+            deps = ",".join(node.dependency_ids) if node.dependency_ids else "-"
+            props = ",".join(node.proposal_ids) if node.proposal_ids else "-"
+            blk = f" reason={node.blocked_reason}" if node.blocked_reason else ""
+            fail = f" err={(node.failure_info or {}).get('error')}" if node.failure_info and not blk else ""
+            print(
+                f"  - [{node.order_index}] {node.node_id} exec={node.execution_status} "
+                f"verify={node.verification_status} proposals=[{props}] deps=[{deps}] "
+                f"desc={node.description!r}{blk}{fail}"
+            )
+    blocked_nodes = tg.get_blocked_nodes() if hasattr(tg, "get_blocked_nodes") else []
+    if blocked_nodes:
+        print("Blocked Nodes:")
+        for bn in blocked_nodes:
+            print(f"  - {bn.node_id}: {bn.blocked_reason or 'blocked'}")
+    failed_nodes = tg.get_failed_nodes() if hasattr(tg, "get_failed_nodes") else []
+    if failed_nodes:
+        print("Failed Prerequisites:")
+        for fn in failed_nodes:
+            err_s = (fn.failure_info or {}).get("error") or fn.blocked_reason or "failed"
+            print(f"  - {fn.node_id}: {err_s} (recoverable={fn.recoverable})")
+
+
 def _print_checkpoint_assessment(
     ledger: Any,
     execution_id: str,
@@ -1146,6 +1225,8 @@ def _print_checkpoint_assessment(
                 f"auth={pa.authorization_status} dep={pa.dependency_status} depends_on=[{deps_str}] "
                 f"dispatched={pa.dispatch_attempted}{blk_str}"
             )
+    if assessment.task_graph is not None:
+        _print_task_graph_view(assessment)
     if assessment.blocking_reasons:
         print("Blocking Reasons:")
         for reason in assessment.blocking_reasons:
@@ -1895,6 +1976,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Display latest durable checkpoint and resume safety assessment",
+    )
+    p_exec.add_argument(
+        "--graph",
+        action="store_true",
+        default=False,
+        help="Display dependency-aware task graph, node states, and blockers",
     )
     p_exec.add_argument("--json", action="store_true", default=False, help="Output structured JSON summary")
     p_exec.add_argument("--db-path", type=str, default=None, help="Override execution ledger SQLite DB path")

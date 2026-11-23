@@ -1422,6 +1422,44 @@ class NativeOrchestrator:
             "model": payload.get("model"),
             "task_prompt": user_prompt,
         }
+
+        raw_task_graph = payload.get("task_graph") or (
+            eff_ledger.get_task_graph() if hasattr(eff_ledger, "get_task_graph") else None
+        )
+        if raw_task_graph is not None:
+            from zelyr.engine.task_graph import TaskGraph, TaskGraphValidationError
+
+            if isinstance(raw_task_graph, TaskGraph):
+                if raw_task_graph.execution_id and raw_task_graph.execution_id != exec_id:
+                    raise TaskGraphValidationError(
+                        f"Cross-execution isolation violation: TaskGraph '{raw_task_graph.graph_id}' belongs to '{raw_task_graph.execution_id}', cannot run under '{exec_id}'."
+                    )
+                if not raw_task_graph.execution_id:
+                    raw_task_graph.execution_id = exec_id
+                active_graph = raw_task_graph
+            elif isinstance(raw_task_graph, dict):
+                active_graph = TaskGraph.from_dict(raw_task_graph, default_execution_id=exec_id, verify_integrity=False)
+                if active_graph.execution_id != exec_id:
+                    raise TaskGraphValidationError(
+                        f"Cross-execution isolation violation: TaskGraph '{active_graph.graph_id}' belongs to '{active_graph.execution_id}', cannot run under '{exec_id}'."
+                    )
+            else:
+                raise TaskGraphValidationError("payload['task_graph'] must be a TaskGraph or JSON dictionary.")
+            active_graph.validate(
+                known_proposals=eff_ledger.get_tracked_proposals() if hasattr(eff_ledger, "get_tracked_proposals") else None,
+                allow_blocked=True,
+            )
+            active_graph.recompute_schedule(
+                known_proposals=eff_ledger.get_tracked_proposals() if hasattr(eff_ledger, "get_tracked_proposals") else None,
+            )
+            if hasattr(eff_ledger, "attach_task_graph"):
+                eff_ledger.attach_task_graph(active_graph)
+
+        active_tg_meta = {}
+        active_tg_now = eff_ledger.get_task_graph() if hasattr(eff_ledger, "get_task_graph") else None
+        if active_tg_now is not None:
+            active_tg_meta = {"graph_id": active_tg_now.graph_id, "graph_status": active_tg_now.status}
+
         central_ledger.record_event(
             exec_id,
             LedgerEventType.PLANNING_DECISION,
@@ -1431,6 +1469,7 @@ class NativeOrchestrator:
             metadata={
                 "max_steps": getattr(self, "max_steps", 5),
                 "has_acceptance_criteria": bool(acceptance_spec),
+                **active_tg_meta,
             },
             idempotency_key=f"{exec_id}:plan:{'resume' if is_resumed_root else 'root'}:{actual_step_count}",
         )
@@ -2258,7 +2297,7 @@ class NativeOrchestrator:
                             )
                         if "id" in tc and tc["id"]:
                             pending_tool_calls[idx]["id"] = tc["id"]
-                        for opt_k in ("proposal_id", "depends_on", "expires_at", "external_source"):
+                        for opt_k in ("proposal_id", "depends_on", "expires_at", "external_source", "node_id"):
                             if opt_k in tc and tc[opt_k] is not None:
                                 pending_tool_calls[idx][opt_k] = tc[opt_k]
                         if "function" in tc and isinstance(tc["function"], dict):
@@ -2975,13 +3014,41 @@ class NativeOrchestrator:
                     ]
                     tools_str = ", ".join(tool_names) if tool_names else "manage_workspace_file, execute_command"
 
+                    active_tg = eff_ledger.get_task_graph() if hasattr(eff_ledger, "get_task_graph") else None
+                    tg_section = ""
+                    tg_plan_meta: Dict[str, Any] = {}
+                    if active_tg is not None:
+                        try:
+                            active_tg.recompute_schedule(
+                                known_proposals=eff_ledger.get_tracked_proposals() if hasattr(eff_ledger, "get_tracked_proposals") else None
+                            )
+                            next_gn = active_tg.get_next_eligible_node()
+                            g_sum = active_tg.summary or {}
+                            blk_desc = ", ".join(f"{b.node_id}({b.blocked_reason})" for b in active_tg.get_blocked_nodes()[:5]) or "none"
+                            fail_desc_g = ", ".join(f"{f.node_id}" for f in active_tg.get_failed_nodes()[:5]) or "none"
+                            tg_section = (
+                                f"\n\n5. Task Dependency Graph Status (graph_id={active_tg.graph_id}, status={active_tg.status}):\n"
+                                f"- Verified Nodes: {g_sum.get('completed_verified_count', 0)}/{g_sum.get('total_nodes', len(active_tg.nodes))}\n"
+                                f"- Next Eligible Node: {next_gn.node_id if next_gn else 'none'}\n"
+                                f"- Failed Nodes: {fail_desc_g}\n"
+                                f"- Blocked Nodes: {blk_desc}"
+                            )
+                            tg_plan_meta = {
+                                "graph_id": active_tg.graph_id,
+                                "graph_status": active_tg.status,
+                                "next_eligible_node_id": next_gn.node_id if next_gn else None,
+                            }
+                        except Exception:
+                            tg_section = ""
+
                     replanning_directive = (
                         "[SYSTEM DIRECTIVE: Goal-Aware Replanning]\n"
                         "The model produced a text response without tool actions, but the original task remains incomplete.\n\n"
                         f"1. Original Task:\n{clean_user_prompt}\n\n"
                         f"2. Independently Verified Outcomes (DO NOT REPEAT OR REGRESS):\n{verified_str}\n\n"
                         f"3. Unfulfilled Task Requirements:\n{unfulfilled_str}\n\n"
-                        f"4. Available Actuator Tools:\n{tools_str}\n\n"
+                        f"4. Available Actuator Tools:\n{tools_str}"
+                        f"{tg_section}\n\n"
                         "CRITICAL INSTRUCTIONS FOR REPLANNING:\n"
                         "- Earlier proposals were NOT executed and do NOT constitute authorization.\n"
                         "- Reassess the current host machine state strictly using the actual observations.\n"
@@ -3010,6 +3077,7 @@ class NativeOrchestrator:
                                     "replanning_attempt": replanning_attempts + 1,
                                     "unfulfilled_count": len(unfulfilled_outcomes),
                                     "verified_count": len(verified_outcomes),
+                                    **tg_plan_meta,
                                 },
                                 idempotency_key=f"{eff_ledger._execution_id}:replan:{replanning_attempts + 1}:{depth}",
                             )
@@ -3202,6 +3270,8 @@ class NativeOrchestrator:
                         tc["expires_at"] = eff_exp
                     if eff_ext is not None:
                         tc["external_source"] = dict(eff_ext)
+                    if extra_tc_meta.get("node_id") and not tc.get("node_id"):
+                        tc["node_id"] = extra_tc_meta["node_id"]
                     eff_ledger.record_proposed(
                         tc["id"],
                         tc["function"]["name"],
@@ -3508,6 +3578,47 @@ class NativeOrchestrator:
                                 rejection_detail = f"Prerequisite '{dep_ref}' has not completed yet; execute/verify prerequisite before '{func_name}'."
                             break
 
+                # Enforce TaskGraph prerequisite verification & node readiness before dispatch
+                active_tg_step = eff_ledger.get_task_graph() if hasattr(eff_ledger, "get_task_graph") else None
+                bound_tg_nodes: List[Any] = []
+                if active_tg_step is not None:
+                    from zelyr.engine.task_graph import TaskGraphValidationError, TaskNodeStatus
+
+                    try:
+                        tracked_for_tg = eff_ledger.get_tracked_proposals() if hasattr(eff_ledger, "get_tracked_proposals") else []
+                        active_tg_step.recompute_schedule(known_proposals=tracked_for_tg)
+                        active_tg_step.validate(known_proposals=tracked_for_tg, allow_blocked=True)
+                    except TaskGraphValidationError as tg_exc:
+                        rejection_reason = "invalid_task_graph"
+                        rejection_detail = str(tg_exc)
+                    else:
+                        bound_tg_nodes = active_tg_step.find_nodes_for_call(tool_call_id, proposal_id=tc.get("proposal_id"))
+                        explicit_nid = tc.get("node_id")
+                        if explicit_nid:
+                            exp_node = active_tg_step.get_node(str(explicit_nid))
+                            if exp_node is not None and exp_node not in bound_tg_nodes:
+                                bound_tg_nodes.append(exp_node)
+                        if rejection_reason is None:
+                            for gn in bound_tg_nodes:
+                                if gn.execution_status == TaskNodeStatus.COMPLETED_VERIFIED.value:
+                                    rejection_reason = "outcome_already_verified"
+                                    rejection_detail = f"TaskGraph node '{gn.node_id}' is already completed and verified."
+                                    break
+                                if gn.execution_status in (TaskNodeStatus.PENDING.value, TaskNodeStatus.BLOCKED.value):
+                                    rejection_reason = (
+                                        "dependency_blocked"
+                                        if gn.execution_status == TaskNodeStatus.BLOCKED.value
+                                        else "dependency_not_satisfied"
+                                    )
+                                    rejection_detail = gn.blocked_reason or (
+                                        f"TaskGraph node '{gn.node_id}' cannot execute until prerequisite dependencies are independently verified."
+                                    )
+                                    break
+                                if gn.execution_status in (TaskNodeStatus.FAILED.value, TaskNodeStatus.CANCELLED.value):
+                                    rejection_reason = f"node_{gn.execution_status}"
+                                    rejection_detail = gn.blocked_reason or f"TaskGraph node '{gn.node_id}' is {gn.execution_status} and cannot execute."
+                                    break
+
                 # Runtime-enforced user prohibitions: an explicit "do not create/write/delete <path>"
                 # in the user's own request cannot be overridden by model-proposed tool calls.
                 if rejection_reason is None:
@@ -3607,7 +3718,33 @@ class NativeOrchestrator:
                         rejection_reason=rejection_reason,
                         structured_observation=rej_obs,
                     )
+                    if active_tg_step is not None and bound_tg_nodes and rejection_reason not in (
+                        "dependency_not_satisfied",
+                        "dependency_blocked",
+                        "outcome_already_verified",
+                        "node_failed",
+                        "node_cancelled",
+                    ):
+                        for gn in bound_tg_nodes:
+                            try:
+                                if gn.execution_status not in ("completed_verified", "blocked", "cancelled"):
+                                    active_tg_step.apply_observation(
+                                        gn.node_id,
+                                        rej_obs,
+                                        action_record=eff_ledger._records.get(tool_call_id),
+                                        known_proposals=eff_ledger.get_tracked_proposals() if hasattr(eff_ledger, "get_tracked_proposals") else None,
+                                    )
+                            except Exception:
+                                pass
                     continue
+
+                if active_tg_step is not None and bound_tg_nodes:
+                    from zelyr.engine.task_graph import TaskNodeStatus
+
+                    for gn in bound_tg_nodes:
+                        if gn.execution_status == TaskNodeStatus.READY.value:
+                            gn.execution_status = TaskNodeStatus.RUNNING.value
+                            gn.updated_at = time.time()
 
                 actual_step_count += 1
                 if actual_step_count >= eff_step_limit:
@@ -3764,6 +3901,17 @@ class NativeOrchestrator:
                         exit_code=1,
                         structured_observation=cancel_obs,
                     )
+                    if active_tg_step is not None and bound_tg_nodes:
+                        for gn in bound_tg_nodes:
+                            try:
+                                active_tg_step.apply_observation(
+                                    gn.node_id,
+                                    cancel_obs,
+                                    action_record=eff_ledger._records.get(tool_call_id),
+                                    known_proposals=eff_ledger.get_tracked_proposals() if hasattr(eff_ledger, "get_tracked_proposals") else None,
+                                )
+                            except Exception:
+                                pass
                     raise
                 except (TimeoutError, asyncio.TimeoutError):
                     was_timed_out = True
@@ -4106,6 +4254,18 @@ class NativeOrchestrator:
                     verified_targets=verified_targets_for_obs,
                     structured_observation=structured_obs,
                 )
+                if active_tg_step is not None and bound_tg_nodes:
+                    for gn in bound_tg_nodes:
+                        try:
+                            active_tg_step.apply_observation(
+                                gn.node_id,
+                                structured_obs,
+                                action_record=eff_ledger._records.get(tool_call_id),
+                                outcome_verifier_passed=(True if is_verified else (False if criteria_failed else None)),
+                                known_proposals=eff_ledger.get_tracked_proposals() if hasattr(eff_ledger, "get_tracked_proposals") else None,
+                            )
+                        except Exception:
+                            pass
 
                 if acceptance_spec and not is_failed and c_results and all(r.success for _, r in c_results):
                     all_criteria_satisfied = all(

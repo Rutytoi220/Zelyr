@@ -62,6 +62,20 @@ from zelyr.engine.observation_framing import (
     StructuredObservation,
 )
 from zelyr.engine.schema_compact import CompactSchemaGenerator
+from zelyr.engine.task_graph import (
+    TASK_GRAPH_VERSION,
+    CorruptedTaskGraphError,
+    TaskGraph,
+    TaskGraphEdge,
+    TaskGraphError,
+    TaskGraphStatus,
+    TaskGraphValidationError,
+    TaskNode,
+    TaskNodeStatus,
+    UnsupportedTaskGraphVersionError,
+    compute_task_graph_digest,
+    reconstruct_task_graph_from_records,
+)
 
 __all__ = [
     "CoreEngine",
@@ -99,6 +113,18 @@ __all__ = [
     "StaleCheckpointError",
     "StructuredObservation",
     "TaskCheckpoint",
+    "TASK_GRAPH_VERSION",
+    "CorruptedTaskGraphError",
+    "TaskGraph",
+    "TaskGraphEdge",
+    "TaskGraphError",
+    "TaskGraphStatus",
+    "TaskGraphValidationError",
+    "TaskNode",
+    "TaskNodeStatus",
+    "UnsupportedTaskGraphVersionError",
+    "compute_task_graph_digest",
+    "reconstruct_task_graph_from_records",
     "TurnExecutionLedger",
     "UnsupportedCheckpointVersionError",
     "VerificationStatus",

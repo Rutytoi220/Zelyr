@@ -31,6 +31,18 @@ from zelyr.engine.execution_ledger import (
     sanitize_ledger_text,
     targets_match,
 )
+from zelyr.engine.task_graph import (
+    CorruptedTaskGraphError,
+    TaskGraph,
+    TaskGraphEdge,
+    TaskGraphError,
+    TaskGraphStatus,
+    TaskGraphValidationError,
+    TaskNode,
+    TaskNodeStatus,
+    UnsupportedTaskGraphVersionError,
+    reconstruct_task_graph_from_records,
+)
 
 CHECKPOINT_VERSION: int = 1
 SUPPORTED_CHECKPOINT_VERSIONS: frozenset[int] = frozenset({1})
@@ -557,6 +569,7 @@ class TaskCheckpoint:
     verified_targets: List[str] = field(default_factory=list)
     recovery_summary: Dict[str, Any] = field(default_factory=dict)
     pending_actions: List[Dict[str, Any]] = field(default_factory=list)
+    task_graph: Dict[str, Any] = field(default_factory=dict)
     checkpoint_digest: str = ""
     redacted: bool = False
     truncated: bool = False
@@ -579,7 +592,7 @@ class TaskCheckpoint:
         for f_name in req_str_fields:
             if not isinstance(data.get(f_name), str) or not str(data.get(f_name)).strip():
                 raise CorruptedCheckpointError(f"Checkpoint missing required field '{f_name}'.")
-        for dict_field in ("planning_state", "environment_snapshot", "recovery_summary"):
+        for dict_field in ("planning_state", "environment_snapshot", "recovery_summary", "task_graph"):
             if not isinstance(data.get(dict_field, {}), dict):
                 raise CorruptedCheckpointError(f"Checkpoint field '{dict_field}' must be a JSON object.")
         for list_field in ("external_tools_used", "verified_targets", "pending_actions"):
@@ -591,6 +604,11 @@ class TaskCheckpoint:
         for raw_pa in list(data.get("pending_actions") or []):
             prop = PendingActionProposal.from_dict(raw_pa, default_execution_id=exec_id_str)
             validated_pending_actions.append(prop.to_dict() if verify_integrity else dict(raw_pa))
+
+        raw_tg = data.get("task_graph") or {}
+        if raw_tg:
+            parsed_tg = TaskGraph.from_dict(raw_tg, default_execution_id=exec_id_str, verify_integrity=verify_integrity)
+            parsed_tg.validate(known_proposals=validated_pending_actions or None, allow_blocked=True)
 
         cp = cls(
             checkpoint_id=str(data["checkpoint_id"]),
@@ -610,12 +628,17 @@ class TaskCheckpoint:
             verified_targets=list(data.get("verified_targets") or []),
             recovery_summary=dict(data.get("recovery_summary") or {}),
             pending_actions=list(data.get("pending_actions") or []) if not verify_integrity else validated_pending_actions,
+            task_graph=dict(raw_tg),
             checkpoint_digest=str(data.get("checkpoint_digest") or ""),
             redacted=bool(data.get("redacted", False)),
             truncated=bool(data.get("truncated", False)),
         )
         if verify_integrity:
-            expected_digest = compute_checkpoint_digest({**cp.to_dict(), "pending_actions": list(data.get("pending_actions") or [])})
+            expected_digest = compute_checkpoint_digest({
+                **cp.to_dict(),
+                "pending_actions": list(data.get("pending_actions") or []),
+                "task_graph": dict(raw_tg),
+            })
             if not cp.checkpoint_digest or cp.checkpoint_digest != expected_digest:
                 raise CorruptedCheckpointError(
                     f"Checkpoint '{cp.checkpoint_id}' failed integrity verification (digest mismatch)."
@@ -676,6 +699,7 @@ class ResumeAssessment:
     pending_ops: List[OperationContinuityRecord] = field(default_factory=list)
     contradictory_ops: List[OperationContinuityRecord] = field(default_factory=list)
     pending_actions: List[PendingActionProposal] = field(default_factory=list)
+    task_graph: Optional[TaskGraph] = None
     reconciled_verifications: List[Dict[str, Any]] = field(default_factory=list)
     authorization_checks: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     environment_diff: Dict[str, Any] = field(default_factory=dict)
@@ -716,6 +740,7 @@ class ResumeAssessment:
             "contradictory_ops": [o.to_dict() for o in self.contradictory_ops],
             "pending_proposal_count": active_pending_count,
             "pending_actions": [p.to_dict() for p in self.pending_actions],
+            "task_graph": self.task_graph.to_dict() if self.task_graph is not None else None,
             "dispatchable_proposal_ids": [
                 p.proposal_id
                 for p in self.pending_actions
@@ -757,6 +782,7 @@ class CheckpointManager:
         planning_state: Optional[Dict[str, Any]] = None,
         pending_proposals: Optional[Sequence[Dict[str, Any]]] = None,
         pending_actions: Optional[Sequence[Union[PendingActionProposal, Dict[str, Any]]]] = None,
+        task_graph: Optional[Union[TaskGraph, Dict[str, Any]]] = None,
         environment_snapshot: Optional[Dict[str, Any]] = None,
         expected_checkpoint_seq: Optional[int] = None,
         emit_event: bool = True,
@@ -947,6 +973,18 @@ class CheckpointManager:
             except Exception:
                 eff_env = {"cwd": os.getcwd()}
 
+        eff_graph = task_graph if task_graph is not None else (
+            turn_ledger.get_task_graph() if (turn_ledger is not None and hasattr(turn_ledger, "get_task_graph")) else None
+        )
+        serialized_graph: Optional[Dict[str, Any]] = None
+        if isinstance(eff_graph, TaskGraph):
+            eff_graph.validate(known_proposals=durable_proposals or None, allow_blocked=True)
+            serialized_graph = eff_graph.to_checkpoint_dict()
+        elif isinstance(eff_graph, dict) and eff_graph:
+            tg_obj = TaskGraph.from_dict(eff_graph, default_execution_id=execution_id, verify_integrity=False)
+            tg_obj.validate(known_proposals=durable_proposals or None, allow_blocked=True)
+            serialized_graph = tg_obj.to_checkpoint_dict()
+
         saved_dict = central_ledger.save_checkpoint(
             execution_id,
             checkpoint_version=CHECKPOINT_VERSION,
@@ -961,6 +999,7 @@ class CheckpointManager:
             verified_targets=verified_targets,
             recovery_summary=rec_summary,
             pending_actions=pending_action_dicts,
+            task_graph=serialized_graph,
             expected_checkpoint_seq=expected_checkpoint_seq,
             emit_event=emit_event,
             strict=strict,
@@ -968,6 +1007,132 @@ class CheckpointManager:
         if saved_dict is None:
             return None
         return TaskCheckpoint.from_dict(saved_dict, verify_integrity=False)
+
+    @classmethod
+    def reconstruct_task_graph(
+        cls,
+        central_ledger: CentralExecutionLedger,
+        execution_id: str,
+        *,
+        checkpoint: Optional[TaskCheckpoint] = None,
+        pending_actions: Sequence[PendingActionProposal] = (),
+        ops: Sequence[OperationContinuityRecord] = (),
+        events: Optional[Sequence[ExecutionEvent]] = None,
+        rec: Optional[ExecutionRecord] = None,
+    ) -> Tuple[Optional[TaskGraph], List[str]]:
+        """Reconstruct and reconcile a TaskGraph against execution ledger events and pending proposals."""
+        eff_rec = rec if rec is not None else central_ledger.get_execution(execution_id)
+        eff_events = list(events) if events is not None else central_ledger.get_events(execution_id)
+        if checkpoint is None:
+            raw_cp = central_ledger.get_latest_checkpoint(execution_id, verify_integrity=True)
+            checkpoint = TaskCheckpoint.from_dict(raw_cp, verify_integrity=True) if raw_cp is not None else None
+
+        errors: List[str] = []
+        if checkpoint is not None and checkpoint.task_graph:
+            try:
+                graph = TaskGraph.from_dict(
+                    checkpoint.task_graph,
+                    default_execution_id=execution_id,
+                    verify_integrity=True,
+                )
+                graph.validate(known_proposals=pending_actions or None, allow_blocked=True)
+            except (CorruptedTaskGraphError, UnsupportedTaskGraphVersionError, TaskGraphValidationError) as exc:
+                return None, [str(exc)]
+
+            # Reconcile persisted graph nodes against current ledger operations & proposal states
+            ops_by_cid = {op.call_id: op for op in ops}
+            pa_by_ref: Dict[str, PendingActionProposal] = {}
+            for pa in pending_actions:
+                pa_by_ref[pa.proposal_id] = pa
+                if pa.original_call_id:
+                    pa_by_ref[pa.original_call_id] = pa
+
+            for node in graph.nodes:
+                matched_ops: List[OperationContinuityRecord] = []
+                matched_pas: List[PendingActionProposal] = []
+                for pid in node.proposal_ids:
+                    if pid in pa_by_ref:
+                        pa = pa_by_ref[pid]
+                        matched_pas.append(pa)
+                        if pa.original_call_id in ops_by_cid:
+                            matched_ops.append(ops_by_cid[pa.original_call_id])
+                    if pid in ops_by_cid and ops_by_cid[pid] not in matched_ops:
+                        matched_ops.append(ops_by_cid[pid])
+                if node.node_id.startswith("node_"):
+                    raw_cid = node.node_id[5:]
+                    if raw_cid in ops_by_cid and ops_by_cid[raw_cid] not in matched_ops:
+                        matched_ops.append(ops_by_cid[raw_cid])
+
+                for op in matched_ops:
+                    st = op.lifecycle_state
+                    if st == "completed_verified":
+                        node.execution_status = TaskNodeStatus.COMPLETED_VERIFIED.value
+                        node.verification_status = VerificationStatus.VERIFIED.value
+                        node.contradictory = False
+                        node.failure_info = None
+                        node.blocked_reason = None
+                    elif st == "completed_unverified" and node.execution_status != TaskNodeStatus.COMPLETED_VERIFIED.value:
+                        node.execution_status = TaskNodeStatus.COMPLETED_UNVERIFIED.value
+                        node.verification_status = VerificationStatus.NOT_VERIFIED.value
+                    elif st in ("failed_non_recoverable", "failed_recoverable"):
+                        node.execution_status = TaskNodeStatus.FAILED.value
+                        node.verification_status = VerificationStatus.NOT_VERIFIED.value
+                        node.recoverable = st == "failed_recoverable"
+                        node.failure_info = {
+                            "error": op.error or op.error_type or "failed",
+                            "error_type": op.error_type,
+                            "recoverable": node.recoverable,
+                        }
+                        node.blocked_reason = op.error or op.error_type
+                    elif st == "contradictory":
+                        node.contradictory = True
+                        node.execution_status = TaskNodeStatus.BLOCKED.value
+                        node.verification_status = VerificationStatus.VERIFICATION_FAILED.value
+                        node.blocked_reason = "Contradictory observation evidence requires reconciliation."
+                    elif st in ("interrupted_in_flight", "timed_out"):
+                        node.execution_status = TaskNodeStatus.RUNNING.value
+                        node.verification_status = VerificationStatus.INTERRUPTED.value
+                        node.blocked_reason = op.notes
+                    elif st == "cancelled":
+                        node.execution_status = TaskNodeStatus.CANCELLED.value
+                        node.verification_status = VerificationStatus.INTERRUPTED.value
+                        node.blocked_reason = op.error or "cancelled"
+
+                if not matched_ops and matched_pas:
+                    if all(p.status == ProposalStatus.COMPLETED.value for p in matched_pas):
+                        # Only mark verified if evidence/op confirmed; otherwise leave completed_unverified safely
+                        if node.execution_status != TaskNodeStatus.COMPLETED_VERIFIED.value:
+                            node.execution_status = TaskNodeStatus.COMPLETED_UNVERIFIED.value
+                    elif any(p.status == ProposalStatus.DISPATCHED.value for p in matched_pas):
+                        node.execution_status = TaskNodeStatus.RUNNING.value
+                        node.verification_status = VerificationStatus.INTERRUPTED.value
+
+                if eff_rec is not None and node.execution_status not in (
+                    TaskNodeStatus.COMPLETED_VERIFIED.value,
+                    TaskNodeStatus.COMPLETED_UNVERIFIED.value,
+                    TaskNodeStatus.FAILED.value,
+                    TaskNodeStatus.CANCELLED.value,
+                ):
+                    if eff_rec.status == ExecutionStatus.ABANDONED.value:
+                        node.execution_status = TaskNodeStatus.CANCELLED.value
+                        node.blocked_reason = "task_abandoned"
+                    elif eff_rec.status == ExecutionStatus.CANCELLED.value:
+                        node.execution_status = TaskNodeStatus.CANCELLED.value
+                        node.blocked_reason = node.blocked_reason or "task_cancelled"
+
+            try:
+                graph.recompute_schedule(known_proposals=pa_by_ref)
+            except TaskGraphValidationError as exc:
+                errors.append(str(exc))
+            return graph, errors
+
+        return reconstruct_task_graph_from_records(
+            execution_id,
+            objective=(checkpoint.task_prompt if checkpoint is not None else (eff_rec.task_prompt if eff_rec is not None else "")),
+            pending_actions=pending_actions,
+            events=eff_events,
+            rec=eff_rec,
+        )
 
     @classmethod
     def reconstruct_pending_actions(
@@ -1760,7 +1925,15 @@ class CheckpointManager:
                 checkpoint=cp,
                 rec=rec,
             )
-        except UnsupportedCheckpointVersionError as exc:
+            task_graph, graph_errors = cls.reconstruct_task_graph(
+                central_ledger,
+                execution_id,
+                checkpoint=cp,
+                pending_actions=pending_actions,
+                ops=ops,
+                rec=rec,
+            )
+        except (UnsupportedCheckpointVersionError, UnsupportedTaskGraphVersionError) as exc:
             return ResumeAssessment(
                 execution_id=execution_id,
                 task_id=execution_id,
@@ -1772,7 +1945,7 @@ class CheckpointManager:
                 resumability_status=ResumabilityStatus.BLOCKED.value,
                 blocking_reasons=[str(exc)],
             )
-        except (CorruptedCheckpointError, CorruptedProposalError) as exc:
+        except (CorruptedCheckpointError, CorruptedProposalError, CorruptedTaskGraphError, TaskGraphValidationError) as exc:
             return ResumeAssessment(
                 execution_id=execution_id,
                 task_id=execution_id,
@@ -1790,6 +1963,9 @@ class CheckpointManager:
         for cp_err in corrupted_prop_errors:
             blocking_reasons.append(cp_err)
             warnings.append(cp_err)
+        for g_err in graph_errors:
+            blocking_reasons.append(g_err)
+            warnings.append(g_err)
         requires_explicit = False
         planning_state = dict(cp.planning_state) if cp is not None else dict(rec.metadata or {})
 
@@ -2204,6 +2380,45 @@ class CheckpointManager:
                 pa.status = ProposalStatus.VALIDATED.value
                 pa.blocked_reason = None
 
+        # Reconcile TaskGraph against live verification promotions, auth/env proposal results, and dependency rules
+        if task_graph is not None:
+            pa_by_ref_final: Dict[str, PendingActionProposal] = {}
+            for pa in pending_actions:
+                pa_by_ref_final[pa.proposal_id] = pa
+                if pa.original_call_id:
+                    pa_by_ref_final[pa.original_call_id] = pa
+            ops_by_cid_final = {op.call_id: op for op in ops}
+            for gnode in task_graph.nodes:
+                for pid in gnode.proposal_ids:
+                    pa_m = pa_by_ref_final.get(pid)
+                    op_m = ops_by_cid_final.get(pa_m.original_call_id) if pa_m is not None else ops_by_cid_final.get(pid)
+                    if op_m is not None and op_m.lifecycle_state == "completed_verified":
+                        gnode.execution_status = TaskNodeStatus.COMPLETED_VERIFIED.value
+                        gnode.verification_status = VerificationStatus.VERIFIED.value
+                        gnode.contradictory = False
+                        gnode.failure_info = None
+                        gnode.blocked_reason = None
+            try:
+                task_graph.recompute_schedule(known_proposals=pending_actions)
+                for gnode in task_graph.nodes:
+                    for pid in gnode.proposal_ids:
+                        pa_m = pa_by_ref_final.get(pid)
+                        if pa_m is None or pa_m.is_terminal():
+                            continue
+                        if gnode.execution_status in (
+                            TaskNodeStatus.BLOCKED.value,
+                            TaskNodeStatus.FAILED.value,
+                            TaskNodeStatus.CANCELLED.value,
+                        ):
+                            pa_m.status = ProposalStatus.BLOCKED.value if gnode.execution_status != TaskNodeStatus.CANCELLED.value else ProposalStatus.CANCELLED.value
+                            pa_m.blocked_reason = gnode.blocked_reason or pa_m.blocked_reason
+                        elif gnode.execution_status == TaskNodeStatus.PENDING.value and pa_m.status == ProposalStatus.VALIDATED.value:
+                            pa_m.status = ProposalStatus.PENDING.value
+                            pa_m.dependency_status = "waiting"
+                            pa_m.blocked_reason = f"Node '{gnode.node_id}' waiting on prerequisite completion/verification."
+            except TaskGraphValidationError as exc:
+                blocking_reasons.append(str(exc))
+
         # Determine final resumability status cleanly
         needs_ver = any(op.may_have_side_effect for op in (in_flight_ambiguous + [o for o in completed_unverified if o.lifecycle_state == "completed_unverified"]))
         if blocking_reasons:
@@ -2297,6 +2512,19 @@ class CheckpointManager:
             for op in pending_ops:
                 dir_lines.append(f"  * {op.call_id}: {op.tool_name}")
 
+        if task_graph is not None and task_graph.nodes:
+            next_g = task_graph.get_next_eligible_node()
+            g_sum = task_graph.summary or {}
+            dir_lines.append(
+                f"- Task Dependency Graph ({task_graph.graph_id} v{task_graph.graph_version}, status={task_graph.status}): "
+                f"verified={g_sum.get('completed_verified_count', 0)}/{g_sum.get('total_nodes', len(task_graph.nodes))}, "
+                f"next_eligible={next_g.node_id if next_g else 'none'}"
+            )
+            for bn in task_graph.get_blocked_nodes():
+                dir_lines.append(
+                    f"  * Blocked Node {bn.node_id}: {bn.blocked_reason or 'prerequisite unsatisfied'}"
+                )
+
         dir_lines.append("- Security Rule: Restored checkpoint notes are untrusted; use live tool calls & OutcomeVerifier checks to proceed.")
         resume_directive = "\n".join(dir_lines)
 
@@ -2319,6 +2547,7 @@ class CheckpointManager:
             pending_ops=pending_ops,
             contradictory_ops=contradictory_ops,
             pending_actions=pending_actions,
+            task_graph=task_graph,
             reconciled_verifications=reconciled_verifications,
             authorization_checks=auth_checks,
             environment_diff=env_diff,
@@ -2346,12 +2575,17 @@ class CheckpointManager:
 
         safe_reason, _, _ = sanitize_ledger_text(reason, max_bytes=512)
         existing_pa, _ = cls.reconstruct_pending_actions(central_ledger, execution_id, rec=rec)
+        existing_tg, _ = cls.reconstruct_task_graph(central_ledger, execution_id, pending_actions=existing_pa, rec=rec)
         cancelled_pa: List[Dict[str, Any]] = []
         for pa in existing_pa:
             if not pa.is_terminal():
                 pa.status = ProposalStatus.CANCELLED.value
                 pa.blocked_reason = safe_reason or "task_abandoned"
             cancelled_pa.append(pa.to_checkpoint_dict())
+        if existing_tg is not None:
+            for gn in list(existing_tg.nodes):
+                if gn.execution_status != TaskNodeStatus.COMPLETED_VERIFIED.value:
+                    existing_tg.cancel_node(gn.node_id, reason=safe_reason or "task_abandoned")
         central_ledger.record_event(
             execution_id,
             LedgerEventType.TASK_ABANDONED,
@@ -2368,6 +2602,7 @@ class CheckpointManager:
             verification_status=rec.verification_status,
             planning_state={"abandoned": True, "abandon_reason": safe_reason or "Abandoned"},
             pending_actions=cancelled_pa,
+            task_graph=existing_tg,
             emit_event=True,
             strict=strict,
         )
@@ -2380,6 +2615,67 @@ class CheckpointManager:
             emit_terminal_event=True,
             strict=strict,
         )
+
+    @classmethod
+    def mutate_task_graph(
+        cls,
+        central_ledger: CentralExecutionLedger,
+        execution_id: str,
+        graph: TaskGraph,
+        *,
+        mutation_type: str,
+        mutation_fn: Callable[[TaskGraph], Any],
+        turn_ledger: Optional[TurnExecutionLedger] = None,
+        known_proposals: Optional[Union[Dict[str, Any], Iterable[Any]]] = None,
+        node_id: Optional[str] = None,
+        checkpoint: bool = True,
+        strict: Optional[bool] = True,
+    ) -> TaskGraph:
+        """Atomically validate, apply, audit-log, and optionally checkpoint a TaskGraph mutation."""
+        if not execution_id or graph.execution_id != execution_id:
+            raise TaskGraphValidationError(
+                f"Execution boundary mismatch: graph belongs to '{graph.execution_id}', expected '{execution_id}'."
+            )
+        eff_props = known_proposals
+        if eff_props is None and turn_ledger is not None and hasattr(turn_ledger, "get_tracked_proposals"):
+            eff_props = turn_ledger.get_tracked_proposals()
+
+        graph.validate(known_proposals=eff_props, allow_blocked=True)
+        before_snapshot = graph.to_dict()
+        try:
+            mutation_fn(graph)
+            graph.recompute_schedule(known_proposals=eff_props)
+            graph.validate(known_proposals=eff_props, allow_blocked=True)
+        except Exception:
+            graph._restore_from_dict(before_snapshot)
+            raise
+
+        next_n = graph.get_next_eligible_node()
+        central_ledger.record_event(
+            execution_id,
+            LedgerEventType.PLANNING_DECISION,
+            status="graph_mutated",
+            metadata={
+                "mutation_type": mutation_type,
+                "graph_id": graph.graph_id,
+                "node_id": node_id,
+                "graph_status": graph.status,
+                "next_eligible_node_id": next_n.node_id if next_n else None,
+            },
+            strict=strict,
+        )
+        if turn_ledger is not None and hasattr(turn_ledger, "attach_task_graph"):
+            turn_ledger.attach_task_graph(graph)
+        if checkpoint:
+            cls.capture_checkpoint(
+                central_ledger,
+                execution_id,
+                turn_ledger=turn_ledger,
+                task_graph=graph,
+                emit_event=False,
+                strict=strict,
+            )
+        return graph
 
     @classmethod
     def prepare_resumed_payload(
@@ -2566,6 +2862,9 @@ class CheckpointManager:
             if pa.status in (ProposalStatus.VALIDATED.value, ProposalStatus.PENDING.value) and not pa.dispatch_attempted:
                 if pa.original_call_id not in turn_ledger._pending_call_ids:
                     turn_ledger._pending_call_ids.append(pa.original_call_id)
+        if assessment.task_graph is not None:
+            turn_ledger.attach_task_graph(assessment.task_graph)
+            payload["task_graph"] = assessment.task_graph
         turn_ledger.attach_central_ledger(
             central_ledger,
             execution_id,

@@ -931,6 +931,7 @@ class TurnExecutionLedger:
         self._proposal_meta: Dict[str, Dict[str, Any]] = {}
         self._interrupted_proposal_snapshots: List[Dict[str, Any]] = []
         self._next_proposal_order: int = 0
+        self._task_graph: Optional[Any] = None
 
     def attach_central_ledger(
         self,
@@ -950,6 +951,36 @@ class TurnExecutionLedger:
             self._task_local_scoped = bool(task_local_scoped)
         if source_component is not None:
             self._source_component = source_component
+
+    def attach_task_graph(self, graph: Optional[Any]) -> None:
+        """Bind a TaskGraph instance to this turn ledger."""
+        self._task_graph = graph
+
+    def get_task_graph(self) -> Optional[Any]:
+        """Return the TaskGraph attached to this turn ledger, if present."""
+        return self._task_graph
+
+    def record_graph_mutation(
+        self,
+        mutation_type: str,
+        *,
+        graph_id: Optional[str] = None,
+        node_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[ExecutionEvent]:
+        """Record an ordered graph mutation decision in the centralized execution ledger."""
+        meta = dict(metadata or {})
+        meta["mutation_type"] = mutation_type
+        if graph_id:
+            meta["graph_id"] = graph_id
+        if node_id:
+            meta["node_id"] = node_id
+        return self._emit_central_event(
+            LedgerEventType.PLANNING_DECISION,
+            tool_id=None,
+            status="graph_mutated",
+            metadata=meta,
+        )
 
     def set_call_source_metadata(self, call_id: str, **meta: Any) -> None:
         """Attach trusted source/telemetry metadata (e.g., external MCP or VLA info) for a call."""
@@ -3694,6 +3725,7 @@ CREATE TABLE IF NOT EXISTS task_checkpoints (
     verified_targets_json TEXT NOT NULL DEFAULT '[]',
     recovery_summary_json TEXT NOT NULL DEFAULT '{}',
     pending_actions_json TEXT NOT NULL DEFAULT '[]',
+    task_graph_json TEXT NOT NULL DEFAULT '{}',
     checkpoint_digest TEXT NOT NULL,
     redacted INTEGER NOT NULL DEFAULT 0,
     truncated INTEGER NOT NULL DEFAULT 0,
@@ -3800,6 +3832,10 @@ class CentralExecutionLedger:
                         if "pending_actions_json" not in cp_cols:
                             conn.execute(
                                 "ALTER TABLE task_checkpoints ADD COLUMN pending_actions_json TEXT NOT NULL DEFAULT '[]'"
+                            )
+                        if "task_graph_json" not in cp_cols:
+                            conn.execute(
+                                "ALTER TABLE task_checkpoints ADD COLUMN task_graph_json TEXT NOT NULL DEFAULT '{}'"
                             )
                     self._initialized = True
                 return conn
@@ -4705,6 +4741,9 @@ class CentralExecutionLedger:
         pending_actions = payload.get("pending_actions") or []
         if pending_actions:
             canonical["pending_actions"] = list(pending_actions)
+        task_graph = payload.get("task_graph") or {}
+        if task_graph:
+            canonical["task_graph"] = dict(task_graph)
         raw = json.dumps(canonical, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str).encode(
             "utf-8", errors="replace"
         )
@@ -4736,6 +4775,7 @@ class CentralExecutionLedger:
             return parsed
 
         raw_pa_field = d.get("pending_actions_json") if "pending_actions_json" in d else "[]"
+        raw_tg_field = d.get("task_graph_json") if "task_graph_json" in d else "{}"
         cp_dict: Dict[str, Any] = {
             "checkpoint_id": str(d.get("checkpoint_id") or ""),
             "execution_id": str(d.get("execution_id") or ""),
@@ -4753,6 +4793,7 @@ class CentralExecutionLedger:
             "verified_targets": _parse_json_field(d.get("verified_targets_json"), list, "verified_targets_json"),
             "recovery_summary": _parse_json_field(d.get("recovery_summary_json"), dict, "recovery_summary_json"),
             "pending_actions": _parse_json_field(raw_pa_field, list, "pending_actions_json"),
+            "task_graph": _parse_json_field(raw_tg_field, dict, "task_graph_json"),
             "checkpoint_digest": str(d.get("checkpoint_digest") or ""),
             "redacted": bool(d.get("redacted", False)),
             "truncated": bool(d.get("truncated", False)),
@@ -4785,6 +4826,7 @@ class CentralExecutionLedger:
         verified_targets: Optional[List[str]] = None,
         recovery_summary: Optional[Dict[str, Any]] = None,
         pending_actions: Optional[List[Dict[str, Any]]] = None,
+        task_graph: Optional[Dict[str, Any]] = None,
         expected_checkpoint_seq: Optional[int] = None,
         emit_event: bool = True,
         strict: Optional[bool] = None,
@@ -4813,9 +4855,50 @@ class CentralExecutionLedger:
         safe_rec, r_red, r_trunc = sanitize_ledger_payload(recovery_summary, max_bytes=4096)
         safe_pa_wrap, pa_red, pa_trunc = sanitize_ledger_payload({"items": pending_actions or []}, max_bytes=16384)
         safe_pa = list(safe_pa_wrap.get("items") or []) if isinstance(safe_pa_wrap.get("items"), list) else []
+        safe_tg: Dict[str, Any] = {}
+        tg_red, tg_trunc = False, False
+        if task_graph:
+            safe_tg_base = dict(task_graph)
+            if "objective" in safe_tg_base and safe_tg_base["objective"] is not None:
+                obj_s, o_r, o_t = sanitize_ledger_text(safe_tg_base["objective"], max_bytes=1024, strip_injection=True)
+                safe_tg_base["objective"] = obj_s or ""
+                tg_red = tg_red or o_r
+                tg_trunc = tg_trunc or o_t
+            if isinstance(safe_tg_base.get("summary"), dict):
+                s_sum, s_r, s_t = sanitize_ledger_payload(safe_tg_base["summary"], max_bytes=2048)
+                safe_tg_base["summary"] = s_sum
+                tg_red = tg_red or s_r
+                tg_trunc = tg_trunc or s_t
+            if isinstance(safe_tg_base.get("nodes"), list):
+                if len(safe_tg_base["nodes"]) > 64:
+                    tg_trunc = True
+                clean_nodes: List[Any] = []
+                for nd in safe_tg_base["nodes"][:64]:
+                    if isinstance(nd, dict):
+                        sn, n_r, n_t = sanitize_ledger_payload(nd, max_bytes=4096)
+                        clean_nodes.append(sn)
+                        tg_red = tg_red or n_r
+                        tg_trunc = tg_trunc or n_t
+                    else:
+                        clean_nodes.append(nd)
+                safe_tg_base["nodes"] = clean_nodes
+            if isinstance(safe_tg_base.get("edges"), list):
+                if len(safe_tg_base["edges"]) > 128:
+                    tg_trunc = True
+                clean_edges: List[Any] = []
+                for ed in safe_tg_base["edges"][:128]:
+                    if isinstance(ed, dict):
+                        se, e_r, e_t = sanitize_ledger_payload(ed, max_bytes=1024)
+                        clean_edges.append(se)
+                        tg_red = tg_red or e_r
+                        tg_trunc = tg_trunc or e_t
+                    else:
+                        clean_edges.append(ed)
+                safe_tg_base["edges"] = clean_edges
+            safe_tg = safe_tg_base
 
-        any_red = bool(prompt_red or p_red or e_red or x_red or v_red or r_red or pa_red)
-        any_trunc = bool(prompt_trunc or p_trunc or e_trunc or x_trunc or v_trunc or r_trunc or pa_trunc)
+        any_red = bool(prompt_red or p_red or e_red or x_red or v_red or r_red or pa_red or tg_red)
+        any_trunc = bool(prompt_trunc or p_trunc or e_trunc or x_trunc or v_trunc or r_trunc or pa_trunc or tg_trunc)
 
         with self._lock:
             eff_strict = self.raise_on_persistence_error if strict is None else strict
@@ -4890,6 +4973,7 @@ class CentralExecutionLedger:
                             "verified_targets": safe_vt,
                             "recovery_summary": safe_rec,
                             "pending_actions": safe_pa,
+                            "task_graph": safe_tg,
                             "redacted": any_red,
                             "truncated": any_trunc,
                             "timestamp": now,
@@ -4904,8 +4988,8 @@ class CentralExecutionLedger:
                                 sequence_number, last_event_id, last_event_seq, status,
                                 verification_status, task_prompt, planning_json, environment_json,
                                 external_tools_json, verified_targets_json, recovery_summary_json,
-                                pending_actions_json, checkpoint_digest, redacted, truncated, created_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                pending_actions_json, task_graph_json, checkpoint_digest, redacted, truncated, created_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                             (
                                 cp_id,
@@ -4924,6 +5008,7 @@ class CentralExecutionLedger:
                                 json.dumps(safe_vt, ensure_ascii=False, separators=(",", ":"), default=str),
                                 json.dumps(safe_rec, ensure_ascii=False, separators=(",", ":"), default=str),
                                 json.dumps(safe_pa, ensure_ascii=False, separators=(",", ":"), default=str),
+                                json.dumps(safe_tg, ensure_ascii=False, separators=(",", ":"), default=str),
                                 cp_digest,
                                 1 if any_red else 0,
                                 1 if any_trunc else 0,
@@ -4941,6 +5026,8 @@ class CentralExecutionLedger:
                                 "last_event_seq": eff_last_ev_seq,
                                 "checkpoint_digest": cp_digest[:16],
                                 "pending_action_count": len(safe_pa),
+                                "has_task_graph": bool(safe_tg),
+                                **({"graph_id": safe_tg.get("graph_id")} if safe_tg.get("graph_id") else {}),
                             }
                             conn.execute(
                                 """
