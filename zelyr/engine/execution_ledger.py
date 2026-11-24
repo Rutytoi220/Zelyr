@@ -963,6 +963,49 @@ class TurnExecutionLedger:
         self._interrupted_proposal_snapshots: List[Dict[str, Any]] = []
         self._next_proposal_order: int = 0
         self._task_graph: Optional[Any] = None
+        self._model_request_count: int = 0
+        self._model_request_duration_ms: float = 0.0
+        self._orchestration_step_count: int = 0
+
+    @_synchronized
+    def record_model_request(self, duration_ms: float) -> None:
+        """Record a measured monotonic model-request count and duration in memory."""
+        self._model_request_count += 1
+        try:
+            self._model_request_duration_ms += max(0.0, float(duration_ms))
+        except (TypeError, ValueError):
+            pass
+
+    @_synchronized
+    def record_orchestration_step(self, count: int = 1) -> None:
+        """Increment measured orchestration step counter cleanly in memory."""
+        self._orchestration_step_count += max(0, int(count or 0))
+
+    @_synchronized
+    def get_observability_counters(self) -> Dict[str, Any]:
+        """Return measured in-memory orchestration & model request counters."""
+        return {
+            "model_request_count": int(getattr(self, "_model_request_count", 0)),
+            "model_request_duration_ms": round(float(getattr(self, "_model_request_duration_ms", 0.0)), 3),
+            "orchestration_step_count": int(getattr(self, "_orchestration_step_count", 0)),
+        }
+
+    def flush_observability_metrics(self) -> Optional[ExecutionEvent]:
+        """Persist measured in-memory orchestration/model metrics once per execution without hot-path I/O."""
+        counters = self.get_observability_counters()
+        if counters["model_request_count"] == 0 and counters["orchestration_step_count"] == 0:
+            return None
+        return self._emit_central_event(
+            LedgerEventType.PLANNING_DECISION,
+            tool_id=None,
+            status="metrics_snapshot",
+            metadata={
+                "metrics_snapshot": True,
+                "measurement_kind": "measured",
+                **counters,
+            },
+            idempotency_suffix=f"metrics:{counters['orchestration_step_count']}:{counters['model_request_count']}",
+        )
 
     def attach_central_ledger(
         self,
@@ -1885,6 +1928,8 @@ class TurnExecutionLedger:
         verified_targets: Optional[List[str]] = None,
         rejection_reason: Optional[str] = None,
         structured_observation: Optional[Any] = None,
+        duration_ms: Optional[float] = None,
+        verification_duration_ms: Optional[float] = None,
     ) -> None:
         """Record host observation and final state for an action."""
         old = self._records.get(call_id)
@@ -2019,17 +2064,22 @@ class TurnExecutionLedger:
             res_status = "failed"
         else:
             res_status = "succeeded"
+        result_meta: Dict[str, Any] = {
+            "exit_code": effective_exit_code,
+            "error": effective_error,
+            "rejection_reason": effective_rejection_reason,
+            "verified": effective_verified,
+        }
+        if duration_ms is not None:
+            result_meta["duration_ms"] = round(max(0.0, float(duration_ms)), 3)
+        if verification_duration_ms is not None:
+            result_meta["verification_duration_ms"] = round(max(0.0, float(verification_duration_ms)), 3)
         self._emit_central_event(
             LedgerEventType.TOOL_EXECUTION_RESULT,
             call_id=call_id,
             tool_id=tool_name or None,
             status=res_status,
-            metadata={
-                "exit_code": effective_exit_code,
-                "error": effective_error,
-                "rejection_reason": effective_rejection_reason,
-                "verified": effective_verified,
-            },
+            metadata=result_meta,
             idempotency_suffix="result",
         )
         if structured_observation is not None:
@@ -2065,21 +2115,27 @@ class TurnExecutionLedger:
                 idempotency_suffix="observed",
             )
         if effective_verified:
+            ver_ev_meta: Dict[str, Any] = {"detail": effective_detail, "verified_targets": eff_verified_targets}
+            if verification_duration_ms is not None:
+                ver_ev_meta["duration_ms"] = round(max(0.0, float(verification_duration_ms)), 3)
             self._emit_central_event(
                 LedgerEventType.VERIFICATION_RECORDED,
                 call_id=call_id,
                 tool_id=tool_name or None,
                 status=VerificationStatus.VERIFIED.value,
-                metadata={"detail": effective_detail, "verified_targets": eff_verified_targets},
+                metadata=ver_ev_meta,
                 idempotency_suffix="verified",
             )
         elif effective_verification_failed:
+            ver_ev_meta = {"detail": effective_detail, "failed_targets": eff_failed_targets}
+            if verification_duration_ms is not None:
+                ver_ev_meta["duration_ms"] = round(max(0.0, float(verification_duration_ms)), 3)
             self._emit_central_event(
                 LedgerEventType.VERIFICATION_RECORDED,
                 call_id=call_id,
                 tool_id=tool_name or None,
                 status=VerificationStatus.VERIFICATION_FAILED.value,
-                metadata={"detail": effective_detail, "failed_targets": eff_failed_targets},
+                metadata=ver_ev_meta,
                 idempotency_suffix="verification_failed",
             )
 

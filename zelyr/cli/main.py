@@ -1543,6 +1543,20 @@ def cmd_execution(args: argparse.Namespace) -> None:
             )
             return
 
+        if getattr(args, "metrics", False):
+            from zelyr.engine.observability import collect_execution_metrics, format_observability_summary
+
+            metrics = collect_execution_metrics(ledger, record.execution_id)
+            if getattr(args, "json", False):
+                print(json.dumps(metrics, indent=2))
+                if metrics.get("persistence_errors"):
+                    sys.exit(1)
+                return
+            print(format_observability_summary(metrics))
+            if metrics.get("persistence_errors"):
+                sys.exit(1)
+            return
+
         if getattr(args, "checkpoint", False):
             _print_checkpoint_assessment(ledger, record.execution_id, output_json=bool(getattr(args, "json", False)))
             return
@@ -1680,6 +1694,52 @@ def cmd_diagnose(args: argparse.Namespace) -> None:
             verify=bool(getattr(args, "verify", False)),
             output_json=bool(getattr(args, "json", False)),
         )
+    finally:
+        if owns_conn:
+            ledger.close()
+
+
+def cmd_metrics(args: argparse.Namespace) -> None:
+    """Summarize measured execution performance & policy observability metrics."""
+    from zelyr.engine.observability import (
+        collect_execution_metrics,
+        collect_fleet_observability,
+        format_observability_summary,
+    )
+
+    exec_query = getattr(args, "execution_id", None)
+    ledger, owns_conn = _open_cli_ledger(getattr(args, "db_path", None))
+    try:
+        if exec_query:
+            record, matches = ledger.find_execution_by_prefix(exec_query)
+            if record is None:
+                perrs = ledger.get_persistence_errors() if hasattr(ledger, "get_persistence_errors") else []
+                msg = (
+                    f"Ambiguous execution ID prefix '{exec_query}': matched {', '.join(matches[:5])}"
+                    if len(matches) > 1
+                    else f"Execution '{exec_query}' not found."
+                )
+                if getattr(args, "json", False):
+                    print(json.dumps({"found": False, "execution_id": exec_query, "error": msg, "persistence_errors": perrs}, indent=2))
+                else:
+                    sys.stderr.write(msg + "\n")
+                    sys.stderr.flush()
+                sys.exit(1)
+            summary = collect_execution_metrics(ledger, record.execution_id)
+        else:
+            summary = collect_fleet_observability(ledger, limit=int(getattr(args, "limit", 20) or 20))
+
+        if getattr(args, "json", False):
+            print(json.dumps(summary, indent=2))
+            if summary.get("persistence_errors"):
+                sys.exit(1)
+            return
+        print(format_observability_summary(summary))
+        if summary.get("persistence_errors"):
+            for perr in summary["persistence_errors"]:
+                sys.stderr.write(f"Persistence error: {perr.get('error', 'database error')}\n")
+            sys.stderr.flush()
+            sys.exit(1)
     finally:
         if owns_conn:
             ledger.close()
@@ -2679,6 +2739,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Reconcile live OutcomeVerifier checks when running --diagnose",
     )
+    p_exec.add_argument(
+        "--metrics",
+        action="store_true",
+        default=False,
+        help="Display execution and policy observability metrics",
+    )
     p_exec.add_argument("--json", action="store_true", default=False, help="Output structured JSON summary")
     p_exec.add_argument("--db-path", type=str, default=None, help="Override execution ledger SQLite DB path")
 
@@ -2690,6 +2756,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p_diag.add_argument("--verify", action="store_true", default=False, help="Reconcile live OutcomeVerifier checks (read-only)")
     p_diag.add_argument("--json", action="store_true", default=False, help="Output structured JSON diagnostic report")
     p_diag.add_argument("--db-path", type=str, default=None, help="Override execution ledger SQLite DB path")
+
+    p_metrics = sub.add_parser(
+        "metrics",
+        aliases=["observability"],
+        help="Summarize measured execution timings, counts, and policy outcomes",
+    )
+    p_metrics.add_argument("execution_id", nargs="?", default=None, help="Optional execution ID or prefix (omit for recent summary)")
+    p_metrics.add_argument("--limit", "-n", type=int, default=20, help="Maximum recent executions to aggregate (default: 20)")
+    p_metrics.add_argument("--json", action="store_true", default=False, help="Output structured JSON metrics")
+    p_metrics.add_argument("--db-path", type=str, default=None, help="Override execution ledger SQLite DB path")
 
     p_cp = sub.add_parser(
         "checkpoint",
@@ -2903,8 +2979,10 @@ def main() -> None:
         "env":      cmd_env,
         "manifest": cmd_env,
         "executions": cmd_executions,
-        "execution":  cmd_execution,
-        "diagnose":   cmd_diagnose,
+        "execution":     cmd_execution,
+        "diagnose":      cmd_diagnose,
+        "metrics":       cmd_metrics,
+        "observability": cmd_metrics,
         "checkpoint": cmd_checkpoint,
         "resume":     cmd_resume,
         "test":     cmd_test,

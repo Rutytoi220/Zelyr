@@ -1206,6 +1206,7 @@ class ExecutionPolicyDecision:
     config_source: Dict[str, str] = field(default_factory=dict)
     is_preview: bool = False
     auth_error_type: Optional[str] = None
+    confirmation_wait_ms: Optional[float] = None
 
     @property
     def allowed(self) -> bool:
@@ -1290,6 +1291,8 @@ class ExecutionPolicyDecision:
         }
         if self.auth_error_type is not None:
             payload["auth_error_type"] = self.auth_error_type
+        if self.confirmation_wait_ms is not None:
+            payload["confirmation_wait_ms"] = self.confirmation_wait_ms
         return payload
 
     def to_tool_error_payload(self) -> Dict[str, Any]:
@@ -1510,6 +1513,7 @@ class ExecutionPolicyEngine:
         record_to_ledger: bool = True,
         now: Optional[float] = None,
         preview: bool = False,
+        _confirmation_wait_ms: Optional[float] = None,
     ) -> ExecutionPolicyDecision:
         """Evaluate execution policy deterministically across Rules 1..6 and optionally log to ledger."""
         if preview:
@@ -1597,8 +1601,10 @@ class ExecutionPolicyEngine:
             conf_id: Optional[str] = None,
             remediation: str = "",
             auth_error_type: Optional[str] = None,
+            confirmation_wait_ms: Optional[float] = None,
         ) -> ExecutionPolicyDecision:
             sanitized_scope = [_sanitize_scope_item(s) for s in resource_scope if _sanitize_scope_item(s)]
+            eff_wait_ms = confirmation_wait_ms if confirmation_wait_ms is not None else _confirmation_wait_ms
             dec = ExecutionPolicyDecision(
                 decision_id=decision_id,
                 outcome=outcome,
@@ -1627,6 +1633,7 @@ class ExecutionPolicyEngine:
                 config_source=dict(self.config.config_sources),
                 is_preview=bool(preview),
                 auth_error_type=auth_error_type,
+                confirmation_wait_ms=eff_wait_ms,
             )
             if (not preview) and record_to_ledger and central_ledger is not None and execution_id:
                 self._record_decision_to_ledger(
@@ -1954,7 +1961,11 @@ class ExecutionPolicyEngine:
                 config_source=dict(self.config.config_sources),
                 is_preview=bool(preview),
             )
-            approved = bool(confirm_callback(pre_decision))
+            cb_t0 = time.monotonic()
+            try:
+                approved = bool(confirm_callback(pre_decision))
+            finally:
+                cb_wait_ms = round((time.monotonic() - cb_t0) * 1000.0, 3)
             if approved:
                 raw_tok, rec = self.confirmation_store.issue_confirmation(
                     tool_id=tid,
@@ -1991,6 +2002,7 @@ class ExecutionPolicyEngine:
                         conf_req=True,
                         conf_status=ver.status,
                         conf_id=rec.confirmation_id,
+                        confirmation_wait_ms=cb_wait_ms,
                     )
             rule_ids.append("rule6:callback_denied")
             return _finalize(
@@ -2002,6 +2014,7 @@ class ExecutionPolicyEngine:
                 conf_req=True,
                 conf_status="declined",
                 remediation="User declined confirmation for this action.",
+                confirmation_wait_ms=cb_wait_ms,
             )
 
         rule_ids.append("rule6:confirmation_missing")
@@ -2058,6 +2071,11 @@ class ExecutionPolicyEngine:
                     "policy_version": decision.policy_version,
                     "source_surface": decision.source_surface,
                     "is_external": decision.is_external,
+                    **(
+                        {"confirmation_wait_ms": decision.confirmation_wait_ms}
+                        if decision.confirmation_wait_ms is not None
+                        else {}
+                    ),
                 }
             )
             central_ledger.record_event(
@@ -2123,8 +2141,12 @@ class ExecutionPolicyEngine:
                 )
             return pre
 
-        cb_res = confirm_callback(pre)
-        approved = bool(await cb_res if inspect.isawaitable(cb_res) else cb_res)
+        cb_t0 = time.monotonic()
+        try:
+            cb_res = confirm_callback(pre)
+            approved = bool(await cb_res if inspect.isawaitable(cb_res) else cb_res)
+        finally:
+            cb_wait_ms = round((time.monotonic() - cb_t0) * 1000.0, 3)
         if not approved:
             kwargs_no_rec = dict(kwargs)
             central = kwargs_no_rec.get("central_ledger")
@@ -2153,6 +2175,7 @@ class ExecutionPolicyEngine:
                 policy_mode=self.config.policy_mode,
                 config_source=dict(self.config.config_sources),
                 is_preview=False,
+                confirmation_wait_ms=cb_wait_ms,
             )
             if kwargs_no_rec.get("record_to_ledger", True) and central is not None and denied.execution_id:
                 self._record_decision_to_ledger(central, denied, correlation_id=corr)
@@ -2177,6 +2200,7 @@ class ExecutionPolicyEngine:
             raw_arguments,
             consume_confirmation=consume_flag,
             confirm_callback=None,
+            _confirmation_wait_ms=cb_wait_ms,
             **kwargs,
         )
 

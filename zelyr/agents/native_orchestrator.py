@@ -1565,6 +1565,11 @@ class NativeOrchestrator:
             raise
         finally:
             if (owns_root_exec or is_resumed_root) and getattr(eff_ledger, "_execution_id", None) == exec_id:
+                try:
+                    if hasattr(eff_ledger, "flush_observability_metrics"):
+                        eff_ledger.flush_observability_metrics()
+                except Exception:
+                    pass
                 existing_rec = central_ledger.get_execution(exec_id)
                 already_finalized = (
                     existing_rec is not None
@@ -2274,6 +2279,9 @@ class NativeOrchestrator:
         refusal_detected = False
         stream_finish_reason = None
 
+        if hasattr(eff_ledger, "record_orchestration_step"):
+            eff_ledger.record_orchestration_step()
+        _llm_t0 = time.monotonic()
         try:
             async for data in self._stream_model_events(payload, base_url, stream_provider=eff_stream_provider):
                 if "_api_error" in data:
@@ -2436,6 +2444,9 @@ class NativeOrchestrator:
             err_label = f"{type(exc).__name__}: {err_detail}" if err_detail else type(exc).__name__
             yield {"choices": [{"delta": {"content": f"\n⚠️ [Request Error] Communication failure with {base_url}: {err_label}\n"}}]}
             return
+        finally:
+            if hasattr(eff_ledger, "record_model_request"):
+                eff_ledger.record_model_request((time.monotonic() - _llm_t0) * 1000.0)
 
         if is_reasoning:
             collected_assistant_text.append("</think>")
@@ -3946,6 +3957,8 @@ class NativeOrchestrator:
                 was_cancelled = False
                 raw_tool_payload: Any = None
                 ext_src_for_frame: Optional[Dict[str, Any]] = None
+                _tool_t0 = time.monotonic()
+                _tool_duration_ms: Optional[float] = None
                 try:
                     with policy_scope_cm, ledger_scope_cm as call_ctx:
                         if eff_tool_executor is not None:
@@ -4060,6 +4073,7 @@ class NativeOrchestrator:
                         error=cancel_payload["error"],
                         exit_code=1,
                         structured_observation=cancel_obs,
+                        duration_ms=round((time.monotonic() - _tool_t0) * 1000.0, 3),
                     )
                     if active_tg_step is not None and bound_tg_nodes:
                         for gn in bound_tg_nodes:
@@ -4098,6 +4112,8 @@ class NativeOrchestrator:
                         "allowed_actions": [],
                     }
                     res_str = json.dumps(raw_tool_payload)
+                finally:
+                    _tool_duration_ms = round((time.monotonic() - _tool_t0) * 1000.0, 3)
 
                 from zelyr.engine.observation_framing import ObservationFramingEngine
 
@@ -4155,6 +4171,7 @@ class NativeOrchestrator:
                 failed_criteria_records: List[Dict[str, Any]] = []
                 verified_targets_for_obs: List[str] = []
                 failed_targets_for_obs: List[str] = []
+                _ver_duration_ms: Optional[float] = None
                 if acceptance_spec and not is_failed:
                     from zelyr.engine.execution_ledger import (
                         _is_inspection_action,
@@ -4166,23 +4183,27 @@ class NativeOrchestrator:
                         targets_match,
                     )
                     from zelyr.engine.verifier import OutcomeVerifier
-                    parsed_c = parse_acceptance_criteria(acceptance_spec)
-                    all_c_targets = [c.get("target", "") for c in parsed_c if c.get("target")]
-                    c_results = []
-                    by_target: Dict[str, List[Any]] = {}
-                    for c in parsed_c:
-                        vr = OutcomeVerifier.verify(check=c["check"], target=c["target"], expected=c.get("expected"))
-                        c_results.append((c, vr))
-                        norm_ct = canonicalize_target(c.get("target", ""), check_type=c.get("check")) if c.get("target") else ""
-                        if norm_ct:
-                            by_target.setdefault(norm_ct, []).append((c, vr))
-                        if str(c.get("check", "")).lower() in ("command_output", "command", "cmd") and c.get("target"):
-                            for ref_ft in extract_file_targets_from_text(str(c["target"])):
-                                norm_ft = canonicalize_target(ref_ft)
-                                if norm_ft:
-                                    by_target.setdefault(norm_ft, []).append(
-                                        ({"check": "file_exists", "target": ref_ft, "expected": c.get("expected")}, vr)
-                                    )
+                    _ver_t0 = time.monotonic()
+                    try:
+                        parsed_c = parse_acceptance_criteria(acceptance_spec)
+                        all_c_targets = [c.get("target", "") for c in parsed_c if c.get("target")]
+                        c_results = []
+                        by_target: Dict[str, List[Any]] = {}
+                        for c in parsed_c:
+                            vr = OutcomeVerifier.verify(check=c["check"], target=c["target"], expected=c.get("expected"))
+                            c_results.append((c, vr))
+                            norm_ct = canonicalize_target(c.get("target", ""), check_type=c.get("check")) if c.get("target") else ""
+                            if norm_ct:
+                                by_target.setdefault(norm_ct, []).append((c, vr))
+                            if str(c.get("check", "")).lower() in ("command_output", "command", "cmd") and c.get("target"):
+                                for ref_ft in extract_file_targets_from_text(str(c["target"])):
+                                    norm_ft = canonicalize_target(ref_ft)
+                                    if norm_ft:
+                                        by_target.setdefault(norm_ft, []).append(
+                                            ({"check": "file_exists", "target": ref_ft, "expected": c.get("expected")}, vr)
+                                        )
+                    finally:
+                        _ver_duration_ms = round((time.monotonic() - _ver_t0) * 1000.0, 3)
 
                     for norm_ct, items in by_target.items():
                         first_c = items[0][0]
@@ -4413,6 +4434,8 @@ class NativeOrchestrator:
                     failed_targets=failed_targets_for_obs,
                     verified_targets=verified_targets_for_obs,
                     structured_observation=structured_obs,
+                    duration_ms=_tool_duration_ms,
+                    verification_duration_ms=_ver_duration_ms,
                 )
                 if active_tg_step is not None and bound_tg_nodes:
                     for gn in bound_tg_nodes:
@@ -5110,6 +5133,7 @@ class NativeOrchestrator:
             did_dispatch = True
 
             raw_res: Any = None
+            _node_tool_t0 = time.monotonic()
             with authorized_policy_context(pol_dec_node), execution_scope(
                 central_ledger,
                 eff_exec_id,
@@ -5161,6 +5185,7 @@ class NativeOrchestrator:
                             raw_res = await asyncio.wait_for(coro, timeout=node_timeout)
                         else:
                             raw_res = coro
+            _node_tool_duration_ms = round((time.monotonic() - _node_tool_t0) * 1000.0, 3)
 
             # Normalize tool output payload
             if raw_res is not None and hasattr(raw_res, "success") and not isinstance(raw_res, dict):
@@ -5241,18 +5266,23 @@ class NativeOrchestrator:
             verified_targets_for_obs: List[str] = []
             failed_targets_for_obs: List[str] = []
             verification_detail: Optional[str] = None
+            _node_ver_duration_ms: Optional[float] = None
 
             if not is_failed:
                 if applicable_criteria:
                     v_fn = verifier_fn or OutcomeVerifier.verify
                     c_results = []
-                    for crit in applicable_criteria:
-                        vr = v_fn(
-                            check=crit["check"],
-                            target=crit["target"],
-                            expected=crit.get("expected"),
-                        )
-                        c_results.append((crit, vr))
+                    _node_ver_t0 = time.monotonic()
+                    try:
+                        for crit in applicable_criteria:
+                            vr = v_fn(
+                                check=crit["check"],
+                                target=crit["target"],
+                                expected=crit.get("expected"),
+                            )
+                            c_results.append((crit, vr))
+                    finally:
+                        _node_ver_duration_ms = round((time.monotonic() - _node_ver_t0) * 1000.0, 3)
                     failed_c = [
                         (c, r) for c, r in c_results if not getattr(r, "success", False)
                     ]
@@ -5342,6 +5372,8 @@ class NativeOrchestrator:
                 failed_targets=failed_targets_for_obs,
                 verified_targets=verified_targets_for_obs,
                 structured_observation=structured_obs,
+                duration_ms=_node_tool_duration_ms,
+                verification_duration_ms=_node_ver_duration_ms,
             )
             return {
                 "node_id": node_id,
@@ -5376,6 +5408,7 @@ class NativeOrchestrator:
                 error=timeout_err,
                 verified=False,
                 structured_observation=structured_obs,
+                duration_ms=round((time.monotonic() - _node_tool_t0) * 1000.0, 3),
             )
             return {"node_id": node_id, "call_id": call_id, "status": "timed_out", "error": timeout_err}
         except asyncio.CancelledError:
@@ -5814,6 +5847,8 @@ class NativeOrchestrator:
                 ]
 
                 if executed_steps < eff_max_steps and len(active_tasks) < eff_max_conc and ready_nodes:
+                    if hasattr(eff_ledger, "record_orchestration_step"):
+                        eff_ledger.record_orchestration_step()
                     dispatch_failed_ids: List[str] = []
                     now_loop = time.time()
                     for node in ready_nodes:
@@ -6195,6 +6230,11 @@ class NativeOrchestrator:
                 fin_exec_status = ExecutionStatus.INTERRUPTED if was_cancelled else ExecutionStatus.FAILED
                 fin_ver_status = VerificationStatus.NOT_VERIFIED
 
+            try:
+                if hasattr(eff_ledger, "flush_observability_metrics"):
+                    eff_ledger.flush_observability_metrics()
+            except Exception:
+                pass
             _capture_cp(fin_exec_status)
             if finalize_execution:
                 eff_central.finalize_execution(

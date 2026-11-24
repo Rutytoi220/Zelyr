@@ -100,6 +100,12 @@ from zelyr.engine.diagnostics import (
     diagnose_execution_lifecycle,
     format_execution_lifecycle_report,
 )
+from zelyr.engine.observability import (
+    ExecutionMetricsReport,
+    collect_execution_metrics,
+    collect_fleet_observability,
+    format_observability_summary,
+)
 from zelyr.engine.execution_policy import (
     POLICY_VERSION,
     SUPPORTED_POLICY_MODES,
@@ -157,8 +163,12 @@ __all__ = [
     "ExecutionContextToken",
     "ExecutionLifecycleDiagnostics",
     "ExecutionLifecycleReport",
+    "ExecutionMetricsReport",
+    "collect_execution_metrics",
+    "collect_fleet_observability",
     "diagnose_execution_lifecycle",
     "format_execution_lifecycle_report",
+    "format_observability_summary",
     "ExecutionEvent",
     "ExecutionIsolationError",
     "ExecutionRecord",
