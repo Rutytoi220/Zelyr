@@ -1233,12 +1233,30 @@ def cmd_env(args: argparse.Namespace) -> None:
         probe_timeout=probe_timeout,
         refresh=refresh,
     )
+    compat_report = None
+    if getattr(args, "model_check", False):
+        from zelyr.engine.model_compatibility import (
+            check_model_compatibility,
+            format_model_compatibility_report,
+        )
+
+        compat_report = check_model_compatibility(
+            probe=probe_services,
+            timeout=probe_timeout,
+        )
+        if isinstance(manifest, dict):
+            manifest = dict(manifest)
+            manifest["model_compatibility"] = compat_report.to_dict()
+
     if getattr(args, "json", False):
         print(json.dumps(manifest, indent=2))
         return
 
     report = RuntimeEnvironmentManifest.format_diagnostic_report(manifest)
     print(report)
+    if compat_report is not None:
+        print()
+        print(format_model_compatibility_report(compat_report))
 
 
 def _open_cli_ledger(db_path: Optional[str]) -> tuple[Any, bool]:
@@ -1764,6 +1782,39 @@ def cmd_config(args: argparse.Namespace) -> None:
     if report.parse_error or not report.valid:
         sys.exit(1)
     if strict and (report.validation_issues or report.unknown_keys):
+        sys.exit(1)
+
+
+def cmd_model(args: argparse.Namespace) -> None:
+    """Assess model and provider compatibility for a Zelyr workflow."""
+    from zelyr.engine.environment import CapabilityStatus
+    from zelyr.engine.model_compatibility import (
+        check_model_compatibility,
+        format_model_compatibility_report,
+    )
+
+    try:
+        report = check_model_compatibility(
+            model=getattr(args, "model", None),
+            base_url=getattr(args, "base_url", None),
+            workflow=str(getattr(args, "workflow", None) or "planned_graph"),
+            probe=not bool(getattr(args, "no_probe", False)),
+            timeout=float(getattr(args, "timeout", 2.0) or 2.0),
+        )
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if getattr(args, "json", False):
+        print(json.dumps(report.to_dict(), indent=2))
+    else:
+        print(format_model_compatibility_report(report))
+
+    if report.overall_status == CapabilityStatus.UNAVAILABLE.value or report.workflow_compatible is False:
+        sys.exit(1)
+    if getattr(args, "strict", False) and (
+        report.overall_status != CapabilityStatus.AVAILABLE.value or report.workflow_compatible is not True
+    ):
         sys.exit(1)
 
 
@@ -2712,6 +2763,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Force-refresh cached manifest state",
     )
+    p_env.add_argument(
+        "--model-check",
+        action="store_true",
+        default=False,
+        help="Include honest model/provider compatibility diagnostics in the manifest",
+    )
 
     p_execs = sub.add_parser(
         "executions",
@@ -2805,6 +2862,28 @@ def _build_parser() -> argparse.ArgumentParser:
     p_config.add_argument("--config-path", type=str, default=None, help="Inspect an explicit config JSON file")
     p_config.add_argument("--strict", action="store_true", default=False, help="Exit non-zero on warnings or unknown keys")
     p_config.add_argument("--json", action="store_true", default=False, help="Output structured JSON")
+
+    p_model = sub.add_parser(
+        "model",
+        help="Inspect model and provider compatibility for Zelyr workflows",
+    )
+    model_sub = p_model.add_subparsers(dest="model_cmd")
+    p_model_check = model_sub.add_parser(
+        "check",
+        help="Assess model capabilities, context window, and workflow readiness",
+    )
+    p_model_check.add_argument("--model", type=str, default=None, help="Model name to assess (defaults to configured model)")
+    p_model_check.add_argument("--base-url", type=str, default=None, help="Provider endpoint URL override")
+    p_model_check.add_argument(
+        "--workflow",
+        choices=["planned_graph", "react_tools", "chat", "vision"],
+        default="planned_graph",
+        help="Target Zelyr workflow to evaluate (default: planned_graph)",
+    )
+    p_model_check.add_argument("--no-probe", action="store_true", default=False, help="Skip live HTTP probes (honestly report unknown)")
+    p_model_check.add_argument("--timeout", type=float, default=2.0, help="HTTP probe timeout in seconds (default: 2.0)")
+    p_model_check.add_argument("--strict", action="store_true", default=False, help="Exit non-zero unless status is available and workflow_compatible is true")
+    p_model_check.add_argument("--json", action="store_true", default=False, help="Output structured JSON")
 
     p_cp = sub.add_parser(
         "checkpoint",
@@ -3049,6 +3128,11 @@ def main() -> None:
             cmd_policy(args)
         else:
             parser.parse_args(["policy", "--help"])
+    elif args.command == "model":
+        if getattr(args, "model_cmd", None) == "check":
+            cmd_model(args)
+        else:
+            parser.parse_args(["model", "--help"])
     elif args.command in dispatch:
         if args.command == "eval":
             cmd_eval(args, extra)

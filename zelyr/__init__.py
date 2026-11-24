@@ -92,6 +92,9 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "ExecutionLifecycleDiagnostics": ("zelyr.engine.diagnostics", "ExecutionLifecycleDiagnostics"),
     "ExecutionLifecycleReport": ("zelyr.engine.diagnostics", "ExecutionLifecycleReport"),
     "ExecutionMetricsReport": ("zelyr.engine.observability", "ExecutionMetricsReport"),
+    "ModelCompatibilityDiagnostics": ("zelyr.engine.model_compatibility", "ModelCompatibilityDiagnostics"),
+    "ModelCompatibilityReport": ("zelyr.engine.model_compatibility", "ModelCompatibilityReport"),
+    "check_model_compatibility": ("zelyr.engine.model_compatibility", "check_model_compatibility"),
     "collect_execution_metrics": ("zelyr.engine.observability", "collect_execution_metrics"),
     "collect_fleet_observability": ("zelyr.engine.observability", "collect_fleet_observability"),
     "diagnose_execution_lifecycle": ("zelyr.engine.diagnostics", "diagnose_execution_lifecycle"),
@@ -186,6 +189,10 @@ __all__ = [
     "RiskClassifier",
     "RiskLevel",
     "UnsupportedPolicyVersionError",
+    # Model Compatibility
+    "ModelCompatibilityDiagnostics",
+    "ModelCompatibilityReport",
+    "check_model_compatibility",
     # Agents
     "BaseAgent",
     "AgentResult",

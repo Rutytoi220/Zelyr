@@ -100,6 +100,12 @@ from zelyr.engine.config_diagnostics import (
     diagnose_configuration,
     format_configuration_diagnostics,
 )
+from zelyr.engine.model_compatibility import (
+    ModelCompatibilityDiagnostics,
+    ModelCompatibilityReport,
+    check_model_compatibility,
+    format_model_compatibility_report,
+)
 from zelyr.engine.diagnostics import (
     ExecutionLifecycleDiagnostics,
     ExecutionLifecycleReport,
@@ -172,12 +178,16 @@ __all__ = [
     "ExecutionLifecycleDiagnostics",
     "ExecutionLifecycleReport",
     "ExecutionMetricsReport",
+    "ModelCompatibilityDiagnostics",
+    "ModelCompatibilityReport",
+    "check_model_compatibility",
     "collect_execution_metrics",
     "collect_fleet_observability",
     "diagnose_configuration",
     "diagnose_execution_lifecycle",
     "format_configuration_diagnostics",
     "format_execution_lifecycle_report",
+    "format_model_compatibility_report",
     "format_observability_summary",
     "ExecutionEvent",
     "ExecutionIsolationError",
