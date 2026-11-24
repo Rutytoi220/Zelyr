@@ -94,6 +94,12 @@ from zelyr.engine.recovery import (
     build_graph_recovery_overview,
     validate_recovery_state_dict,
 )
+from zelyr.engine.config_diagnostics import (
+    ConfigurationDiagnosticReport,
+    ConfigurationDiagnostics,
+    diagnose_configuration,
+    format_configuration_diagnostics,
+)
 from zelyr.engine.diagnostics import (
     ExecutionLifecycleDiagnostics,
     ExecutionLifecycleReport,
@@ -161,12 +167,16 @@ __all__ = [
     "ProposalStatus",
     "VALID_PROPOSAL_TRANSITIONS",
     "ExecutionContextToken",
+    "ConfigurationDiagnosticReport",
+    "ConfigurationDiagnostics",
     "ExecutionLifecycleDiagnostics",
     "ExecutionLifecycleReport",
     "ExecutionMetricsReport",
     "collect_execution_metrics",
     "collect_fleet_observability",
+    "diagnose_configuration",
     "diagnose_execution_lifecycle",
+    "format_configuration_diagnostics",
     "format_execution_lifecycle_report",
     "format_observability_summary",
     "ExecutionEvent",

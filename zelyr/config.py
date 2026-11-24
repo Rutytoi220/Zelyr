@@ -170,16 +170,29 @@ Returns:
     execution_policy_max_confirmation_lifetime_seconds: float = 900.0
     _explicit_fields: set[str] = field(default_factory=set, repr=False, compare=False)
     _config_source_path: Optional[str] = field(default=None, repr=False, compare=False)
+    _unknown_keys: list[str] = field(default_factory=list, repr=False, compare=False)
+    _migrated_keys: list[str] = field(default_factory=list, repr=False, compare=False)
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> 'ZelyrConfig':
         """Create config from dictionary."""
+        legacy_migration_keys = {'persona_tone', 'persona_complexity', 'special_instructions'}
         filtered = {
             k: v
             for k, v in config_dict.items()
             if k in cls.__dataclass_fields__ and not str(k).startswith("_")
         }
         explicit_fields = set(filtered.keys())
+        unknown_keys = sorted(
+            str(k)
+            for k in config_dict.keys()
+            if k not in cls.__dataclass_fields__
+            and not str(k).startswith("_")
+            and k not in legacy_migration_keys
+        )
+        migrated_keys = sorted(
+            str(k) for k in config_dict.keys() if k in legacy_migration_keys
+        )
         
         # Migrate legacy loose persona strings to new dict structure
         if 'persona' not in filtered:
@@ -232,6 +245,8 @@ Returns:
             except (TypeError, ValueError):
                 filtered['execution_policy_max_confirmation_lifetime_seconds'] = 900.0
         filtered['_explicit_fields'] = explicit_fields
+        filtered['_unknown_keys'] = unknown_keys
+        filtered['_migrated_keys'] = migrated_keys
         return cls(**filtered)
 
     def to_dict(self) -> dict:

@@ -1745,6 +1745,28 @@ def cmd_metrics(args: argparse.Namespace) -> None:
             ledger.close()
 
 
+def cmd_config(args: argparse.Namespace) -> None:
+    """Inspect and validate effective Zelyr configuration, sources, unknown keys, and ranges."""
+    from zelyr.engine.config_diagnostics import (
+        diagnose_configuration,
+        format_configuration_diagnostics,
+    )
+
+    report = diagnose_configuration(config_path=getattr(args, "config_path", None))
+    subcmd = getattr(args, "config_cmd", None) or "show"
+    strict = bool(getattr(args, "strict", False)) or (subcmd == "validate")
+
+    if getattr(args, "json", False):
+        print(json.dumps(report.to_dict(), indent=2))
+    else:
+        print(format_configuration_diagnostics(report))
+
+    if report.parse_error or not report.valid:
+        sys.exit(1)
+    if strict and (report.validation_issues or report.unknown_keys):
+        sys.exit(1)
+
+
 def _print_task_graph_view(assessment: Any, *, empty_notice: Optional[str] = None) -> None:
     """Render readable dependency-aware task graph summary, nodes, edges, and blockers."""
     tg = getattr(assessment, "task_graph", None)
@@ -2767,6 +2789,23 @@ def _build_parser() -> argparse.ArgumentParser:
     p_metrics.add_argument("--json", action="store_true", default=False, help="Output structured JSON metrics")
     p_metrics.add_argument("--db-path", type=str, default=None, help="Override execution ledger SQLite DB path")
 
+    p_config = sub.add_parser(
+        "config",
+        help="Inspect and validate configuration provenance, types, ranges, and unknown keys",
+    )
+    config_sub = p_config.add_subparsers(dest="config_cmd")
+    for cfg_sub_name, cfg_help in (
+        ("show", "Show effective configuration settings and sources"),
+        ("validate", "Validate configuration types, bounds, unknown keys, and divergence"),
+    ):
+        p_cfg_sub = config_sub.add_parser(cfg_sub_name, help=cfg_help)
+        p_cfg_sub.add_argument("--config-path", type=str, default=None, help="Inspect an explicit config JSON file")
+        p_cfg_sub.add_argument("--strict", action="store_true", default=False, help="Exit non-zero on warnings or unknown keys")
+        p_cfg_sub.add_argument("--json", action="store_true", default=False, help="Output structured JSON")
+    p_config.add_argument("--config-path", type=str, default=None, help="Inspect an explicit config JSON file")
+    p_config.add_argument("--strict", action="store_true", default=False, help="Exit non-zero on warnings or unknown keys")
+    p_config.add_argument("--json", action="store_true", default=False, help="Output structured JSON")
+
     p_cp = sub.add_parser(
         "checkpoint",
         help="List, inspect, or abandon task continuity checkpoints",
@@ -2983,6 +3022,7 @@ def main() -> None:
         "diagnose":      cmd_diagnose,
         "metrics":       cmd_metrics,
         "observability": cmd_metrics,
+        "config":        cmd_config,
         "checkpoint": cmd_checkpoint,
         "resume":     cmd_resume,
         "test":     cmd_test,
