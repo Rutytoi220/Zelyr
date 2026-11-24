@@ -59,6 +59,7 @@ COMMANDS = {
     "/rules": "Display active global and local project instructions",
     "/env": "Inspect the structured runtime environment and capability manifest",
     "/policy": "Inspect policy config, explain a tool decision, or view policy history (/policy show|explain <tool>|history)",
+    "/diagnose": "Run read-only lifecycle diagnostics for an execution ID (/diagnose <execution_id> [--json])",
     "/status": "Display live system, bridge, desktop, and tool telemetry",
     "/doctor": "Run diagnostic health checks across all 6 subsystems",
     "/undo": "Rollback the last modified file to its previous state",
@@ -826,6 +827,55 @@ class InlineRepl:
                 return True
 
             console.print("[label]Usage:[/label] /policy <show|explain <tool_id> [json_args]|history> [--json]\n")
+            return True
+
+        elif cmd == "/diagnose":
+            from zelyr.engine.diagnostics import (
+                diagnose_execution_lifecycle,
+                format_execution_lifecycle_report,
+            )
+            from zelyr.engine.execution_ledger import get_default_central_ledger
+
+            arg_toks = [t for t in parts[1:] if t.lower() not in ("--json", "--verify")]
+            want_json = "--json" in {t.lower() for t in parts[1:]}
+            verify_live = "--verify" in {t.lower() for t in parts[1:]}
+            if not arg_toks:
+                console.print("[label]Usage:[/label] /diagnose <execution_id> [--verify] [--json]\n")
+                return True
+
+            exec_query = arg_toks[0]
+            orch = getattr(self, "orchestrator", None)
+            ledger = getattr(orch, "central_ledger", None) if orch is not None else None
+            if ledger is None:
+                ledger = get_default_central_ledger()
+            record, matches = ledger.find_execution_by_prefix(exec_query)
+            if record is None:
+                msg = (
+                    f"Ambiguous execution ID prefix '{exec_query}': matched {', '.join(matches[:5])}"
+                    if len(matches) > 1
+                    else f"Execution '{exec_query}' not found."
+                )
+                console.print(f"[#f7768e]{msg}[/#f7768e]\n")
+                return True
+
+            tool_reg = getattr(orch, "tool_registry", None) if verify_live and orch is not None else None
+            report = diagnose_execution_lifecycle(
+                ledger,
+                record.execution_id,
+                verify_outcomes=verify_live,
+                tool_registry=tool_reg,
+            )
+            if want_json:
+                console.print(json.dumps(report.to_dict(), indent=2))
+            else:
+                console.print(
+                    Panel(
+                        format_execution_lifecycle_report(report),
+                        title=f"[title]Execution Lifecycle Diagnostic ({record.execution_id})[/title]",
+                        border_style="#7aa2f7",
+                        padding=(1, 2),
+                    )
+                )
             return True
 
         elif cmd == "/status":

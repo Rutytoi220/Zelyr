@@ -94,6 +94,12 @@ from zelyr.engine.recovery import (
     build_graph_recovery_overview,
     validate_recovery_state_dict,
 )
+from zelyr.engine.diagnostics import (
+    ExecutionLifecycleDiagnostics,
+    ExecutionLifecycleReport,
+    diagnose_execution_lifecycle,
+    format_execution_lifecycle_report,
+)
 from zelyr.engine.execution_policy import (
     POLICY_VERSION,
     SUPPORTED_POLICY_MODES,
@@ -149,6 +155,10 @@ __all__ = [
     "ProposalStatus",
     "VALID_PROPOSAL_TRANSITIONS",
     "ExecutionContextToken",
+    "ExecutionLifecycleDiagnostics",
+    "ExecutionLifecycleReport",
+    "diagnose_execution_lifecycle",
+    "format_execution_lifecycle_report",
     "ExecutionEvent",
     "ExecutionIsolationError",
     "ExecutionRecord",

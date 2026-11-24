@@ -1534,6 +1534,15 @@ def cmd_execution(args: argparse.Namespace) -> None:
                 _print_task_graph_view(assess_g, empty_notice=f"No task dependency graph recorded for execution '{record.execution_id}'.")
             return
 
+        if getattr(args, "diagnose", False):
+            _print_execution_diagnostics(
+                ledger,
+                record.execution_id,
+                verify=bool(getattr(args, "verify", False)),
+                output_json=bool(getattr(args, "json", False)),
+            )
+            return
+
         if getattr(args, "checkpoint", False):
             _print_checkpoint_assessment(ledger, record.execution_id, output_json=bool(getattr(args, "json", False)))
             return
@@ -1603,6 +1612,74 @@ def cmd_execution(args: argparse.Namespace) -> None:
                 f"  #{ev['sequence_number']:03d} [{t_str}] {ev['event_type']} "
                 f"status={ev['status']}{tool_part}{ext_tag}{flag_str}"
             )
+    finally:
+        if owns_conn:
+            ledger.close()
+
+
+def _print_execution_diagnostics(
+    ledger: Any,
+    execution_id: str,
+    *,
+    verify: bool = False,
+    output_json: bool = False,
+) -> None:
+    """Render read-only end-to-end execution lifecycle diagnostics in JSON or text form."""
+    from zelyr.engine.diagnostics import (
+        diagnose_execution_lifecycle,
+        format_execution_lifecycle_report,
+    )
+
+    tool_reg = None
+    if verify:
+        from zelyr.tool_registry import ToolRegistry
+
+        tool_reg = ToolRegistry()
+
+    report = diagnose_execution_lifecycle(
+        ledger,
+        execution_id,
+        verify_outcomes=verify,
+        tool_registry=tool_reg,
+    )
+    if output_json:
+        print(json.dumps(report.to_dict(), indent=2))
+        if report.persistence_errors or not report.found:
+            sys.exit(1)
+        return
+    print(format_execution_lifecycle_report(report))
+    if report.persistence_errors or not report.found:
+        sys.exit(1)
+
+
+def cmd_diagnose(args: argparse.Namespace) -> None:
+    """Run read-only end-to-end execution lifecycle diagnostics for an execution ID or prefix."""
+    exec_query = getattr(args, "execution_id", "")
+    ledger, owns_conn = _open_cli_ledger(getattr(args, "db_path", None))
+    try:
+        record, matches = ledger.find_execution_by_prefix(exec_query)
+        if record is None:
+            perrs = ledger.get_persistence_errors() if hasattr(ledger, "get_persistence_errors") else []
+            msg = (
+                f"Ambiguous execution ID prefix '{exec_query}': matched {', '.join(matches[:5])}"
+                if len(matches) > 1
+                else f"Execution '{exec_query}' not found."
+            )
+            if perrs:
+                msg = f"{msg} (persistence error: {perrs[-1].get('error', 'database error')})"
+            if getattr(args, "json", False):
+                print(json.dumps({"found": False, "execution_id": exec_query, "error": msg, "persistence_errors": perrs}, indent=2))
+            else:
+                sys.stderr.write(msg + "\n")
+                sys.stderr.flush()
+            sys.exit(1)
+
+        _print_execution_diagnostics(
+            ledger,
+            record.execution_id,
+            verify=bool(getattr(args, "verify", False)),
+            output_json=bool(getattr(args, "json", False)),
+        )
     finally:
         if owns_conn:
             ledger.close()
@@ -2590,8 +2667,29 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Display dependency-aware task graph, node states, and blockers",
     )
+    p_exec.add_argument(
+        "--diagnose",
+        action="store_true",
+        default=False,
+        help="Display unified end-to-end execution lifecycle diagnostics",
+    )
+    p_exec.add_argument(
+        "--verify",
+        action="store_true",
+        default=False,
+        help="Reconcile live OutcomeVerifier checks when running --diagnose",
+    )
     p_exec.add_argument("--json", action="store_true", default=False, help="Output structured JSON summary")
     p_exec.add_argument("--db-path", type=str, default=None, help="Override execution ledger SQLite DB path")
+
+    p_diag = sub.add_parser(
+        "diagnose",
+        help="Run read-only end-to-end lifecycle diagnostics for an execution",
+    )
+    p_diag.add_argument("execution_id", type=str, help="Execution ID or unique prefix to diagnose")
+    p_diag.add_argument("--verify", action="store_true", default=False, help="Reconcile live OutcomeVerifier checks (read-only)")
+    p_diag.add_argument("--json", action="store_true", default=False, help="Output structured JSON diagnostic report")
+    p_diag.add_argument("--db-path", type=str, default=None, help="Override execution ledger SQLite DB path")
 
     p_cp = sub.add_parser(
         "checkpoint",
@@ -2806,6 +2904,7 @@ def main() -> None:
         "manifest": cmd_env,
         "executions": cmd_executions,
         "execution":  cmd_execution,
+        "diagnose":   cmd_diagnose,
         "checkpoint": cmd_checkpoint,
         "resume":     cmd_resume,
         "test":     cmd_test,
