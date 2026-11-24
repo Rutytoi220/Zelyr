@@ -319,9 +319,34 @@ class SomClickTool(BaseTool):
                 error="Error: Mouse automation is not supported on this specific Wayland compositor. Do not attempt to click again.",
             )
 
+        from zelyr.engine.execution_policy import (
+            authorized_policy_context,
+            evaluate_direct_tool_policy,
+        )
+
+        pol_dec = evaluate_direct_tool_policy(
+            self.tool_id,
+            {"tag": tag, "button": button, "clicks": clicks},
+            tool_obj=self,
+            schema=self.schema if hasattr(self, "schema") else None,
+            required_ring=getattr(self, "required_ring", 0),
+            is_registered=True,
+            source_surface="som_tools.click_tag",
+        )
+        if not pol_dec.allowed:
+            err_p = pol_dec.to_tool_error_payload()
+            return ToolResult(
+                success=False,
+                output=err_p,
+                error=pol_dec.reason,
+                error_type=err_p["error_type"],
+                metadata={"policy_decision": pol_dec.to_safe_dict()},
+            )
+
         # ── Perform the click ─────────────────────────────────────────────────
         try:
-            controller.click(x, y, button, clicks)
+            with authorized_policy_context(pol_dec):
+                controller.click(x, y, button, clicks)
         except Exception as exc:
             logger.error("SomClickTool: click failed at (%d, %d): %s", x, y, exc)
             return ToolResult(
@@ -372,9 +397,34 @@ class SomTypeTool(BaseTool):
                 success=False,
                 error="Error: Keyboard automation is not supported on this specific Wayland compositor. Do not attempt to type again."
             )
-            
+
+        from zelyr.engine.execution_policy import (
+            authorized_policy_context,
+            evaluate_direct_tool_policy,
+        )
+
+        pol_dec = evaluate_direct_tool_policy(
+            self.tool_id,
+            {"text": text},
+            tool_obj=self,
+            schema=self.schema if hasattr(self, "schema") else None,
+            required_ring=getattr(self, "required_ring", 0),
+            is_registered=True,
+            source_surface="som_tools.type_text",
+        )
+        if not pol_dec.allowed:
+            err_p = pol_dec.to_tool_error_payload()
+            return ToolResult(
+                success=False,
+                output=err_p,
+                error=pol_dec.reason,
+                error_type=err_p["error_type"],
+                metadata={"policy_decision": pol_dec.to_safe_dict()},
+            )
+
         try:
-            controller.type_text(text)
+            with authorized_policy_context(pol_dec):
+                controller.type_text(text)
             return ToolResult(
                 success=True,
                 output=f"Successfully typed: '{text}'"
@@ -414,9 +464,34 @@ class SomKeyTool(BaseTool):
                 success=False,
                 error="Error: Keyboard automation is not supported on this specific Wayland compositor. Do not attempt to press keys again."
             )
-            
+
+        from zelyr.engine.execution_policy import (
+            authorized_policy_context,
+            evaluate_direct_tool_policy,
+        )
+
+        pol_dec = evaluate_direct_tool_policy(
+            self.tool_id,
+            {"key": key},
+            tool_obj=self,
+            schema=self.schema if hasattr(self, "schema") else None,
+            required_ring=getattr(self, "required_ring", 0),
+            is_registered=True,
+            source_surface="som_tools.press_key",
+        )
+        if not pol_dec.allowed:
+            err_p = pol_dec.to_tool_error_payload()
+            return ToolResult(
+                success=False,
+                output=err_p,
+                error=pol_dec.reason,
+                error_type=err_p["error_type"],
+                metadata={"policy_decision": pol_dec.to_safe_dict()},
+            )
+
         try:
-            controller.press_key(key)
+            with authorized_policy_context(pol_dec):
+                controller.press_key(key)
             return ToolResult(
                 success=True,
                 output=f"Successfully pressed key: '{key}'"

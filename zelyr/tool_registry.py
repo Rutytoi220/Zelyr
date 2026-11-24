@@ -443,6 +443,7 @@ def resolve_tool_ring(
     tool: Optional[Any] = None,
     tool_registry: Optional[Any] = None,
     active_schemas: Optional[List[Dict[str, Any]]] = None,
+    task_local_scope: Optional[Any] = None,
 ) -> Optional[int]:
     """Resolve explicit integer security ring [0, 3], or return None on unknown/invalid ring.
 
@@ -450,6 +451,15 @@ def resolve_tool_ring(
     fail closed on lookup failures.
     """
     import sys
+
+    if task_local_scope is not None:
+        tl_rings = getattr(task_local_scope, "tool_rings", None)
+        if isinstance(tl_rings, dict) and tool_id in tl_rings:
+            raw_tl = tl_rings[tool_id]
+            return raw_tl if _is_valid_ring_value(raw_tl) else None
+        tl_schemas = getattr(task_local_scope, "tool_schemas", None)
+        if isinstance(tl_schemas, list) and active_schemas is None:
+            active_schemas = tl_schemas
 
     reg = tool_registry
     if reg is None:
@@ -1833,11 +1843,107 @@ Returns:
         except Exception:
             pass
 
+    def _evaluate_execution_policy(
+        self,
+        *,
+        tool_id: str,
+        tool: Any,
+        raw_arguments: Dict[str, Any],
+        normalized_arguments: Dict[str, Any],
+        caller_ring: Optional[int],
+        allowed_tools: Optional[Any],
+        tracker: Optional[Dict[str, Any]],
+        policy_engine: Optional[Any] = None,
+        policy_config: Optional[Any] = None,
+        zelyr_config: Optional[Any] = None,
+        confirmation_token: Optional[str] = None,
+        confirmation_id: Optional[str] = None,
+        execution_id: Optional[str] = None,
+        node_id: Optional[str] = None,
+        workspace_root: Optional[Any] = None,
+        confirm_callback: Optional[Any] = None,
+        source_surface: str = "tool_registry",
+    ) -> Any:
+        from zelyr.engine.execution_ledger import get_active_execution_context
+        from zelyr.engine.execution_policy import (
+            build_execution_policy_engine,
+            matches_active_policy_decision,
+        )
+
+        active_ctx = get_active_execution_context()
+        eff_exec_id = execution_id or (tracker["execution_id"] if tracker else None) or (
+            getattr(active_ctx, "execution_id", None) if active_ctx else None
+        )
+        eff_node_id = node_id or (getattr(active_ctx, "node_id", None) if active_ctx else None)
+        eff_central = (tracker["ledger"] if tracker else None) or (
+            getattr(active_ctx, "central_ledger", None) if active_ctx else None
+        )
+        eff_corr = (tracker["call_id"] if tracker else None) or (
+            getattr(active_ctx, "correlation_id", None) if active_ctx else None
+        )
+
+        existing = matches_active_policy_decision(
+            tool_id,
+            normalized_arguments,
+            workspace_root=workspace_root,
+            execution_id=eff_exec_id,
+            node_id=eff_node_id,
+        )
+        if existing is not None:
+            return existing
+
+        pol_engine = build_execution_policy_engine(
+            policy_engine=policy_engine,
+            policy_config=policy_config,
+            zelyr_config=zelyr_config,
+        )
+        ext_entry = self.get_external_tool_entry(tool_id)
+        ext_meta = dict(getattr(ext_entry, "metadata", None) or {}) if ext_entry is not None else None
+        schema = tool.to_openai_schema() if hasattr(tool, "to_openai_schema") else getattr(tool, "schema", None)
+        req_ring = resolve_tool_ring(tool_id, tool=tool, tool_registry=self)
+        is_ext = bool(ext_entry is not None or getattr(tool, "is_external", False) or str(tool_id).startswith("ext__"))
+        src_id = getattr(ext_entry, "source_id", None) if ext_entry is not None else getattr(tool, "source_id", None)
+        src_type = getattr(ext_entry, "source_type", None) if ext_entry is not None else getattr(tool, "source_type", None)
+
+        return pol_engine.evaluate(
+            tool_id,
+            raw_arguments,
+            normalized_arguments=normalized_arguments,
+            schema=schema,
+            tool_obj=tool,
+            required_ring=req_ring,
+            is_registered=True,
+            is_external=is_ext,
+            source_id=src_id,
+            source_type=src_type,
+            external_metadata=ext_meta,
+            workspace_root=workspace_root,
+            execution_id=eff_exec_id,
+            node_id=eff_node_id,
+            correlation_id=eff_corr,
+            confirmation_token=confirmation_token,
+            confirmation_id=confirmation_id,
+            consume_confirmation=True,
+            confirm_callback=confirm_callback,
+            source_surface=source_surface,
+            central_ledger=eff_central,
+        )
+
     def execute(
         self,
         tool_id: str,
         caller_ring: Optional[int] = None,
         allowed_tools: Optional[Any] = None,
+        *,
+        confirmation_token: Optional[str] = None,
+        confirmation_id: Optional[str] = None,
+        policy_engine: Optional[Any] = None,
+        policy_config: Optional[Any] = None,
+        zelyr_config: Optional[Any] = None,
+        execution_id: Optional[str] = None,
+        node_id: Optional[str] = None,
+        workspace_root: Optional[Any] = None,
+        confirm_callback: Optional[Any] = None,
         **arguments: Any,
     ) -> ToolResult:  # type: ignore[override]
         """Execute a registered tool safely, regardless of its calling convention."""
@@ -1846,6 +1952,7 @@ Returns:
         if allowed_tools is None and "allowed_tools" in arguments:
             allowed_tools = arguments.pop("allowed_tools")
 
+        raw_arguments = dict(arguments)
         tool_id, arguments = canonicalize_tool_invocation(tool_id, arguments)
         tracker = self._begin_standalone_ledger_call(tool_id, caller_ring, allowed_tools, arguments)
         tool = self.get_tool(tool_id)
@@ -1904,11 +2011,45 @@ Returns:
             self._finish_standalone_ledger_call(tracker, schema_error)
             return schema_error  # type: ignore[return-value]
         arguments = normalized_args
+
+        pol_dec = self._evaluate_execution_policy(
+            tool_id=tool_id,
+            tool=tool,
+            raw_arguments=raw_arguments,
+            normalized_arguments=arguments,
+            caller_ring=caller_ring,
+            allowed_tools=allowed_tools,
+            tracker=tracker,
+            policy_engine=policy_engine,
+            policy_config=policy_config,
+            zelyr_config=zelyr_config,
+            confirmation_token=confirmation_token,
+            confirmation_id=confirmation_id,
+            execution_id=execution_id,
+            node_id=node_id,
+            workspace_root=workspace_root,
+            confirm_callback=confirm_callback,
+            source_surface="tool_registry.execute",
+        )
+        if not pol_dec.allowed:
+            err_payload = pol_dec.to_tool_error_payload()
+            pol_res = ToolResult(
+                success=False,
+                output=err_payload,
+                error=pol_dec.reason,
+                error_type=err_payload["error_type"],
+                remedy_hint=pol_dec.remediation_hint or None,
+                metadata={"policy_decision": pol_dec.to_safe_dict()},
+            )
+            self._finish_standalone_ledger_call(tracker, pol_res, error_type=err_payload["error_type"])
+            return pol_res
+
         self._emit_tracker_stage(tracker, "ARGUMENT_VALIDATED", "valid", metadata={"arguments": arguments}, suffix="validated")
         self._emit_tracker_stage(tracker, "TOOL_EXECUTION_START", "started", metadata={"arguments": arguments}, suffix="started")
 
         from contextlib import nullcontext
         from zelyr.engine.execution_ledger import execution_scope
+        from zelyr.engine.execution_policy import authorized_policy_context
 
         scope_cm = (
             execution_scope(
@@ -1923,10 +2064,11 @@ Returns:
             else nullcontext(None)
         )
         try:
-            with scope_cm as call_ctx:
-                raw_res = tool(**arguments)
-                res = raw_res if isinstance(raw_res, ToolResult) else ToolResult(success=True, output=raw_res)
-                bag = getattr(call_ctx, "telemetry_bag", None)
+            with authorized_policy_context(pol_dec):
+                with scope_cm as call_ctx:
+                    raw_res = tool(**arguments)
+                    res = raw_res if isinstance(raw_res, ToolResult) else ToolResult(success=True, output=raw_res)
+                    bag = getattr(call_ctx, "telemetry_bag", None)
             self._finish_standalone_ledger_call(tracker, res, telemetry_bag=bag)
             return res
         except Exception as exc:
@@ -1954,6 +2096,16 @@ Returns:
         tool_id: str,
         caller_ring: Optional[int] = None,
         allowed_tools: Optional[Any] = None,
+        *,
+        confirmation_token: Optional[str] = None,
+        confirmation_id: Optional[str] = None,
+        policy_engine: Optional[Any] = None,
+        policy_config: Optional[Any] = None,
+        zelyr_config: Optional[Any] = None,
+        execution_id: Optional[str] = None,
+        node_id: Optional[str] = None,
+        workspace_root: Optional[Any] = None,
+        confirm_callback: Optional[Any] = None,
         **arguments: Any,
     ) -> ToolResult:
         """Async version of execute.
@@ -1965,6 +2117,7 @@ Returns:
         import inspect
         from contextlib import nullcontext
         from zelyr.engine.execution_ledger import execution_scope
+        from zelyr.engine.execution_policy import authorized_policy_context
         from zelyr.tools.core import ToolResult
 
         if caller_ring is None and "caller_ring" in arguments:
@@ -1972,6 +2125,7 @@ Returns:
         if allowed_tools is None and "allowed_tools" in arguments:
             allowed_tools = arguments.pop("allowed_tools")
 
+        raw_arguments = dict(arguments)
         tool_id, arguments = canonicalize_tool_invocation(tool_id, arguments)
         tracker = self._begin_standalone_ledger_call(tool_id, caller_ring, allowed_tools, arguments)
         tool = self.get_tool(tool_id)
@@ -2008,6 +2162,7 @@ Returns:
             return auth_error
         self._emit_tracker_stage(tracker, "AUTHORIZATION_DECISION", "allowed", metadata={"allowed_tools_scoped": allowed_tools is not None}, suffix="auth")
 
+        eff_confirm_cb = confirm_callback
         if getattr(tool, 'requires_approval', False):
             try:
                 from zelyr.services.governor import GovernorService
@@ -2023,6 +2178,8 @@ Returns:
                         self._emit_tracker_stage(tracker, "AUTHORIZATION_DECISION", "denied", metadata={"reason": "governor_denied"}, suffix="auth")
                         self._finish_standalone_ledger_call(tracker, res, error_type="AUTHORIZATION_DENIED")
                         return res
+                    if eff_confirm_cb is None:
+                        eff_confirm_cb = lambda _dec: True
             except Exception as e:
                 res = ToolResult(success=False, error=f"Governor failed: {e}")
                 self._finish_standalone_ledger_call(tracker, res)
@@ -2039,6 +2196,47 @@ Returns:
             self._finish_standalone_ledger_call(tracker, schema_error)
             return schema_error  # type: ignore[return-value]
         arguments = normalized_args
+
+        async def _eval_async_policy():
+            if eff_confirm_cb is not None and inspect.iscoroutinefunction(eff_confirm_cb):
+                res_cb = await eff_confirm_cb(tool_id)
+                resolved_cb = (lambda _d: bool(res_cb))
+            else:
+                resolved_cb = eff_confirm_cb
+            return self._evaluate_execution_policy(
+                tool_id=tool_id,
+                tool=tool,
+                raw_arguments=raw_arguments,
+                normalized_arguments=arguments,
+                caller_ring=caller_ring,
+                allowed_tools=allowed_tools,
+                tracker=tracker,
+                policy_engine=policy_engine,
+                policy_config=policy_config,
+                zelyr_config=zelyr_config,
+                confirmation_token=confirmation_token,
+                confirmation_id=confirmation_id,
+                execution_id=execution_id,
+                node_id=node_id,
+                workspace_root=workspace_root,
+                confirm_callback=resolved_cb,
+                source_surface="tool_registry.execute_async",
+            )
+
+        pol_dec = await _eval_async_policy()
+        if not pol_dec.allowed:
+            err_payload = pol_dec.to_tool_error_payload()
+            pol_res = ToolResult(
+                success=False,
+                output=err_payload,
+                error=pol_dec.reason,
+                error_type=err_payload["error_type"],
+                remedy_hint=pol_dec.remediation_hint or None,
+                metadata={"policy_decision": pol_dec.to_safe_dict()},
+            )
+            self._finish_standalone_ledger_call(tracker, pol_res, error_type=err_payload["error_type"])
+            return pol_res
+
         self._emit_tracker_stage(tracker, "ARGUMENT_VALIDATED", "valid", metadata={"arguments": arguments}, suffix="validated")
         self._emit_tracker_stage(tracker, "TOOL_EXECUTION_START", "started", metadata={"arguments": arguments}, suffix="started")
 
@@ -2055,18 +2253,19 @@ Returns:
             else nullcontext(None)
         )
         try:
-            with scope_cm as call_ctx:
-                sig = inspect.signature(tool.execute)
-                params_list = list(sig.parameters.values())
-                single_dict_param = len(params_list) == 1 and (params_list[0].annotation == Dict[str, Any] or params_list[0].name in ('params', 'arguments', 'kwargs'))
-                if single_dict_param:
-                    result = tool.execute(arguments)
-                else:
-                    result = tool.execute(**arguments)
-                if asyncio.iscoroutine(result):
-                    result = await result
-                res_obj = result if isinstance(result, ToolResult) else ToolResult(success=True, output=result)
-                bag = getattr(call_ctx, "telemetry_bag", None)
+            with authorized_policy_context(pol_dec):
+                with scope_cm as call_ctx:
+                    sig = inspect.signature(tool.execute)
+                    params_list = list(sig.parameters.values())
+                    single_dict_param = len(params_list) == 1 and (params_list[0].annotation == Dict[str, Any] or params_list[0].name in ('params', 'arguments', 'kwargs'))
+                    if single_dict_param:
+                        result = tool.execute(arguments)
+                    else:
+                        result = tool.execute(**arguments)
+                    if asyncio.iscoroutine(result):
+                        result = await result
+                    res_obj = result if isinstance(result, ToolResult) else ToolResult(success=True, output=result)
+                    bag = getattr(call_ctx, "telemetry_bag", None)
             self._finish_standalone_ledger_call(tracker, res_obj, telemetry_bag=bag)
             return result
         except Exception as exc:

@@ -3681,6 +3681,128 @@ class NativeOrchestrator:
                                 f"The call to '{func_name}' is blocked; do not retry it."
                             )
 
+                # Centralized Unified Execution Policy gate right before dispatch
+                pol_dec: Any = None
+                if rejection_reason is None:
+                    from zelyr.engine.execution_policy import (
+                        PolicyDecisionOutcome,
+                        UNTRUSTED_POLICY_OVERRIDE_KEYS,
+                        build_execution_policy_engine,
+                    )
+                    from zelyr.engine.normalizer import strict_json_loads
+                    from zelyr.tool_registry import resolve_tool_ring
+
+                    raw_tc_args: Any = func_args
+                    cand_raw = tc.get("arguments")
+                    if isinstance(cand_raw, dict):
+                        raw_tc_args = cand_raw
+                    elif isinstance(cand_raw, str) and cand_raw.strip():
+                        try:
+                            parsed_raw = strict_json_loads(cand_raw.strip())
+                            if isinstance(parsed_raw, dict):
+                                raw_tc_args = parsed_raw
+                        except Exception:
+                            raw_tc_args = func_args
+
+                    smuggled_pol = (
+                        [str(k) for k in raw_tc_args.keys() if str(k).strip() in UNTRUSTED_POLICY_OVERRIDE_KEYS]
+                        if isinstance(raw_tc_args, dict)
+                        else []
+                    )
+                    if smuggled_pol:
+                        rejection_reason = "policy_denied"
+                        rejection_detail = (
+                            f"Policy denied '{func_name}': untrusted authorization/policy keys "
+                            f"{sorted(set(smuggled_pol))} rejected."
+                        )
+                    else:
+                        pol_engine = build_execution_policy_engine(
+                            policy_engine=getattr(self, "execution_policy_engine", None),
+                            policy_config=getattr(self, "execution_policy_config", None),
+                            zelyr_config=self._active_config(),
+                            confirmation_store=getattr(self, "confirmation_store", None),
+                        )
+                        reg_tool_obj = (
+                            self.tool_registry.get_tool(func_name)
+                            if (self.tool_registry is not None and callable(getattr(self.tool_registry, "get_tool", None)))
+                            else None
+                        )
+                        ext_entry_pol = (
+                            self.tool_registry.get_external_tool_entry(func_name)
+                            if (self.tool_registry is not None and callable(getattr(self.tool_registry, "get_external_tool_entry", None)))
+                            else None
+                        )
+                        eff_schemas_pol = payload.get("tools") or []
+                        matched_pol_schema = next(
+                            (
+                                s
+                                for s in eff_schemas_pol
+                                if isinstance(s, dict) and (s.get("function") or {}).get("name") == func_name
+                            ),
+                            None,
+                        )
+                        req_ring_pol = resolve_tool_ring(
+                            func_name,
+                            tool=reg_tool_obj,
+                            tool_registry=self.tool_registry,
+                            active_schemas=eff_schemas_pol,
+                            task_local_scope=eff_task_local_scope if is_valid_task_scope else None,
+                        )
+                        is_ext_pol = bool(
+                            ext_entry_pol is not None
+                            or getattr(reg_tool_obj, "is_external", False)
+                            or str(func_name).startswith("ext__")
+                        )
+                        src_id_pol = (
+                            getattr(ext_entry_pol, "source_id", None)
+                            if ext_entry_pol is not None
+                            else getattr(reg_tool_obj, "source_id", None)
+                        )
+                        src_type_pol = (
+                            getattr(ext_entry_pol, "source_type", None)
+                            if ext_entry_pol is not None
+                            else getattr(reg_tool_obj, "source_type", None)
+                        )
+                        ext_meta_pol = (
+                            dict(getattr(ext_entry_pol, "metadata", None) or {})
+                            if ext_entry_pol is not None
+                            else None
+                        )
+                        pol_conf_map = getattr(self, "confirmation_tokens", None)
+                        pol_tok_pair = pol_conf_map.get(tool_call_id) if isinstance(pol_conf_map, dict) else None
+                        pol_tok = pol_tok_pair[0] if isinstance(pol_tok_pair, tuple) else (pol_tok_pair if isinstance(pol_tok_pair, str) else None)
+                        pol_cid = pol_tok_pair[1] if isinstance(pol_tok_pair, tuple) and len(pol_tok_pair) > 1 else None
+                        pol_dec = await pol_engine.evaluate_async(
+                            func_name,
+                            raw_tc_args,
+                            normalized_arguments=func_args,
+                            schema=matched_pol_schema,
+                            tool_obj=reg_tool_obj,
+                            required_ring=req_ring_pol,
+                            auth_decision=decision,
+                            is_registered=bool(decision.allowed),
+                            is_external=is_ext_pol,
+                            source_id=src_id_pol,
+                            source_type=src_type_pol,
+                            external_metadata=ext_meta_pol,
+                            workspace_root=getattr(self, "workspace_root", None),
+                            execution_id=getattr(eff_ledger, "_execution_id", None),
+                            correlation_id=tool_call_id,
+                            confirmation_token=pol_tok,
+                            confirmation_id=pol_cid,
+                            consume_confirmation=True,
+                            confirm_callback=getattr(self, "confirm_callback", None),
+                            source_surface="native_orchestrator.react",
+                            central_ledger=getattr(eff_ledger, "_central_ledger", None),
+                        )
+                        if not pol_dec.allowed:
+                            rejection_reason = (
+                                "confirmation_required"
+                                if pol_dec.outcome == PolicyDecisionOutcome.REQUIRE_CONFIRMATION
+                                else "policy_denied"
+                            )
+                            rejection_detail = pol_dec.reason
+
                 if rejection_reason is not None:
                     actual_step_count += 1
                     if actual_step_count >= eff_step_limit:
@@ -3799,6 +3921,13 @@ class NativeOrchestrator:
                 timeout_int = int(timeout)
                 from contextlib import nullcontext
                 from zelyr.engine.execution_ledger import execution_scope
+                from zelyr.engine.execution_policy import authorized_policy_context
+
+                policy_scope_cm = (
+                    authorized_policy_context(pol_dec)
+                    if (pol_dec is not None and pol_dec.allowed)
+                    else nullcontext(None)
+                )
 
                 ledger_scope_cm = (
                     execution_scope(
@@ -3818,7 +3947,7 @@ class NativeOrchestrator:
                 raw_tool_payload: Any = None
                 ext_src_for_frame: Optional[Dict[str, Any]] = None
                 try:
-                    with ledger_scope_cm as call_ctx:
+                    with policy_scope_cm, ledger_scope_cm as call_ctx:
                         if eff_tool_executor is not None:
                             with activate_task_local_scope(
                                 eff_task_local_scope if is_valid_task_scope else None
@@ -4543,6 +4672,11 @@ class NativeOrchestrator:
         parsed_criteria: List[Dict[str, Any]],
         node_timeout: float,
         verifier_fn: Optional[Callable[..., Any]] = None,
+        policy_engine: Optional[Any] = None,
+        policy_config: Optional[Any] = None,
+        confirm_callback: Optional[Callable[[Any], Any]] = None,
+        node_confirmation: Optional[Tuple[Optional[str], Optional[str]]] = None,
+        workspace_root: Optional[Union[str, Path]] = None,
     ) -> Dict[str, Any]:
         """Execute a single reserved TaskNode inside an isolated task-local & ledger execution scope."""
         from zelyr.engine.execution_ledger import (
@@ -4703,6 +4837,174 @@ class NativeOrchestrator:
             func_name = decision.tool_name
             func_args = dict(decision.normalized_arguments)
 
+            # Unified Execution Policy evaluation right after runtime auth & normalization
+            from zelyr.engine.execution_policy import (
+                PolicyDecisionOutcome,
+                UNTRUSTED_POLICY_OVERRIDE_KEYS,
+                authorized_policy_context,
+                build_execution_policy_engine,
+            )
+            from zelyr.tool_registry import resolve_tool_ring
+
+            raw_prop_args = proposal.get("arguments", func_args)
+            smuggled_node_pol = (
+                [str(k) for k in raw_prop_args.keys() if str(k).strip() in UNTRUSTED_POLICY_OVERRIDE_KEYS]
+                if isinstance(raw_prop_args, dict)
+                else []
+            )
+            eff_pol_engine = build_execution_policy_engine(
+                policy_engine=policy_engine or getattr(self, "execution_policy_engine", None),
+                policy_config=policy_config or getattr(self, "execution_policy_config", None),
+                zelyr_config=self._active_config(),
+                confirmation_store=getattr(self, "confirmation_store", None),
+            )
+            reg_tool_pol = (
+                self.tool_registry.get_tool(func_name)
+                if (self.tool_registry is not None and callable(getattr(self.tool_registry, "get_tool", None)))
+                else None
+            )
+            ext_entry_pol = (
+                self.tool_registry.get_external_tool_entry(func_name)
+                if (self.tool_registry is not None and callable(getattr(self.tool_registry, "get_external_tool_entry", None)))
+                else None
+            )
+            matched_node_schema = next(
+                (
+                    s
+                    for s in (auth_schemas or [])
+                    if isinstance(s, dict) and (s.get("function") or {}).get("name") == func_name
+                ),
+                None,
+            )
+            req_ring_node = resolve_tool_ring(
+                func_name,
+                tool=reg_tool_pol,
+                tool_registry=self.tool_registry,
+                active_schemas=auth_schemas,
+                task_local_scope=eff_task_local_scope,
+            )
+            is_ext_node = bool(
+                (ext_src and ext_src.get("is_external"))
+                or ext_entry_pol is not None
+                or getattr(reg_tool_pol, "is_external", False)
+                or str(func_name).startswith("ext__")
+            )
+            src_id_node = (
+                ext_src.get("source_id") if isinstance(ext_src, dict) and ext_src.get("source_id") else (
+                    getattr(ext_entry_pol, "source_id", None)
+                    if ext_entry_pol is not None
+                    else getattr(reg_tool_pol, "source_id", None)
+                )
+            )
+            src_type_node = (
+                ext_src.get("source_type") if isinstance(ext_src, dict) and ext_src.get("source_type") else (
+                    getattr(ext_entry_pol, "source_type", None)
+                    if ext_entry_pol is not None
+                    else getattr(reg_tool_pol, "source_type", None)
+                )
+            )
+            ext_meta_node = (
+                dict(getattr(ext_entry_pol, "metadata", None) or {})
+                if ext_entry_pol is not None
+                else None
+            )
+            conf_tok_node = node_confirmation[0] if isinstance(node_confirmation, tuple) and len(node_confirmation) > 0 else None
+            conf_id_node = node_confirmation[1] if isinstance(node_confirmation, tuple) and len(node_confirmation) > 1 else None
+
+            if smuggled_node_pol:
+                pol_dec_node = eff_pol_engine.evaluate(
+                    func_name,
+                    raw_prop_args if isinstance(raw_prop_args, dict) else func_args,
+                    normalized_arguments=func_args,
+                    schema=matched_node_schema,
+                    tool_obj=reg_tool_pol,
+                    required_ring=req_ring_node,
+                    auth_decision=decision,
+                    is_registered=True,
+                    is_external=is_ext_node,
+                    source_id=src_id_node,
+                    source_type=src_type_node,
+                    external_metadata=ext_meta_node,
+                    workspace_root=workspace_root or getattr(self, "workspace_root", None),
+                    node_target_resources=getattr(node_cur, "target_resources", ()),
+                    execution_id=eff_exec_id,
+                    node_id=node_id,
+                    correlation_id=call_id,
+                    source_surface="native_orchestrator.task_graph",
+                    central_ledger=central_ledger,
+                )
+            else:
+                pol_dec_node = await eff_pol_engine.evaluate_async(
+                    func_name,
+                    raw_prop_args if isinstance(raw_prop_args, dict) else func_args,
+                    normalized_arguments=func_args,
+                    schema=matched_node_schema,
+                    tool_obj=reg_tool_pol,
+                    required_ring=req_ring_node,
+                    auth_decision=decision,
+                    is_registered=True,
+                    is_external=is_ext_node,
+                    source_id=src_id_node,
+                    source_type=src_type_node,
+                    external_metadata=ext_meta_node,
+                    workspace_root=workspace_root or getattr(self, "workspace_root", None),
+                    node_target_resources=getattr(node_cur, "target_resources", ()),
+                    execution_id=eff_exec_id,
+                    node_id=node_id,
+                    correlation_id=call_id,
+                    confirmation_token=conf_tok_node,
+                    confirmation_id=conf_id_node,
+                    consume_confirmation=True,
+                    confirm_callback=confirm_callback or getattr(self, "confirm_callback", None),
+                    source_surface="native_orchestrator.task_graph",
+                    central_ledger=central_ledger,
+                )
+
+            if not pol_dec_node.allowed:
+                err_payload = pol_dec_node.to_tool_error_payload()
+                err_payload["status"] = "rejected"
+                err_payload["detail"] = pol_dec_node.reason
+                structured_obs = ObservationFramingEngine.frame_structured(
+                    func_name,
+                    err_payload,
+                    requested_tool=func_name,
+                    requested_args=func_args,
+                    executed_args=func_args,
+                    dispatched=False,
+                    execution_id=eff_exec_id,
+                    correlation_id=call_id,
+                    external_source=ext_src,
+                )
+                if turn_ledger.get_record(call_id) is None:
+                    turn_ledger.record_proposed(
+                        call_id,
+                        func_name,
+                        func_args,
+                        proposal_id=proposal["proposal_id"],
+                        depends_on=proposal.get("depends_on"),
+                        external_source=ext_src,
+                    )
+                turn_ledger.record_rejected(call_id, reason=pol_dec_node.reason)
+                turn_ledger.record_observation(
+                    call_id,
+                    status="rejected",
+                    output=json.dumps(err_payload),
+                    error=pol_dec_node.reason,
+                    rejection_reason=err_payload["reason"],
+                    structured_observation=structured_obs,
+                )
+                is_failed = True
+                return {
+                    "node_id": node_id,
+                    "call_id": call_id,
+                    "tool_name": func_name,
+                    "status": "rejected",
+                    "error": pol_dec_node.reason,
+                    "error_type": err_payload["error_type"],
+                    "policy_decision": pol_dec_node.to_safe_dict(),
+                    "dispatched": False,
+                }
+
             cur_rec = turn_ledger.get_record(call_id)
             if cur_rec is None:
                 turn_ledger.record_proposed(
@@ -4808,7 +5110,7 @@ class NativeOrchestrator:
             did_dispatch = True
 
             raw_res: Any = None
-            with execution_scope(
+            with authorized_policy_context(pol_dec_node), execution_scope(
                 central_ledger,
                 eff_exec_id,
                 caller_ring=eff_caller_ring,
@@ -5220,6 +5522,11 @@ class NativeOrchestrator:
         verifier_fn: Optional[Callable[..., Any]] = None,
         reconcile_on_recovery: bool = False,
         confirm_recovery: bool = False,
+        policy_engine: Optional[Any] = None,
+        policy_config: Optional[Any] = None,
+        confirm_callback: Optional[Callable[[Any], Any]] = None,
+        node_confirmations: Optional[Dict[str, Tuple[Optional[str], Optional[str]]]] = None,
+        workspace_root: Optional[Union[str, Path]] = None,
     ) -> Dict[str, Any]:
         """Execute READY independent nodes in a validated TaskGraph with bounded parallelism."""
         from zelyr.engine.checkpoint import CheckpointManager
@@ -5452,6 +5759,10 @@ class NativeOrchestrator:
                     caller_ring=eff_caller_ring,
                     allowed_tools=eff_allowed_tools,
                     task_local_scope=eff_task_local_scope,
+                    zelyr_config=self._active_config(),
+                    policy_engine=policy_engine or getattr(self, "execution_policy_engine", None),
+                    policy_config=policy_config or getattr(self, "execution_policy_config", None),
+                    workspace_root=workspace_root or getattr(self, "workspace_root", None),
                     acceptance_criteria=acceptance_criteria,
                     verifier_fn=verifier_fn,
                     reconcile_state=reconcile_on_recovery,
@@ -5795,6 +6106,11 @@ class NativeOrchestrator:
                             parsed_criteria=parsed_criteria,
                             node_timeout=eff_timeout,
                             verifier_fn=verifier_fn,
+                            policy_engine=policy_engine,
+                            policy_config=policy_config,
+                            confirm_callback=confirm_callback,
+                            node_confirmation=(node_confirmations.get(node.node_id) if isinstance(node_confirmations, dict) else None),
+                            workspace_root=workspace_root,
                         )
                         task = asyncio.create_task(worker_coro, name=f"graph_node_{node.node_id}_{owner_id}")
                         active_tasks[task] = (node.node_id, call_id, owner_id, rid)
@@ -6154,6 +6470,72 @@ class NativeOrchestrator:
             },
             idempotency_key=f"{eff_exec_id}:plan_confirm:allowed",
         )
+
+        # When plan execution was explicitly confirmed, issue per-node single-use bound
+        # ConfirmationRecords strictly in memory (never persisted on TaskGraph/checkpoints).
+        plan_node_confirmations: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+        if is_permitted and (eff_require_conf or confirmed is True or confirm_callback is not None):
+            from zelyr.engine.execution_policy import (
+                PolicyDecisionOutcome,
+                build_execution_policy_engine,
+            )
+
+            plan_pol_engine = build_execution_policy_engine(
+                policy_engine=getattr(self, "execution_policy_engine", None),
+                policy_config=getattr(self, "execution_policy_config", None),
+                zelyr_config=self._active_config(),
+                confirmation_store=getattr(self, "confirmation_store", None),
+            )
+            prop_by_id_plan = {p.proposal_id: p for p in (bundle.proposals or [])}
+            eff_plan_schemas = tool_schemas if tool_schemas is not None else getattr(self, "tool_schemas", None)
+            for gn in bundle.task_graph.nodes:
+                if not gn.proposal_ids:
+                    continue
+                gp = prop_by_id_plan.get(gn.proposal_ids[0])
+                if gp is None:
+                    continue
+                gp_schema = next(
+                    (
+                        s
+                        for s in (eff_plan_schemas or [])
+                        if isinstance(s, dict) and (s.get("function") or {}).get("name") == gp.tool_id
+                    ),
+                    None,
+                )
+                gp_tool_obj = (
+                    self.tool_registry.get_tool(gp.tool_id)
+                    if (self.tool_registry is not None and callable(getattr(self.tool_registry, "get_tool", None)))
+                    else None
+                )
+                pre_pol = plan_pol_engine.evaluate(
+                    gp.tool_id,
+                    gp.normalized_arguments,
+                    normalized_arguments=gp.normalized_arguments,
+                    schema=gp_schema,
+                    tool_obj=gp_tool_obj,
+                    workspace_root=workspace_root or getattr(self, "workspace_root", None),
+                    node_target_resources=getattr(gn, "target_resources", ()),
+                    is_external=bool(gp.external_source),
+                    execution_id=eff_exec_id,
+                    node_id=gn.node_id,
+                    consume_confirmation=False,
+                    record_to_ledger=False,
+                    source_surface="plan_compiler",
+                )
+                if pre_pol.outcome == PolicyDecisionOutcome.REQUIRE_CONFIRMATION:
+                    raw_t, rec_t = plan_pol_engine.confirmation_store.issue_confirmation(
+                        tool_id=pre_pol.tool_id,
+                        arg_digest=pre_pol.arg_digest,
+                        resource_scope=pre_pol.resource_scope,
+                        execution_id=eff_exec_id,
+                        node_id=gn.node_id,
+                        ttl_seconds=plan_pol_engine.config.confirmation_ttl_seconds,
+                        max_lifetime_seconds=plan_pol_engine.config.max_confirmation_lifetime_seconds,
+                        policy_version=plan_pol_engine.config.policy_version,
+                        approved_by="plan_confirmation",
+                    )
+                    plan_node_confirmations[gn.node_id] = (raw_t, rec_t.confirmation_id)
+
         exec_res = await self.execute_task_graph(
             bundle.task_graph,
             bundle.proposals,
@@ -6170,6 +6552,9 @@ class NativeOrchestrator:
             node_timeouts=node_timeouts,
             default_node_timeout=default_node_timeout,
             task_prompt=bundle.structured_plan.objective,
+            confirm_callback=confirm_callback,
+            node_confirmations=plan_node_confirmations or None,
+            workspace_root=workspace_root,
         )
         exec_res["bundle"] = bundle
         exec_res["executed"] = True
@@ -6251,6 +6636,10 @@ class NativeOrchestrator:
             caller_ring=eff_ring,
             allowed_tools=eff_allowed,
             task_local_scope=eff_scope,
+            zelyr_config=self._active_config(),
+            policy_engine=getattr(self, "execution_policy_engine", None),
+            policy_config=getattr(self, "execution_policy_config", None),
+            workspace_root=getattr(self, "workspace_root", None),
             acceptance_criteria=acceptance_criteria,
             verifier_fn=verifier_fn,
             reconcile_state=reconcile_state,

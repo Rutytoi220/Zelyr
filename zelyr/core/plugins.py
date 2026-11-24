@@ -1074,9 +1074,25 @@ async def execute_tool(
     *,
     caller_ring: Optional[int] = None,
     allowed_tools: Optional[Any] = None,
+    confirmation_token: Optional[str] = None,
+    confirmation_id: Optional[str] = None,
+    execution_id: Optional[str] = None,
+    node_id: Optional[str] = None,
+    policy_engine: Optional[Any] = None,
+    policy_config: Optional[Any] = None,
+    zelyr_config: Optional[Any] = None,
+    workspace_root: Optional[Any] = None,
+    confirm_callback: Optional[Any] = None,
     **kwargs,
 ) -> str:
     from zelyr.tool_registry import authorize_and_validate_tool_call, get_active_task_local_scope
+    from zelyr.engine.execution_policy import (
+        UNTRUSTED_POLICY_OVERRIDE_KEYS,
+        authorized_policy_context,
+        build_execution_policy_engine,
+        matches_active_policy_decision,
+    )
+    from zelyr.engine.execution_ledger import get_active_execution_context
 
     if get_active_task_local_scope() is not None:
         return json.dumps({
@@ -1105,20 +1121,78 @@ async def execute_tool(
             "reason": decision.reason or "authorization_denied",
         })
 
+    smuggled = [str(k) for k in kwargs.keys() if str(k).strip() in UNTRUSTED_POLICY_OVERRIDE_KEYS]
+    if smuggled:
+        return json.dumps({
+            "success": False,
+            "error": f"Policy denied '{name}': untrusted authorization/policy keys {sorted(set(smuggled))} rejected.",
+            "error_type": "POLICY_DENIED",
+            "reason": "policy_denied",
+        })
+
     name = decision.tool_name
     kwargs = decision.normalized_arguments
+
+    matched_schema = next(
+        (s for s in _schemas if isinstance(s, dict) and s.get("function", {}).get("name") == name),
+        None,
+    )
+    active_ctx = get_active_execution_context()
+    eff_exec_id = execution_id or (getattr(active_ctx, "execution_id", None) if active_ctx else None)
+    eff_node_id = node_id or (getattr(active_ctx, "node_id", None) if active_ctx else None)
+    eff_central = getattr(active_ctx, "central_ledger", None) if active_ctx else None
+    eff_corr = getattr(active_ctx, "correlation_id", None) if active_ctx else None
+
+    pol_dec = matches_active_policy_decision(
+        name,
+        kwargs,
+        workspace_root=workspace_root,
+        execution_id=eff_exec_id,
+        node_id=eff_node_id,
+    )
+    if pol_dec is None:
+        pol_engine = build_execution_policy_engine(
+            policy_engine=policy_engine,
+            policy_config=policy_config,
+            zelyr_config=zelyr_config,
+        )
+        is_reg = (name in _executors) or (name in _rings) or (matched_schema is not None)
+        pol_dec = await pol_engine.evaluate_async(
+            name,
+            kwargs,
+            normalized_arguments=kwargs,
+            schema=matched_schema,
+            required_ring=_rings.get(name),
+            auth_decision=decision,
+            is_registered=is_reg,
+            is_external=str(name).startswith("ext__"),
+            workspace_root=workspace_root,
+            execution_id=eff_exec_id,
+            node_id=eff_node_id,
+            correlation_id=eff_corr,
+            confirmation_token=confirmation_token,
+            confirmation_id=confirmation_id,
+            consume_confirmation=True,
+            confirm_callback=confirm_callback,
+            source_surface="plugin_execute_tool",
+            central_ledger=eff_central,
+        )
+
+    if not pol_dec.allowed:
+        return json.dumps(pol_dec.to_tool_error_payload())
 
     if name not in _executors:
         try:
             from zelyr.tool_registry import ToolRegistry
             registry = ToolRegistry()
             if registry.get_tool(name) is not None:
-                res = await registry.execute_async(
-                    name,
-                    caller_ring=caller_ring,
-                    allowed_tools=allowed_tools,
-                    **kwargs,
-                )
+                with authorized_policy_context(pol_dec):
+                    res = await registry.execute_async(
+                        name,
+                        caller_ring=caller_ring,
+                        allowed_tools=allowed_tools,
+                        **kwargs,
+                    )
                 if hasattr(res, "to_dict"):
                     return json.dumps(res.to_dict(tool=name, arguments=kwargs))
                 return str(res)
@@ -1150,10 +1224,11 @@ async def execute_tool(
                 return func(**kwargs)
 
         try:
-            res = await asyncio.wait_for(
-                asyncio.to_thread(thread_worker),
-                timeout=timeout
-            )
+            with authorized_policy_context(pol_dec):
+                res = await asyncio.wait_for(
+                    asyncio.to_thread(thread_worker),
+                    timeout=timeout
+                )
             return str(res)
         except (TimeoutError, asyncio.TimeoutError):
             return json.dumps({
@@ -1165,7 +1240,8 @@ async def execute_tool(
     else:
         from zelyr.core.plugin_sandbox import SandboxedPluginRunner
         runner = SandboxedPluginRunner(func, name=name, timeout=timeout)
-        tool_res = await runner.run_async(**kwargs)
+        with authorized_policy_context(pol_dec):
+            tool_res = await runner.run_async(**kwargs)
         if not tool_res.success:
             return json.dumps({"success": False, "error": tool_res.error})
         if isinstance(tool_res.output, str):

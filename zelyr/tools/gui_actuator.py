@@ -121,6 +121,33 @@ class GUIActuateTool(BaseTool):
         ))
 
     def execute(self, params: Dict[str, Any]) -> ToolResult:
+        if not isinstance(params, dict):
+            return ToolResult(success=False, error="Invalid arguments: expected dict.", error_type="SCHEMA_VALIDATION_ERROR")
+
+        from zelyr.engine.execution_policy import (
+            authorized_policy_context,
+            evaluate_direct_tool_policy,
+        )
+
+        pol_dec = evaluate_direct_tool_policy(
+            self.tool_id,
+            params,
+            tool_obj=self,
+            schema=self.schema if hasattr(self, "schema") else None,
+            required_ring=getattr(self, "required_ring", 0),
+            is_registered=True,
+            source_surface="gui_actuator.execute",
+        )
+        if not pol_dec.allowed:
+            err_p = pol_dec.to_tool_error_payload()
+            return ToolResult(
+                success=False,
+                output=err_p,
+                error=pol_dec.reason,
+                error_type=err_p["error_type"],
+                metadata={"policy_decision": pol_dec.to_safe_dict()},
+            )
+
         action = params.get("action", "")
         
         ydotool = shutil.which("ydotool")
@@ -158,7 +185,8 @@ class GUIActuateTool(BaseTool):
             
         try:
             logger.info(f"Executing GUI Actuator: {' '.join(cmd)}")
-            res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            with authorized_policy_context(pol_dec):
+                res = subprocess.run(cmd, capture_output=True, text=True, check=True)
             return ToolResult(success=True, output=f"Executed {action} successfully.\n{res.stdout}")
         except subprocess.CalledProcessError as e:
             return ToolResult(success=False, error=f"Actuation failed: {e.stderr}")

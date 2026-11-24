@@ -273,6 +273,8 @@ class RecoveryAssessment:
     affected_dependents: List[str] = field(default_factory=list)
     blocked_reason: Optional[str] = None
     call_id: Optional[str] = None
+    policy_outcome: Optional[str] = None
+    policy_decision: Optional[Dict[str, Any]] = None
     proposal_id: Optional[str] = None
     tool_name: Optional[str] = None
     normalized_arguments: Optional[Dict[str, Any]] = None
@@ -465,6 +467,13 @@ class RecoveryEngine:
         verifier_fn: Optional[Callable[..., Any]] = None,
         reconcile_state: bool = False,
         confirm_recovery: bool = False,
+        zelyr_config: Optional[Any] = None,
+        policy_engine: Optional[Any] = None,
+        policy_config: Optional[Any] = None,
+        workspace_root: Optional[Any] = None,
+        confirmation_token: Optional[str] = None,
+        confirmation_id: Optional[str] = None,
+        confirm_callback: Optional[Callable[[Any], Any]] = None,
         now_ts: Optional[float] = None,
     ) -> RecoveryAssessment:
         """Analyze ledger events, observations, verifier state, dependencies, and auth to choose recovery."""
@@ -985,8 +994,121 @@ class RecoveryEngine:
         elif reval_fail_reason is None:
             revalidation_passed = True
 
+        # Fresh execution-policy evaluation on recovery (non-consuming check; never uses stale grants).
+        pol_outcome_val: Optional[str] = None
+        pol_dec_dict: Optional[Dict[str, Any]] = None
+        if revalidation_passed and func_name:
+            from zelyr.engine.execution_policy import (
+                PolicyDecisionOutcome,
+                build_execution_policy_engine,
+            )
+            from zelyr.tool_registry import resolve_tool_ring
+
+            pol_engine = build_execution_policy_engine(
+                policy_engine=policy_engine,
+                policy_config=policy_config,
+                zelyr_config=zelyr_config,
+            )
+            reg_tool_rec = (
+                tool_registry.get_tool(func_name)
+                if (tool_registry is not None and callable(getattr(tool_registry, "get_tool", None)))
+                else None
+            )
+            ext_entry_rec = (
+                tool_registry.get_external_tool_entry(func_name)
+                if (tool_registry is not None and callable(getattr(tool_registry, "get_external_tool_entry", None)))
+                else None
+            )
+            matched_rec_schema = next(
+                (
+                    s
+                    for s in (active_schemas or [])
+                    if isinstance(s, dict) and (s.get("function") or {}).get("name") == func_name
+                ),
+                None,
+            )
+            req_ring_rec = resolve_tool_ring(
+                func_name,
+                tool=reg_tool_rec,
+                task_local_scope=task_local_scope,
+            )
+            is_ext_rec = bool(
+                (ext_src and ext_src.get("is_external"))
+                or ext_entry_rec is not None
+                or getattr(reg_tool_rec, "is_external", False)
+                or str(func_name).startswith("ext__")
+            )
+            ext_meta_rec = (
+                dict(getattr(ext_entry_rec, "metadata", None) or {})
+                if ext_entry_rec is not None
+                else None
+            )
+            args_for_pol = dict(normalized_args_out if normalized_args_out is not None else func_args)
+            pol_dec_rec = pol_engine.evaluate(
+                func_name,
+                _get_prop_field(proposal, "arguments") or args_for_pol,
+                normalized_arguments=args_for_pol,
+                schema=matched_rec_schema,
+                tool_obj=reg_tool_rec,
+                required_ring=req_ring_rec,
+                is_registered=True,
+                is_external=is_ext_rec,
+                external_metadata=ext_meta_rec,
+                workspace_root=workspace_root,
+                node_target_resources=getattr(node, "target_resources", ()),
+                execution_id=exec_id,
+                node_id=node_id,
+                confirmation_token=confirmation_token,
+                confirmation_id=confirmation_id,
+                consume_confirmation=False,
+                confirm_callback=confirm_callback,
+                source_surface="recovery_engine",
+                central_ledger=central_ledger,
+                record_to_ledger=False,
+                now=eff_now,
+            )
+            pol_outcome_val = pol_dec_rec.outcome.value
+            pol_dec_dict = pol_dec_rec.to_safe_dict()
+            if pol_dec_rec.outcome == PolicyDecisionOutcome.DENY:
+                revalidation_passed = False
+                reval_fail_reason = pol_dec_rec.reason
+                reval_err_type = "POLICY_DENIED"
+            elif pol_dec_rec.outcome == PolicyDecisionOutcome.REQUIRE_CONFIRMATION and not confirm_recovery:
+                return RecoveryAssessment(
+                    execution_id=exec_id,
+                    node_id=node_id,
+                    failure_category="POLICY_CONFIRMATION_REQUIRED",
+                    previous_status=node.execution_status,
+                    structured_observation=struct_obs.to_compact_dict() if struct_obs is not None else None,
+                    evidence_level=str(ev_level),
+                    execution_started=has_exec_start,
+                    may_have_side_effect=may_have_side_effect,
+                    verified_outcome=False,
+                    recoverable=True,
+                    recovery_guidance=rec_guidance,
+                    recovery_decision=RecoveryDecision.REQUIRE_CONFIRMATION.value,
+                    reason=pol_dec_rec.reason,
+                    attempt_count=attempt_count,
+                    max_attempts=eff_policy.max_attempts,
+                    retry_deadline=retry_deadline,
+                    backoff_seconds=0.0,
+                    reconciliation_required=bool(has_exec_start and may_have_side_effect),
+                    revalidation_passed=True,
+                    verification_result=ver_summary,
+                    evidence_refs=evidence_refs,
+                    proposed_next_action="obtain_confirmation_for_retry",
+                    affected_dependents=affected_dependents,
+                    blocked_reason=pol_dec_rec.reason,
+                    call_id=call_id,
+                    proposal_id=proposal_id,
+                    tool_name=func_name or None,
+                    normalized_arguments=normalized_args_out,
+                    policy_outcome=pol_outcome_val,
+                    policy_decision=pol_dec_dict,
+                )
+
         if not revalidation_passed:
-            is_auth_block = reval_err_type in ("AUTHORIZATION_DENIED", "AUTHORIZATION_ERROR", "PROHIBITED_BY_USER")
+            is_auth_block = reval_err_type in ("AUTHORIZATION_DENIED", "AUTHORIZATION_ERROR", "PROHIBITED_BY_USER", "POLICY_DENIED")
             dec_fail = RecoveryDecision.BLOCKED.value if is_auth_block else RecoveryDecision.REPLAN_NODE.value
             return RecoveryAssessment(
                 execution_id=exec_id,
@@ -1017,6 +1139,8 @@ class RecoveryEngine:
                 proposal_id=proposal_id,
                 tool_name=func_name or None,
                 normalized_arguments=normalized_args_out,
+                policy_outcome=pol_outcome_val,
+                policy_decision=pol_dec_dict,
             )
 
         if failure_category in _REPLAN_FAILURE_CATEGORIES:
@@ -1050,6 +1174,8 @@ class RecoveryEngine:
                 proposal_id=proposal_id,
                 tool_name=func_name or None,
                 normalized_arguments=normalized_args_out,
+                policy_outcome=pol_outcome_val,
+                policy_decision=pol_dec_dict,
             )
 
         # Enforce deadline and retry attempt limits before proposing any retry
@@ -1084,6 +1210,8 @@ class RecoveryEngine:
                 proposal_id=proposal_id,
                 tool_name=func_name or None,
                 normalized_arguments=normalized_args_out,
+                policy_outcome=pol_outcome_val,
+                policy_decision=pol_dec_dict,
             )
 
         if attempt_count >= eff_policy.max_attempts:
@@ -1117,6 +1245,8 @@ class RecoveryEngine:
                 proposal_id=proposal_id,
                 tool_name=func_name or None,
                 normalized_arguments=normalized_args_out,
+                policy_outcome=pol_outcome_val,
+                policy_decision=pol_dec_dict,
             )
 
         backoff_s = eff_policy.compute_backoff_seconds(attempt_count + 1)
@@ -1230,6 +1360,8 @@ class RecoveryEngine:
                 proposal_id=proposal_id,
                 tool_name=func_name or None,
                 normalized_arguments=normalized_args_out,
+                policy_outcome=pol_outcome_val,
+                policy_decision=pol_dec_dict,
             )
 
         # Execution did not start & no side effect could occur
@@ -1302,6 +1434,8 @@ class RecoveryEngine:
                 proposal_id=proposal_id,
                 tool_name=func_name or None,
                 normalized_arguments=normalized_args_out,
+                policy_outcome=pol_outcome_val,
+                policy_decision=pol_dec_dict,
             )
 
         # Insufficient or ambiguous evidence defaults fail-closed to UNRESOLVED / REQUIRE_CONFIRMATION
@@ -1464,6 +1598,14 @@ class RecoveryEngine:
                     "new_status": new_status,
                     "unlocked_nodes": [n.node_id for n in graph.get_ready_nodes()],
                 }
+
+            if will_retry or decision == RecoveryDecision.REPLAN_NODE.value:
+                try:
+                    from zelyr.engine.execution_policy import get_default_confirmation_store
+
+                    get_default_confirmation_store().revoke_node_confirmations(exec_id, node_id)
+                except Exception:
+                    pass
 
             if will_retry:
                 next_attempt = assessment.attempt_count + 1

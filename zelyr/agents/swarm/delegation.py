@@ -462,6 +462,34 @@ class DelegatedSubagent(BaseSubagent):
                 _finish_sub_call("rejected", err=msg, is_ext=is_ext, src_id=src_id, src_type=src_type)
                 return msg
 
+        from zelyr.engine.execution_policy import authorized_policy_context, build_execution_policy_engine
+        from zelyr.tool_registry import resolve_tool_ring
+
+        pol_engine_sub = build_execution_policy_engine(
+            policy_engine=getattr(self, "execution_policy_engine", None),
+            policy_config=getattr(self, "execution_policy_config", None),
+            zelyr_config=getattr(self, "config", None),
+        )
+        pol_dec_sub = await pol_engine_sub.evaluate_async(
+            tool_name,
+            raw_arguments,
+            normalized_arguments=validated_arguments,
+            tool_obj=tool_obj,
+            required_ring=resolve_tool_ring(tool_name, tool=tool_obj),
+            auth_decision=decision,
+            is_registered=bool(decision.allowed),
+            is_external=is_ext,
+            execution_id=exec_id,
+            correlation_id=call_id,
+            consume_confirmation=True,
+            confirm_callback=getattr(self, "confirm_callback", None),
+            source_surface="swarm_delegation",
+            central_ledger=ledger,
+        )
+        if not pol_dec_sub.allowed:
+            _finish_sub_call("rejected", err=pol_dec_sub.reason, is_ext=is_ext, src_id=src_id, src_type=src_type)
+            return json.dumps(pol_dec_sub.to_tool_error_payload())
+
         try:
             ledger.record_event(
                 exec_id,
@@ -492,7 +520,7 @@ class DelegatedSubagent(BaseSubagent):
             pass
 
         try:
-            with execution_scope(
+            with authorized_policy_context(pol_dec_sub), execution_scope(
                 ledger,
                 exec_id,
                 caller_ring=eff_ring,

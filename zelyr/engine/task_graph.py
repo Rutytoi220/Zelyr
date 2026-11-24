@@ -73,6 +73,15 @@ _FORBIDDEN_GRAPH_KEYS: frozenset[str] = frozenset(
         "skip_recovery_verification",
         "override_retry_limit",
         "force_retry",
+        "policy_override",
+        "risk_override",
+        "skip_confirmation",
+        "bypass_policy",
+        "confirmation_token",
+        "confirm_token",
+        "confirmed_grant",
+        "policy_mode",
+        "policy_decision",
     }
 )
 
@@ -1766,6 +1775,12 @@ class TaskGraph:
                             n.blocked_reason = None
 
         try:
+            from zelyr.engine.execution_policy import get_default_confirmation_store
+
+            get_default_confirmation_store().revoke_node_confirmations(self.execution_id, failed_node_id)
+        except Exception:
+            pass
+        try:
             self.recompute_schedule(known_proposals=known_proposals)
             self.validate(known_proposals=known_proposals, allow_blocked=True)
         except Exception:
@@ -1792,6 +1807,12 @@ class TaskGraph:
         if node.execution_status == TaskNodeStatus.BLOCKED.value and not node.contradictory:
             node.execution_status = TaskNodeStatus.PENDING.value
             node.blocked_reason = None
+        try:
+            from zelyr.engine.execution_policy import get_default_confirmation_store
+
+            get_default_confirmation_store().revoke_node_confirmations(self.execution_id, node_id)
+        except Exception:
+            pass
         try:
             self.recompute_schedule(known_proposals=known_proposals)
             self.validate(known_proposals=known_proposals, allow_blocked=True)
@@ -1975,6 +1996,12 @@ class TaskGraph:
         node.blocked_reason = None
         node.updated_at = time.time()
         try:
+            from zelyr.engine.execution_policy import get_default_confirmation_store
+
+            get_default_confirmation_store().revoke_node_confirmations(self.execution_id, node_id)
+        except Exception:
+            pass
+        try:
             self.recompute_schedule(known_proposals=known_proposals)
             self.validate(known_proposals=known_proposals, allow_blocked=True)
         except Exception:
@@ -2017,6 +2044,12 @@ class TaskGraph:
                 target.failure_info = None
                 target.blocked_reason = None
         target.updated_at = time.time()
+        try:
+            from zelyr.engine.execution_policy import get_default_confirmation_store
+
+            get_default_confirmation_store().revoke_node_confirmations(self.execution_id, failed_node_id)
+        except Exception:
+            pass
         try:
             self.recompute_schedule(known_proposals=known_proposals)
             self.validate(known_proposals=known_proposals, allow_blocked=True)

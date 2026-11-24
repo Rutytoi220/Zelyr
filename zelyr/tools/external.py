@@ -959,8 +959,22 @@ class ExternalAdaptedTool(BaseTool):
             return self._manager.is_adapted_tool_live(self)
         return True
 
-    async def execute(self, params: Optional[Dict[str, Any]] = None, **kwargs: Any) -> ToolResult:
-        """Normalize arguments, re-verify live authorization/staleness, and invoke the external source."""
+    async def execute(
+        self,
+        params: Optional[Dict[str, Any]] = None,
+        *,
+        policy_engine: Optional[Any] = None,
+        policy_config: Optional[Any] = None,
+        zelyr_config: Optional[Any] = None,
+        confirmation_token: Optional[str] = None,
+        confirmation_id: Optional[str] = None,
+        execution_id: Optional[str] = None,
+        node_id: Optional[str] = None,
+        workspace_root: Optional[Any] = None,
+        confirm_callback: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> ToolResult:
+        """Normalize arguments, re-verify live authorization/staleness/policy, and invoke external source."""
         meta = {
             "external": True,
             "source_id": self.source_id,
@@ -970,6 +984,7 @@ class ExternalAdaptedTool(BaseTool):
             "tool_id": self.tool_id,
         }
 
+        entry = None
         if self._manager is not None:
             entry = self._manager.get_tool_entry(self.tool_id)
             if entry is None or entry.source_epoch != self._source_epoch or entry.adapted_tool is not self:
@@ -1036,9 +1051,84 @@ class ExternalAdaptedTool(BaseTool):
                 metadata=meta,
             )
 
-        result = await self._source.invoke_tool(self.external_tool_name, norm_args)
+        from zelyr.engine.execution_policy import (
+            UNTRUSTED_POLICY_OVERRIDE_KEYS,
+            authorized_policy_context,
+            build_execution_policy_engine,
+            matches_active_policy_decision,
+        )
+        from zelyr.engine.execution_ledger import get_active_execution_context
+
+        smuggled = [str(k) for k in raw_args.keys() if str(k).strip() in UNTRUSTED_POLICY_OVERRIDE_KEYS]
+        if smuggled:
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Policy denied '{self.tool_id}': untrusted policy/authorization keys {sorted(set(smuggled))} rejected.",
+                error_type="POLICY_DENIED",
+                metadata=meta,
+            )
+
+        active_ctx = get_active_execution_context()
+        eff_exec_id = execution_id or (getattr(active_ctx, "execution_id", None) if active_ctx else None)
+        eff_node_id = node_id or (getattr(active_ctx, "node_id", None) if active_ctx else None)
+        eff_central = getattr(active_ctx, "central_ledger", None) if active_ctx else None
+        eff_corr = getattr(active_ctx, "correlation_id", None) if active_ctx else None
+
+        pol_dec = matches_active_policy_decision(
+            self.tool_id,
+            norm_args,
+            workspace_root=workspace_root,
+            execution_id=eff_exec_id,
+            node_id=eff_node_id,
+        )
+        if pol_dec is None:
+            pol_engine = build_execution_policy_engine(
+                policy_engine=policy_engine,
+                policy_config=policy_config,
+                zelyr_config=zelyr_config,
+            )
+            ext_meta = dict(getattr(entry, "metadata", None) or {}) if entry is not None else {}
+            pol_dec = await pol_engine.evaluate_async(
+                self.tool_id,
+                raw_args,
+                normalized_arguments=norm_args,
+                schema=self.schema,
+                tool_obj=self,
+                required_ring=getattr(self, "required_ring", 1),
+                is_registered=True,
+                is_external=True,
+                source_id=self.source_id,
+                source_type=self.source_type,
+                external_metadata=ext_meta,
+                workspace_root=workspace_root,
+                execution_id=eff_exec_id,
+                node_id=eff_node_id,
+                correlation_id=eff_corr,
+                confirmation_token=confirmation_token,
+                confirmation_id=confirmation_id,
+                consume_confirmation=True,
+                confirm_callback=confirm_callback,
+                source_surface="external_adapter",
+                central_ledger=eff_central,
+            )
+
+        if not pol_dec.allowed:
+            err_payload = pol_dec.to_tool_error_payload()
+            return ToolResult(
+                success=False,
+                output=err_payload,
+                error=pol_dec.reason,
+                error_type=err_payload["error_type"],
+                remedy_hint=pol_dec.remediation_hint or None,
+                metadata={**meta, "policy_decision": pol_dec.to_safe_dict()},
+            )
+
+        with authorized_policy_context(pol_dec):
+            result = await self._source.invoke_tool(self.external_tool_name, norm_args)
         merged_meta = dict(getattr(result, "metadata", None) or {})
         merged_meta.update(meta)
+        merged_meta["policy_decision"] = pol_dec.to_safe_dict()
         result.metadata = merged_meta
         return result
 

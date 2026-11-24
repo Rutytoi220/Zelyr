@@ -1559,6 +1559,49 @@ Returns:
         validated_arguments = copy.deepcopy(decision.normalized_arguments)
         arguments = copy.deepcopy(validated_arguments)
 
+        # Unified Execution Policy check before ActionGovernor / FastestPath / Tool invoke
+        from zelyr.engine.execution_policy import authorized_policy_context, build_execution_policy_engine
+        from zelyr.tool_registry import resolve_tool_ring
+
+        pol_engine_orch = build_execution_policy_engine(
+            policy_engine=getattr(self, "execution_policy_engine", None),
+            policy_config=getattr(self, "execution_policy_config", None),
+            zelyr_config=getattr(self, "config", None),
+        )
+        pol_dec_orch = pol_engine_orch.evaluate(
+            tool_name,
+            raw_arguments if isinstance(raw_arguments, dict) else validated_arguments,
+            normalized_arguments=validated_arguments,
+            tool_obj=eff_tool,
+            required_ring=resolve_tool_ring(tool_name, tool=eff_tool) if eff_tool is not None else None,
+            auth_decision=decision,
+            is_registered=not fast_path_eligible,
+            is_external=is_ext,
+            execution_id=exec_id,
+            correlation_id=call_id,
+            consume_confirmation=fast_path_eligible,
+            confirm_callback=getattr(self, "confirm_callback", None),
+            source_surface="orchestrator_agent.pre_governor",
+            central_ledger=ledger,
+            record_to_ledger=fast_path_eligible,
+        )
+        if not pol_dec_orch.allowed:
+            res = self._structured_tool_result(
+                tool_name,
+                validated_arguments,
+                pol_dec_orch.to_tool_error_payload(),
+                False,
+            )
+            return record_outcome(
+                res,
+                t_id=tool_name,
+                src_id=src_id,
+                src_type=src_type,
+                is_ext=is_ext,
+                auth_status="denied",
+                auth_reason=pol_dec_orch.reason,
+            )
+
         # ── Approval Queue Guardrails ──────────────────────────────────────────
         from zelyr.core.governor import ActionGovernor
         from zelyr.config import get_config
@@ -1672,6 +1715,39 @@ Returns:
             )
             return record_outcome(res, t_id=tool_name, src_id=src_id, src_type=src_type, is_ext=is_ext, auth_status="denied", auth_reason="toctou_stale_callable")
 
+        pol_dec_orch = pol_engine_orch.evaluate(
+            tool_name,
+            raw_arguments if isinstance(raw_arguments, dict) else validated_arguments,
+            normalized_arguments=validated_arguments,
+            tool_obj=eff_tool,
+            required_ring=resolve_tool_ring(tool_name, tool=eff_tool),
+            auth_decision=decision,
+            is_registered=True,
+            is_external=is_ext,
+            execution_id=exec_id,
+            correlation_id=call_id,
+            consume_confirmation=True,
+            confirm_callback=getattr(self, "confirm_callback", None),
+            source_surface="orchestrator_agent.execute",
+            central_ledger=ledger,
+        )
+        if not pol_dec_orch.allowed:
+            res = self._structured_tool_result(
+                tool_name,
+                copy.deepcopy(validated_arguments),
+                pol_dec_orch.to_tool_error_payload(),
+                False,
+            )
+            return record_outcome(
+                res,
+                t_id=tool_name,
+                src_id=src_id,
+                src_type=src_type,
+                is_ext=is_ext,
+                auth_status="denied",
+                auth_reason=pol_dec_orch.reason,
+            )
+
         try:
             ledger.record_event(
                 exec_id,
@@ -1723,7 +1799,7 @@ Returns:
                 import asyncio
 
                 def _call_target():
-                    with exec_scope_fn(
+                    with authorized_policy_context(pol_dec_orch), exec_scope_fn(
                         ledger,
                         exec_id,
                         caller_ring=eff_ring,
@@ -1748,7 +1824,7 @@ Returns:
                             return fn(kwargs_dict) if single_dict else fn(**kwargs_dict)
                         return bound_tool(**kwargs_dict)
 
-                with exec_scope_fn(
+                with authorized_policy_context(pol_dec_orch), exec_scope_fn(
                     ledger,
                     exec_id,
                     caller_ring=eff_ring,

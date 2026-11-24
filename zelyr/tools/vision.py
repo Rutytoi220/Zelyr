@@ -460,6 +460,7 @@ class InteractWithUITool(BaseTool):
             )
 
         # Follow existing GovernorService.instance() approval policy when not already checked by ToolRegistry
+        gov_confirm_cb = None
         if reg_instance is None and getattr(self, "requires_approval", False):
             try:
                 from zelyr.services.governor import GovernorService
@@ -474,8 +475,35 @@ class InteractWithUITool(BaseTool):
                             error="User denied execution via The Governor.",
                             error_type="AUTHORIZATION_DENIED",
                         )
+                    gov_confirm_cb = lambda _dec: True
             except Exception as e:
                 return ToolResult(False, error=f"Governor failed: {e}", error_type="AUTHORIZATION_DENIED")
+
+        from zelyr.engine.execution_policy import (
+            authorized_policy_context,
+            evaluate_direct_tool_policy_async,
+        )
+
+        pol_dec = await evaluate_direct_tool_policy_async(
+            self.tool_id,
+            params,
+            tool_obj=self,
+            schema=self.schema if hasattr(self, "schema") else None,
+            required_ring=getattr(self, "REQUIRED_RING", 0),
+            auth_decision=decision,
+            is_registered=True,
+            confirm_callback=gov_confirm_cb,
+            source_surface="vision.interact_with_ui",
+        )
+        if not pol_dec.allowed:
+            err_p = pol_dec.to_tool_error_payload()
+            return ToolResult(
+                False,
+                output=err_p,
+                error=pol_dec.reason,
+                error_type=err_p["error_type"],
+                metadata={"policy_decision": pol_dec.to_safe_dict()},
+            )
 
         # Primary Tier 3 Path: Closed-loop Spotless-Arms VLA via persistent /dev/uinput (<0.1ms actuation)
         move_only = bool(params.get("move_only", False))
@@ -485,13 +513,14 @@ class InteractWithUITool(BaseTool):
 
         if not use_legacy_json and is_spotless_arms_available():
             try:
-                reflex = await asyncio.to_thread(
-                    run_reflex_action,
-                    instruction,
-                    max_ticks,
-                    move_only,
-                    dry_run_arm,
-                )
+                with authorized_policy_context(pol_dec):
+                    reflex = await asyncio.to_thread(
+                        run_reflex_action,
+                        instruction,
+                        max_ticks,
+                        move_only,
+                        dry_run_arm,
+                    )
                 msg = (
                     f"Closed-loop VLA reflex '{instruction}' completed in {reflex['total_ms']:.1f}ms "
                     f"({reflex['ticks']} ticks, K={reflex['k_schedule']}, xy={reflex['final_xy']}, "

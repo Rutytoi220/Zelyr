@@ -161,6 +161,14 @@ Returns:
     graph_recovery_backoff_max_seconds: float = 2.0
     graph_recovery_deadline_seconds: float = 120.0
 
+    # Unified Execution Policy & Risk-Aware Approval (trusted application configuration)
+    execution_policy_mode: Optional[str] = None
+    execution_policy_risk_defaults: dict = field(default_factory=dict)
+    execution_policy_tool_overrides: dict = field(default_factory=dict)
+    execution_policy_resource_restrictions: dict = field(default_factory=dict)
+    execution_policy_confirmation_ttl_seconds: float = 300.0
+    execution_policy_max_confirmation_lifetime_seconds: float = 900.0
+
     @classmethod
     def from_dict(cls, config_dict: dict) -> 'ZelyrConfig':
         """Create config from dictionary."""
@@ -185,6 +193,37 @@ Returns:
                 filtered['auth_mode'] = AuthMode(filtered['auth_mode'])
             except ValueError:
                 filtered['auth_mode'] = AuthMode.BASIC
+
+        if 'execution_policy_mode' in filtered and filtered['execution_policy_mode'] is not None:
+            mode_val = str(filtered['execution_policy_mode']).strip().lower()
+            if mode_val in ('conservative', 'strict', 'balanced', 'basic', 'autopilot'):
+                filtered['execution_policy_mode'] = mode_val
+            else:
+                logger.warning(f"Invalid execution_policy_mode {filtered['execution_policy_mode']!r}; falling back to 'conservative'.")
+                filtered['execution_policy_mode'] = 'conservative'
+
+        for dict_key in (
+            'execution_policy_risk_defaults',
+            'execution_policy_tool_overrides',
+            'execution_policy_resource_restrictions',
+        ):
+            if dict_key in filtered and not isinstance(filtered[dict_key], dict):
+                filtered[dict_key] = {}
+
+        if 'execution_policy_confirmation_ttl_seconds' in filtered:
+            try:
+                ttl_val = float(filtered['execution_policy_confirmation_ttl_seconds'])
+                filtered['execution_policy_confirmation_ttl_seconds'] = max(1.0, min(ttl_val, 86400.0))
+            except (TypeError, ValueError):
+                filtered['execution_policy_confirmation_ttl_seconds'] = 300.0
+
+        if 'execution_policy_max_confirmation_lifetime_seconds' in filtered:
+            try:
+                max_val = float(filtered['execution_policy_max_confirmation_lifetime_seconds'])
+                ttl_floor = float(filtered.get('execution_policy_confirmation_ttl_seconds', 300.0))
+                filtered['execution_policy_max_confirmation_lifetime_seconds'] = max(ttl_floor, min(max_val, 86400.0))
+            except (TypeError, ValueError):
+                filtered['execution_policy_max_confirmation_lifetime_seconds'] = 900.0
         return cls(**filtered)
 
     def to_dict(self) -> dict:
@@ -239,6 +278,12 @@ Returns:
             'graph_recovery_backoff_base_seconds': self.graph_recovery_backoff_base_seconds,
             'graph_recovery_backoff_max_seconds': self.graph_recovery_backoff_max_seconds,
             'graph_recovery_deadline_seconds': self.graph_recovery_deadline_seconds,
+            'execution_policy_mode': self.execution_policy_mode,
+            'execution_policy_risk_defaults': self.execution_policy_risk_defaults,
+            'execution_policy_tool_overrides': self.execution_policy_tool_overrides,
+            'execution_policy_resource_restrictions': self.execution_policy_resource_restrictions,
+            'execution_policy_confirmation_ttl_seconds': self.execution_policy_confirmation_ttl_seconds,
+            'execution_policy_max_confirmation_lifetime_seconds': self.execution_policy_max_confirmation_lifetime_seconds,
         }
 
     def get_effective_num_ctx(self, caller_override: Optional[Any] = None) -> int:

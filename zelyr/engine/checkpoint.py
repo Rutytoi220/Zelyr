@@ -2013,6 +2013,10 @@ class CheckpointManager:
         verify_outcomes: bool = True,
         current_environment: Optional[Dict[str, Any]] = None,
         verifier_fn: Optional[Callable[..., Any]] = None,
+        zelyr_config: Optional[Any] = None,
+        policy_engine: Optional[Any] = None,
+        policy_config: Optional[Any] = None,
+        workspace_root: Optional[Any] = None,
     ) -> ResumeAssessment:
         """Evaluate checkpoint validity, verification state, duplicate risks, auth, and env drift."""
         rec = central_ledger.get_execution(execution_id)
@@ -2427,6 +2431,75 @@ class CheckpointManager:
                     )
             elif not pa_auth_blocked:
                 pa.authorization_status = "not_evaluated"
+
+            # Fresh non-consuming policy evaluation on resume (never trust checkpoint grants).
+            if not pa_auth_blocked:
+                from zelyr.engine.execution_policy import (
+                    PolicyDecisionOutcome,
+                    build_execution_policy_engine,
+                )
+                from zelyr.tool_registry import resolve_tool_ring
+
+                pol_engine_res = build_execution_policy_engine(
+                    policy_engine=policy_engine,
+                    policy_config=policy_config,
+                    zelyr_config=zelyr_config,
+                )
+                reg_tool_pa = (
+                    tool_registry.get_tool(pa.tool_id)
+                    if (tool_registry is not None and callable(getattr(tool_registry, "get_tool", None)))
+                    else None
+                )
+                schema_pa = next(
+                    (
+                        s
+                        for s in (active_schemas or [])
+                        if isinstance(s, dict) and (s.get("function") or {}).get("name") == pa.tool_id
+                    ),
+                    None,
+                )
+                req_ring_pa = resolve_tool_ring(pa.tool_id, tool=reg_tool_pa, task_local_scope=task_local_scope)
+                is_reg_pa = bool(
+                    (tool_registry is None and active_schemas is None and task_local_scope is None)
+                    or reg_tool_pa is not None
+                    or schema_pa is not None
+                    or (task_local_scope is not None and pa.tool_id in (getattr(task_local_scope, "tool_names", None) or ()))
+                )
+                pol_dec_pa = pol_engine_res.evaluate(
+                    pa.tool_id,
+                    pa.normalized_arguments,
+                    normalized_arguments=pa.normalized_arguments,
+                    schema=schema_pa,
+                    tool_obj=reg_tool_pa,
+                    required_ring=req_ring_pa,
+                    is_registered=is_reg_pa,
+                    is_external=pa_is_ext,
+                    external_metadata=dict(getattr(pa_ext_entry, "metadata", None) or {}) if pa_ext_entry is not None else None,
+                    workspace_root=workspace_root,
+                    execution_id=execution_id,
+                    consume_confirmation=False,
+                    source_surface="checkpoint_resume",
+                    central_ledger=central_ledger,
+                    record_to_ledger=False,
+                )
+                auth_checks.setdefault(pa.tool_id, {})
+                auth_checks[pa.tool_id]["policy_outcome"] = pol_dec_pa.outcome.value
+                auth_checks[pa.tool_id]["policy_decision"] = pol_dec_pa.to_safe_dict()
+                if pol_dec_pa.outcome == PolicyDecisionOutcome.DENY:
+                    pa_auth_blocked = True
+                    pa.status = ProposalStatus.BLOCKED.value
+                    pa.authorization_status = "policy_denied"
+                    pa.blocked_reason = pol_dec_pa.reason
+                    auth_checks[pa.tool_id]["allowed"] = False
+                    auth_checks[pa.tool_id]["error_type"] = "POLICY_DENIED"
+                    auth_checks[pa.tool_id]["reason"] = pol_dec_pa.reason
+                    if pol_dec_pa.reason not in blocking_reasons:
+                        blocking_reasons.append(pol_dec_pa.reason)
+                elif pol_dec_pa.outcome == PolicyDecisionOutcome.REQUIRE_CONFIRMATION:
+                    pa.authorization_status = "requires_confirmation"
+                    warnings.append(
+                        f"Pending proposal '{pa.proposal_id}' ({pa.tool_id}) requires fresh confirmation before execution."
+                    )
 
             # Check environment capability changes affecting this pending proposal
             if not pa_auth_blocked and eff_current_env:

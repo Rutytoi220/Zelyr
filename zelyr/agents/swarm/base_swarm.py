@@ -249,6 +249,40 @@ Returns:
                     candidate_names.add(attr_val.strip())
 
         if candidate_names & expanded_mutating_names:
+            from zelyr.engine.execution_policy import build_execution_policy_engine
+            from zelyr.tool_registry import resolve_tool_ring
+
+            pre_pol_engine = build_execution_policy_engine(
+                policy_engine=getattr(self, "execution_policy_engine", None),
+                policy_config=getattr(self, "execution_policy_config", None),
+                zelyr_config=getattr(self, "config", None),
+            )
+            pre_pol_dec = pre_pol_engine.evaluate(
+                canonical_name,
+                validated_arguments,
+                normalized_arguments=validated_arguments,
+                tool_obj=authorized_tool,
+                required_ring=resolve_tool_ring(canonical_name, tool=authorized_tool),
+                is_registered=True,
+                is_external=is_ext,
+                execution_id=exec_id,
+                correlation_id=call_id,
+                consume_confirmation=False,
+                source_surface="base_swarm.pre_consensus",
+                central_ledger=ledger,
+                record_to_ledger=False,
+            )
+            if not pre_pol_dec.allowed:
+                err = pre_pol_dec.to_tool_error_payload()
+                try:
+                    ledger.record_event(exec_id, LedgerEventType.AUTHORIZATION_DECISION, tool_id=tool_name, source_id=src_id, source_type=src_type, is_external=is_ext, status="denied", correlation_id=call_id, caller_ring=eff_ring, metadata={"reason": err.get("reason"), "policy_decision": pre_pol_dec.to_safe_dict()}, idempotency_key=f"{exec_id}:{call_id}:auth")
+                    ledger.record_event(exec_id, LedgerEventType.TOOL_EXECUTION_RESULT, tool_id=tool_name, source_id=src_id, source_type=src_type, is_external=is_ext, status="rejected", correlation_id=call_id, caller_ring=eff_ring, metadata=err, idempotency_key=f"{exec_id}:{call_id}:result")
+                    if own_exec:
+                        ledger.finalize_execution(exec_id, status=ExecutionStatus.FAILED, verification_status=VerificationStatus.NOT_VERIFIED, error=err["error"])
+                except Exception:
+                    pass
+                return err
+
             if not self.consensus:
                 err = {'error': 'Consensus engine required for mutating tools'}
                 try:
@@ -303,6 +337,34 @@ Returns:
             self._write_to_blackboard(f'{tool_name}_error', error)
             return error
 
+        from zelyr.engine.execution_policy import authorized_policy_context, build_execution_policy_engine
+        from zelyr.tool_registry import resolve_tool_ring
+
+        pol_engine_final = build_execution_policy_engine(
+            policy_engine=getattr(self, "execution_policy_engine", None),
+            policy_config=getattr(self, "execution_policy_config", None),
+            zelyr_config=getattr(self, "config", None),
+        )
+        pol_dec_final = pol_engine_final.evaluate(
+            canonical_name,
+            validated_arguments,
+            normalized_arguments=validated_arguments,
+            tool_obj=authorized_tool,
+            required_ring=resolve_tool_ring(canonical_name, tool=authorized_tool),
+            is_registered=True,
+            is_external=is_ext,
+            execution_id=exec_id,
+            correlation_id=call_id,
+            consume_confirmation=True,
+            confirm_callback=getattr(self, "confirm_callback", None),
+            source_surface="base_swarm.execute",
+            central_ledger=ledger,
+        )
+        if not pol_dec_final.allowed:
+            err = pol_dec_final.to_tool_error_payload()
+            self._write_to_blackboard(f'{tool_name}_error', err)
+            return err
+
         try:
             ledger.record_event(exec_id, LedgerEventType.AUTHORIZATION_DECISION, tool_id=tool_name, source_id=src_id, source_type=src_type, is_external=is_ext, status="allowed", correlation_id=call_id, caller_ring=eff_ring, idempotency_key=f"{exec_id}:{call_id}:auth")
             ledger.record_event(exec_id, LedgerEventType.TOOL_EXECUTION_START, tool_id=tool_name, source_id=src_id, source_type=src_type, is_external=is_ext, status="started", correlation_id=call_id, caller_ring=eff_ring, metadata={"arguments": validated_arguments}, idempotency_key=f"{exec_id}:{call_id}:started")
@@ -312,7 +374,7 @@ Returns:
         try:
             import inspect
             exec_args = copy.deepcopy(validated_arguments)
-            with execution_scope(ledger, exec_id, caller_ring=eff_ring, source_component="base_swarm", correlation_id=call_id, owned_by_outer=True):
+            with authorized_policy_context(pol_dec_final), execution_scope(ledger, exec_id, caller_ring=eff_ring, source_component="base_swarm", correlation_id=call_id, owned_by_outer=True):
                 raw_res = authorized_tool(**exec_args)
                 result = await raw_res if inspect.isawaitable(raw_res) else raw_res
             res_ok = bool(getattr(result, "success", True)) if not isinstance(result, dict) else not bool(result.get("error"))

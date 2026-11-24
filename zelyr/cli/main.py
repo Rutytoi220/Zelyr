@@ -318,10 +318,45 @@ async def _execute_headless_run(
             })
         clean_name = decision.tool_name
         norm_kwargs = decision.normalized_arguments
+
+        from zelyr.engine.execution_policy import (
+            authorized_policy_context,
+            evaluate_direct_tool_policy_async,
+        )
+        from zelyr.tool_registry import resolve_tool_ring
+
+        matched_dyn_schema = next(
+            (s for s in (dynamic_tools or []) if isinstance(s, dict) and (s.get("function") or {}).get("name") == clean_name),
+            None,
+        )
+        reg_tool_cli = (
+            orch.tool_registry.get_tool(clean_name)
+            if getattr(orch, "tool_registry", None) is not None and callable(getattr(orch.tool_registry, "get_tool", None))
+            else None
+        )
+        pol_dec = await evaluate_direct_tool_policy_async(
+            clean_name,
+            norm_kwargs,
+            tool_obj=reg_tool_cli,
+            schema=matched_dyn_schema,
+            required_ring=resolve_tool_ring(clean_name, tool=reg_tool_cli),
+            auth_decision=decision,
+            is_registered=bool(decision.allowed),
+            is_external=bool(getattr(reg_tool_cli, "is_external", False) or str(clean_name).startswith("ext__")),
+            confirm_callback=getattr(orch, "confirm_callback", None),
+            policy_engine=getattr(orch, "execution_policy_engine", None),
+            policy_config=getattr(orch, "execution_policy_config", None),
+            zelyr_config=orch._active_config(),
+            source_surface="cli.headless_execute_tool",
+        )
+        if not pol_dec.allowed:
+            return json.dumps(pol_dec.to_tool_error_payload())
+
         if not output_json:
             sys.stderr.write(f"[tool] {clean_name} {json.dumps(norm_kwargs)}\n")
             sys.stderr.flush()
-        res = await original_execute(clean_name, **norm_kwargs)
+        with authorized_policy_context(pol_dec):
+            res = await original_execute(clean_name, **norm_kwargs)
         return str(res)
 
     orch.execute_tool = headless_execute_tool
@@ -947,8 +982,30 @@ def cmd_tool_list(args: argparse.Namespace) -> None:
 
 
 def cmd_tool_run(args: argparse.Namespace) -> None:
-    """Execute a tool by ID."""
-    from zelyr.tool_registry import ToolRegistry
+    """Execute a tool by ID under unified execution policy enforcement."""
+    from zelyr.config import get_config
+    from zelyr.engine.execution_policy import (
+        ExecutionPolicyConfig,
+        ExecutionPolicyEngine,
+        PolicyDecisionOutcome,
+        get_default_confirmation_store,
+    )
+    from zelyr.tool_registry import ToolRegistry, resolve_tool_ring
+
+    cfg = get_config()
+    eff_mode = getattr(args, "policy_mode", None) or getattr(cfg, "execution_policy_mode", None) or "conservative"
+    pol_cfg = ExecutionPolicyConfig(
+        policy_mode=eff_mode,
+        risk_defaults=dict(getattr(cfg, "execution_policy_risk_defaults", {}) or {}),
+        tool_overrides=dict(getattr(cfg, "execution_policy_tool_overrides", {}) or {}),
+        resource_restrictions=dict(getattr(cfg, "execution_policy_resource_restrictions", {}) or {}),
+        confirmation_ttl_seconds=getattr(cfg, "execution_policy_confirmation_ttl_seconds", 300.0),
+        max_confirmation_lifetime_seconds=getattr(cfg, "execution_policy_max_confirmation_lifetime_seconds", 900.0),
+    )
+    pol_engine = ExecutionPolicyEngine(config=pol_cfg, confirmation_store=get_default_confirmation_store())
+    use_json = bool(getattr(args, "json", False))
+    caller_ring = getattr(args, "caller_ring", None)
+    confirm_flag = bool(getattr(args, "confirm", False))
 
     registry = ToolRegistry()
     tool = registry.get_tool(args.tool_id)
@@ -962,21 +1019,120 @@ def cmd_tool_run(args: argparse.Namespace) -> None:
         except Exception:
             pass
 
+    try:
+        tool_args = json.loads(args.args) if args.args else {}
+    except Exception as exc:
+        if use_json:
+            print(json.dumps({"success": False, "error": f"Invalid --args JSON: {exc}"}))
+        else:
+            _print(f"[red]✗[/red] Invalid --args JSON: {exc}")
+        sys.exit(1)
+
     if tool is None:
-        _print(f"[red]✗[/red] Tool '{args.tool_id}' not found.")
-        return
+        pol_dec = pol_engine.evaluate(
+            args.tool_id,
+            tool_args if isinstance(tool_args, dict) else {},
+            is_registered=False,
+            consume_confirmation=False,
+            source_surface="cli.tool_run",
+        )
+        if use_json:
+            print(json.dumps({"success": False, "error": f"Tool '{args.tool_id}' not found.", "policy_decision": pol_dec.to_safe_dict()}))
+        else:
+            _print(f"[red]✗[/red] Tool '{args.tool_id}' not found ({pol_dec.reason}).")
+        sys.exit(2)
 
-    tool_args = json.loads(args.args) if args.args else {}
+    req_ring = resolve_tool_ring(args.tool_id, tool=tool)
+    if caller_ring is not None and req_ring is not None and int(caller_ring) > int(req_ring):
+        msg = f"AuthorizationError: Tool '{args.tool_id}' requires caller_ring <= {req_ring}, got {caller_ring}."
+        if use_json:
+            print(json.dumps({"success": False, "error_type": "AUTHORIZATION_DENIED", "error": msg}))
+        else:
+            _print(f"[red]✗[/red] {msg}")
+        sys.exit(2)
 
-    async def _run() -> None:
-        _print(f"[bold]Running[/bold] {args.tool_id} with args {tool_args}…")
+    pre_dec = pol_engine.evaluate(
+        args.tool_id,
+        tool_args,
+        tool_obj=tool,
+        required_ring=req_ring,
+        is_registered=True,
+        is_external=bool(getattr(tool, "is_external", False) or str(args.tool_id).startswith("ext__")),
+        consume_confirmation=False,
+        source_surface="cli.tool_run",
+    )
+    if pre_dec.outcome == PolicyDecisionOutcome.DENY:
+        if use_json:
+            print(json.dumps(pre_dec.to_tool_error_payload()))
+        else:
+            _print(f"[red]✗ Policy denied ({pre_dec.risk_level.value}):[/red] {pre_dec.reason}")
+        sys.exit(2)
+
+    conf_token: Optional[str] = None
+    conf_id: Optional[str] = None
+    if pre_dec.outcome == PolicyDecisionOutcome.REQUIRE_CONFIRMATION:
+        approved = False
+        if confirm_flag:
+            approved = True
+        elif sys.stdin.isatty():
+            _print(
+                f"[yellow]⚠ Confirmation required[/yellow] tool={pre_dec.tool_id} risk={pre_dec.risk_level.value} "
+                f"digest={pre_dec.arg_digest[:12]} scope={pre_dec.resource_scope}"
+            )
+            try:
+                ans = input("Proceed with this exact action? [y/N]: ").strip().lower()
+                approved = ans in ("y", "yes")
+            except (EOFError, KeyboardInterrupt):
+                approved = False
+        if not approved:
+            if use_json:
+                print(json.dumps(pre_dec.to_tool_error_payload()))
+            else:
+                _print(
+                    f"[yellow]⏸ Confirmation required ({pre_dec.risk_level.value}):[/yellow] {pre_dec.reason} "
+                    "(pass --confirm to approve this exact normalized invocation)."
+                )
+            sys.exit(2)
+        conf_token, conf_rec = pol_engine.confirmation_store.issue_confirmation(
+            tool_id=pre_dec.tool_id,
+            arg_digest=pre_dec.arg_digest,
+            resource_scope=pre_dec.resource_scope,
+            ttl_seconds=pol_cfg.confirmation_ttl_seconds,
+            max_lifetime_seconds=pol_cfg.max_confirmation_lifetime_seconds,
+            policy_version=pol_cfg.policy_version,
+            approved_by="cli_tool_run",
+        )
+        conf_id = conf_rec.confirmation_id
+
+    async def _run() -> int:
+        if not use_json:
+            _print(f"[bold]Running[/bold] {args.tool_id} with args {tool_args} (risk={pre_dec.risk_level.value})…")
         try:
-            result = await registry.execute_async(args.tool_id, **tool_args)
-            _print(f"[green]Result:[/green] {result}")
+            result = await registry.execute_async(
+                args.tool_id,
+                caller_ring=caller_ring if caller_ring is not None else req_ring,
+                allowed_tools=[args.tool_id],
+                confirmation_token=conf_token,
+                confirmation_id=conf_id,
+                policy_engine=pol_engine,
+                **tool_args,
+            )
+            if use_json:
+                out_d = result.to_dict(tool=args.tool_id, arguments=tool_args) if hasattr(result, "to_dict") else {"success": bool(result), "output": result}
+                print(json.dumps(out_d, default=str))
+            else:
+                _print(f"[green]Result:[/green] {result}")
+            return 0 if getattr(result, "success", True) else 2
         except Exception as exc:
-            _print(f"[red]Execution failed:[/red] {exc}")
+            if use_json:
+                print(json.dumps({"success": False, "error": str(exc)}))
+            else:
+                _print(f"[red]Execution failed:[/red] {exc}")
+            return 1
 
-    asyncio.run(_run())
+    rc = asyncio.run(_run())
+    if rc != 0:
+        sys.exit(rc)
 
 
 def cmd_status(args: argparse.Namespace) -> None:
@@ -2176,6 +2332,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p_tool_run = tool_sub.add_parser("run", help="Run a specific tool")
     p_tool_run.add_argument("tool_id", type=str)
     p_tool_run.add_argument("--args", type=str, default="{}")
+    p_tool_run.add_argument("--caller-ring", type=int, default=None, help="Explicit caller security ring (0-2)")
+    p_tool_run.add_argument(
+        "--policy-mode",
+        type=str,
+        default=None,
+        choices=["conservative", "strict", "balanced", "basic", "autopilot"],
+        help="Execution policy mode override for this invocation",
+    )
+    p_tool_run.add_argument("--confirm", action="store_true", default=False, help="Approve policy confirmation for this exact invocation")
+    p_tool_run.add_argument("--json", action="store_true", default=False, help="Emit structured JSON output")
 
     p_mem = sub.add_parser("memory", help="Manage persistent memory and compaction")
     mem_sub = p_mem.add_subparsers(dest="mem_cmd")

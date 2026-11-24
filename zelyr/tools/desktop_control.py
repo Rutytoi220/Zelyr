@@ -107,12 +107,37 @@ class DesktopAutomationTool(BaseTool):
     # ── Dispatcher ────────────────────────────────────────────────────── #
 
     async def execute(self, action: str, **kwargs) -> ToolResult:
+        from zelyr.engine.execution_policy import (
+            authorized_policy_context,
+            evaluate_direct_tool_policy_async,
+        )
+
+        pol_dec = await evaluate_direct_tool_policy_async(
+            self.tool_id,
+            {"action": action, **kwargs},
+            tool_obj=self,
+            schema=self.schema if hasattr(self, "schema") else None,
+            required_ring=getattr(self, "required_ring", 0),
+            is_registered=True,
+            source_surface="desktop_control.execute",
+        )
+        if not pol_dec.allowed:
+            err_p = pol_dec.to_tool_error_payload()
+            return ToolResult(
+                success=False,
+                output=err_p,
+                error=pol_dec.reason,
+                error_type=err_p["error_type"],
+                metadata={"policy_decision": pol_dec.to_safe_dict()},
+            )
+
         # 1. Fast Path Router Heuristic Evaluation
         # If the requested action or parameters can be fulfilled by a native CLI command
         # (e.g., opening a browser via xdg-open rather than clicking Firefox icon), route it!
         try:
             from zelyr.core.fast_path_router import FastestPathRouter
-            fast_path_result = FastestPathRouter.evaluate_and_intercept(action, kwargs)
+            with authorized_policy_context(pol_dec):
+                fast_path_result = FastestPathRouter.evaluate_and_intercept(action, kwargs)
             if fast_path_result and fast_path_result.get("intercepted"):
                 cmd_str = " ".join(fast_path_result.get("command", []))
                 logger.info(
@@ -134,7 +159,8 @@ class DesktopAutomationTool(BaseTool):
         try:
             self._ensure_gui()
             handler = getattr(self, f"_action_{action}")
-            return await handler(**kwargs)
+            with authorized_policy_context(pol_dec):
+                return await handler(**kwargs)
         except Exception as e:
             logger.error(f"DesktopAutomationTool error ({action}): {e}")
             return ToolResult(success=False, error=f"Desktop automation error: {e}")

@@ -1071,13 +1071,63 @@ class InlineRepl:
             name = decision.tool_name
             kwargs = decision.normalized_arguments
 
+            from zelyr.engine.execution_policy import (
+                authorized_policy_context,
+                evaluate_direct_tool_policy_async,
+            )
+            from zelyr.tool_registry import resolve_tool_ring
+
+            def _repl_confirm(pol_d: Any) -> bool:
+                if getattr(nat_orch, "confirm_callback", None) is not None:
+                    return bool(nat_orch.confirm_callback(pol_d))
+                if not sys.stdin.isatty():
+                    return False
+                console.print(
+                    f"\n  [bold yellow]⚠ Policy confirmation required[/bold yellow] "
+                    f"tool={pol_d.tool_id} risk={pol_d.risk_level.value} digest={pol_d.arg_digest[:12]}"
+                )
+                try:
+                    ans = input("  Approve exact action? [y/N]: ").strip().lower()
+                    return ans in ("y", "yes")
+                except (EOFError, KeyboardInterrupt):
+                    return False
+
+            matched_repl_schema = next(
+                (s for s in (payload.get("tools") or []) if isinstance(s, dict) and (s.get("function") or {}).get("name") == name),
+                None,
+            )
+            reg_tool_repl = (
+                nat_orch.tool_registry.get_tool(name)
+                if getattr(nat_orch, "tool_registry", None) is not None and callable(getattr(nat_orch.tool_registry, "get_tool", None))
+                else None
+            )
+            pol_dec = await evaluate_direct_tool_policy_async(
+                name,
+                kwargs,
+                tool_obj=reg_tool_repl,
+                schema=matched_repl_schema,
+                required_ring=resolve_tool_ring(name, tool=reg_tool_repl),
+                auth_decision=decision,
+                is_registered=bool(decision.allowed),
+                is_external=bool(getattr(reg_tool_repl, "is_external", False) or str(name).startswith("ext__")),
+                confirm_callback=_repl_confirm if (getattr(nat_orch, "confirm_callback", None) is not None or sys.stdin.isatty()) else None,
+                policy_engine=getattr(nat_orch, "execution_policy_engine", None),
+                policy_config=getattr(nat_orch, "execution_policy_config", None),
+                zelyr_config=getattr(self, "config", None),
+                source_surface="cli.repl",
+            )
+            if not pol_dec.allowed:
+                err_p = pol_dec.to_tool_error_payload()
+                console.print(f"\n  [bold red]✗ Policy blocked {name}:[/bold red] {pol_dec.reason}\n")
+                return json.dumps(err_p)
+
             hint = f"Executing {name}..."
             console.print(f"\n  [tool.badge]⚡ Tool Dispatch:[/tool.badge] [tool.name]{name}[/tool.name] [dim]{json.dumps(kwargs)}[/dim]")
             from zelyr.core.plugins import get_tier_timeout
             timeout = get_tier_timeout(name)
             timeout_int = int(timeout)
             try:
-                with console.status(f"  [#e0af68]{hint}[/#e0af68]", spinner="dots"):
+                with authorized_policy_context(pol_dec), console.status(f"  [#e0af68]{hint}[/#e0af68]", spinner="dots"):
                     res = await asyncio.wait_for(original_execute(name, **kwargs), timeout=timeout)
             except (TimeoutError, asyncio.TimeoutError):
                 err_dict = {
