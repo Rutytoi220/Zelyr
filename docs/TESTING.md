@@ -1,48 +1,52 @@
-# Zelyr Testing & CI Baseline
+# Zelyr Testing & Headless Verification Guide
 
-This document outlines the strict testing conventions, environment isolation protocols, and execution boundaries for the Zelyr V11+ codebase. 
+This document summarizes the active testing configuration, isolation fixtures, and offline verification workflow configured in [`pyproject.toml`](../pyproject.toml) and [`tests/conftest.py`](../tests/conftest.py).
 
-## Philosophy
+For detailed developer setup and packaging workflows, see [`DEVELOPER_GUIDE.md`](DEVELOPER_GUIDE.md).
 
-Zelyr interacts with the host desktop (Vision, Mouse, Keyboard, Filesystem). Testing these components blindly leads to flakiness, corrupted developer environments, and false-positive test passes. We enforce a zero-trust execution sandbox for our tests.
+---
 
-## 1. Pytest Markers
+## 1. Consolidated Test Layout & Markers
 
-All tests **must** be explicitly marked in `pyproject.toml`. Unmarked tests or improperly marked tests will fail CI constraints.
+Active automated tests live directly in top-level [`tests/test_*.py`](../tests/) modules. Legacy subdirectories (`tests/fixtures`, `tests/unit`, `tests/gui`, `tests/e2e`, `tests/integration`, `tests/optional`, `tests/simulation`, `zelyr/tests`) are excluded by `norecursedirs` and `addopts` in `pyproject.toml`, and `addopts` applies `-m 'not e2e and not requires_wayland and not hardware'` by default.
 
-- `@pytest.mark.unit`: Fast, purely isolated tests. No filesystem mutations, no external API calls, no LLM calls. Everything external is mocked.
-- `@pytest.mark.integration`: Tests interactions between components (e.g., `ToolRegistry` calling `SandboxRunner`). These may use temporary filesystems.
-- `@pytest.mark.e2e`: End-to-end critical path tests (e.g., `tests/integration/test_critical_path.py`). These verify the system from the FastAPI edge to the command execution sandbox.
-- `@pytest.mark.gui`: PySide6 GUI tests running in headless mode. These use Qt bot and require explicit teardowns.
+Custom markers declared in `pyproject.toml`:
+- `unit`: Fast, purely isolated offline tests.
+- `integration`: Component interaction tests using temporary directories/SQLite databases.
+- `e2e`: End-to-end flows excluded from default offline CI runs.
+- `gui`: Headless Qt / PySide6 widget tests (require `QT_QPA_PLATFORM=offscreen`).
+- `requires_wayland` / `hardware`: Host compositor or physical device tests excluded by default.
 
-## 2. Execution Boundaries & Isolation
+---
 
-### Network & LLM Blocking (`block_external_io`)
-By default, the `block_external_io` autouse fixture in `tests/conftest.py` **brutally blocks** any outgoing HTTP requests (`httpx`) and `litellm` calls. Tests that intentionally trigger external IO will raise a `RuntimeError`. If you need to test network interactions, you must either write a mock, or explicit test isolation. 
+## 2. Automatic Headless Isolation (`tests/conftest.py`)
 
-### Filesystem Isolation (`mock_home_directory`)
-Tests should **never** write to the developer's real `~/.zelyr` state. The `mock_home_directory` autouse fixture explicitly overrides `$HOME`, `$XDG_CONFIG_HOME`, `$XDG_DATA_HOME`, and `Path.home()` to redirect all state storage to a temporary directory.
+To ensure tests never mutate the developer's `~/.config/zelyr/` directory or trigger external inference/network calls:
+1. **Offscreen Qt Rendering:** Sets `QT_QPA_PLATFORM=offscreen`.
+2. **Home Directory Isolation:** Redirects `$HOME`, `$USERPROFILE`, `$XDG_CONFIG_HOME`, `$XDG_DATA_HOME`, and `Path.home()` to a per-test `TemporaryDirectory`.
+3. **Outbound Network Blocking:** Monkeypatches `httpx.get`, `httpx.post`, `urllib.request.urlopen`, and `litellm.completion` so accidental unmocked external IO fails immediately (`RuntimeError`).
+4. **No Desktop Popups:** Subprocess/browser launcher calls (`webbrowser.open`, `xdg-open`) must be mocked cleanly.
 
-### GUI Teardowns (`robust_teardown_qt_widgets`)
-Headless Qt widgets often leak memory or crash `_Py_Dealloc` during Python GC. We use a global `robust_teardown_qt_widgets` fixture to call `.deleteLater()` and flush the Qt event loop (`processEvents()`) to prevent segfaults.
+---
 
-## 3. Running Tests
+## 3. Running Tests & Static Checks
 
-To run the full suite:
 ```bash
-QT_QPA_PLATFORM=offscreen uv run pytest
-```
-*Note: `QT_QPA_PLATFORM=offscreen` is mandatory for running headless GUI tests in CI.*
+# Run the consolidated offline test suite
+QT_QPA_PLATFORM=offscreen ZELYR_TESTING=1 uv run pytest -v
 
-To run unit tests only:
-```bash
-QT_QPA_PLATFORM=offscreen uv run pytest -m unit
+# Run targeted subsystem / boundary suites
+QT_QPA_PLATFORM=offscreen ZELYR_TESTING=1 uv run pytest -v \
+  tests/test_execution_policy_management.py \
+  tests/test_execution_lifecycle_diagnostics.py \
+  tests/test_execution_observability.py \
+  tests/test_configuration_diagnostics.py \
+  tests/test_model_compatibility_diagnostics.py \
+  tests/test_execution_failure_boundaries.py
+
+# Static linting and diff whitespace checks
+uv run ruff check .
+git diff --check
 ```
 
-To run the master critical path test:
-```bash
-QT_QPA_PLATFORM=offscreen uv run pytest tests/integration/test_critical_path.py -v
-```
-
-## 4. The Critical Path Test
-The `test_critical_path_websocket_to_sandbox` test is the gold standard of Zelyr's functionality. It spawns the FastAPI server, connects to the Swarm WebSocket, injects a mocked LLM response, and verifies that the `SandboxRunner` executes the tool payload (using Bubblewrap containment) and returns the output successfully through the full pipeline.
+> **Note:** On loaded machines, `tests/test_model_matrix.py::TestModelMatrixEvaluator::test_mock_matrix_evaluation_speed_and_determinism` enforces a strict 1.0s wall-clock ceiling (`elapsed < 1.0`) and may fail under high background CPU load without indicating a logic regression.

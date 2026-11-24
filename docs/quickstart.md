@@ -88,13 +88,16 @@ ollama pull nomic-embed-text
 
 Before launching the interactive interfaces, run the self-contained verification suite to confirm that environment paths, database storage, and tool dispatch work cleanly.
 
-### 1. Run Offline Pre-Flight Test
+### 1. Run Offline Pre-Flight & Diagnostics Checks
 ```bash
-uv run python3 -m unittest -v test_install_bootstrap.py
+uv run pytest -v tests/test_install_bootstrap.py
+uv run zelyr config validate
+uv run zelyr model check --no-probe
+uv run zelyr policy show
 ```
 This tests:
 - Clean first-run auto-creation of `~/.config/zelyr/` directories (`tools.d`, `plugins`, `sessions`, `logs`).
-- Zero hardcoded developer paths in production code.
+- Effective configuration provenance & unknown-key validation (`config validate`).
 - Package entry points and dependencies.
 
 ### 2. Run Level 1 Deterministic Benchmark Suite
@@ -135,8 +138,12 @@ Useful slash commands inside the REPL:
 - `/model`: Switch the active reasoning model.
 - `/tools`: List registered tools in the Three-Tier hierarchy.
 - `/memory list`: View persistent facts in the SQLite store.
+- `/policy show` | `/policy explain <tool>`: Inspect execution policy and preview rules safely.
+- `/diagnose <execution_id>`: Run read-only end-to-end lifecycle diagnostics.
 - `/doctor`: Run diagnostic health checks across all subsystems.
 - `/exit`: Exit the session cleanly.
+
+See [`WORKFLOWS.md`](WORKFLOWS.md) for planning (`--plan`), parallel graphs, checkpoints/resume, and observability metrics.
 
 ### B. Full-Screen Terminal UI (TUI)
 For an IDE-like terminal workspace:
@@ -178,7 +185,11 @@ uv run python3 -m zelyr.cli.main run "List open windows and create a summary in 
   ```
   If Ollama is listening on a custom address or container host, specify it via:
   ```bash
-  export OLLAMA_BASE_URL="http://127.0.0.1:11434"
+  export ZELYR_OLLAMA_BASE_URL="http://127.0.0.1:11434"
+  ```
+  Then verify connectivity and model metadata with:
+  ```bash
+  uv run zelyr model check
   ```
 
 ### 3. Hyprland IPC Commands Fail Outside Hyprland

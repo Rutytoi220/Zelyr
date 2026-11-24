@@ -14,7 +14,7 @@ Each section specifies module responsibilities, public interfaces, state mutatio
   Does not execute LLM inference directly; delegates to `repl.py`, `tui.py`, or `app.py`.
 - **Verified Public Interfaces:**  
   `main() -> None`: Main console dispatcher.  
-  `_build_parser() -> ArgumentParser`: Configures CLI arguments (`repl`, `chat`, `ui`, `server`, `run`, `send`, `status`, `test`, `daemon`, `serve`, `tool list`, `tool run`).
+  `_build_parser() -> ArgumentParser`: Configures CLI arguments (`repl`/`chat`, `ui`/`gui`, `server`, `run`, `send`, `tool`, `memory`, `status`, `env`/`manifest`, `executions`, `execution`, `diagnose`, `metrics`/`observability`, `config`, `model`, `checkpoint`, `resume`, `test`, `eval`, `daemon`, `serve`, `mcp`, `routine`, `policy`).
 - **Dependencies:** `argparse`, `rich` (optional graceful degradation), `zelyr.config`.
 - **State Mutations:** Triggers `zelyr.config.initialize_directories()`.
 - **Failure Modes:** Falls back to standard `print()` if `rich` is unavailable.
@@ -25,7 +25,7 @@ Each section specifies module responsibilities, public interfaces, state mutatio
   Provides an inline, non-fullscreen streaming REPL with Tokyo Night aesthetics, prompt auto-suggestion, slash command autocompletion, and reasoning `<think>` token toggles.
 - **Verified Public Interfaces:**  
   `run_repl() -> None`: Starts interactive prompt session.  
-  `COMMANDS: Dict[str, str]`: Slash command registry (`/help`, `/model`, `/session`, `/thought`, `/tools`, `/memory`, `/doctor`, `/undo`, `/exit`).
+  `COMMANDS: Dict[str, str]`: Slash command registry (`/help`, `/model`, `/session`, `/resume`, `/clear`, `/effort`, `/thought`, `/tools`, `/routine`, `/memory`, `/rules`, `/env`, `/policy`, `/diagnose`, `/status`, `/doctor`, `/undo`, `/exit`).
 - **Dependencies:** `prompt_toolkit`, `rich`, `zelyr.agents.native_orchestrator.NativeOrchestrator`.
 - **Backing Tests:** Interactive verification via pseudo-terminal (PTY) harnesses.
 
@@ -165,4 +165,16 @@ Each section specifies module responsibilities, public interfaces, state mutatio
   `get_effective_ollama_base_url(caller_override: Optional[Any] = None) -> str`: Resolves the active Ollama endpoint (`caller_override` -> `ZELYR_OLLAMA_BASE_URL` -> `config.ollama_base_url` -> `http://127.0.0.1:11434`).
   `get_effective_keep_alive(caller_override: Optional[Any] = None) -> Union[str, int]`: Resolves keep-alive duration (`caller_override` -> `ZELYR_OLLAMA_KEEP_ALIVE` -> `config.ollama_keep_alive` -> `"5m"`).
   `get_effective_read_timeout(caller_override: Optional[Any] = None) -> float`: Resolves HTTP stream read timeout in seconds (`caller_override` -> `ZELYR_OLLAMA_READ_TIMEOUT` -> `config.ollama_read_timeout` -> `300.0`, clamped to `[5.0, 3600.0]`).
-- **Backing Tests:** [`tests/test_install_bootstrap.py`](../tests/test_install_bootstrap.py), [`tests/test_multi_turn_payload.py`](../tests/test_multi_turn_payload.py), [`tests/test_remote_ollama_and_concurrency.py`](../tests/test_remote_ollama_and_concurrency.py).
+- **Backing Tests:** [`tests/test_install_bootstrap.py`](../tests/test_install_bootstrap.py), [`tests/test_multi_turn_payload.py`](../tests/test_multi_turn_payload.py), [`tests/test_remote_ollama_and_concurrency.py`](../tests/test_remote_ollama_and_concurrency.py), [`tests/test_configuration_diagnostics.py`](../tests/test_configuration_diagnostics.py).
+
+---
+
+## 7. Continuity, Planning, Recovery, Policy & Diagnostics `[VERIFIED]`
+
+- **Execution Ledgers & Continuity:** [`zelyr/engine/execution_ledger.py`](../zelyr/engine/execution_ledger.py) (`CentralExecutionLedger`, `TurnExecutionLedger`) and [`zelyr/engine/checkpoint.py`](../zelyr/engine/checkpoint.py) (`CheckpointManager`, `TaskCheckpoint`, `PendingActionProposal`, `ResumeAssessment`) persist task state across interruptions while blocking blind replay of verified or post-dispatch ambiguous mutating actions.
+- **TaskGraph & Plan Compiler:** [`zelyr/engine/task_graph.py`](../zelyr/engine/task_graph.py) (`TaskGraph`, `TaskNode`, `TaskGraphEdge`) and [`zelyr/planning/compiler.py`](../zelyr/planning/compiler.py) (`PlanCompiler`, `compile_structured_plan_to_task_graph`, `replan_task_graph`) compile objectives into dependency-validated DAGs executed with bounded parallelism and resource-conflict serialization.
+- **Verification-Driven Recovery:** [`zelyr/engine/verifier.py`](../zelyr/engine/verifier.py) (`OutcomeVerifier`) and [`zelyr/engine/recovery.py`](../zelyr/engine/recovery.py) (`RecoveryEngine`, `RecoveryPolicy`, `RecoveryDecision`) prevent false-success claims and separate safe retries from reconciliation-required failures.
+- **Unified Execution Policy & Explainability:** [`zelyr/engine/execution_policy.py`](../zelyr/engine/execution_policy.py) (`ExecutionPolicyEngine`, `ConfirmationStore`, `PolicyExplanation`, `preview_tool_policy`, `inspect_policy_configuration`, `query_policy_history`) governs all tool dispatch paths fail-closed.
+- **Diagnostics & Observability:** [`zelyr/engine/diagnostics.py`](../zelyr/engine/diagnostics.py), [`zelyr/engine/observability.py`](../zelyr/engine/observability.py), [`zelyr/engine/config_diagnostics.py`](../zelyr/engine/config_diagnostics.py), and [`zelyr/engine/model_compatibility.py`](../zelyr/engine/model_compatibility.py) expose read-only CLI/REPL reports (`diagnose`, `metrics`, `config`, `model check`, `env --model-check`).
+- **MCP Integration:** [`zelyr/mcp/`](../zelyr/mcp/) (`MCPManager`, stdio/SSE clients, `zelyr mcp serve`) bridges external servers under default-deny tool registration (`ToolRegistry.authorize_external_tool`).
+- **Operational Reference:** See [`WORKFLOWS.md`](WORKFLOWS.md).

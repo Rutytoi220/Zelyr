@@ -11,6 +11,7 @@ Every statement, code path, and interface in these documents is grounded in veri
 
 | Developer Objective | Recommended Reading | Primary Source Files |
 | :--- | :--- | :--- |
+| **Run Operational Workflows** | [`WORKFLOWS.md: Operational Workflows`](WORKFLOWS.md) | [`zelyr/cli/main.py`](../zelyr/cli/main.py), [`zelyr/engine/`](../zelyr/engine/) |
 | **Trace a User Request** | [`ARCHITECTURE.md: Request Lifecycle`](ARCHITECTURE.md#2-request-lifecycle-execution-flow-verified) | [`zelyr/cli/main.py`](../zelyr/cli/main.py), [`zelyr/agents/native_orchestrator.py`](../zelyr/agents/native_orchestrator.py) |
 | **Add or Modify a Tool** | [`TOOLS.md: Tool Creation & Extension`](TOOLS.md) | [`zelyr/core/plugins.py`](../zelyr/core/plugins.py), [`zelyr/tools/base.py`](../zelyr/tools/base.py) |
 | **Understand Subsystems** | [`SUBSYSTEMS.md: Subsystem Catalog`](SUBSYSTEMS.md) | [`zelyr/`](../zelyr/) |
@@ -33,6 +34,7 @@ ChienGPT/
 ├── pyproject.toml             # Python package manifest, dependencies, entry points, pytest config
 ├── docs/                      # Central technical documentation repository
 │   ├── INDEX.md               # [This file] The central AI and developer navigation map
+│   ├── WORKFLOWS.md           # Verified operational workflows, CLI commands, and troubleshooting
 │   ├── ARCHITECTURE.md        # Runtime architecture, request lifecycle, context budgeting
 │   ├── SUBSYSTEMS.md          # Module-by-module reference of verified subsystems
 │   ├── TOOLS.md               # Tool creation guide, dynamic plugin format, capability tiers
@@ -40,13 +42,25 @@ ChienGPT/
 │   └── DEVELOPER_GUIDE.md     # Development workflows, test suites, headless requirements
 ├── zelyr/                     # Core application source code
 │   ├── agents/                # Orchestration engines and actuator arbitration
-│   │   ├── native_orchestrator.py  # [VERIFIED] Active ReAct orchestrator used by CLI REPL/TUI
+│   │   ├── native_orchestrator.py  # [VERIFIED] Active ReAct & parallel TaskGraph orchestrator
 │   │   ├── actuator_arbiter.py     # [VERIFIED] Dynamic 3-tier capability router (IPC/DOM/Vision)
 │   │   └── orchestrator_agent.py   # [PARTIALLY VERIFIED] Heavy state-machine agent
 │   ├── cli/                   # Console interfaces and user entry points
 │   │   ├── main.py            # [VERIFIED] Console script entry point (`zelyr`)
 │   │   ├── repl.py            # [VERIFIED] Modern inline streaming CLI (Tokyo Night theme)
 │   │   └── tui.py             # [VERIFIED] Fullscreen OpenCode-tier TUI
+│   ├── engine/                # Ledger, continuity, TaskGraph, recovery, policy & diagnostics
+│   │   ├── execution_ledger.py     # [VERIFIED] Central & turn execution ledgers (SQLite)
+│   │   ├── checkpoint.py           # [VERIFIED] TaskCheckpoint & PendingActionProposal continuity
+│   │   ├── task_graph.py           # [VERIFIED] Dependency-aware TaskGraph & conflict reservations
+│   │   ├── recovery.py             # [VERIFIED] Evidence-driven node recovery engine
+│   │   ├── execution_policy.py     # [VERIFIED] Unified risk policy, confirmations & explainability
+│   │   ├── diagnostics.py          # [VERIFIED] Read-only end-to-end execution lifecycle diagnostics
+│   │   ├── observability.py        # [VERIFIED] Measured execution/policy counts & monotonic timings
+│   │   ├── config_diagnostics.py   # [VERIFIED] Config provenance, unknown-key & validation report
+│   │   └── model_compatibility.py  # [VERIFIED] Honest model/provider compatibility checks
+│   ├── planning/              # Structured plan parsing, validation, compilation & replanning
+│   ├── mcp/                   # MCP stdio/SSE client & gateway server (`zelyr mcp serve`)
 │   ├── config.py              # [VERIFIED] Configuration, path resolution, context clamping
 │   ├── core/                  # Kernel components, fast-path routing, and plugin loader
 │   │   ├── fast_path_router.py# [VERIFIED] Intercepts URL/app launches to bypass LLM
@@ -90,7 +104,20 @@ ChienGPT/
     ├── test_shell_authorization.py  # [VERIFIED] Shell execution confirmation and fail-closed security
     ├── test_swarm_blackboard.py     # [VERIFIED] Multi-agent blackboard namespace isolation
     ├── test_tool_permission_parity.py # [VERIFIED] Native/fallback/registry/subagent permission parity tests
-    └── test_web_search.py           # [VERIFIED] Web search, extraction, SSRF, prompt injection tests
+    ├── test_web_search.py           # [VERIFIED] Web search, extraction, SSRF, prompt injection tests
+    ├── test_checkpointed_task_continuity.py # [VERIFIED] Durable checkpoints & resume safety gates
+    ├── test_pending_tool_calls.py   # [VERIFIED] Pending proposal continuity & dependency gates
+    ├── test_task_dependency_graphs.py # [VERIFIED] TaskGraph model, edges & observation updates
+    ├── test_graph_parallel_execution.py # [VERIFIED] Bounded TaskGraph parallel scheduling & locks
+    ├── test_plan_to_graph_compilation.py # [VERIFIED] PlanCompiler DAG compilation & replanning
+    ├── test_verification_driven_recovery.py # [VERIFIED] Evidence-driven node recovery & reconciliation
+    ├── test_unified_execution_policy.py # [VERIFIED] Policy risk classification & confirmation binding
+    ├── test_execution_policy_management.py # [VERIFIED] Policy show/explain/history CLI & explainability
+    ├── test_execution_lifecycle_diagnostics.py # [VERIFIED] Read-only end-to-end execution diagnostics
+    ├── test_execution_observability.py # [VERIFIED] Monotonic timings & unmeasured telemetry separation
+    ├── test_configuration_diagnostics.py # [VERIFIED] Config provenance, unknown keys & validation CLI
+    ├── test_model_compatibility_diagnostics.py # [VERIFIED] Offline/probed model & provider checks
+    └── test_execution_failure_boundaries.py # [VERIFIED] Cancel, timeout, confirmation & DB error boundaries
 ```
 
 ---

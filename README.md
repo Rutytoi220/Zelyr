@@ -154,6 +154,7 @@ For developers, architects, and AI coding agents navigating the codebase, refer 
 | Guide | Description | Target Audience |
 | :--- | :--- | :--- |
 | **[`docs/INDEX.md`](docs/INDEX.md)** | **Central AI & Developer Navigation Map** | Coding agents, contributors |
+| **[`docs/WORKFLOWS.md`](docs/WORKFLOWS.md)** | **End-to-End Operational Workflows & CLI Reference** | Operators, users, contributors |
 | **[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)** | Runtime architecture, request lifecycle, context budgeting | Architects, developers |
 | **[`docs/SUBSYSTEMS.md`](docs/SUBSYSTEMS.md)** | Subsystem catalog, module responsibilities, public APIs | Developers, maintainers |
 | **[`docs/TOOLS.md`](docs/TOOLS.md)** | Tool creation guide, dynamic plugin format, capability tiers | Tool authors, extenders |
@@ -180,9 +181,24 @@ zelyr ui
 # Start background FastAPI compute node & OpenAI-compatible proxy
 zelyr server
 
-# Run autonomous agent with natural-language prompt (optional --base-url for remote Ollama)
+# Run autonomous agent with natural-language prompt (optional --base-url, --plan, --verify)
 zelyr run "Inspect open windows and list system memory"
 zelyr run --base-url http://192.168.1.50:11434 "Summarize repository status"
+zelyr run --plan --confirm --max-concurrency 2 "Verify config and generate report.txt"
+
+# Validate config, model compatibility, execution policy, and runtime environment
+zelyr config validate --strict
+zelyr model check
+zelyr policy show
+zelyr policy explain manage_workspace_file --args '{"action": "write", "path": "a.txt", "content": "hi"}'
+zelyr env --model-check
+
+# Inspect executions, checkpoints, diagnostics, and measured observability metrics
+zelyr executions --resumable
+zelyr checkpoint list
+zelyr resume <execution_id> --inspect
+zelyr diagnose <execution_id> --verify
+zelyr metrics [<execution_id>]
 
 # List all registered and dynamic tools
 zelyr tool list
