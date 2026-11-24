@@ -1341,6 +1341,148 @@ def cmd_executions(args: argparse.Namespace) -> None:
             ledger.close()
 
 
+def _resolve_policy_config_for_cli(args: argparse.Namespace) -> Any:
+    """Resolve ExecutionPolicyConfig lazily from --config-path or default ZelyrConfig."""
+    from pathlib import Path
+    from zelyr.config import ZelyrConfig, get_config
+    from zelyr.engine.execution_policy import ExecutionPolicyConfig
+
+    cfg_path_arg = getattr(args, "config_path", None)
+    if cfg_path_arg:
+        cfg_path = Path(cfg_path_arg).expanduser()
+        if not cfg_path.exists():
+            print(f"Error: Config file not found: {cfg_path}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            z_cfg = ZelyrConfig.load(cfg_path)
+        except Exception as exc:
+            print(f"Error: Failed to load config file '{cfg_path}': {exc}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        z_cfg = get_config()
+
+    pol_cfg = ExecutionPolicyConfig.from_zelyr_config(z_cfg)
+    mode_override = getattr(args, "policy_mode", None)
+    if mode_override:
+        sources = dict(pol_cfg.config_sources)
+        sources["policy_mode"] = "explicit:cli"
+        pol_cfg = ExecutionPolicyConfig(
+            policy_version=pol_cfg.policy_version,
+            policy_mode=str(mode_override),
+            risk_defaults=pol_cfg.risk_defaults,
+            tool_overrides=pol_cfg.tool_overrides,
+            resource_restrictions=pol_cfg.resource_restrictions,
+            confirmation_ttl_seconds=pol_cfg.confirmation_ttl_seconds,
+            max_confirmation_lifetime_seconds=pol_cfg.max_confirmation_lifetime_seconds,
+            governor_strict_mode=pol_cfg.governor_strict_mode,
+            config_sources=sources,
+            _config_file_path=pol_cfg._config_file_path,
+            _auth_mode_str=pol_cfg._auth_mode_str,
+        )
+    return pol_cfg
+
+
+def cmd_policy(args: argparse.Namespace) -> None:
+    """Inspect active execution policy, preview tool decisions, or query ledger policy history."""
+    subcmd = getattr(args, "policy_cmd", None)
+    if subcmd == "show":
+        from zelyr.engine.execution_policy import (
+            format_policy_configuration,
+            inspect_policy_configuration,
+        )
+
+        pol_cfg = _resolve_policy_config_for_cli(args)
+        view = inspect_policy_configuration(policy_config=pol_cfg)
+        if getattr(args, "json", False):
+            print(json.dumps(view, indent=2))
+            return
+        print(format_policy_configuration(view))
+        return
+
+    if subcmd == "explain":
+        from zelyr.engine.execution_policy import (
+            format_policy_explanation,
+            preview_tool_policy,
+        )
+
+        pol_cfg = _resolve_policy_config_for_cli(args)
+        allowed_raw = getattr(args, "allowed_tools", None)
+        allowed_tools = (
+            [t.strip() for t in str(allowed_raw).split(",") if t.strip()]
+            if allowed_raw is not None
+            else None
+        )
+        raw_args = getattr(args, "args", None)
+        eff_args: Any = {} if raw_args is None else raw_args
+        preview_res = preview_tool_policy(
+            args.tool_id,
+            eff_args,
+            caller_ring=getattr(args, "caller_ring", None),
+            allowed_tools=allowed_tools,
+            workspace_root=getattr(args, "workspace_root", None),
+            policy_config=pol_cfg,
+            source_surface="cli_policy_explain",
+        )
+        if getattr(args, "json", False):
+            print(json.dumps(preview_res.to_safe_dict(), indent=2))
+            return
+        print(format_policy_explanation(preview_res))
+        return
+
+    if subcmd == "history":
+        import datetime
+        from zelyr.engine.execution_policy import query_policy_history
+
+        ledger, owns_conn = _open_cli_ledger(getattr(args, "db_path", None))
+        try:
+            hist = query_policy_history(
+                ledger,
+                limit=int(getattr(args, "limit", 20) or 20),
+                outcome=getattr(args, "outcome", None),
+                tool_id=getattr(args, "tool", None),
+                execution_id=getattr(args, "execution_id", None),
+            )
+            if getattr(args, "json", False):
+                print(json.dumps(hist, indent=2))
+                if hist.get("persistence_errors"):
+                    sys.exit(1)
+                return
+
+            if hist.get("persistence_errors"):
+                for perr in hist["persistence_errors"]:
+                    print(
+                        f"Error: Ledger persistence failure ({perr.get('operation', 'query')}): {perr.get('error', 'unknown error')}",
+                        file=sys.stderr,
+                    )
+                sys.exit(1)
+
+            entries = hist.get("entries") or []
+            if not entries:
+                print("No policy authorization decisions recorded.")
+                return
+
+            print(f"Policy Authorization History ({hist.get('db_path')}) — {len(entries)} decision(s):")
+            for entry in entries:
+                ts_val = float(entry.get("timestamp") or 0.0)
+                ts_str = datetime.datetime.fromtimestamp(ts_val).strftime("%Y-%m-%d %H:%M:%S")
+                tags: List[str] = []
+                if entry.get("legacy_metadata"):
+                    tags.append("legacy")
+                if entry.get("malformed_metadata"):
+                    tags.append("malformed")
+                tag_str = f" [{' '.join(tags)}]" if tags else ""
+                print(
+                    f"  {ts_str}  outcome={entry.get('outcome')}  tool={entry.get('tool_id')}  "
+                    f"risk={entry.get('risk_level')}  stage={entry.get('precedence_stage')}  "
+                    f"reason_code={entry.get('reason_code')}  exec={entry.get('execution_id')}  "
+                    f"scope={entry.get('resource_scope')}{tag_str}"
+                )
+            return
+        finally:
+            if owns_conn:
+                ledger.close()
+
+
 def cmd_execution(args: argparse.Namespace) -> None:
     """Inspect a single execution record, ordered timeline, and optional checkpoint details."""
     import datetime
@@ -2592,6 +2734,46 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Maximum number of history records to show (default: 20)",
     )
 
+    # ── Execution Policy inspection, preview & history ───────────────────────
+    p_policy = sub.add_parser(
+        "policy",
+        help="Inspect effective execution policy, preview tool decisions, and view policy history",
+    )
+    policy_sub = p_policy.add_subparsers(dest="policy_cmd")
+
+    p_pol_show = policy_sub.add_parser("show", help="Show effective execution policy settings and precedence")
+    p_pol_show.add_argument("--config-path", type=str, default=None, help="Load settings from an explicit ZelyrConfig JSON file")
+    p_pol_show.add_argument(
+        "--policy-mode",
+        choices=["conservative", "strict", "balanced", "basic", "autopilot"],
+        default=None,
+        help="Preview effective defaults under a specific policy mode",
+    )
+    p_pol_show.add_argument("--json", action="store_true", default=False, help="Output structured JSON")
+
+    p_pol_explain = policy_sub.add_parser("explain", help="Preview and explain policy outcome for a tool without executing")
+    p_pol_explain.add_argument("tool_id", help="Tool ID to evaluate in non-executing preview mode")
+    p_pol_explain.add_argument("--args", type=str, default=None, help="JSON object string of tool arguments to preview")
+    p_pol_explain.add_argument("--caller-ring", type=int, default=None, help="Simulated caller ring (0-3)")
+    p_pol_explain.add_argument("--allowed-tools", type=str, default=None, help="Comma-separated allowed tool IDs")
+    p_pol_explain.add_argument("--workspace-root", type=str, default=None, help="Workspace root path for containment preview")
+    p_pol_explain.add_argument("--config-path", type=str, default=None, help="Load settings from an explicit ZelyrConfig JSON file")
+    p_pol_explain.add_argument(
+        "--policy-mode",
+        choices=["conservative", "strict", "balanced", "basic", "autopilot"],
+        default=None,
+        help="Override policy mode for explanation preview",
+    )
+    p_pol_explain.add_argument("--json", action="store_true", default=False, help="Output structured JSON")
+
+    p_pol_hist = policy_sub.add_parser("history", help="Query redacted AUTHORIZATION_DECISION history from execution ledger")
+    p_pol_hist.add_argument("--limit", "-n", type=int, default=20, help="Maximum history entries to show (default: 20)")
+    p_pol_hist.add_argument("--outcome", type=str, default=None, help="Filter by outcome (allow, require_confirmation, deny)")
+    p_pol_hist.add_argument("--tool", type=str, default=None, help="Filter by tool ID")
+    p_pol_hist.add_argument("--execution-id", type=str, default=None, help="Filter by execution ID")
+    p_pol_hist.add_argument("--db-path", type=str, default=None, help="Override execution ledger SQLite DB path")
+    p_pol_hist.add_argument("--json", action="store_true", default=False, help="Output structured JSON")
+
     return parser
 
 
@@ -2645,6 +2827,11 @@ def main() -> None:
         cmd_mcp(args)
     elif args.command == "routine":
         cmd_routine(args)
+    elif args.command == "policy":
+        if getattr(args, "policy_cmd", None):
+            cmd_policy(args)
+        else:
+            parser.parse_args(["policy", "--help"])
     elif args.command in dispatch:
         if args.command == "eval":
             cmd_eval(args, extra)

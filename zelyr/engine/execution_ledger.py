@@ -3536,13 +3536,18 @@ class ExecutionEvent:
         raw_meta = d.get("metadata_json") if "metadata_json" in d else d.get("metadata", {})
         if isinstance(raw_meta, str):
             try:
-                meta = json.loads(raw_meta) if raw_meta else {}
+                parsed_meta = json.loads(raw_meta) if raw_meta else {}
+                meta = (
+                    {}
+                    if parsed_meta is None
+                    else (parsed_meta if isinstance(parsed_meta, dict) else {"_malformed_metadata": True})
+                )
             except Exception:
-                meta = {}
+                meta = {"_malformed_metadata": True}
         elif isinstance(raw_meta, dict):
             meta = dict(raw_meta)
         else:
-            meta = {}
+            meta = {"_malformed_metadata": True} if raw_meta is not None else {}
         return cls(
             event_id=str(d["event_id"]),
             execution_id=str(d["execution_id"]),
@@ -3613,13 +3618,18 @@ class ExecutionRecord:
         raw_meta = d.get("metadata_json") if "metadata_json" in d else d.get("metadata", {})
         if isinstance(raw_meta, str):
             try:
-                meta = json.loads(raw_meta) if raw_meta else {}
+                parsed_meta = json.loads(raw_meta) if raw_meta else {}
+                meta = (
+                    {}
+                    if parsed_meta is None
+                    else (parsed_meta if isinstance(parsed_meta, dict) else {"_malformed_metadata": True})
+                )
             except Exception:
-                meta = {}
+                meta = {"_malformed_metadata": True}
         elif isinstance(raw_meta, dict):
             meta = dict(raw_meta)
         else:
-            meta = {}
+            meta = {"_malformed_metadata": True} if raw_meta is not None else {}
         eff_count = event_count if event_count is not None else int(d.get("event_count") or max(int(d.get("next_seq", 1)) - 1, 0))
         return cls(
             execution_id=str(d["execution_id"]),
@@ -4530,6 +4540,94 @@ class CentralExecutionLedger:
             if correlation_id:
                 evs = [e for e in evs if e.correlation_id == str(correlation_id)]
             return sorted(evs, key=lambda e: e.sequence_number)
+
+    def query_authorization_decisions(
+        self,
+        *,
+        limit: int = 20,
+        outcome: Optional[str] = None,
+        tool_id: Optional[str] = None,
+        execution_id: Optional[str] = None,
+    ) -> List[ExecutionEvent]:
+        """Return recent AUTHORIZATION_DECISION events ordered deterministically newest-first."""
+        eff_limit = max(1, min(int(limit or 20), 500))
+        norm_outcome = str(outcome or "").strip().lower() or None
+        outcome_aliases: Dict[str, Set[str]] = {
+            "allow": {"allow", "allowed"},
+            "allowed": {"allow", "allowed"},
+            "require_confirmation": {
+                "require_confirmation",
+                "requires_confirmation",
+                "confirmation_required",
+            },
+            "requires_confirmation": {
+                "require_confirmation",
+                "requires_confirmation",
+                "confirmation_required",
+            },
+            "deny": {"deny", "denied", "rejected"},
+            "denied": {"deny", "denied", "rejected"},
+        }
+        accepted_outcomes = outcome_aliases.get(norm_outcome, {norm_outcome}) if norm_outcome else None
+
+        def _matches_outcome(ev: ExecutionEvent) -> bool:
+            if accepted_outcomes is None:
+                return True
+            meta = ev.metadata if isinstance(ev.metadata, dict) else {}
+            pol_dec = str(meta.get("policy_decision") or "").strip().lower()
+            st = str(ev.status or "").strip().lower()
+            return (pol_dec in accepted_outcomes) or (st in accepted_outcomes)
+
+        with self._lock:
+            conn = self._ensure_connection(raise_on_error=False, execution_id=execution_id)
+            if conn is not None:
+                try:
+                    clauses = ["event_type = ?"]
+                    params: List[Any] = [LedgerEventType.AUTHORIZATION_DECISION.value]
+                    if tool_id:
+                        clauses.append("tool_id = ?")
+                        params.append(str(tool_id))
+                    if execution_id:
+                        clauses.append("execution_id = ?")
+                        params.append(str(execution_id))
+                    where_sql = " AND ".join(clauses)
+                    rows = conn.execute(
+                        f"SELECT * FROM execution_events WHERE {where_sql} "
+                        "ORDER BY timestamp DESC, sequence_number DESC, id DESC",
+                        params,
+                    ).fetchall()
+                    out_events: List[ExecutionEvent] = []
+                    for r in rows:
+                        ev = ExecutionEvent.from_row(r)
+                        if _matches_outcome(ev):
+                            out_events.append(ev)
+                            if len(out_events) >= eff_limit:
+                                break
+                    return out_events
+                except Exception as exc:
+                    self._record_persistence_failure(
+                        "query_authorization_decisions",
+                        exc,
+                        execution_id=execution_id,
+                        strict=False,
+                    )
+
+            mem_events: List[ExecutionEvent] = []
+            for exec_events in self._memory_events.values():
+                for ev in exec_events:
+                    if ev.event_type != LedgerEventType.AUTHORIZATION_DECISION.value:
+                        continue
+                    if tool_id and ev.tool_id != str(tool_id):
+                        continue
+                    if execution_id and ev.execution_id != str(execution_id):
+                        continue
+                    if _matches_outcome(ev):
+                        mem_events.append(ev)
+            mem_events.sort(
+                key=lambda e: (float(e.timestamp or 0.0), int(e.sequence_number or 0), str(e.event_id or "")),
+                reverse=True,
+            )
+            return mem_events[:eff_limit]
 
     def list_executions(
         self,

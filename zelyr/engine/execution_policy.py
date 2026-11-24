@@ -327,6 +327,48 @@ def _looks_like_filesystem_path(val: str) -> bool:
     return "/" in val or "\\" in val or val.startswith(("~", ".")) or "." in Path(val).name
 
 
+def _sanitize_scope_item(item: Any) -> str:
+    """Scrub URL credentials/tokens and sensitive text from a resource scope string."""
+    raw = str(item or "").strip()
+    if not raw:
+        return ""
+    scrubbed = re.sub(r"(?i)(https?://)([^/@\s]+@)", r"\1[REDACTED]@", raw)
+    scrubbed = re.sub(
+        r"(?i)([?&](?:token|key|api_key|secret|password|auth|sig|access_token)=)([^&\s]+)",
+        r"\1[REDACTED]",
+        scrubbed,
+    )
+    return _safe_policy_text(scrubbed)
+
+
+def _redact_policy_config_value(value: Any, *, key_name: str = "") -> Any:
+    """Recursively redact sensitive leaf values inside trusted policy configuration views."""
+    if isinstance(value, Mapping):
+        return {str(k): _redact_policy_config_value(v, key_name=str(k)) for k, v in value.items()}
+    low_k = str(key_name or "").lower()
+    if any(
+        tok in low_k
+        for tok in (
+            "secret",
+            "token",
+            "password",
+            "passwd",
+            "api_key",
+            "apikey",
+            "credential",
+            "private_key",
+            "bearer",
+            "authorization",
+        )
+    ):
+        return "[REDACTED]"
+    if isinstance(value, (list, tuple, set)):
+        return [_redact_policy_config_value(v) for v in value]
+    if isinstance(value, str):
+        return _sanitize_scope_item(value)
+    return value
+
+
 def extract_resource_scope(
     tool_id: str,
     normalized_arguments: Mapping[str, Any],
@@ -339,7 +381,7 @@ def extract_resource_scope(
     scopes: Set[str] = set()
 
     for item in node_target_resources or ():
-        s = str(item or "").strip()
+        s = _sanitize_scope_item(item)
         if s:
             scopes.add(s)
 
@@ -349,10 +391,12 @@ def extract_resource_scope(
             if isinstance(val, str) and val.strip():
                 canon = _canonicalize_path_str(val, ws_path)
                 if canon:
-                    scopes.add(f"path:{canon}")
+                    scopes.add(_sanitize_scope_item(f"path:{canon}"))
         url_val = normalized_arguments.get("url") or normalized_arguments.get("endpoint")
         if isinstance(url_val, str) and url_val.strip():
-            scopes.add(f"url:{url_val.strip()}")
+            scrubbed_url = _sanitize_scope_item(f"url:{url_val.strip()}")
+            if scrubbed_url:
+                scopes.add(scrubbed_url)
 
     if tool_id in {"interact_with_ui", "gui_actuate", "desktop_control", "desktop_automation", "click_tag", "type_text", "press_key"}:
         scopes.add("exclusive:ui_desktop")
@@ -450,8 +494,12 @@ class ExecutionPolicyConfig:
     confirmation_ttl_seconds: float = 300.0
     max_confirmation_lifetime_seconds: float = 900.0
     governor_strict_mode: bool = False
+    config_sources: Dict[str, str] = field(default_factory=dict)
+    _config_file_path: Optional[str] = field(default=None, repr=False, compare=False)
+    _auth_mode_str: Optional[str] = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        raw_sources = dict(self.config_sources or {})
         if self.policy_version not in SUPPORTED_POLICY_VERSIONS:
             raise UnsupportedPolicyVersionError(
                 f"Unsupported execution policy version: {self.policy_version!r}"
@@ -488,6 +536,18 @@ class ExecutionPolicyConfig:
         self.tool_overrides = clean_overrides
         self.resource_restrictions = dict(self.resource_restrictions or {})
 
+        inferred_sources: Dict[str, str] = {
+            "policy_mode": "explicit" if self.policy_mode != "conservative" else "default",
+            "risk_defaults": "explicit" if self.risk_defaults else "default",
+            "tool_overrides": "explicit" if self.tool_overrides else "default",
+            "resource_restrictions": "explicit" if self.resource_restrictions else "default",
+            "confirmation_ttl_seconds": "explicit" if self.confirmation_ttl_seconds != 300.0 else "default",
+            "max_confirmation_lifetime_seconds": "explicit" if self.max_confirmation_lifetime_seconds != 900.0 else "default",
+            "governor_strict_mode": "explicit" if self.governor_strict_mode else "default",
+        }
+        inferred_sources.update({str(k): str(v) for k, v in raw_sources.items()})
+        self.config_sources = inferred_sources
+
     @classmethod
     def from_zelyr_config(
         cls,
@@ -503,42 +563,77 @@ class ExecutionPolicyConfig:
 
         auth_val = getattr(getattr(config, "auth_mode", None), "value", getattr(config, "auth_mode", "basic"))
         auth_str = str(auth_val or "basic").strip().lower()
+        explicit_fields = set(getattr(config, "_explicit_fields", set()) or ())
+        cfg_file_path = getattr(config, "_config_source_path", None)
+
+        def _src(field_name: str, is_non_default: bool) -> str:
+            if field_name in explicit_fields:
+                return f"config_file:{cfg_file_path}" if cfg_file_path else "explicit"
+            if is_non_default:
+                return "explicit"
+            return "default"
 
         raw_mode = getattr(config, "execution_policy_mode", None)
-        if raw_mode is not None and str(raw_mode).strip():
+        mode_explicit = raw_mode is not None and bool(str(raw_mode).strip())
+        if mode_explicit:
             eff_mode = str(raw_mode).strip().lower()
             if eff_mode not in SUPPORTED_POLICY_MODES:
                 eff_mode = "conservative"
+            mode_source = f"config_file:{cfg_file_path}" if ("execution_policy_mode" in explicit_fields and cfg_file_path) else "explicit"
         elif auth_str == "strict":
             eff_mode = "strict"
+            mode_source = f"derived:auth_mode:{auth_str}"
         elif auth_str == "autopilot":
             eff_mode = "autopilot"
+            mode_source = f"derived:auth_mode:{auth_str}"
         else:
             eff_mode = "basic"
+            mode_source = f"derived:auth_mode:{auth_str}"
 
         strict_gov = bool(governor_strict_mode) if governor_strict_mode is not None else (auth_str == "strict")
+        gov_source = "explicit" if governor_strict_mode is not None else (f"derived:auth_mode:{auth_str}" if auth_str == "strict" else "default")
         if governor_strict_mode is None:
             try:
                 from zelyr.services.governor import GovernorService
 
                 if GovernorService.instance().is_strict_mode():
                     strict_gov = True
+                    if auth_str != "strict":
+                        gov_source = "derived:governor_strict_mode"
             except Exception:
                 pass
         if strict_gov and eff_mode == "basic":
             eff_mode = "strict"
+            if not mode_explicit:
+                mode_source = "derived:governor_strict_mode"
+
+        risk_defaults = dict(getattr(config, "execution_policy_risk_defaults", {}) or {})
+        tool_overrides = dict(getattr(config, "execution_policy_tool_overrides", {}) or {})
+        resource_restrictions = dict(getattr(config, "execution_policy_resource_restrictions", {}) or {})
+        ttl = getattr(config, "execution_policy_confirmation_ttl_seconds", 300.0)
+        max_lt = getattr(config, "execution_policy_max_confirmation_lifetime_seconds", 900.0)
 
         return cls(
             policy_version=POLICY_VERSION,
             policy_mode=eff_mode,
-            risk_defaults=dict(getattr(config, "execution_policy_risk_defaults", {}) or {}),
-            tool_overrides=dict(getattr(config, "execution_policy_tool_overrides", {}) or {}),
-            resource_restrictions=dict(getattr(config, "execution_policy_resource_restrictions", {}) or {}),
-            confirmation_ttl_seconds=getattr(config, "execution_policy_confirmation_ttl_seconds", 300.0),
-            max_confirmation_lifetime_seconds=getattr(
-                config, "execution_policy_max_confirmation_lifetime_seconds", 900.0
-            ),
+            risk_defaults=risk_defaults,
+            tool_overrides=tool_overrides,
+            resource_restrictions=resource_restrictions,
+            confirmation_ttl_seconds=ttl,
+            max_confirmation_lifetime_seconds=max_lt,
             governor_strict_mode=strict_gov,
+            config_sources={
+                "policy_mode": mode_source,
+                "risk_defaults": _src("execution_policy_risk_defaults", bool(risk_defaults)),
+                "tool_overrides": _src("execution_policy_tool_overrides", bool(tool_overrides)),
+                "resource_restrictions": _src("execution_policy_resource_restrictions", bool(resource_restrictions)),
+                "confirmation_ttl_seconds": _src("execution_policy_confirmation_ttl_seconds", float(ttl) != 300.0),
+                "max_confirmation_lifetime_seconds": _src("execution_policy_max_confirmation_lifetime_seconds", float(max_lt) != 900.0),
+                "governor_strict_mode": gov_source,
+                "auth_mode": _src("auth_mode", auth_str != "basic"),
+            },
+            _config_file_path=cfg_file_path,
+            _auth_mode_str=auth_str,
         )
 
     def resolve_default_outcome_for_risk(self, risk_level: RiskLevel, *, workspace_scoped: bool = True) -> PolicyDecisionOutcome:
@@ -1013,6 +1108,73 @@ def get_default_confirmation_store() -> ConfirmationStore:
     return _DEFAULT_CONFIRMATION_STORE
 
 
+_PRECEDENCE_STAGE_LABELS: Dict[str, str] = {
+    "rule1:hard_security": "Rule 1 — Hard Security Boundaries",
+    "rule2:runtime_authorization": "Rule 2 — Runtime Authorization & Isolation",
+    "rule3:tool_override": "Rule 3 — Trusted Tool-Specific Override",
+    "rule4:resource_restriction": "Rule 4 — Resource-Scope & Workspace Containment",
+    "rule5:risk_policy": "Rule 5 — Configured Risk Policy Defaults",
+    "rule6:confirmation_validation": "Rule 6 — Bound Single-Use Confirmation Validation",
+}
+
+
+@dataclass(frozen=True)
+class PolicyExplanation:
+    """Structured, human- and machine-readable explanation derived from a real policy evaluation."""
+
+    decision_id: str
+    outcome: str
+    risk_level: str
+    tool_id: str
+    reason_code: str
+    precedence_stage: str
+    precedence_stage_label: str
+    determining_rule_id: str
+    rule_ids: Tuple[str, ...]
+    policy_mode: str
+    policy_version: int
+    config_source: Dict[str, str]
+    resource_scope: Tuple[str, ...]
+    confirmation_required: bool
+    confirmation_status: str
+    is_preview: bool
+    summary: str
+    remediation_hint: str
+    auth_error_type: Optional[str] = None
+    execution_id: Optional[str] = None
+    node_id: Optional[str] = None
+    source_surface: str = "unknown"
+    is_external: bool = False
+
+    def to_safe_dict(self) -> Dict[str, Any]:
+        """Serialize sanitized explanation without exposing raw arguments or confirmation tokens."""
+        return {
+            "decision_id": self.decision_id,
+            "outcome": self.outcome,
+            "risk_level": self.risk_level,
+            "tool_id": self.tool_id,
+            "reason_code": self.reason_code,
+            "precedence_stage": self.precedence_stage,
+            "precedence_stage_label": self.precedence_stage_label,
+            "determining_rule_id": self.determining_rule_id,
+            "rule_ids": list(self.rule_ids),
+            "policy_mode": self.policy_mode,
+            "policy_version": self.policy_version,
+            "config_source": dict(self.config_source),
+            "resource_scope": [_sanitize_scope_item(s) for s in self.resource_scope if _sanitize_scope_item(s)],
+            "confirmation_required": self.confirmation_required,
+            "confirmation_status": self.confirmation_status,
+            "is_preview": self.is_preview,
+            "summary": _safe_policy_text(self.summary),
+            "remediation_hint": _safe_policy_text(self.remediation_hint),
+            "auth_error_type": self.auth_error_type,
+            "execution_id": self.execution_id,
+            "node_id": self.node_id,
+            "source_surface": self.source_surface,
+            "is_external": self.is_external,
+        }
+
+
 @dataclass
 class ExecutionPolicyDecision:
     """Deterministic structured policy evaluation result for a tool call."""
@@ -1037,23 +1199,86 @@ class ExecutionPolicyDecision:
     source_id: Optional[str] = None
     source_type: Optional[str] = None
     remediation_hint: str = ""
+    reason_code: str = ""
+    precedence_stage: str = ""
+    determining_rule_id: str = ""
+    policy_mode: str = ""
+    config_source: Dict[str, str] = field(default_factory=dict)
+    is_preview: bool = False
+    auth_error_type: Optional[str] = None
 
     @property
     def allowed(self) -> bool:
         return self.outcome == PolicyDecisionOutcome.ALLOW
 
+    def explain(self) -> PolicyExplanation:
+        """Build a structured PolicyExplanation directly from recorded evaluation metadata."""
+        eff_stage = self.precedence_stage or "unrecorded_stage"
+        eff_stage_label = _PRECEDENCE_STAGE_LABELS.get(eff_stage, eff_stage)
+        eff_rule = self.determining_rule_id or (self.rule_ids[-1] if self.rule_ids else "unspecified")
+        eff_reason_code = self.reason_code or eff_rule
+        eff_mode = self.policy_mode or "unspecified"
+        sanitized_scope = tuple(s for s in (_sanitize_scope_item(x) for x in self.resource_scope) if s)
+        preview_tag = "[PREVIEW] " if self.is_preview else ""
+        base_reason = _safe_policy_text(self.reason) or f"Outcome {self.outcome.value} for '{self.tool_id}'."
+        trigger_rules = [
+            r for r in self.rule_ids if r.startswith(("rule3:tool_override", "rule5:risk_policy", "rule4:", "rule1:", "rule2:"))
+        ]
+        chain_note = f" Evaluated chain: {', '.join(trigger_rules)}." if trigger_rules else ""
+        summary = (
+            f"{preview_tag}{self.outcome.value.upper()} '{self.tool_id}' "
+            f"(risk={self.risk_level.value}, mode={eff_mode}, stage={eff_stage}, "
+            f"rule={eff_rule}, reason_code={eff_reason_code}): {base_reason}{chain_note}"
+        )
+        return PolicyExplanation(
+            decision_id=self.decision_id,
+            outcome=self.outcome.value,
+            risk_level=self.risk_level.value,
+            tool_id=self.tool_id,
+            reason_code=eff_reason_code,
+            precedence_stage=eff_stage,
+            precedence_stage_label=eff_stage_label,
+            determining_rule_id=eff_rule,
+            rule_ids=tuple(self.rule_ids),
+            policy_mode=eff_mode,
+            policy_version=self.policy_version,
+            config_source=dict(self.config_source),
+            resource_scope=sanitized_scope,
+            confirmation_required=self.confirmation_required,
+            confirmation_status=self.confirmation_status,
+            is_preview=bool(self.is_preview),
+            summary=_safe_policy_text(summary),
+            remediation_hint=_safe_policy_text(self.remediation_hint),
+            auth_error_type=self.auth_error_type,
+            execution_id=self.execution_id,
+            node_id=self.node_id,
+            source_surface=self.source_surface,
+            is_external=self.is_external,
+        )
+
+    def to_explanation_dict(self) -> Dict[str, Any]:
+        """Return a sanitized dictionary representation of `explain()`."""
+        return self.explain().to_safe_dict()
+
     def to_safe_dict(self) -> Dict[str, Any]:
         """Serialize sanitized policy decision safe for ledgers, error responses, and model feedback."""
-        return {
+        sanitized_scope = [_sanitize_scope_item(s) for s in self.resource_scope if _sanitize_scope_item(s)]
+        payload: Dict[str, Any] = {
             "decision_id": self.decision_id,
             "outcome": self.outcome.value,
             "risk_level": self.risk_level.value,
             "tool_id": self.tool_id,
             "arg_digest": self.arg_digest,
-            "resource_scope": list(self.resource_scope),
+            "resource_scope": sanitized_scope,
             "policy_version": self.policy_version,
             "rule_ids": list(self.rule_ids),
             "reason": _safe_policy_text(self.reason),
+            "reason_code": self.reason_code,
+            "precedence_stage": self.precedence_stage,
+            "determining_rule_id": self.determining_rule_id,
+            "policy_mode": self.policy_mode,
+            "config_source": dict(self.config_source),
+            "is_preview": bool(self.is_preview),
             "confirmation_required": self.confirmation_required,
             "confirmation_status": self.confirmation_status,
             "confirmation_id": self.confirmation_id,
@@ -1063,6 +1288,9 @@ class ExecutionPolicyDecision:
             "is_external": self.is_external,
             "remediation_hint": _safe_policy_text(self.remediation_hint),
         }
+        if self.auth_error_type is not None:
+            payload["auth_error_type"] = self.auth_error_type
+        return payload
 
     def to_tool_error_payload(self) -> Dict[str, Any]:
         """Build deterministic error dict suitable for tool runners and orchestrator messages."""
@@ -1072,17 +1300,23 @@ class ExecutionPolicyDecision:
             if self.outcome == PolicyDecisionOutcome.REQUIRE_CONFIRMATION
             else "POLICY_DENIED"
         )
+        sanitized_scope = [_sanitize_scope_item(s) for s in self.resource_scope if _sanitize_scope_item(s)]
         return {
             "success": False,
             "status": status,
             "error_type": err_type,
             "reason": "confirmation_required" if self.outcome == PolicyDecisionOutcome.REQUIRE_CONFIRMATION else "policy_denied",
+            "reason_code": self.reason_code,
+            "precedence_stage": self.precedence_stage,
+            "determining_rule_id": self.determining_rule_id,
+            "policy_mode": self.policy_mode,
+            "is_preview": bool(self.is_preview),
             "error": _safe_policy_text(self.reason),
             "tool": self.tool_id,
             "risk_level": self.risk_level.value,
             "decision_id": self.decision_id,
             "arg_digest": self.arg_digest,
-            "resource_scope": list(self.resource_scope),
+            "resource_scope": sanitized_scope,
             "rule_ids": list(self.rule_ids),
             "confirmation_status": self.confirmation_status,
             "remediation_hint": _safe_policy_text(self.remediation_hint),
@@ -1275,8 +1509,15 @@ class ExecutionPolicyEngine:
         central_ledger: Optional[Any] = None,
         record_to_ledger: bool = True,
         now: Optional[float] = None,
+        preview: bool = False,
     ) -> ExecutionPolicyDecision:
         """Evaluate execution policy deterministically across Rules 1..6 and optionally log to ledger."""
+        if preview:
+            consume_confirmation = False
+            confirm_callback = None
+            record_to_ledger = False
+            central_ledger = None
+
         tid = str(getattr(auth_decision, "tool_name", None) or tool_id or "").strip()
         decision_id = f"pol_{secrets.token_hex(8)}"
         ws_path = Path(workspace_root).expanduser().resolve(strict=False) if workspace_root else None
@@ -1348,11 +1589,16 @@ class ExecutionPolicyEngine:
             outcome: PolicyDecisionOutcome,
             reason: str,
             *,
+            reason_code: str,
+            precedence_stage: str,
+            determining_rule_id: str,
             conf_req: bool = False,
             conf_status: str = "not_required",
             conf_id: Optional[str] = None,
             remediation: str = "",
+            auth_error_type: Optional[str] = None,
         ) -> ExecutionPolicyDecision:
+            sanitized_scope = [_sanitize_scope_item(s) for s in resource_scope if _sanitize_scope_item(s)]
             dec = ExecutionPolicyDecision(
                 decision_id=decision_id,
                 outcome=outcome,
@@ -1360,7 +1606,7 @@ class ExecutionPolicyEngine:
                 tool_id=tid,
                 normalized_arguments=eff_args,
                 arg_digest=arg_digest,
-                resource_scope=resource_scope,
+                resource_scope=sanitized_scope,
                 policy_version=self.config.policy_version,
                 rule_ids=rule_ids,
                 reason=reason,
@@ -1374,8 +1620,15 @@ class ExecutionPolicyEngine:
                 source_id=source_id,
                 source_type=source_type,
                 remediation_hint=remediation,
+                reason_code=reason_code,
+                precedence_stage=precedence_stage,
+                determining_rule_id=determining_rule_id,
+                policy_mode=self.config.policy_mode,
+                config_source=dict(self.config.config_sources),
+                is_preview=bool(preview),
+                auth_error_type=auth_error_type,
             )
-            if record_to_ledger and central_ledger is not None and execution_id:
+            if (not preview) and record_to_ledger and central_ledger is not None and execution_id:
                 self._record_decision_to_ledger(
                     central_ledger,
                     dec,
@@ -1389,6 +1642,9 @@ class ExecutionPolicyEngine:
             return _finalize(
                 PolicyDecisionOutcome.DENY,
                 f"Policy denied '{tid}': arguments must be a dictionary object.",
+                reason_code="invalid_argument_container",
+                precedence_stage="rule1:hard_security",
+                determining_rule_id="rule1:invalid_argument_container",
                 remediation="Provide structured dictionary arguments.",
             )
 
@@ -1397,6 +1653,9 @@ class ExecutionPolicyEngine:
             return _finalize(
                 PolicyDecisionOutcome.DENY,
                 f"Policy denied '{tid}': untrusted authorization/policy keys {sorted(set(smuggled_keys))} rejected.",
+                reason_code="untrusted_policy_or_auth_keys",
+                precedence_stage="rule1:hard_security",
+                determining_rule_id="rule1:untrusted_policy_or_auth_keys",
                 remediation="Remove authorization and policy override fields from tool arguments.",
             )
 
@@ -1410,6 +1669,9 @@ class ExecutionPolicyEngine:
             return _finalize(
                 PolicyDecisionOutcome.DENY,
                 f"Policy denied '{tid}': command references protected system or credential path.",
+                reason_code="restricted_credential_or_security_command",
+                precedence_stage="rule1:hard_security",
+                determining_rule_id="rule1:restricted_credential_or_security_command",
                 remediation="Do not access or modify protected system or credential files.",
             )
 
@@ -1422,6 +1684,9 @@ class ExecutionPolicyEngine:
                 return _finalize(
                     PolicyDecisionOutcome.DENY,
                     f"Policy denied '{tid}': target path references protected system/credential resource.",
+                    reason_code="restricted_credential_or_security_path",
+                    precedence_stage="rule1:hard_security",
+                    determining_rule_id="rule1:restricted_credential_or_security_path",
                     remediation="Target workspace files rather than system security or credential stores.",
                 )
             if base_name in _SENSITIVE_FILENAMES and (
@@ -1431,6 +1696,9 @@ class ExecutionPolicyEngine:
                 return _finalize(
                     PolicyDecisionOutcome.DENY,
                     f"Policy denied '{tid}': sensitive target '{base_name}' is protected by hard security policy.",
+                    reason_code="sensitive_file_target",
+                    precedence_stage="rule1:hard_security",
+                    determining_rule_id="rule1:sensitive_file_target",
                     remediation="Do not access or modify secret/credential files.",
                 )
             if is_mutating_action and any(low_canon.startswith(prefix) or low_canon == prefix.rstrip("/") for prefix in _MUTATING_SYSTEM_FILES):
@@ -1438,6 +1706,9 @@ class ExecutionPolicyEngine:
                 return _finalize(
                     PolicyDecisionOutcome.DENY,
                     f"Policy denied '{tid}': mutating system path '{canon_p}' is forbidden.",
+                    reason_code="protected_system_file_mutation",
+                    precedence_stage="rule1:hard_security",
+                    determining_rule_id="rule1:protected_system_file_mutation",
                     remediation="Confine mutations to authorized workspace paths.",
                 )
 
@@ -1451,10 +1722,15 @@ class ExecutionPolicyEngine:
                     or "Authorization denied."
                 )
                 err_type = str(getattr(auth_decision, "error_type", None) or "AUTHORIZATION_DENIED")
-                rule_ids.append(f"rule2:auth_denied:{err_type}")
+                auth_rule_id = f"rule2:auth_denied:{err_type}"
+                rule_ids.append(auth_rule_id)
                 return _finalize(
                     PolicyDecisionOutcome.DENY,
                     err_msg,
+                    reason_code=f"auth_denied:{err_type}",
+                    precedence_stage="rule2:runtime_authorization",
+                    determining_rule_id=auth_rule_id,
+                    auth_error_type=err_type,
                     remediation="Ensure tool is registered, authorized for caller ring/allowlist/scope, and valid.",
                 )
             rule_ids.append("rule2:auth_passed")
@@ -1481,6 +1757,9 @@ class ExecutionPolicyEngine:
                     return _finalize(
                         PolicyDecisionOutcome.DENY,
                         f"Policy denied '{tid}': path '{canon_p}' falls under restricted prefix.",
+                        reason_code="denied_path_prefix",
+                        precedence_stage="rule4:resource_restriction",
+                        determining_rule_id="rule4:denied_path_prefix",
                         remediation="Select an allowed path outside restricted directories.",
                     )
             if restricted_ws_path is not None and not _is_path_within(canon_p, restricted_ws_path):
@@ -1490,6 +1769,9 @@ class ExecutionPolicyEngine:
                     return _finalize(
                         PolicyDecisionOutcome.DENY,
                         f"Policy denied '{tid}': mutating path '{canon_p}' escapes configured workspace '{restricted_ws_path}'.",
+                        reason_code="outside_workspace_mutation_denied",
+                        precedence_stage="rule4:resource_restriction",
+                        determining_rule_id="rule4:outside_workspace_mutation_denied",
                         remediation="Keep file modifications inside the configured workspace root.",
                     )
 
@@ -1501,26 +1783,42 @@ class ExecutionPolicyEngine:
                     return _finalize(
                         PolicyDecisionOutcome.DENY,
                         f"Policy denied '{tid}': target host is restricted by resource policy.",
+                        reason_code="denied_host",
+                        precedence_stage="rule4:resource_restriction",
+                        determining_rule_id="rule4:denied_host",
                         remediation="Target an approved host/endpoint.",
                     )
 
         # Evaluate override outcomes AFTER hard security & resource restrictions (Rules 1-4 stay supreme!).
         base_outcome: Optional[PolicyDecisionOutcome] = None
+        baseline_stage = "rule5:risk_policy"
+        baseline_rule_id = ""
+        baseline_reason_code = ""
         if override:
             if "outcome" in override:
                 base_outcome = _normalize_outcome(override["outcome"])
-                rule_ids.append(f"rule3:tool_override_outcome:{base_outcome.value}")
+                ov_rule_id = f"rule3:tool_override_outcome:{base_outcome.value}"
+                rule_ids.append(ov_rule_id)
+                baseline_stage = "rule3:tool_override"
+                baseline_rule_id = ov_rule_id
                 if base_outcome == PolicyDecisionOutcome.DENY:
                     return _finalize(
                         PolicyDecisionOutcome.DENY,
                         f"Policy denied '{tid}' by explicit trusted tool policy override.",
+                        reason_code="tool_override_deny",
+                        precedence_stage="rule3:tool_override",
+                        determining_rule_id=ov_rule_id,
                         remediation="Tool is explicitly disallowed by policy configuration.",
                     )
+                baseline_reason_code = "tool_override_allow" if base_outcome == PolicyDecisionOutcome.ALLOW else "tool_override_require_confirmation"
             elif override.get("deny") is True:
                 rule_ids.append("rule3:tool_override_deny")
                 return _finalize(
                     PolicyDecisionOutcome.DENY,
                     f"Policy denied '{tid}' by explicit trusted tool denial rule.",
+                    reason_code="tool_override_deny",
+                    precedence_stage="rule3:tool_override",
+                    determining_rule_id="rule3:tool_override_deny",
                     remediation="Tool is explicitly disallowed by policy configuration.",
                 )
             if "risk_level" in override:
@@ -1540,7 +1838,18 @@ class ExecutionPolicyEngine:
                 risk_level,
                 workspace_scoped=not outside_workspace,
             )
-            rule_ids.append(f"rule5:risk_policy:{self.config.policy_mode}:{risk_level.value}->{base_outcome.value}")
+            r5_rule_id = f"rule5:risk_policy:{self.config.policy_mode}:{risk_level.value}->{base_outcome.value}"
+            rule_ids.append(r5_rule_id)
+            baseline_stage = "rule5:risk_policy"
+            baseline_rule_id = r5_rule_id
+            if risk_level == RiskLevel.UNKNOWN:
+                baseline_reason_code = "unknown_tool_blocked"
+            elif risk_level == RiskLevel.IRREVERSIBLE:
+                baseline_reason_code = "irreversible_action_blocked"
+            elif risk_level.value in self.config.risk_defaults:
+                baseline_reason_code = f"risk_default_{base_outcome.value}:{risk_level.value}"
+            else:
+                baseline_reason_code = f"risk_policy_{base_outcome.value}:{risk_level.value}"
 
         # Unknown and Irreversible default to DENY under Rule 5 and NEVER accept casual overrides unless trusted policy explicitly permitted confirmation.
         if base_outcome == PolicyDecisionOutcome.DENY:
@@ -1549,6 +1858,9 @@ class ExecutionPolicyEngine:
                 (
                     f"Policy denied '{tid}' (risk={risk_level.value}) under policy mode '{self.config.policy_mode}'."
                 ),
+                reason_code=baseline_reason_code,
+                precedence_stage=baseline_stage,
+                determining_rule_id=baseline_rule_id,
                 remediation=(
                     "Tool is unknown or classified irreversible and blocked by default safety policy."
                     if risk_level in (RiskLevel.UNKNOWN, RiskLevel.IRREVERSIBLE)
@@ -1560,6 +1872,9 @@ class ExecutionPolicyEngine:
             return _finalize(
                 PolicyDecisionOutcome.ALLOW,
                 f"Policy allowed '{tid}' (risk={risk_level.value}) automatically under mode '{self.config.policy_mode}'.",
+                reason_code=baseline_reason_code,
+                precedence_stage=baseline_stage,
+                determining_rule_id=baseline_rule_id,
                 conf_req=False,
                 conf_status="not_required",
             )
@@ -1578,16 +1893,20 @@ class ExecutionPolicyEngine:
                 consume=consume_confirmation,
                 now=now,
             )
+            conf_rule_id = f"rule6:confirmation_{ver.status}"
             if ver.valid:
-                rule_ids.append(f"rule6:confirmation_{ver.status}")
+                rule_ids.append(conf_rule_id)
                 return _finalize(
                     PolicyDecisionOutcome.ALLOW,
                     f"Policy allowed '{tid}' with bound single-use confirmation ({ver.confirmation_id}).",
+                    reason_code=f"confirmation_{ver.status}",
+                    precedence_stage="rule6:confirmation_validation",
+                    determining_rule_id=conf_rule_id,
                     conf_req=True,
                     conf_status=ver.status,
                     conf_id=ver.confirmation_id,
                 )
-            rule_ids.append(f"rule6:confirmation_{ver.status}")
+            rule_ids.append(conf_rule_id)
             # Expired, replayed, revoked, or mismatched confirmations fail closed cleanly.
             fail_outcome = (
                 PolicyDecisionOutcome.DENY
@@ -1597,6 +1916,9 @@ class ExecutionPolicyEngine:
             return _finalize(
                 fail_outcome,
                 f"Policy rejected '{tid}': {ver.reason}",
+                reason_code=f"confirmation_{ver.status}",
+                precedence_stage="rule6:confirmation_validation",
+                determining_rule_id=conf_rule_id,
                 conf_req=True,
                 conf_status=ver.status,
                 conf_id=ver.confirmation_id,
@@ -1612,7 +1934,7 @@ class ExecutionPolicyEngine:
                 tool_id=tid,
                 normalized_arguments=eff_args,
                 arg_digest=arg_digest,
-                resource_scope=resource_scope,
+                resource_scope=sanitized_scope if (sanitized_scope := [_sanitize_scope_item(s) for s in resource_scope if _sanitize_scope_item(s)]) else [],
                 policy_version=self.config.policy_version,
                 rule_ids=list(rule_ids),
                 reason=(
@@ -1625,6 +1947,12 @@ class ExecutionPolicyEngine:
                 source_surface=source_surface,
                 is_external=is_external,
                 remediation_hint="Confirm exact normalized action to proceed.",
+                reason_code=baseline_reason_code or "confirmation_required",
+                precedence_stage=baseline_stage,
+                determining_rule_id=baseline_rule_id or "rule6:confirmation_pending",
+                policy_mode=self.config.policy_mode,
+                config_source=dict(self.config.config_sources),
+                is_preview=bool(preview),
             )
             approved = bool(confirm_callback(pre_decision))
             if approved:
@@ -1657,6 +1985,9 @@ class ExecutionPolicyEngine:
                     return _finalize(
                         PolicyDecisionOutcome.ALLOW,
                         f"Policy allowed '{tid}' after interactive confirmation ({rec.confirmation_id}).",
+                        reason_code="callback_confirmed",
+                        precedence_stage="rule6:confirmation_validation",
+                        determining_rule_id="rule6:callback_confirmed",
                         conf_req=True,
                         conf_status=ver.status,
                         conf_id=rec.confirmation_id,
@@ -1665,6 +1996,9 @@ class ExecutionPolicyEngine:
             return _finalize(
                 PolicyDecisionOutcome.DENY,
                 f"Policy denied '{tid}': interactive confirmation declined.",
+                reason_code="callback_denied",
+                precedence_stage="rule6:confirmation_validation",
+                determining_rule_id="rule6:callback_denied",
                 conf_req=True,
                 conf_status="declined",
                 remediation="User declined confirmation for this action.",
@@ -1677,6 +2011,9 @@ class ExecutionPolicyEngine:
                 f"Explicit confirmation required before executing '{tid}' "
                 f"(risk={risk_level.value}, mode='{self.config.policy_mode}')."
             ),
+            reason_code="confirmation_missing",
+            precedence_stage="rule6:confirmation_validation",
+            determining_rule_id="rule6:confirmation_missing",
             conf_req=True,
             conf_status="missing",
             remediation="Issue a bound confirmation for this exact action digest or confirm interactively.",
@@ -1689,7 +2026,7 @@ class ExecutionPolicyEngine:
         *,
         correlation_id: Optional[str] = None,
     ) -> None:
-        if not decision.execution_id:
+        if decision.is_preview or not decision.execution_id:
             return
         try:
             status_map = {
@@ -1697,6 +2034,32 @@ class ExecutionPolicyEngine:
                 PolicyDecisionOutcome.REQUIRE_CONFIRMATION: "requires_confirmation",
                 PolicyDecisionOutcome.DENY: "denied",
             }
+            sanitized_scope = [_sanitize_scope_item(s) for s in decision.resource_scope if _sanitize_scope_item(s)]
+            meta_payload = sanitize_policy_metadata(
+                {
+                    "policy_decision": decision.outcome.value,
+                    "decision_id": decision.decision_id,
+                    "node_id": decision.node_id,
+                    "risk_level": decision.risk_level.value,
+                    "arg_digest": decision.arg_digest,
+                    "resource_scope": sanitized_scope,
+                    "rule_ids": list(decision.rule_ids),
+                    "reason": _safe_policy_text(decision.reason),
+                    "reason_code": decision.reason_code,
+                    "precedence_stage": decision.precedence_stage,
+                    "determining_rule_id": decision.determining_rule_id,
+                    "policy_mode": decision.policy_mode,
+                    "config_source": dict(decision.config_source),
+                    "remediation_hint": _safe_policy_text(decision.remediation_hint),
+                    "auth_error_type": decision.auth_error_type,
+                    "confirmation_required": decision.confirmation_required,
+                    "confirmation_status": decision.confirmation_status,
+                    "confirmation_id": decision.confirmation_id,
+                    "policy_version": decision.policy_version,
+                    "source_surface": decision.source_surface,
+                    "is_external": decision.is_external,
+                }
+            )
             central_ledger.record_event(
                 decision.execution_id,
                 LedgerEventType.AUTHORIZATION_DECISION,
@@ -1706,21 +2069,7 @@ class ExecutionPolicyEngine:
                 is_external=decision.is_external,
                 correlation_id=correlation_id or decision.decision_id,
                 status=status_map.get(decision.outcome, "denied"),
-                metadata={
-                    "policy_decision": decision.outcome.value,
-                    "decision_id": decision.decision_id,
-                    "node_id": decision.node_id,
-                    "risk_level": decision.risk_level.value,
-                    "arg_digest": decision.arg_digest,
-                    "resource_scope": decision.resource_scope,
-                    "rule_ids": decision.rule_ids,
-                    "confirmation_required": decision.confirmation_required,
-                    "confirmation_status": decision.confirmation_status,
-                    "confirmation_id": decision.confirmation_id,
-                    "policy_version": decision.policy_version,
-                    "source_surface": decision.source_surface,
-                    "is_external": decision.is_external,
-                },
+                metadata=meta_payload,
                 idempotency_key=f"{decision.execution_id}:{correlation_id or decision.decision_id}:policy:{decision.decision_id}",
             )
         except Exception:
@@ -1737,6 +2086,12 @@ class ExecutionPolicyEngine:
     ) -> ExecutionPolicyDecision:
         """Async wrapper over `evaluate` supporting awaitable confirmation callbacks."""
         import inspect
+
+        if kwargs.get("preview"):
+            kwargs["consume_confirmation"] = False
+            kwargs["record_to_ledger"] = False
+            kwargs["central_ledger"] = None
+            confirm_callback = None
 
         consume_flag = bool(kwargs.pop("consume_confirmation", False))
         if confirm_callback is None:
@@ -1792,6 +2147,12 @@ class ExecutionPolicyEngine:
                 source_surface=pre.source_surface,
                 is_external=pre.is_external,
                 remediation_hint="User declined confirmation for this action.",
+                reason_code="callback_denied",
+                precedence_stage="rule6:confirmation_validation",
+                determining_rule_id="rule6:callback_denied",
+                policy_mode=self.config.policy_mode,
+                config_source=dict(self.config.config_sources),
+                is_preview=False,
             )
             if kwargs_no_rec.get("record_to_ledger", True) and central is not None and denied.execution_id:
                 self._record_decision_to_ledger(central, denied, correlation_id=corr)
@@ -2040,6 +2401,532 @@ async def evaluate_direct_tool_policy_async(
     )
 
 
+@dataclass(frozen=True)
+class PolicyPreviewResult:
+    """Result of a strictly non-executing, non-mutating execution-policy preview."""
+
+    decision: ExecutionPolicyDecision
+    explanation: PolicyExplanation
+    fact_status: str  # "verified" | "unknown" | "unverified"
+    is_registered: bool
+    is_external: bool
+    external_available: Optional[bool]
+    auth_allowed: bool
+    auth_error_type: Optional[str] = None
+
+    def to_safe_dict(self) -> Dict[str, Any]:
+        """Serialize safe preview result without exposing raw arguments or token secrets."""
+        return {
+            "is_preview": True,
+            "fact_status": self.fact_status,
+            "is_registered": self.is_registered,
+            "is_external": self.is_external,
+            "external_available": self.external_available,
+            "auth_allowed": self.auth_allowed,
+            "auth_error_type": self.auth_error_type,
+            "decision": self.decision.to_safe_dict(),
+            "explanation": self.explanation.to_safe_dict(),
+        }
+
+
+def _extract_schema_for_preview(
+    canonical_name: str,
+    *,
+    tool_obj: Optional[Any],
+    registry: Optional[Any],
+    active_scope: Optional[Any],
+    active_schemas: Optional[List[Dict[str, Any]]],
+) -> Optional[Mapping[str, Any]]:
+    if active_scope is not None and hasattr(active_scope, "find_schema"):
+        try:
+            s = active_scope.find_schema(canonical_name, active_schemas=active_schemas)
+            if isinstance(s, Mapping):
+                return s
+        except Exception:
+            pass
+    if active_schemas:
+        for s in active_schemas:
+            if not isinstance(s, Mapping):
+                continue
+            fn = s.get("function") if isinstance(s.get("function"), Mapping) else {}
+            s_name = fn.get("name") or s.get("name")
+            if s_name == canonical_name:
+                return s
+    if tool_obj is not None and hasattr(tool_obj, "schema") and isinstance(getattr(tool_obj, "schema"), Mapping):
+        return {
+            "type": "function",
+            "function": {
+                "name": canonical_name,
+                "parameters": dict(getattr(tool_obj, "schema")),
+            },
+        }
+    if registry is not None:
+        try:
+            from zelyr.tool_registry import _find_schema_for_tool
+
+            s = _find_schema_for_tool(
+                canonical_name,
+                tool=tool_obj,
+                tool_registry=registry,
+                active_schemas=active_schemas,
+            )
+            if isinstance(s, Mapping):
+                return s
+        except Exception:
+            pass
+    return None
+
+
+def preview_tool_policy(
+    tool_id: str,
+    arguments: Optional[Union[Mapping[str, Any], str]] = None,
+    *,
+    tool_registry: Optional[Any] = None,
+    task_local_scope: Optional[Any] = None,
+    caller_ring: Optional[int] = None,
+    allowed_tools: Optional[Iterable[str]] = None,
+    active_schemas: Optional[List[Dict[str, Any]]] = None,
+    workspace_root: Optional[Union[str, Path]] = None,
+    node_target_resources: Sequence[str] = (),
+    policy_engine: Optional[ExecutionPolicyEngine] = None,
+    policy_config: Optional[ExecutionPolicyConfig] = None,
+    zelyr_config: Optional[Any] = None,
+    source_surface: str = "policy_preview",
+) -> PolicyPreviewResult:
+    """Preview policy evaluation safely without executing tools, minting tokens, or writing ledger state."""
+    from zelyr.engine.normalizer import _strict_json_loads_object
+    from zelyr.tool_registry import (
+        BUILTIN_TOOLS,
+        SWARM_TOOLS,
+        ToolRegistry,
+        authorize_and_validate_tool_call,
+        canonicalize_tool_invocation,
+        get_active_task_local_scope,
+        resolve_tool_ring,
+    )
+
+    eff_input_args: Any = {} if arguments is None else arguments
+    raw_for_eval: Any = eff_input_args
+    if isinstance(eff_input_args, str):
+        parsed_obj, _ = _strict_json_loads_object(eff_input_args)
+        if parsed_obj is not None:
+            raw_for_eval = parsed_obj
+
+    auth_decision = authorize_and_validate_tool_call(
+        tool_id,
+        eff_input_args,
+        caller_ring=caller_ring,
+        allowed_tools=allowed_tools,
+        active_schemas=active_schemas,
+        tool_registry=tool_registry,
+        task_local_scope=task_local_scope,
+        require_registered=True,
+        normalize_args=True,
+        validate_schema=True,
+        argument_source="model",
+    )
+
+    canonical_name = str(getattr(auth_decision, "tool_name", None) or "").strip()
+    if not canonical_name:
+        canonical_name, _ = canonicalize_tool_invocation(str(tool_id or ""), {})
+    canonical_name = canonical_name or str(tool_id or "").strip()
+
+    active_scope = task_local_scope if task_local_scope is not None else get_active_task_local_scope()
+    eff_reg = tool_registry
+    if eff_reg is None and active_scope is None:
+        try:
+            eff_reg = ToolRegistry()
+        except Exception:
+            eff_reg = None
+
+    tool_obj: Optional[Any] = None
+    ext_entry: Optional[Any] = None
+    is_mock_reg = eff_reg is not None and getattr(type(eff_reg), "__module__", "").startswith("unittest.mock")
+    if eff_reg is not None:
+        if hasattr(eff_reg, "get_external_tool_entry") and not is_mock_reg:
+            try:
+                ext_entry = eff_reg.get_external_tool_entry(canonical_name)
+            except Exception:
+                ext_entry = None
+        if hasattr(eff_reg, "get_tool"):
+            try:
+                tool_obj = eff_reg.get_tool(canonical_name)
+            except Exception:
+                tool_obj = None
+
+    eff_schema = _extract_schema_for_preview(
+        canonical_name,
+        tool_obj=tool_obj,
+        registry=eff_reg,
+        active_scope=active_scope,
+        active_schemas=active_schemas,
+    )
+
+    resolved_ring: Optional[int] = getattr(auth_decision, "required_ring", None)
+    if resolved_ring is None:
+        if active_scope is not None and hasattr(active_scope, "resolve_ring"):
+            try:
+                resolved_ring = active_scope.resolve_ring(canonical_name, active_schemas=active_schemas)
+            except Exception:
+                resolved_ring = None
+        elif eff_reg is not None or tool_obj is not None:
+            try:
+                resolved_ring = resolve_tool_ring(
+                    canonical_name,
+                    tool=tool_obj,
+                    tool_registry=eff_reg,
+                    active_schemas=active_schemas,
+                )
+            except Exception:
+                resolved_ring = None
+
+    auth_err_type = getattr(auth_decision, "error_type", None)
+    if active_scope is not None:
+        is_registered = bool(canonical_name and canonical_name in active_scope.get_known_tools())
+    elif auth_err_type == "TOOL_NOT_FOUND":
+        is_registered = False
+    else:
+        is_registered = bool(
+            tool_obj is not None
+            or ext_entry is not None
+            or canonical_name in BUILTIN_TOOLS
+            or canonical_name in SWARM_TOOLS
+            or eff_schema is not None
+            or auth_decision.allowed
+        )
+
+    is_external = bool(
+        (tool_obj is not None and getattr(tool_obj, "is_external", False))
+        or ext_entry is not None
+        or canonical_name.startswith("ext__")
+    )
+    source_id = (
+        getattr(ext_entry, "source_id", None)
+        if ext_entry is not None
+        else getattr(tool_obj, "source_id", None)
+    )
+    source_type = (
+        getattr(ext_entry, "source_type", None)
+        if ext_entry is not None
+        else getattr(tool_obj, "source_type", None)
+    )
+
+    ext_meta: Optional[Dict[str, Any]] = None
+    if is_external:
+        ext_meta = {}
+        if ext_entry is not None:
+            ext_meta["authorized"] = bool(getattr(ext_entry, "authorized", False))
+            ext_meta["lifecycle"] = str(
+                getattr(getattr(ext_entry, "lifecycle", None), "value", getattr(ext_entry, "lifecycle", ""))
+            )
+            for attr in ("destructive_hint", "destructiveHint", "irreversible", "annotations"):
+                if hasattr(ext_entry, attr):
+                    ext_meta[attr] = getattr(ext_entry, attr)
+        if tool_obj is not None:
+            for attr in ("destructiveHint", "destructive_hint", "irreversible", "annotations"):
+                if hasattr(tool_obj, attr):
+                    ext_meta[attr] = getattr(tool_obj, attr)
+
+    external_available: Optional[bool] = None
+    if is_external:
+        if auth_err_type == "TOOL_UNAVAILABLE":
+            external_available = False
+        elif ext_entry is not None:
+            ext_lc = getattr(getattr(ext_entry, "lifecycle", None), "value", str(getattr(ext_entry, "lifecycle", "")))
+            obj_ok = bool(tool_obj.is_available()) if (tool_obj is not None and hasattr(tool_obj, "is_available")) else True
+            external_available = (ext_lc == "AVAILABLE") and obj_ok
+        elif tool_obj is not None and hasattr(tool_obj, "is_available"):
+            try:
+                external_available = bool(tool_obj.is_available())
+            except Exception:
+                external_available = False
+
+    if (not is_registered) or auth_err_type == "TOOL_NOT_FOUND":
+        fact_status = "unknown"
+    elif auth_err_type in ("TOOL_UNAVAILABLE", "SCHEMA_VALIDATION_ERROR") or (
+        is_external and external_available is False
+    ):
+        fact_status = "unverified"
+    elif not isinstance(raw_for_eval, Mapping):
+        fact_status = "unverified"
+    else:
+        fact_status = "verified"
+
+    engine = build_execution_policy_engine(
+        policy_engine=policy_engine,
+        policy_config=policy_config,
+        zelyr_config=zelyr_config,
+    )
+    decision = engine.evaluate(
+        canonical_name,
+        raw_for_eval,
+        normalized_arguments=(
+            auth_decision.normalized_arguments
+            if (auth_decision.allowed and isinstance(auth_decision.normalized_arguments, Mapping))
+            else None
+        ),
+        schema=eff_schema,
+        tool_obj=tool_obj,
+        required_ring=resolved_ring,
+        auth_decision=auth_decision,
+        is_registered=is_registered,
+        is_external=is_external,
+        source_id=source_id,
+        source_type=source_type,
+        external_metadata=ext_meta,
+        workspace_root=workspace_root,
+        node_target_resources=node_target_resources,
+        execution_id=None,
+        node_id=None,
+        correlation_id=None,
+        confirmation_token=None,
+        confirmation_id=None,
+        consume_confirmation=False,
+        confirm_callback=None,
+        source_surface=source_surface,
+        central_ledger=None,
+        record_to_ledger=False,
+        preview=True,
+    )
+    explanation = decision.explain()
+    return PolicyPreviewResult(
+        decision=decision,
+        explanation=explanation,
+        fact_status=fact_status,
+        is_registered=is_registered,
+        is_external=is_external,
+        external_available=external_available,
+        auth_allowed=bool(auth_decision.allowed),
+        auth_error_type=auth_err_type,
+    )
+
+
+def inspect_policy_configuration(
+    *,
+    zelyr_config: Optional[Any] = None,
+    policy_config: Optional[ExecutionPolicyConfig] = None,
+    governor_strict_mode: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Return a sanitized inspection view of effective policy configuration and field provenance."""
+    cfg = policy_config or ExecutionPolicyConfig.from_zelyr_config(
+        zelyr_config,
+        governor_strict_mode=governor_strict_mode,
+    )
+    risk_matrix: Dict[str, Dict[str, str]] = {}
+    for lvl in RiskLevel:
+        risk_matrix[lvl.value] = {
+            "workspace_scoped": cfg.resolve_default_outcome_for_risk(lvl, workspace_scoped=True).value,
+            "outside_workspace": cfg.resolve_default_outcome_for_risk(lvl, workspace_scoped=False).value,
+        }
+
+    return {
+        "policy_version": cfg.policy_version,
+        "policy_mode": cfg.policy_mode,
+        "auth_mode": cfg._auth_mode_str,
+        "governor_strict_mode": cfg.governor_strict_mode,
+        "confirmation_ttl_seconds": cfg.confirmation_ttl_seconds,
+        "max_confirmation_lifetime_seconds": cfg.max_confirmation_lifetime_seconds,
+        "risk_defaults": dict(cfg.risk_defaults),
+        "effective_risk_matrix": risk_matrix,
+        "tool_overrides": _redact_policy_config_value(cfg.tool_overrides),
+        "resource_restrictions": _redact_policy_config_value(cfg.resource_restrictions),
+        "config_sources": dict(cfg.config_sources),
+        "config_file_path": cfg._config_file_path,
+    }
+
+
+def format_policy_configuration(view: Mapping[str, Any]) -> str:
+    """Render an effective policy configuration view cleanly for terminal/REPL display."""
+    sources = view.get("config_sources") or {}
+    lines: List[str] = [
+        f"Execution Policy Configuration (v{view.get('policy_version', POLICY_VERSION)}):",
+        f"  policy_mode:           {view.get('policy_mode')}  (source: {sources.get('policy_mode', 'unknown')})",
+        f"  auth_mode:             {view.get('auth_mode') or 'n/a'}  (source: {sources.get('auth_mode', 'n/a')})",
+        f"  governor_strict_mode:  {view.get('governor_strict_mode')}  (source: {sources.get('governor_strict_mode', 'unknown')})",
+        f"  confirmation_ttl_s:    {view.get('confirmation_ttl_seconds')}  (source: {sources.get('confirmation_ttl_seconds', 'unknown')})",
+        f"  max_confirm_life_s:    {view.get('max_confirmation_lifetime_seconds')}  (source: {sources.get('max_confirmation_lifetime_seconds', 'unknown')})",
+    ]
+    if view.get("config_file_path"):
+        lines.append(f"  config_file:           {view.get('config_file_path')}")
+    lines.append("  effective_risk_matrix:")
+    for rk, outcomes in (view.get("effective_risk_matrix") or {}).items():
+        lines.append(
+            f"    {rk:<18} in_workspace={outcomes.get('workspace_scoped')}  outside_workspace={outcomes.get('outside_workspace')}"
+        )
+    overrides = view.get("tool_overrides") or {}
+    lines.append(
+        f"  tool_overrides:        {len(overrides)} rule(s) (source: {sources.get('tool_overrides', 'unknown')})"
+    )
+    for tid, spec in sorted(overrides.items()):
+        lines.append(f"    {tid}: {json.dumps(spec, sort_keys=True)}")
+    restrictions = view.get("resource_restrictions") or {}
+    lines.append(
+        f"  resource_restrictions: (source: {sources.get('resource_restrictions', 'unknown')}) "
+        f"{json.dumps(restrictions, sort_keys=True) if restrictions else '{}'}"
+    )
+    return "\n".join(lines)
+
+
+def format_policy_explanation(target: Union[PolicyPreviewResult, PolicyExplanation, ExecutionPolicyDecision]) -> str:
+    """Format a PolicyPreviewResult, ExecutionPolicyDecision, or PolicyExplanation for CLI/REPL."""
+    preview_res: Optional[PolicyPreviewResult] = target if isinstance(target, PolicyPreviewResult) else None
+    if preview_res is not None:
+        exp = preview_res.explanation
+    elif isinstance(target, ExecutionPolicyDecision):
+        exp = target.explain()
+    else:
+        exp = target
+
+    header = "Execution Policy Preview (non-executing)" if exp.is_preview else "Execution Policy Explanation"
+    lines: List[str] = [
+        f"{header}: {exp.outcome.upper()} for '{exp.tool_id}'",
+        f"  decision_id:         {exp.decision_id}",
+        f"  risk_level:          {exp.risk_level}",
+        f"  precedence_stage:    {exp.precedence_stage_label} [{exp.precedence_stage}]",
+        f"  determining_rule_id: {exp.determining_rule_id}",
+        f"  reason_code:         {exp.reason_code}",
+        f"  policy_mode:         {exp.policy_mode} (v{exp.policy_version})",
+        f"  confirmation:        required={exp.confirmation_required} status={exp.confirmation_status}",
+    ]
+    if preview_res is not None:
+        lines.append(
+            f"  fact_status:         {preview_res.fact_status} "
+            f"(registered={preview_res.is_registered}, external={preview_res.is_external}, "
+            f"external_available={preview_res.external_available}, auth_allowed={preview_res.auth_allowed})"
+        )
+    if exp.auth_error_type:
+        lines.append(f"  auth_error_type:     {exp.auth_error_type}")
+    lines.append(f"  resource_scope:      {list(exp.resource_scope)}")
+    lines.append(f"  rule_ids:            {list(exp.rule_ids)}")
+    lines.append(f"  summary:             {_safe_policy_text(exp.summary)}")
+    if exp.remediation_hint:
+        lines.append(f"  remediation_hint:    {_safe_policy_text(exp.remediation_hint)}")
+    return "\n".join(lines)
+
+
+def format_authorization_history_entry(event: Any) -> Dict[str, Any]:
+    """Convert an ExecutionEvent (AUTHORIZATION_DECISION) into a safe redacted history entry."""
+    raw_meta = getattr(event, "metadata", None)
+    meta = dict(raw_meta) if isinstance(raw_meta, Mapping) else {}
+    malformed = bool(meta.get("_malformed_metadata", False)) or not isinstance(raw_meta, Mapping)
+
+    # Strip any legacy/unexpected argument or token fields before sanitizing.
+    for forbidden_key in (
+        "normalized_arguments",
+        "raw_arguments",
+        "arguments",
+        "args",
+        "confirmation_token",
+        "confirm_token",
+        "raw_token",
+        "token_secret",
+    ):
+        meta.pop(forbidden_key, None)
+
+    safe_meta = sanitize_policy_metadata(meta) if isinstance(meta, Mapping) else {}
+    if not isinstance(safe_meta, dict):
+        safe_meta = {}
+        malformed = True
+
+    status_str = str(getattr(event, "status", "recorded") or "recorded")
+    raw_outcome = safe_meta.get("policy_decision")
+    if isinstance(raw_outcome, str) and raw_outcome.strip():
+        outcome = raw_outcome.strip().lower()
+    else:
+        status_to_outcome = {
+            "allowed": "allow",
+            "allow": "allow",
+            "requires_confirmation": "require_confirmation",
+            "require_confirmation": "require_confirmation",
+            "confirmation_required": "require_confirmation",
+            "denied": "deny",
+            "deny": "deny",
+            "rejected": "deny",
+        }
+        outcome = status_to_outcome.get(status_str.strip().lower(), status_str.strip().lower())
+
+    raw_scope = safe_meta.get("resource_scope")
+    if isinstance(raw_scope, (list, tuple)):
+        clean_scope = [_sanitize_scope_item(x) for x in raw_scope if _sanitize_scope_item(x)]
+    elif isinstance(raw_scope, str) and raw_scope.strip():
+        sc = _sanitize_scope_item(raw_scope)
+        clean_scope = [sc] if sc else []
+    else:
+        clean_scope = []
+
+    raw_rules = safe_meta.get("rule_ids")
+    clean_rules = [str(r) for r in raw_rules] if isinstance(raw_rules, (list, tuple)) else []
+
+    reason_code = safe_meta.get("reason_code")
+    precedence_stage = safe_meta.get("precedence_stage")
+    legacy_metadata = (not malformed) and (not reason_code or not precedence_stage)
+
+    return {
+        "event_id": str(getattr(event, "event_id", "")),
+        "execution_id": str(getattr(event, "execution_id", "")),
+        "sequence_number": int(getattr(event, "sequence_number", 0) or 0),
+        "timestamp": float(getattr(event, "timestamp", 0.0) or 0.0),
+        "tool_id": getattr(event, "tool_id", None) or "unknown",
+        "outcome": outcome,
+        "status": status_str,
+        "decision_id": safe_meta.get("decision_id"),
+        "risk_level": safe_meta.get("risk_level") or "unknown",
+        "reason_code": reason_code or (clean_rules[-1] if clean_rules else ("malformed_metadata" if malformed else "legacy_decision")),
+        "precedence_stage": precedence_stage or ("malformed_metadata" if malformed else "legacy_unrecorded"),
+        "determining_rule_id": safe_meta.get("determining_rule_id") or (clean_rules[-1] if clean_rules else None),
+        "policy_mode": safe_meta.get("policy_mode"),
+        "reason": _safe_policy_text(safe_meta.get("reason") or ""),
+        "remediation_hint": _safe_policy_text(safe_meta.get("remediation_hint") or ""),
+        "resource_scope": clean_scope,
+        "rule_ids": clean_rules,
+        "confirmation_required": bool(safe_meta.get("confirmation_required", False)),
+        "confirmation_status": safe_meta.get("confirmation_status") or "unknown",
+        "confirmation_id": safe_meta.get("confirmation_id"),
+        "source_surface": safe_meta.get("source_surface") or "unknown",
+        "is_external": bool(getattr(event, "is_external", safe_meta.get("is_external", False))),
+        "node_id": safe_meta.get("node_id"),
+        "policy_version": safe_meta.get("policy_version"),
+        "legacy_metadata": legacy_metadata,
+        "malformed_metadata": malformed,
+    }
+
+
+def query_policy_history(
+    central_ledger: Any,
+    *,
+    limit: int = 20,
+    outcome: Optional[str] = None,
+    tool_id: Optional[str] = None,
+    execution_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Query persistent AUTHORIZATION_DECISION ledger events safely and redact all output fields."""
+    if central_ledger is None:
+        return {
+            "count": 0,
+            "db_path": None,
+            "persistence_errors": [{"operation": "query_policy_history", "error": "No central_ledger available."}],
+            "entries": [],
+        }
+    events = central_ledger.query_authorization_decisions(
+        limit=limit,
+        outcome=outcome,
+        tool_id=tool_id,
+        execution_id=execution_id,
+    )
+    persistence_errors = (
+        list(central_ledger.get_persistence_errors())
+        if hasattr(central_ledger, "get_persistence_errors")
+        else []
+    )
+    entries = [format_authorization_history_entry(ev) for ev in events]
+    return {
+        "count": len(entries),
+        "db_path": str(getattr(central_ledger, "db_path", "")),
+        "persistence_errors": persistence_errors,
+        "entries": entries,
+    }
+
+
 __all__ = [
     "POLICY_VERSION",
     "SUPPORTED_POLICY_VERSIONS",
@@ -2054,7 +2941,9 @@ __all__ = [
     "ConfirmationRecord",
     "ConfirmationVerificationResult",
     "ConfirmationStore",
+    "PolicyExplanation",
     "ExecutionPolicyDecision",
+    "PolicyPreviewResult",
     "RiskClassifier",
     "ExecutionPolicyEngine",
     "authorized_policy_context",
@@ -2063,8 +2952,14 @@ __all__ = [
     "evaluate_direct_tool_policy",
     "evaluate_direct_tool_policy_async",
     "extract_resource_scope",
+    "format_authorization_history_entry",
+    "format_policy_configuration",
+    "format_policy_explanation",
     "get_active_policy_decision",
     "get_default_confirmation_store",
+    "inspect_policy_configuration",
     "matches_active_policy_decision",
+    "preview_tool_policy",
+    "query_policy_history",
     "sanitize_policy_metadata",
 ]

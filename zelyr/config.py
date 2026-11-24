@@ -4,7 +4,7 @@ import logging
 import os
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from zelyr.compat import config_dir, config_file, data_dir, get_env
 
@@ -168,11 +168,18 @@ Returns:
     execution_policy_resource_restrictions: dict = field(default_factory=dict)
     execution_policy_confirmation_ttl_seconds: float = 300.0
     execution_policy_max_confirmation_lifetime_seconds: float = 900.0
+    _explicit_fields: set[str] = field(default_factory=set, repr=False, compare=False)
+    _config_source_path: Optional[str] = field(default=None, repr=False, compare=False)
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> 'ZelyrConfig':
         """Create config from dictionary."""
-        filtered = {k: v for k, v in config_dict.items() if k in cls.__dataclass_fields__}
+        filtered = {
+            k: v
+            for k, v in config_dict.items()
+            if k in cls.__dataclass_fields__ and not str(k).startswith("_")
+        }
+        explicit_fields = set(filtered.keys())
         
         # Migrate legacy loose persona strings to new dict structure
         if 'persona' not in filtered:
@@ -224,6 +231,7 @@ Returns:
                 filtered['execution_policy_max_confirmation_lifetime_seconds'] = max(ttl_floor, min(max_val, 86400.0))
             except (TypeError, ValueError):
                 filtered['execution_policy_max_confirmation_lifetime_seconds'] = 900.0
+        filtered['_explicit_fields'] = explicit_fields
         return cls(**filtered)
 
     def to_dict(self) -> dict:
@@ -370,28 +378,42 @@ Returns:
 
         return 300.0
 
-    def save(self) -> None:
-        """Save configuration to ~/.config/zelyr/config.json."""
+    def save(self, path: Optional[Union[str, Path]] = None) -> None:
+        """Save configuration to an explicit path or ~/.config/zelyr/config.json."""
         import json
-        from pathlib import Path
+
         data = self.to_dict()
-        base_dir = get_config_dir()
-        paths = [
-            base_dir / "config.json",
-        ]
+        if path is not None:
+            paths = [Path(path).expanduser()]
+        else:
+            base_dir = get_config_dir()
+            paths = [
+                base_dir / "config.json",
+            ]
         for p in paths:
             try:
                 p.parent.mkdir(parents=True, exist_ok=True)
                 with open(p, 'w', encoding='utf-8') as f:
                     json.dump(data, f, indent=4)
+                self._config_source_path = str(p)
             except Exception as e:
                 print(f"Failed to save Zelyr config to {p}: {e}")
 
     @classmethod
-    def load(cls) -> 'ZelyrConfig':
-        """Load configuration from the Zelyr config file or legacy AXIOM paths."""
+    def load(cls, path: Optional[Union[str, Path]] = None) -> 'ZelyrConfig':
+        """Load configuration from an explicit path, Zelyr config file, or legacy AXIOM paths."""
         import json
-        from pathlib import Path
+
+        if path is not None:
+            config_path = Path(path).expanduser()
+            with open(config_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError(f"Expected JSON object in config file '{config_path}'")
+            cfg = cls.from_dict(data)
+            cfg._config_source_path = str(config_path)
+            return cfg
+
         base_dir = get_config_dir()
         paths = [
             config_file("config.json"),
@@ -408,7 +430,9 @@ Returns:
                     if 'oobe_completed' not in data:
                         legacy_ui_config = config_path.parent / "ui_config.json"
                         data['oobe_completed'] = legacy_ui_config.exists()
-                    return cls.from_dict(data)
+                    cfg = cls.from_dict(data)
+                    cfg._config_source_path = str(config_path)
+                    return cfg
                 except Exception as e:
                     print(f"Failed to load Zelyr config from {config_path}: {e}")
         return cls()

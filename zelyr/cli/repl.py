@@ -58,6 +58,7 @@ COMMANDS = {
     "/memory": "Manage persistent semantic memories (/memory list, /memory add <fact>, /memory <query>)",
     "/rules": "Display active global and local project instructions",
     "/env": "Inspect the structured runtime environment and capability manifest",
+    "/policy": "Inspect policy config, explain a tool decision, or view policy history (/policy show|explain <tool>|history)",
     "/status": "Display live system, bridge, desktop, and tool telemetry",
     "/doctor": "Run diagnostic health checks across all 6 subsystems",
     "/undo": "Rollback the last modified file to its previous state",
@@ -65,13 +66,17 @@ COMMANDS = {
 }
 
 slash_completer = WordCompleter(
-    list(COMMANDS.keys()) + ["/memory list", "/memory add", "/thought toggle", "/session new"],
+    list(COMMANDS.keys())
+    + ["/memory list", "/memory add", "/thought toggle", "/session new", "/policy show", "/policy explain", "/policy history"],
     meta_dict={
         **COMMANDS,
         "/thought toggle": "Toggle reasoning visibility (Expanded <-> Collapsed)",
         "/memory list": "Display all stored semantic memories",
         "/memory add": "Store a permanent fact in semantic memory",
         "/session new": "Start a fresh conversation session",
+        "/policy show": "Show effective execution policy settings",
+        "/policy explain": "Preview policy decision for a tool without executing",
+        "/policy history": "List recent redacted authorization decisions from ledger",
         "/doctor": "Run diagnostic health checks across all 6 subsystems",
         "/undo": "Rollback the last modified file to its previous state",
     },
@@ -683,6 +688,144 @@ class InlineRepl:
                         padding=(1, 2),
                     )
                 )
+            return True
+
+        elif cmd == "/policy":
+            import shlex
+            from zelyr.engine.execution_ledger import get_default_central_ledger
+            from zelyr.engine.execution_policy import (
+                ExecutionPolicyConfig,
+                format_policy_configuration,
+                format_policy_explanation,
+                inspect_policy_configuration,
+                preview_tool_policy,
+                query_policy_history,
+            )
+
+            try:
+                toks = shlex.split(cmd_text)
+            except ValueError:
+                toks = list(parts)
+            sub_toks = toks[1:]
+            subcmd = sub_toks[0].lower() if sub_toks else "show"
+            rest_toks = sub_toks[1:]
+            want_json = "--json" in {t.lower() for t in rest_toks}
+
+            orch = getattr(self, "orchestrator", None)
+            pol_eng = getattr(orch, "policy_engine", None) if orch is not None else None
+            pol_cfg = getattr(pol_eng, "config", None) if pol_eng is not None else ExecutionPolicyConfig.from_zelyr_config(self.config)
+
+            if subcmd == "show":
+                view = inspect_policy_configuration(policy_config=pol_cfg)
+                if want_json:
+                    console.print(json.dumps(view, indent=2))
+                else:
+                    console.print(
+                        Panel(
+                            format_policy_configuration(view),
+                            title="[title]Zelyr Execution Policy Configuration[/title]",
+                            border_style="#7aa2f7",
+                            padding=(1, 2),
+                        )
+                    )
+                return True
+
+            if subcmd == "explain":
+                non_flag = [t for t in rest_toks if t != "--json" and not t.startswith("--args=")]
+                if not non_flag:
+                    console.print("[label]Usage:[/label] /policy explain <tool_id> [json_args] [--json]\n")
+                    return True
+                tool_target = non_flag[0]
+                raw_args_val: Any = {}
+                for t in rest_toks:
+                    if t.startswith("--args="):
+                        raw_args_val = t[len("--args="):]
+                        break
+                else:
+                    if len(non_flag) > 1:
+                        raw_args_val = non_flag[1]
+
+                reg = getattr(orch, "tool_registry", None) if orch is not None else None
+                preview_res = preview_tool_policy(
+                    tool_target,
+                    raw_args_val,
+                    tool_registry=reg,
+                    policy_engine=pol_eng,
+                    policy_config=pol_cfg,
+                    zelyr_config=self.config,
+                    source_surface="repl_policy_explain",
+                )
+                if want_json:
+                    console.print(json.dumps(preview_res.to_safe_dict(), indent=2))
+                else:
+                    console.print(
+                        Panel(
+                            format_policy_explanation(preview_res),
+                            title="[title]Zelyr Policy Preview (Non-Executing)[/title]",
+                            border_style="#e0af68",
+                            padding=(1, 2),
+                        )
+                    )
+                return True
+
+            if subcmd == "history":
+                limit_val = 20
+                outcome_val: Optional[str] = None
+                tool_val: Optional[str] = None
+                i = 0
+                while i < len(rest_toks):
+                    tk = rest_toks[i]
+                    if tk in ("--limit", "-n") and i + 1 < len(rest_toks):
+                        try:
+                            limit_val = int(rest_toks[i + 1])
+                        except ValueError:
+                            pass
+                        i += 2
+                        continue
+                    if tk == "--outcome" and i + 1 < len(rest_toks):
+                        outcome_val = rest_toks[i + 1]
+                        i += 2
+                        continue
+                    if tk == "--tool" and i + 1 < len(rest_toks):
+                        tool_val = rest_toks[i + 1]
+                        i += 2
+                        continue
+                    i += 1
+
+                ledger = getattr(orch, "central_ledger", None) if orch is not None else None
+                if ledger is None:
+                    ledger = get_default_central_ledger()
+                hist = query_policy_history(
+                    ledger,
+                    limit=limit_val,
+                    outcome=outcome_val,
+                    tool_id=tool_val,
+                )
+                if want_json:
+                    console.print(json.dumps(hist, indent=2))
+                    return True
+                if hist.get("persistence_errors"):
+                    console.print(f"[#f7768e]Ledger persistence error: {hist['persistence_errors'][0].get('error')}[/#f7768e]\n")
+                entries = hist.get("entries") or []
+                if not entries:
+                    console.print("[dim]No policy authorization decisions recorded.[/dim]\n")
+                    return True
+                lines = [
+                    f"{e.get('outcome')}  tool={e.get('tool_id')}  risk={e.get('risk_level')}  "
+                    f"stage={e.get('precedence_stage')}  reason_code={e.get('reason_code')}  scope={e.get('resource_scope')}"
+                    for e in entries
+                ]
+                console.print(
+                    Panel(
+                        "\n".join(lines),
+                        title=f"[title]Policy Authorization History ({len(entries)})[/title]",
+                        border_style="#7aa2f7",
+                        padding=(1, 2),
+                    )
+                )
+                return True
+
+            console.print("[label]Usage:[/label] /policy <show|explain <tool_id> [json_args]|history> [--json]\n")
             return True
 
         elif cmd == "/status":
