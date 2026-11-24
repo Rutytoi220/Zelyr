@@ -5823,17 +5823,77 @@ class NativeOrchestrator:
                         backoff_until_by_node.pop(r_nid, None)
             return changed_any
 
-        # Assess pre-existing failed / unverified nodes on entry (e.g., resumed graphs)
-        initial_candidates = [
-            n.node_id
-            for n in graph.nodes
-            if n.execution_status in (TaskNodeStatus.FAILED.value, TaskNodeStatus.COMPLETED_UNVERIFIED.value)
-            or (n.execution_status == TaskNodeStatus.BLOCKED.value and n.contradictory)
-        ]
-        if initial_candidates:
-            _run_recovery_for_nodes(initial_candidates)
+        def _finalize_graph_state() -> None:
+            graph.recompute_schedule(known_proposals=prop_by_ref)
+            if was_cancelled or getattr(self, "_cancelled", False):
+                fin_exec_status = ExecutionStatus.CANCELLED
+                fin_ver_status = VerificationStatus.INTERRUPTED
+            elif graph.status == TaskGraphStatus.COMPLETED_VERIFIED.value:
+                fin_exec_status = ExecutionStatus.COMPLETED
+                fin_ver_status = VerificationStatus.VERIFIED
+            elif graph.status == TaskGraphStatus.COMPLETED_UNVERIFIED.value:
+                fin_exec_status = ExecutionStatus.COMPLETED_UNVERIFIED
+                fin_ver_status = VerificationStatus.NOT_VERIFIED
+            elif graph.status in (TaskGraphStatus.FAILED.value, TaskGraphStatus.BLOCKED.value):
+                fin_exec_status = ExecutionStatus.FAILED
+                fin_ver_status = VerificationStatus.NOT_VERIFIED
+            elif graph.status == TaskGraphStatus.CANCELLED.value:
+                fin_exec_status = ExecutionStatus.CANCELLED
+                fin_ver_status = VerificationStatus.INTERRUPTED
+            else:
+                fin_exec_status = ExecutionStatus.INTERRUPTED if was_cancelled else ExecutionStatus.FAILED
+                fin_ver_status = VerificationStatus.NOT_VERIFIED
 
-        _capture_cp(ExecutionStatus.RUNNING)
+            try:
+                if hasattr(eff_ledger, "flush_observability_metrics"):
+                    eff_ledger.flush_observability_metrics()
+            except Exception:
+                pass
+            cp_exc_to_raise: Optional[BaseException] = None
+            try:
+                _capture_cp(fin_exec_status)
+            except Exception as cp_exc:
+                if getattr(eff_central, "raise_on_persistence_error", False):
+                    cp_exc_to_raise = cp_exc
+            if finalize_execution:
+                try:
+                    eff_central.finalize_execution(
+                        eff_exec_id,
+                        status=fin_exec_status,
+                        verification_status=fin_ver_status,
+                        final_summary=f"TaskGraph '{graph.graph_id}' finished with status={graph.status}",
+                        error=(
+                            "TaskGraph cancelled"
+                            if fin_exec_status == ExecutionStatus.CANCELLED
+                            else (f"TaskGraph ended in status '{graph.status}'" if fin_exec_status == ExecutionStatus.FAILED else None)
+                        ),
+                        metadata=(
+                            {"checkpoint_saved": False, "checkpoint_error": str(cp_exc_to_raise)}
+                            if cp_exc_to_raise is not None
+                            else None
+                        ),
+                    )
+                except Exception:
+                    if cp_exc_to_raise is None and getattr(eff_central, "raise_on_persistence_error", False):
+                        raise
+            if cp_exc_to_raise is not None:
+                raise cp_exc_to_raise
+
+        # Assess pre-existing failed / unverified nodes on entry (e.g., resumed graphs)
+        try:
+            initial_candidates = [
+                n.node_id
+                for n in graph.nodes
+                if n.execution_status in (TaskNodeStatus.FAILED.value, TaskNodeStatus.COMPLETED_UNVERIFIED.value)
+                or (n.execution_status == TaskNodeStatus.BLOCKED.value and n.contradictory)
+            ]
+            if initial_candidates:
+                _run_recovery_for_nodes(initial_candidates)
+
+            _capture_cp(ExecutionStatus.RUNNING)
+        except BaseException:
+            _finalize_graph_state()
+            raise
 
         try:
             while executed_steps < eff_max_steps or active_tasks:
@@ -6210,44 +6270,7 @@ class NativeOrchestrator:
                 await asyncio.gather(*list(active_tasks.keys()), return_exceptions=True)
                 active_tasks.clear()
 
-            graph.recompute_schedule(known_proposals=prop_by_ref)
-            if was_cancelled or getattr(self, "_cancelled", False):
-                fin_exec_status = ExecutionStatus.CANCELLED
-                fin_ver_status = VerificationStatus.INTERRUPTED
-            elif graph.status == TaskGraphStatus.COMPLETED_VERIFIED.value:
-                fin_exec_status = ExecutionStatus.COMPLETED
-                fin_ver_status = VerificationStatus.VERIFIED
-            elif graph.status == TaskGraphStatus.COMPLETED_UNVERIFIED.value:
-                fin_exec_status = ExecutionStatus.COMPLETED_UNVERIFIED
-                fin_ver_status = VerificationStatus.NOT_VERIFIED
-            elif graph.status in (TaskGraphStatus.FAILED.value, TaskGraphStatus.BLOCKED.value):
-                fin_exec_status = ExecutionStatus.FAILED
-                fin_ver_status = VerificationStatus.NOT_VERIFIED
-            elif graph.status == TaskGraphStatus.CANCELLED.value:
-                fin_exec_status = ExecutionStatus.CANCELLED
-                fin_ver_status = VerificationStatus.INTERRUPTED
-            else:
-                fin_exec_status = ExecutionStatus.INTERRUPTED if was_cancelled else ExecutionStatus.FAILED
-                fin_ver_status = VerificationStatus.NOT_VERIFIED
-
-            try:
-                if hasattr(eff_ledger, "flush_observability_metrics"):
-                    eff_ledger.flush_observability_metrics()
-            except Exception:
-                pass
-            _capture_cp(fin_exec_status)
-            if finalize_execution:
-                eff_central.finalize_execution(
-                    eff_exec_id,
-                    status=fin_exec_status,
-                    verification_status=fin_ver_status,
-                    final_summary=f"TaskGraph '{graph.graph_id}' finished with status={graph.status}",
-                    error=(
-                        f"TaskGraph cancelled"
-                        if fin_exec_status == ExecutionStatus.CANCELLED
-                        else (f"TaskGraph ended in status '{graph.status}'" if fin_exec_status == ExecutionStatus.FAILED else None)
-                    ),
-                )
+            _finalize_graph_state()
 
         return {
             "execution_id": eff_exec_id,

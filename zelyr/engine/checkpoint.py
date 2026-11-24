@@ -1770,9 +1770,15 @@ class CheckpointManager:
                 turn_ledger.record_dispatched(cid, emit_event=False)
                 turn_ledger.record_cancelled(cid, reason=e["error"] or "cancelled")
                 lifecycle = "cancelled"
-                rec_action = "block_non_recoverable"
-                may_se = bool(mutating)
-                notes = "Operation was cancelled mid-execution."
+                may_se = bool(mutating and e["dispatched"])
+                rec_action = "do_not_replay_ambiguous" if may_se else "block_non_recoverable"
+                notes = (
+                    "Mutating operation was cancelled mid-execution; inspect host state before retrying."
+                    if may_se
+                    else "Operation was cancelled mid-execution."
+                )
+                if may_se:
+                    ambiguous_fps.add((tname, canon_args))
             elif rec_status == "timed_out" or obs_status == "timed_out":
                 turn_ledger.record_dispatched(cid, emit_event=False)
                 turn_ledger.record_observation(
