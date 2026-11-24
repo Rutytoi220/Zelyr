@@ -610,6 +610,23 @@ class TaskCheckpoint:
             parsed_tg = TaskGraph.from_dict(raw_tg, default_execution_id=exec_id_str, verify_integrity=verify_integrity)
             parsed_tg.validate(known_proposals=validated_pending_actions or None, allow_blocked=True)
 
+        raw_rec_sum = data.get("recovery_summary") or {}
+        if raw_rec_sum:
+            from zelyr.engine.task_graph import _validate_node_recovery_state
+
+            if "recovery_version" in raw_rec_sum:
+                rv = raw_rec_sum.get("recovery_version")
+                if isinstance(rv, bool) or not isinstance(rv, int):
+                    raise CorruptedCheckpointError(f"Checkpoint recovery_summary has malformed recovery_version: {rv!r}")
+                if rv not in (1,):
+                    raise UnsupportedCheckpointVersionError(f"Unsupported checkpoint recovery_version: {rv}")
+            raw_nrs = raw_rec_sum.get("node_recovery_states")
+            if raw_nrs is not None:
+                if not isinstance(raw_nrs, dict):
+                    raise CorruptedCheckpointError("Checkpoint recovery_summary.node_recovery_states must be a dict.")
+                for rnid, rst in raw_nrs.items():
+                    _validate_node_recovery_state(rst, context_label=f"recovery_summary[{rnid}]")
+
         cp = cls(
             checkpoint_id=str(data["checkpoint_id"]),
             execution_id=exec_id_str,
@@ -977,13 +994,44 @@ class CheckpointManager:
             turn_ledger.get_task_graph() if (turn_ledger is not None and hasattr(turn_ledger, "get_task_graph")) else None
         )
         serialized_graph: Optional[Dict[str, Any]] = None
+        parsed_graph_for_rec: Optional[TaskGraph] = None
         if isinstance(eff_graph, TaskGraph):
             eff_graph.validate(known_proposals=durable_proposals or None, allow_blocked=True)
             serialized_graph = eff_graph.to_checkpoint_dict()
+            parsed_graph_for_rec = eff_graph
         elif isinstance(eff_graph, dict) and eff_graph:
             tg_obj = TaskGraph.from_dict(eff_graph, default_execution_id=execution_id, verify_integrity=False)
             tg_obj.validate(known_proposals=durable_proposals or None, allow_blocked=True)
             serialized_graph = tg_obj.to_checkpoint_dict()
+            parsed_graph_for_rec = tg_obj
+
+        if parsed_graph_for_rec is not None:
+            node_rec_states: Dict[str, Dict[str, Any]] = {}
+            for n in parsed_graph_for_rec.nodes:
+                raw_rs = getattr(n, "recovery_state", None)
+                if isinstance(raw_rs, dict) and raw_rs:
+                    # Keep compact scalar summary fields under MAX_LEDGER_DEPTH (full history lives on task_graph)
+                    node_rec_states[n.node_id] = {
+                        k: v
+                        for k, v in raw_rs.items()
+                        if k != "recovery_history" and v is not None
+                    }
+            if node_rec_states:
+                rec_summary["recovery_version"] = 1
+                rec_summary["node_recovery_states"] = node_rec_states
+                rec_summary["nodes_awaiting_confirmation"] = [
+                    nid
+                    for nid, rs in node_rec_states.items()
+                    if rs.get("recovery_decision") == "require_confirmation" or rs.get("reconciliation_required")
+                ]
+                rec_summary["nodes_requiring_replan"] = [
+                    nid
+                    for nid, rs in node_rec_states.items()
+                    if rs.get("recovery_decision") == "replan_node"
+                ]
+                rec_summary["total_node_recovery_attempts"] = sum(
+                    int(rs.get("attempt_count") or 0) for rs in node_rec_states.values()
+                )
 
         saved_dict = central_ledger.save_checkpoint(
             execution_id,
@@ -2464,15 +2512,88 @@ class CheckpointManager:
                 pa.status = ProposalStatus.VALIDATED.value
                 pa.blocked_reason = None
 
-        # Reconcile TaskGraph against live verification promotions, auth/env proposal results, and dependency rules
+        # Reconcile TaskGraph against live verification promotions, auth/env proposal results, recovery state, and dependency rules
         if task_graph is not None:
+            from zelyr.engine.task_graph import _validate_node_recovery_state
+
             pa_by_ref_final: Dict[str, PendingActionProposal] = {}
             for pa in pending_actions:
                 pa_by_ref_final[pa.proposal_id] = pa
                 if pa.original_call_id:
                     pa_by_ref_final[pa.original_call_id] = pa
             ops_by_cid_final = {op.call_id: op for op in ops}
+
+            # Gather persisted RECOVERY_ATTEMPT ledger events per node/call so attempt counts never reset across restarts
+            rec_events_by_node: Dict[str, List[ExecutionEvent]] = {}
+            rec_events_by_cid: Dict[str, List[ExecutionEvent]] = {}
+            for ev in central_ledger.get_events(execution_id):
+                if ev.event_type == LedgerEventType.RECOVERY_ATTEMPT.value:
+                    ev_nid = (ev.metadata or {}).get("node_id")
+                    if ev_nid:
+                        rec_events_by_node.setdefault(str(ev_nid), []).append(ev)
+                    if ev.correlation_id:
+                        rec_events_by_cid.setdefault(str(ev.correlation_id), []).append(ev)
+
+            now_resume_ts = time.time()
+            _SUPPORTED_OUTCOME_CHECKS_RESUME = frozenset(
+                {
+                    "file_exists",
+                    "exists",
+                    "file_contains",
+                    "contains",
+                    "file_checksum",
+                    "checksum",
+                    "sha256",
+                    "file_json",
+                    "json",
+                    "process_running",
+                    "port_listening",
+                    "command_output",
+                }
+            )
             for gnode in task_graph.nodes:
+                if gnode.recovery_state is not None:
+                    gnode.recovery_state = _validate_node_recovery_state(
+                        gnode.recovery_state,
+                        context_label=f"TaskNode '{gnode.node_id}' recovery_state",
+                    )
+                node_call_ids = [
+                    str(pa_by_ref_final[pid].original_call_id)
+                    for pid in gnode.proposal_ids
+                    if pid in pa_by_ref_final and pa_by_ref_final[pid].original_call_id
+                ] + [
+                    str(r.get("call_id"))
+                    for r in gnode.observation_refs
+                    if isinstance(r, dict) and r.get("call_id")
+                ]
+                matching_rec_events = list(rec_events_by_node.get(gnode.node_id, []))
+                for nc_id in node_call_ids:
+                    for ev in rec_events_by_cid.get(nc_id, []):
+                        if ev not in matching_rec_events:
+                            matching_rec_events.append(ev)
+
+                if matching_rec_events or gnode.recovery_state is not None:
+                    merged_rs = dict(
+                        gnode.recovery_state
+                        or {"recovery_version": 1, "attempt_count": 0, "recovery_history": []}
+                    )
+                    max_att = int(merged_rs.get("attempt_count") or 0)
+                    for ev in matching_rec_events:
+                        meta = dict(ev.metadata or {})
+                        ev_att = int(meta.get("attempt") or 0)
+                        max_att = max(max_att, ev_att)
+                        if merged_rs.get("retry_deadline") is None and meta.get("retry_deadline") is not None:
+                            merged_rs["retry_deadline"] = float(meta["retry_deadline"])
+                        if not merged_rs.get("recovery_decision") and meta.get("recovery_decision"):
+                            merged_rs["recovery_decision"] = str(meta["recovery_decision"])
+                        if not merged_rs.get("previous_failure_category") and meta.get("failure_category"):
+                            merged_rs["previous_failure_category"] = str(meta["failure_category"])
+                    merged_rs["attempt_count"] = max_att
+                    gnode.recovery_state = _validate_node_recovery_state(
+                        merged_rs,
+                        context_label=f"TaskNode '{gnode.node_id}' recovery_state",
+                    )
+
                 for pid in gnode.proposal_ids:
                     pa_m = pa_by_ref_final.get(pid)
                     op_m = ops_by_cid_final.get(pa_m.original_call_id) if pa_m is not None else ops_by_cid_final.get(pid)
@@ -2486,6 +2607,83 @@ class CheckpointManager:
                         gnode.reservation_id = None
                         gnode.reserved_at = None
                         task_graph.active_reservations.pop(gnode.node_id, None)
+                        if isinstance(gnode.recovery_state, dict):
+                            gnode.recovery_state["verified_outcome"] = True
+                            gnode.recovery_state["reconciliation_required"] = False
+
+                # Per-node live verification reconciliation against node.verification_requirement
+                if (
+                    verify_outcomes
+                    and getattr(gnode, "verification_requirement", None)
+                    and not gnode.contradictory
+                    and gnode.execution_status in (
+                        TaskNodeStatus.RUNNING.value,
+                        TaskNodeStatus.FAILED.value,
+                        TaskNodeStatus.COMPLETED_UNVERIFIED.value,
+                    )
+                ):
+                    node_crits = [
+                        c
+                        for c in parse_acceptance_criteria(str(gnode.verification_requirement))
+                        if isinstance(c, dict)
+                        and str(c.get("check") or "").strip().lower() in _SUPPORTED_OUTCOME_CHECKS_RESUME
+                        and str(c.get("target") or "").strip()
+                    ]
+                    if node_crits:
+                        from zelyr.engine.verifier import OutcomeVerifier
+
+                        v_fn_node = verifier_fn or OutcomeVerifier.verify
+                        ver_kwargs_n: Dict[str, Any] = {}
+                        if explicit_cwd:
+                            ver_kwargs_n["cwd"] = explicit_cwd
+                        if all(
+                            bool(
+                                getattr(
+                                    v_fn_node(
+                                        check=c["check"],
+                                        target=c["target"],
+                                        expected=c.get("expected"),
+                                        **ver_kwargs_n,
+                                    ),
+                                    "success",
+                                    False,
+                                )
+                            )
+                            for c in node_crits
+                        ):
+                            gnode.execution_status = TaskNodeStatus.COMPLETED_VERIFIED.value
+                            gnode.verification_status = VerificationStatus.VERIFIED.value
+                            gnode.contradictory = False
+                            gnode.failure_info = None
+                            gnode.blocked_reason = None
+                            gnode.reserved_by = None
+                            gnode.reservation_id = None
+                            gnode.reserved_at = None
+                            task_graph.active_reservations.pop(gnode.node_id, None)
+                            if isinstance(gnode.recovery_state, dict):
+                                gnode.recovery_state["recovery_decision"] = "already_completed"
+                                gnode.recovery_state["recovery_status"] = "recovered_verified"
+                                gnode.recovery_state["verified_outcome"] = True
+                                gnode.recovery_state["reconciliation_required"] = False
+                            for pid in gnode.proposal_ids:
+                                pa_v = pa_by_ref_final.get(pid)
+                                if pa_v is not None:
+                                    pa_v.status = ProposalStatus.COMPLETED.value
+                                    pa_v.dispatch_attempted = True
+                                    pa_v.has_result = True
+                                    pa_v.blocked_reason = None
+
+                if isinstance(gnode.recovery_state, dict) and gnode.execution_status != TaskNodeStatus.COMPLETED_VERIFIED.value:
+                    rs = gnode.recovery_state
+                    dl = rs.get("retry_deadline")
+                    if dl is not None and now_resume_ts > float(dl):
+                        warnings.append(
+                            f"Recovery retry deadline exceeded for node '{gnode.node_id}' ({rs.get('previous_failure_category') or gnode.execution_status})."
+                        )
+                    if rs.get("reconciliation_required") or rs.get("recovery_decision") in ("require_confirmation", "unresolved"):
+                        warnings.append(
+                            f"Node '{gnode.node_id}' has unreconciled side-effect state ({rs.get('recovery_decision')}); automatic replay blocked."
+                        )
             if hasattr(task_graph, "reconcile_interrupted_reservations"):
                 res_notes = task_graph.reconcile_interrupted_reservations(release_stale_unstarted=True)
                 for rn in res_notes:

@@ -4542,6 +4542,7 @@ class NativeOrchestrator:
         eff_tool_executor: Optional[Callable[[str, dict], Awaitable[Any]]],
         parsed_criteria: List[Dict[str, Any]],
         node_timeout: float,
+        verifier_fn: Optional[Callable[..., Any]] = None,
     ) -> Dict[str, Any]:
         """Execute a single reserved TaskNode inside an isolated task-local & ledger execution scope."""
         from zelyr.engine.execution_ledger import (
@@ -4719,6 +4720,90 @@ class NativeOrchestrator:
             elif cur_rec is not None and cur_rec.state == ActionState.VALIDATED:
                 turn_ledger.record_authorized(call_id)
 
+            # Pre-dispatch transport/tool readiness check before marking dispatched (failure here is retry-safe)
+            reg_tool_pre = (
+                self.tool_registry.get_tool(func_name)
+                if (self.tool_registry is not None and callable(getattr(self.tool_registry, "get_tool", None)))
+                else None
+            )
+            pre_hook = (
+                getattr(eff_tool_executor, "pre_dispatch", None)
+                if eff_tool_executor is not None
+                else None
+            ) or (getattr(reg_tool_pre, "pre_dispatch", None) if reg_tool_pre is not None else None)
+            if callable(pre_hook):
+                try:
+                    pre_out = pre_hook(func_name, func_args)
+                    if inspect.isawaitable(pre_out):
+                        pre_out = await asyncio.wait_for(pre_out, timeout=node_timeout)
+                    if isinstance(pre_out, dict) and pre_out.get("status") in ("error", "failed", "rejected"):
+                        pre_err = str(pre_out.get("error") or pre_out.get("detail") or "Pre-dispatch readiness failed")
+                        pre_type = str(pre_out.get("error_type") or "FAILED_BEFORE_EXECUTION")
+                        err_env = {"status": "error", "error": pre_err, "error_type": pre_type}
+                        structured_obs = ObservationFramingEngine.frame_structured(
+                            func_name,
+                            err_env,
+                            requested_tool=func_name,
+                            requested_args=func_args,
+                            executed_args=func_args,
+                            dispatched=False,
+                            execution_id=eff_exec_id,
+                            correlation_id=call_id,
+                            external_source=ext_src,
+                        )
+                        turn_ledger.record_observation(
+                            call_id,
+                            status="error",
+                            output="",
+                            error=pre_err,
+                            verified=False,
+                            structured_observation=structured_obs,
+                        )
+                        is_failed = True
+                        return {
+                            "node_id": node_id,
+                            "call_id": call_id,
+                            "tool_name": func_name,
+                            "status": "error",
+                            "error_type": pre_type,
+                            "dispatched": False,
+                            "error": pre_err,
+                        }
+                except asyncio.CancelledError:
+                    raise
+                except Exception as pre_exc:
+                    pre_err = f"{type(pre_exc).__name__}: {pre_exc}"
+                    err_env = {"status": "error", "error": pre_err, "error_type": "FAILED_BEFORE_EXECUTION"}
+                    structured_obs = ObservationFramingEngine.frame_structured(
+                        func_name,
+                        err_env,
+                        requested_tool=func_name,
+                        requested_args=func_args,
+                        executed_args=func_args,
+                        dispatched=False,
+                        execution_id=eff_exec_id,
+                        correlation_id=call_id,
+                        external_source=ext_src,
+                    )
+                    turn_ledger.record_observation(
+                        call_id,
+                        status="error",
+                        output="",
+                        error=pre_err,
+                        verified=False,
+                        structured_observation=structured_obs,
+                    )
+                    is_failed = True
+                    return {
+                        "node_id": node_id,
+                        "call_id": call_id,
+                        "tool_name": func_name,
+                        "status": "error",
+                        "error_type": "FAILED_BEFORE_EXECUTION",
+                        "dispatched": False,
+                        "error": pre_err,
+                    }
+
             turn_ledger.record_dispatched(call_id, emit_event=True)
             did_dispatch = True
 
@@ -4857,9 +4942,10 @@ class NativeOrchestrator:
 
             if not is_failed:
                 if applicable_criteria:
+                    v_fn = verifier_fn or OutcomeVerifier.verify
                     c_results = []
                     for crit in applicable_criteria:
-                        vr = OutcomeVerifier.verify(
+                        vr = v_fn(
                             check=crit["check"],
                             target=crit["target"],
                             expected=crit.get("expected"),
@@ -5077,6 +5163,36 @@ class NativeOrchestrator:
                         outcome_verifier_passed=outcome_passed,
                         known_proposals=prop_by_ref,
                     )
+                if was_cancelled and node_chk is not None:
+                    prev_rs = dict(node_chk.recovery_state) if isinstance(node_chk.recovery_state, dict) else {}
+                    hist = list(prev_rs.get("recovery_history") or [])
+                    hist.append(
+                        {
+                            "attempt": int(prev_rs.get("attempt_count") or 0),
+                            "timestamp": time.time(),
+                            "failure_category": "CANCELLED",
+                            "decision": "blocked",
+                            "previous_status": TaskNodeStatus.RUNNING.value,
+                            "new_status": TaskNodeStatus.CANCELLED.value,
+                            "reason": "Node cancelled while active; preserve recovery history and potential side effects.",
+                            "verified": False,
+                        }
+                    )
+                    node_chk.recovery_state = {
+                        "recovery_version": 1,
+                        "attempt_count": int(prev_rs.get("attempt_count") or 0),
+                        **({"max_attempts": int(prev_rs["max_attempts"])} if prev_rs.get("max_attempts") is not None else {}),
+                        **({"retry_deadline": float(prev_rs["retry_deadline"])} if prev_rs.get("retry_deadline") is not None else {}),
+                        "recovery_decision": "blocked",
+                        "recovery_status": "cancelled",
+                        "previous_failure_category": "CANCELLED",
+                        "may_have_side_effect": bool(did_dispatch),
+                        "execution_started": bool(did_dispatch),
+                        "reconciliation_required": bool(did_dispatch),
+                        "verified_outcome": False,
+                        "next_recovery_action": "manual_intervention_or_replan",
+                        "recovery_history": hist[-24:],
+                    }
 
     async def execute_task_graph(
         self,
@@ -5099,6 +5215,11 @@ class NativeOrchestrator:
         allow_unverified_retry: bool = False,
         finalize_execution: bool = True,
         task_prompt: Optional[str] = None,
+        enable_recovery: bool = True,
+        recovery_policy: Optional[Any] = None,
+        verifier_fn: Optional[Callable[..., Any]] = None,
+        reconcile_on_recovery: bool = False,
+        confirm_recovery: bool = False,
     ) -> Dict[str, Any]:
         """Execute READY independent nodes in a validated TaskGraph with bounded parallelism."""
         from zelyr.engine.checkpoint import CheckpointManager
@@ -5112,6 +5233,11 @@ class NativeOrchestrator:
             parse_acceptance_criteria,
         )
         from zelyr.engine.observation_framing import ObservationFramingEngine
+        from zelyr.engine.recovery import (
+            RecoveryEngine,
+            RecoveryPolicy,
+            build_graph_recovery_overview,
+        )
         from zelyr.engine.task_graph import (
             TaskGraph,
             TaskGraphConflictError,
@@ -5201,6 +5327,8 @@ class NativeOrchestrator:
             p_norm = self._normalize_graph_proposal(p_item, eff_exec_id, fallback_order=idx)
             prop_by_ref[p_norm["proposal_id"]] = p_norm
             prop_by_ref[p_norm["original_call_id"]] = p_norm
+            if hasattr(eff_ledger, "_proposal_meta"):
+                eff_ledger._proposal_meta[p_norm["original_call_id"]] = dict(p_norm)
 
         graph.validate(known_proposals=prop_by_ref, allow_blocked=True)
         graph.recompute_schedule(known_proposals=prop_by_ref)
@@ -5208,10 +5336,15 @@ class NativeOrchestrator:
         parsed_criteria = parse_acceptance_criteria(acceptance_criteria) if acceptance_criteria else []
         eff_default_timeout = float(default_node_timeout if default_node_timeout is not None else 60.0)
         eff_node_timeouts = dict(node_timeouts or {})
+        eff_policy = (
+            recovery_policy
+            if isinstance(recovery_policy, RecoveryPolicy)
+            else RecoveryPolicy.from_config(self._active_config())
+        )
         eff_max_steps = (
             int(max_steps)
             if max_steps is not None
-            else max(int(getattr(self, "max_steps", 5)), len(graph.nodes) * 2)
+            else max(int(getattr(self, "max_steps", 5)), (len(graph.nodes) * 2) + (eff_policy.max_attempts * len(graph.nodes)))
         )
 
         auth_schemas = eff_tool_schemas
@@ -5229,6 +5362,17 @@ class NativeOrchestrator:
                 sname = str(fn.get("name") or s.get("name") or "").strip()
                 if sname:
                     schema_by_name[sname] = s
+
+        def _collect_checkpoint_proposals() -> List[Dict[str, Any]]:
+            uniq: List[Dict[str, Any]] = []
+            seen_ids: set[str] = set()
+            for p_v in prop_by_ref.values():
+                if isinstance(p_v, dict):
+                    pid_s = str(p_v.get("proposal_id") or "")
+                    if pid_s and pid_s not in seen_ids:
+                        seen_ids.add(pid_s)
+                        uniq.append(dict(p_v))
+            return uniq
 
         def _capture_cp(status_val: Any) -> None:
             ver_st = (
@@ -5249,6 +5393,7 @@ class NativeOrchestrator:
                     "executed_steps": executed_steps,
                     "graph_status": graph.status,
                 },
+                pending_actions=_collect_checkpoint_proposals() or None,
                 task_graph=graph,
                 emit_event=False,
                 strict=None,
@@ -5256,9 +5401,93 @@ class NativeOrchestrator:
 
         active_tasks: Dict[asyncio.Task[Dict[str, Any]], Tuple[str, str, str, str]] = {}
         node_results: List[Dict[str, Any]] = []
+        recovery_events_out: List[Dict[str, Any]] = []
         dispatched_node_ids: set[str] = set()
+        backoff_until_by_node: Dict[str, float] = {}
+        for gn_init in graph.nodes:
+            if isinstance(getattr(gn_init, "recovery_state", None), dict):
+                nra = gn_init.recovery_state.get("next_retry_after")
+                if nra is not None:
+                    backoff_until_by_node[gn_init.node_id] = float(nra)
         executed_steps = 0
         was_cancelled = False
+
+        def _run_recovery_for_nodes(target_node_ids: Iterable[str]) -> bool:
+            if not enable_recovery:
+                return False
+            changed_any = False
+            for r_nid in target_node_ids:
+                r_node = graph.get_node(r_nid)
+                if r_node is None:
+                    continue
+                if r_node.reserved_by is not None:
+                    continue
+                if r_node.execution_status not in (
+                    TaskNodeStatus.FAILED.value,
+                    TaskNodeStatus.BLOCKED.value,
+                    TaskNodeStatus.COMPLETED_UNVERIFIED.value,
+                ):
+                    continue
+                # Do not run node recovery on a downstream node blocked solely by an upstream prerequisite
+                if r_node.execution_status == TaskNodeStatus.BLOCKED.value and not r_node.contradictory:
+                    has_unsat_parent = any(
+                        (graph.get_node(dep_id) is None)
+                        or not graph._is_prerequisite_satisfied(
+                            graph.get_node(dep_id), r_node.requires_verified_dependencies
+                        )
+                        for dep_id in r_node.dependency_ids
+                    )
+                    if has_unsat_parent:
+                        continue
+                assess = RecoveryEngine.assess_node_recovery(
+                    graph,
+                    r_nid,
+                    central_ledger=eff_central,
+                    turn_ledger=eff_ledger,
+                    proposals=prop_by_ref,
+                    policy=eff_policy,
+                    tool_registry=self.tool_registry,
+                    active_schemas=auth_schemas,
+                    known_tools=known_for_auth,
+                    caller_ring=eff_caller_ring,
+                    allowed_tools=eff_allowed_tools,
+                    task_local_scope=eff_task_local_scope,
+                    acceptance_criteria=acceptance_criteria,
+                    verifier_fn=verifier_fn,
+                    reconcile_state=reconcile_on_recovery,
+                    confirm_recovery=confirm_recovery,
+                )
+                try:
+                    apply_res = RecoveryEngine.apply_recovery_decision(
+                        graph,
+                        assess,
+                        prop_by_ref=prop_by_ref,
+                        central_ledger=eff_central,
+                        turn_ledger=eff_ledger,
+                        execute_retry=eff_policy.allow_auto_retry,
+                    )
+                except TaskGraphConflictError:
+                    continue
+                recovery_events_out.append(apply_res)
+                changed_any = True
+                if apply_res.get("retried"):
+                    dispatched_node_ids.discard(r_nid)
+                    backoff_s = float(apply_res.get("backoff_seconds") or 0.0)
+                    if backoff_s > 0.0:
+                        backoff_until_by_node[r_nid] = time.time() + backoff_s
+                    else:
+                        backoff_until_by_node.pop(r_nid, None)
+            return changed_any
+
+        # Assess pre-existing failed / unverified nodes on entry (e.g., resumed graphs)
+        initial_candidates = [
+            n.node_id
+            for n in graph.nodes
+            if n.execution_status in (TaskNodeStatus.FAILED.value, TaskNodeStatus.COMPLETED_UNVERIFIED.value)
+            or (n.execution_status == TaskNodeStatus.BLOCKED.value and n.contradictory)
+        ]
+        if initial_candidates:
+            _run_recovery_for_nodes(initial_candidates)
 
         _capture_cp(ExecutionStatus.RUNNING)
 
@@ -5274,11 +5503,17 @@ class NativeOrchestrator:
                 ]
 
                 if executed_steps < eff_max_steps and len(active_tasks) < eff_max_conc and ready_nodes:
+                    dispatch_failed_ids: List[str] = []
+                    now_loop = time.time()
                     for node in ready_nodes:
                         if len(active_tasks) >= eff_max_conc or executed_steps + len(active_tasks) >= eff_max_steps:
                             break
                         if node.node_id in dispatched_node_ids or node.reserved_by is not None:
                             continue
+                        b_until = backoff_until_by_node.get(node.node_id)
+                        if b_until is not None and now_loop < b_until:
+                            continue
+                        backoff_until_by_node.pop(node.node_id, None)
 
                         # Resolve runnable proposal for this node
                         prop_info: Optional[Dict[str, Any]] = None
@@ -5299,6 +5534,7 @@ class NativeOrchestrator:
                             )
                             graph.apply_observation(node.node_id, fail_obs, outcome_verifier_passed=False, known_proposals=prop_by_ref)
                             node_results.append({"node_id": node.node_id, "status": "failed", "error": "missing_proposal"})
+                            dispatch_failed_ids.append(node.node_id)
                             continue
 
                         if prop_info.get("expires_at") is not None and float(prop_info["expires_at"]) <= time.time():
@@ -5331,6 +5567,7 @@ class NativeOrchestrator:
                             )
                             graph.apply_observation(node.node_id, exp_obs, action_record=eff_ledger.get_record(exp_call_id), known_proposals=prop_by_ref)
                             node_results.append({"node_id": node.node_id, "call_id": exp_call_id, "status": "expired", "error": exp_err})
+                            dispatch_failed_ids.append(node.node_id)
                             continue
 
                         call_id = prop_info["original_call_id"]
@@ -5409,6 +5646,7 @@ class NativeOrchestrator:
                             )
                             graph.apply_observation(node.node_id, rej_obs, action_record=eff_ledger.get_record(call_id), known_proposals=prop_by_ref)
                             node_results.append({"node_id": node.node_id, "call_id": call_id, "status": "rejected", "error": ext_err})
+                            dispatch_failed_ids.append(node.node_id)
                             continue
 
                         pre_dec = authorize_and_validate_tool_call(
@@ -5466,6 +5704,7 @@ class NativeOrchestrator:
                             )
                             graph.apply_observation(node.node_id, rej_obs, action_record=eff_ledger.get_record(call_id), known_proposals=prop_by_ref)
                             node_results.append({"node_id": node.node_id, "call_id": call_id, "status": "rejected", "error": rej_detail})
+                            dispatch_failed_ids.append(node.node_id)
                             continue
 
                         # Update normalized tool & args cleanly before reservation
@@ -5555,19 +5794,40 @@ class NativeOrchestrator:
                             eff_tool_executor=eff_tool_executor,
                             parsed_criteria=parsed_criteria,
                             node_timeout=eff_timeout,
+                            verifier_fn=verifier_fn,
                         )
                         task = asyncio.create_task(worker_coro, name=f"graph_node_{node.node_id}_{owner_id}")
                         active_tasks[task] = (node.node_id, call_id, owner_id, rid)
 
+                    if dispatch_failed_ids and _run_recovery_for_nodes(dispatch_failed_ids):
+                        graph.recompute_schedule(known_proposals=prop_by_ref)
+
                 if not active_tasks:
+                    # Wait only bounded backoff for any READY node awaiting retry backoff timer
+                    pending_wait_nodes = [
+                        n.node_id
+                        for n in graph.get_ready_nodes()
+                        if n.node_id not in dispatched_node_ids
+                        and n.node_id in backoff_until_by_node
+                        and backoff_until_by_node[n.node_id] > time.time()
+                    ]
+                    if pending_wait_nodes and executed_steps < eff_max_steps:
+                        soonest = min(backoff_until_by_node[nid] for nid in pending_wait_nodes)
+                        sleep_for = max(0.0, soonest - time.time())
+                        if sleep_for > 0.0:
+                            await asyncio.sleep(sleep_for)
+                        _capture_cp(ExecutionStatus.RUNNING)
+                        continue
                     break
 
                 # Persist active concurrent reservations + RUNNING state before awaiting wave
                 _capture_cp(ExecutionStatus.RUNNING)
 
                 done, _ = await asyncio.wait(active_tasks.keys(), return_when=asyncio.FIRST_COMPLETED)
+                completed_in_wave: List[str] = []
                 for d_task in done:
                     nid_d, cid_d, owner_d, rid_d = active_tasks.pop(d_task)
+                    completed_in_wave.append(nid_d)
                     executed_steps += 1
                     try:
                         res_item = d_task.result()
@@ -5577,6 +5837,9 @@ class NativeOrchestrator:
                         node_results.append({"node_id": nid_d, "call_id": cid_d, "status": "cancelled"})
                     except Exception as task_exc:
                         node_results.append({"node_id": nid_d, "call_id": cid_d, "status": "error", "error": str(task_exc)})
+
+                if completed_in_wave:
+                    _run_recovery_for_nodes(completed_in_wave)
 
                 _capture_cp(ExecutionStatus.RUNNING)
         except asyncio.CancelledError:
@@ -5638,6 +5901,8 @@ class NativeOrchestrator:
             "summary": dict(graph.summary),
             "executed_steps": executed_steps,
             "results": node_results,
+            "recovery_events": recovery_events_out,
+            "recovery_overview": build_graph_recovery_overview(graph),
             "task_graph": graph,
             "turn_ledger": eff_ledger,
         }
@@ -5935,6 +6200,178 @@ class NativeOrchestrator:
             workspace_root=workspace_root,
             tool_schemas=getattr(self, "tool_schemas", None),
             tool_registry=getattr(self, "tool_registry", None),
+            checkpoint=checkpoint,
+        )
+
+    def assess_node_recovery(
+        self,
+        graph: Any,
+        node_id: str,
+        *,
+        central_ledger: Optional[Any] = None,
+        turn_ledger: Optional[Any] = None,
+        proposals: Optional[Any] = None,
+        policy: Optional[Any] = None,
+        tool_schemas: Optional[List[Dict[str, Any]]] = None,
+        caller_ring: Optional[int] = None,
+        allowed_tools: Optional[Iterable[str]] = None,
+        task_local_scope: Optional[Any] = None,
+        acceptance_criteria: Optional[str] = None,
+        verifier_fn: Optional[Callable[..., Any]] = None,
+        reconcile_state: bool = False,
+        confirm_recovery: bool = False,
+    ) -> Any:
+        """Evaluate structured evidence, OutcomeVerifier checks, and live auth for a failed node."""
+        from zelyr.engine.recovery import RecoveryEngine, RecoveryPolicy
+
+        eff_central = central_ledger or getattr(self, "central_ledger", None)
+        eff_turn = turn_ledger or getattr(self, "current_ledger", None)
+        eff_policy = (
+            policy
+            if isinstance(policy, RecoveryPolicy)
+            else RecoveryPolicy.from_config(self._active_config())
+        )
+        eff_schemas = tool_schemas if tool_schemas is not None else getattr(self, "tool_schemas", None)
+        eff_ring = caller_ring if caller_ring is not None else getattr(self, "caller_ring", None)
+        eff_allowed = (
+            list(allowed_tools)
+            if allowed_tools is not None
+            else (list(getattr(self, "allowed_tools", None)) if getattr(self, "allowed_tools", None) is not None else None)
+        )
+        eff_scope = task_local_scope if task_local_scope is not None else getattr(self, "task_local_scope", None)
+        return RecoveryEngine.assess_node_recovery(
+            graph,
+            node_id,
+            central_ledger=eff_central,
+            turn_ledger=eff_turn,
+            proposals=proposals,
+            policy=eff_policy,
+            tool_registry=getattr(self, "tool_registry", None),
+            active_schemas=eff_schemas,
+            caller_ring=eff_ring,
+            allowed_tools=eff_allowed,
+            task_local_scope=eff_scope,
+            acceptance_criteria=acceptance_criteria,
+            verifier_fn=verifier_fn,
+            reconcile_state=reconcile_state,
+            confirm_recovery=confirm_recovery,
+        )
+
+    def recover_graph_node(
+        self,
+        graph: Any,
+        node_id: str,
+        *,
+        proposals: Optional[Any] = None,
+        central_ledger: Optional[Any] = None,
+        turn_ledger: Optional[Any] = None,
+        policy: Optional[Any] = None,
+        reconcile_state: bool = False,
+        confirm_recovery: bool = False,
+        execute_retry: bool = True,
+        acceptance_criteria: Optional[str] = None,
+        verifier_fn: Optional[Callable[..., Any]] = None,
+    ) -> Dict[str, Any]:
+        """Run verification-driven recovery assessment + atomic graph/ledger transition for one node."""
+        from zelyr.engine.recovery import RecoveryEngine
+
+        eff_central = central_ledger or getattr(self, "central_ledger", None)
+        eff_turn = turn_ledger or getattr(self, "current_ledger", None)
+        assessment = self.assess_node_recovery(
+            graph,
+            node_id,
+            central_ledger=eff_central,
+            turn_ledger=eff_turn,
+            proposals=proposals,
+            policy=policy,
+            acceptance_criteria=acceptance_criteria,
+            verifier_fn=verifier_fn,
+            reconcile_state=reconcile_state,
+            confirm_recovery=confirm_recovery,
+        )
+        res = RecoveryEngine.apply_recovery_decision(
+            graph,
+            assessment,
+            prop_by_ref=proposals if isinstance(proposals, dict) else None,
+            central_ledger=eff_central,
+            turn_ledger=eff_turn,
+            execute_retry=execute_retry,
+        )
+        return {"assessment": assessment, **res}
+
+    def replace_failed_graph_node(
+        self,
+        graph: Any,
+        failed_node_id: str,
+        *,
+        replacement_node_id: str,
+        description: str,
+        tool_id: str,
+        arguments: Dict[str, Any],
+        extra_dependencies: Sequence[str] = (),
+        verification_requirement: Optional[str] = None,
+        expected_outcome: str = "",
+        timeout_seconds: Optional[float] = None,
+        proposals: Optional[Any] = None,
+        central_ledger: Optional[Any] = None,
+        turn_ledger: Optional[Any] = None,
+        checkpoint: bool = True,
+    ) -> Tuple[Any, Dict[str, Any]]:
+        """Replace a failed node with an alternative proposal while preserving dependencies and verified work."""
+        from zelyr.engine.recovery import RecoveryEngine
+
+        eff_central = central_ledger or getattr(self, "central_ledger", None)
+        eff_turn = turn_ledger or getattr(self, "current_ledger", None)
+        return RecoveryEngine.recover_node_with_alternative(
+            graph,
+            failed_node_id,
+            replacement_node_id=replacement_node_id,
+            description=description,
+            tool_id=tool_id,
+            arguments=arguments,
+            extra_dependencies=extra_dependencies,
+            verification_requirement=verification_requirement,
+            expected_outcome=expected_outcome,
+            timeout_seconds=timeout_seconds,
+            prop_by_ref=proposals if isinstance(proposals, dict) else None,
+            central_ledger=eff_central,
+            turn_ledger=eff_turn,
+            checkpoint=checkpoint,
+        )
+
+    def add_corrective_graph_node(
+        self,
+        graph: Any,
+        failed_node_id: str,
+        *,
+        corrective_node_id: str,
+        description: str,
+        tool_id: str,
+        arguments: Dict[str, Any],
+        verification_requirement: Optional[str] = None,
+        expected_outcome: str = "",
+        proposals: Optional[Any] = None,
+        central_ledger: Optional[Any] = None,
+        turn_ledger: Optional[Any] = None,
+        checkpoint: bool = True,
+    ) -> Tuple[Any, Dict[str, Any]]:
+        """Insert a corrective prerequisite step before ``failed_node_id`` without dropping dependencies."""
+        from zelyr.engine.recovery import RecoveryEngine
+
+        eff_central = central_ledger or getattr(self, "central_ledger", None)
+        eff_turn = turn_ledger or getattr(self, "current_ledger", None)
+        return RecoveryEngine.add_corrective_step(
+            graph,
+            failed_node_id,
+            corrective_node_id=corrective_node_id,
+            description=description,
+            tool_id=tool_id,
+            arguments=arguments,
+            verification_requirement=verification_requirement,
+            expected_outcome=expected_outcome,
+            prop_by_ref=proposals if isinstance(proposals, dict) else None,
+            central_ledger=eff_central,
+            turn_ledger=eff_turn,
             checkpoint=checkpoint,
         )
 

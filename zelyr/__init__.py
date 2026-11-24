@@ -69,6 +69,15 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "compile_structured_plan_to_task_graph": ("zelyr.planning", "compile_structured_plan_to_task_graph"),
     "parse_structured_plan": ("zelyr.planning", "parse_structured_plan"),
     "replan_task_graph": ("zelyr.planning", "replan_task_graph"),
+    # Recovery
+    "CorruptedRecoveryStateError": ("zelyr.engine.recovery", "CorruptedRecoveryStateError"),
+    "RecoveryAssessment": ("zelyr.engine.recovery", "RecoveryAssessment"),
+    "RecoveryDecision": ("zelyr.engine.recovery", "RecoveryDecision"),
+    "RecoveryEngine": ("zelyr.engine.recovery", "RecoveryEngine"),
+    "RecoveryError": ("zelyr.engine.recovery", "RecoveryError"),
+    "RecoveryPolicy": ("zelyr.engine.recovery", "RecoveryPolicy"),
+    "UnsupportedRecoveryVersionError": ("zelyr.engine.recovery", "UnsupportedRecoveryVersionError"),
+    "build_graph_recovery_overview": ("zelyr.engine.recovery", "build_graph_recovery_overview"),
     # Agents
     "BaseAgent": ("zelyr.agents", "BaseAgent"),
     "AgentResult": ("zelyr.agents", "AgentResult"),
@@ -130,6 +139,15 @@ __all__ = [
     "compile_structured_plan_to_task_graph",
     "parse_structured_plan",
     "replan_task_graph",
+    # Recovery
+    "CorruptedRecoveryStateError",
+    "RecoveryAssessment",
+    "RecoveryDecision",
+    "RecoveryEngine",
+    "RecoveryError",
+    "RecoveryPolicy",
+    "UnsupportedRecoveryVersionError",
+    "build_graph_recovery_overview",
     # Agents
     "BaseAgent",
     "AgentResult",
@@ -204,6 +222,16 @@ if TYPE_CHECKING:
         compile_structured_plan_to_task_graph,
         parse_structured_plan,
         replan_task_graph,
+    )
+    from zelyr.engine.recovery import (
+        CorruptedRecoveryStateError,
+        RecoveryAssessment,
+        RecoveryDecision,
+        RecoveryEngine,
+        RecoveryError,
+        RecoveryPolicy,
+        UnsupportedRecoveryVersionError,
+        build_graph_recovery_overview,
     )
     from zelyr.agents import BaseAgent, AgentResult, OrchestratorAgent, ShellAgent
     from zelyr.tools import (

@@ -27,6 +27,19 @@ from zelyr.engine.execution_ledger import (
 
 TASK_GRAPH_VERSION: int = 1
 SUPPORTED_TASK_GRAPH_VERSIONS: frozenset[int] = frozenset({1})
+RECOVERY_STATE_VERSION: int = 1
+SUPPORTED_RECOVERY_VERSIONS: frozenset[int] = frozenset({1})
+_VALID_RECOVERY_DECISIONS: frozenset[str] = frozenset(
+    {
+        "retry_safe",
+        "retry_after_revalidation",
+        "replan_node",
+        "require_confirmation",
+        "blocked",
+        "already_completed",
+        "unresolved",
+    }
+)
 
 _FORBIDDEN_GRAPH_KEYS: frozenset[str] = frozenset(
     {
@@ -56,8 +69,72 @@ _FORBIDDEN_GRAPH_KEYS: frozenset[str] = frozenset(
         "workspace_root",
         "filesystem_root",
         "sandbox_root",
+        "bypass_recovery",
+        "skip_recovery_verification",
+        "override_retry_limit",
+        "force_retry",
     }
 )
+
+
+def _validate_node_recovery_state(raw: Any, *, context_label: str = "recovery_state") -> Dict[str, Any]:
+    """Validate and sanitize persisted TaskNode / checkpoint recovery state cleanly (fail-closed)."""
+    if not isinstance(raw, dict):
+        raise CorruptedTaskGraphError(f"{context_label} must be a JSON object.")
+
+    rver = raw.get("recovery_version", RECOVERY_STATE_VERSION)
+    if isinstance(rver, bool) or not isinstance(rver, int):
+        raise CorruptedTaskGraphError(f"{context_label} has malformed recovery_version: {rver!r}.")
+    if rver not in SUPPORTED_RECOVERY_VERSIONS:
+        raise UnsupportedTaskGraphVersionError(
+            f"{context_label} uses unsupported recovery_version {rver}; supported: {sorted(SUPPORTED_RECOVERY_VERSIONS)}."
+        )
+
+    attempt_count = raw.get("attempt_count", 0)
+    if isinstance(attempt_count, bool) or not isinstance(attempt_count, int) or attempt_count < 0:
+        raise CorruptedTaskGraphError(f"{context_label} has invalid attempt_count: {attempt_count!r}.")
+
+    max_attempts = raw.get("max_attempts")
+    if max_attempts is not None and (
+        isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 0
+    ):
+        raise CorruptedTaskGraphError(f"{context_label} has invalid max_attempts: {max_attempts!r}.")
+
+    for ts_field in ("retry_deadline", "next_retry_after"):
+        val = raw.get(ts_field)
+        if val is not None and (isinstance(val, bool) or not isinstance(val, (int, float)) or float(val) < 0.0):
+            raise CorruptedTaskGraphError(f"{context_label} has invalid {ts_field}: {val!r}.")
+
+    for bool_field in (
+        "may_have_side_effect",
+        "execution_started",
+        "reconciliation_required",
+        "verified_outcome",
+    ):
+        bval = raw.get(bool_field)
+        if bval is not None and not isinstance(bval, bool):
+            raise CorruptedTaskGraphError(f"{context_label} field '{bool_field}' must be boolean.")
+
+    decision = raw.get("recovery_decision")
+    if decision is not None and (not isinstance(decision, str) or decision not in _VALID_RECOVERY_DECISIONS):
+        raise CorruptedTaskGraphError(f"{context_label} has invalid recovery_decision: {decision!r}.")
+
+    history = raw.get("recovery_history", [])
+    if not isinstance(history, list) or any(not isinstance(h, dict) for h in history):
+        raise CorruptedTaskGraphError(f"{context_label} recovery_history must be a list of dicts.")
+
+    forbidden_found = [k for k in raw.keys() if k in _FORBIDDEN_GRAPH_KEYS]
+    if forbidden_found:
+        raise CorruptedTaskGraphError(
+            f"{context_label} contains forbidden policy/auth override keys: {sorted(forbidden_found)}."
+        )
+
+    safe_map, _, _ = sanitize_ledger_payload(_strip_forbidden_graph_keys(dict(raw)), max_bytes=4096)
+    out = dict(safe_map)
+    out["recovery_version"] = int(rver)
+    out["attempt_count"] = int(attempt_count)
+    out["recovery_history"] = list(history[-24:])
+    return out
 
 
 class TaskGraphError(LedgerPersistenceError):
@@ -199,9 +276,10 @@ def compute_task_graph_digest(payload: Dict[str, Any]) -> str:
             "expected_outcome",
             "verification_requirement",
             "timeout_seconds",
+            "recovery_state",
         ):
             val = n.get(k)
-            if val is not None and val != "" and val != []:
+            if val is not None and val != "" and val != [] and val != {}:
                 extra_n[k] = val
         if nid and extra_n:
             node_res_meta[nid] = extra_n
@@ -523,6 +601,7 @@ class TaskNode:
     expected_outcome: str = ""
     verification_requirement: Optional[str] = None
     timeout_seconds: Optional[float] = None
+    recovery_state: Optional[Dict[str, Any]] = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -564,6 +643,13 @@ class TaskNode:
             out["verification_requirement"] = _sanitize_graph_text(self.verification_requirement, max_bytes=256)
         if self.timeout_seconds is not None:
             out["timeout_seconds"] = float(self.timeout_seconds)
+        if isinstance(self.recovery_state, dict) and self.recovery_state:
+            safe_rec, _, _ = sanitize_ledger_payload(
+                _strip_forbidden_graph_keys(dict(self.recovery_state)),
+                max_bytes=4096,
+            )
+            if safe_rec:
+                out["recovery_state"] = safe_rec
         return out
 
     @classmethod
@@ -628,6 +714,13 @@ class TaskNode:
             isinstance(tout_s, bool) or not isinstance(tout_s, (int, float)) or float(tout_s) <= 0.0
         ):
             raise CorruptedTaskGraphError(f"TaskNode '{nid}' has invalid timeout_seconds: {tout_s!r}.")
+        raw_rec_state = data.get("recovery_state")
+        validated_rec_state: Optional[Dict[str, Any]] = None
+        if raw_rec_state is not None:
+            validated_rec_state = _validate_node_recovery_state(
+                raw_rec_state,
+                context_label=f"TaskNode '{nid}' recovery_state",
+            )
 
         now = time.time()
         return cls(
@@ -653,6 +746,7 @@ class TaskNode:
             expected_outcome=_sanitize_graph_text(exp_out, max_bytes=512) if exp_out else "",
             verification_requirement=_sanitize_graph_text(ver_req, max_bytes=256) if ver_req else None,
             timeout_seconds=float(tout_s) if tout_s is not None else None,
+            recovery_state=validated_rec_state,
             created_at=float(data.get("created_at") or now),
             updated_at=float(data.get("updated_at") or now),
         )
@@ -676,6 +770,7 @@ class TaskGraph:
     max_concurrency: int = 1
     active_reservations: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     _lock: _threading.RLock = field(default_factory=_threading.RLock, init=False, repr=False, compare=False)
+    _recovery_owners: Dict[str, str] = field(default_factory=dict, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.max_concurrency, int) or isinstance(self.max_concurrency, bool) or self.max_concurrency < 1:
@@ -1723,6 +1818,213 @@ class TaskGraph:
         node.updated_at = time.time()
         return self.recompute_schedule(known_proposals=known_proposals)
 
+    def begin_node_recovery(self, node_id: str, owner_id: str) -> str:
+        """Atomically claim exclusive recovery ownership for a single TaskNode."""
+        if not isinstance(owner_id, str) or not owner_id.strip():
+            raise TaskGraphValidationError("Recovery ownership requires a non-empty owner_id.")
+        eff_owner = owner_id.strip()
+        node = self.get_node(node_id)
+        if node is None:
+            raise TaskGraphValidationError(f"Cannot recover unknown task node '{node_id}'.")
+        cur_res_owner = node.reserved_by or (self.active_reservations.get(node_id) or {}).get("owner_id")
+        if cur_res_owner is not None:
+            raise TaskGraphConflictError(
+                f"Cannot initiate recovery on node '{node_id}' while reserved by active worker '{cur_res_owner}'."
+            )
+        cur_rec_owner = self._recovery_owners.get(node_id)
+        if cur_rec_owner is not None and cur_rec_owner != eff_owner:
+            raise TaskGraphConflictError(
+                f"Node '{node_id}' already has an active recovery owner '{cur_rec_owner}'."
+            )
+        self._recovery_owners[node_id] = eff_owner
+        return eff_owner
+
+    def end_node_recovery(self, node_id: str, owner_id: str) -> None:
+        """Release per-node recovery ownership only if held by ``owner_id``."""
+        eff_owner = str(owner_id or "").strip()
+        cur_owner = self._recovery_owners.get(node_id)
+        if cur_owner is None:
+            return
+        if cur_owner != eff_owner:
+            raise TaskGraphConflictError(
+                f"Non-owner '{eff_owner}' cannot release recovery lock held by '{cur_owner}' on '{node_id}'."
+            )
+        self._recovery_owners.pop(node_id, None)
+
+    def get_blocked_dependents(self, node_id: str) -> List[Dict[str, Any]]:
+        """Return direct and transitive downstream nodes blocked by ``node_id``."""
+        node_map = {n.node_id: n for n in self.nodes}
+        if node_id not in node_map:
+            return []
+        children: Dict[str, List[str]] = {n.node_id: [] for n in self.nodes}
+        for n in self.nodes:
+            for d in n.dependency_ids:
+                if d in children:
+                    children[d].append(n.node_id)
+        seen: Set[str] = set()
+        stack: List[str] = list(children.get(node_id, []))
+        dependents: List[TaskNode] = []
+        while stack:
+            cur = stack.pop(0)
+            if cur in seen:
+                continue
+            seen.add(cur)
+            cn = node_map.get(cur)
+            if cn is not None:
+                dependents.append(cn)
+                stack.extend(children.get(cur, []))
+        dependents.sort(key=lambda x: (x.order_index, x.node_id))
+        return [
+            {
+                "node_id": dn.node_id,
+                "execution_status": dn.execution_status,
+                "dependency_ids": list(dn.dependency_ids),
+                "blocked_reason": dn.blocked_reason,
+            }
+            for dn in dependents
+        ]
+
+    def record_node_recovery_state(
+        self,
+        node_id: str,
+        recovery_state: Dict[str, Any],
+        *,
+        transition_status: Optional[str] = None,
+        verification_status: Optional[str] = None,
+        blocked_reason: Optional[str] = None,
+        clear_contradiction: bool = False,
+        clear_failure_info: bool = False,
+        known_proposals: Optional[Union[Dict[str, Any], Iterable[Any]]] = None,
+    ) -> TaskNode:
+        """Persist validated recovery metadata and optional safe status transition on a node."""
+        node = self.get_node(node_id)
+        if node is None:
+            raise TaskGraphValidationError(f"Unknown task node '{node_id}'.")
+        validated = _validate_node_recovery_state(
+            recovery_state,
+            context_label=f"TaskNode '{node_id}' recovery_state",
+        )
+        if node.execution_status == TaskNodeStatus.COMPLETED_VERIFIED.value:
+            if transition_status is not None and transition_status != TaskNodeStatus.COMPLETED_VERIFIED.value:
+                raise TaskGraphValidationError(
+                    f"Cannot transition completed verified node '{node_id}' to '{transition_status}'."
+                )
+            node.recovery_state = validated
+            node.updated_at = time.time()
+            self._refresh_summary_and_digest()
+            return node
+
+        snapshot = self.to_dict()
+        node.recovery_state = validated
+        if clear_contradiction:
+            node.contradictory = False
+        if clear_failure_info:
+            node.failure_info = None
+        if transition_status is not None:
+            if transition_status not in _VALID_NODE_STATUSES:
+                raise TaskGraphValidationError(f"Invalid transition_status '{transition_status}'.")
+            node.execution_status = transition_status
+        if verification_status is not None:
+            if verification_status not in _VALID_VERIFICATION_STATUSES:
+                raise TaskGraphValidationError(f"Invalid verification_status '{verification_status}'.")
+            node.verification_status = verification_status
+        node.blocked_reason = _sanitize_graph_text(blocked_reason, max_bytes=256) if blocked_reason else None
+        node.updated_at = time.time()
+        try:
+            self.recompute_schedule(known_proposals=known_proposals)
+            self.validate(known_proposals=known_proposals, allow_blocked=True)
+        except Exception:
+            self._restore_from_dict(snapshot)
+            raise
+        return node
+
+    def prepare_node_for_retry(
+        self,
+        node_id: str,
+        *,
+        new_proposal_id: Optional[str] = None,
+        recovery_state: Optional[Dict[str, Any]] = None,
+        known_proposals: Optional[Union[Dict[str, Any], Iterable[Any]]] = None,
+    ) -> TaskNode:
+        """Reset a non-reserved recoverable node to PENDING so scheduler validates readiness cleanly."""
+        node = self.get_node(node_id)
+        if node is None:
+            raise TaskGraphValidationError(f"Cannot retry unknown node '{node_id}'.")
+        if node.execution_status == TaskNodeStatus.COMPLETED_VERIFIED.value:
+            raise TaskGraphValidationError(f"Completed verified node '{node_id}' must not be retried.")
+        if node.execution_status == TaskNodeStatus.CANCELLED.value:
+            raise TaskGraphValidationError(f"Cancelled node '{node_id}' cannot be prepared for auto-retry.")
+        if node.reserved_by is not None or node_id in self.active_reservations:
+            raise TaskGraphConflictError(f"Cannot reset reserved node '{node_id}' while still owned.")
+
+        snapshot = self.to_dict()
+        if new_proposal_id:
+            clean_pid = str(new_proposal_id).strip()
+            if not clean_pid:
+                raise TaskGraphValidationError("new_proposal_id must be non-empty.")
+            node.proposal_ids = [clean_pid]
+        if recovery_state is not None:
+            node.recovery_state = _validate_node_recovery_state(
+                recovery_state,
+                context_label=f"TaskNode '{node_id}' recovery_state",
+            )
+        node.execution_status = TaskNodeStatus.PENDING.value
+        node.verification_status = VerificationStatus.NOT_VERIFIED.value
+        node.contradictory = False
+        node.failure_info = None
+        node.blocked_reason = None
+        node.updated_at = time.time()
+        try:
+            self.recompute_schedule(known_proposals=known_proposals)
+            self.validate(known_proposals=known_proposals, allow_blocked=True)
+        except Exception:
+            self._restore_from_dict(snapshot)
+            raise
+        return node
+
+    def add_corrective_node(
+        self,
+        failed_node_id: str,
+        corrective_node: TaskNode,
+        *,
+        make_prerequisite_of_failed: bool = True,
+        reset_failed_to_pending: bool = True,
+        known_proposals: Optional[Union[Dict[str, Any], Iterable[Any]]] = None,
+    ) -> "TaskGraph":
+        """Insert a corrective node without removing existing dependencies on any node."""
+        target = self.get_node(failed_node_id)
+        if target is None:
+            raise TaskGraphValidationError(f"Cannot add corrective node for unknown node '{failed_node_id}'.")
+        if target.execution_status == TaskNodeStatus.COMPLETED_VERIFIED.value:
+            raise TaskGraphValidationError(
+                f"Cannot attach corrective prerequisite to completed verified node '{failed_node_id}'."
+            )
+        snapshot = self.to_dict()
+        corr = TaskNode.from_dict(corrective_node.to_dict())
+        for existing_dep in target.dependency_ids:
+            if existing_dep not in corr.dependency_ids and make_prerequisite_of_failed:
+                corr.dependency_ids.append(existing_dep)
+        if corr.order_index == 0 and target.order_index > 0:
+            corr.order_index = target.order_index
+        self.nodes.append(corr)
+        if make_prerequisite_of_failed:
+            if corr.node_id not in target.dependency_ids:
+                target.dependency_ids.append(corr.node_id)
+            if reset_failed_to_pending:
+                target.execution_status = TaskNodeStatus.PENDING.value
+                target.verification_status = VerificationStatus.NOT_VERIFIED.value
+                target.contradictory = False
+                target.failure_info = None
+                target.blocked_reason = None
+        target.updated_at = time.time()
+        try:
+            self.recompute_schedule(known_proposals=known_proposals)
+            self.validate(known_proposals=known_proposals, allow_blocked=True)
+        except Exception:
+            self._restore_from_dict(snapshot)
+            raise
+        return self
+
     def _restore_from_dict(self, data: Dict[str, Any]) -> None:
         restored = TaskGraph.from_dict(data, default_execution_id=self.execution_id, verify_integrity=False)
         self.nodes = restored.nodes
@@ -1746,9 +2048,22 @@ class TaskGraph:
                 next_node = n.node_id
                 break
 
+        superseded_cancelled = sum(
+            1
+            for n in self.nodes
+            if n.execution_status == TaskNodeStatus.CANCELLED.value
+            and str(n.blocked_reason or "").startswith("Superseded by replacement node ")
+        )
+        non_superseded_cancelled = counts[TaskNodeStatus.CANCELLED.value] - superseded_cancelled
+        active_total = total - superseded_cancelled
+
         if total == 0:
             self.status = TaskGraphStatus.INITIALIZED.value
-        elif counts[TaskNodeStatus.COMPLETED_VERIFIED.value] == total:
+        elif counts[TaskNodeStatus.COMPLETED_VERIFIED.value] == total or (
+            active_total > 0
+            and non_superseded_cancelled == 0
+            and counts[TaskNodeStatus.COMPLETED_VERIFIED.value] == active_total
+        ):
             self.status = TaskGraphStatus.COMPLETED_VERIFIED.value
         elif counts[TaskNodeStatus.RUNNING.value] > 0:
             self.status = TaskGraphStatus.RUNNING.value
@@ -1760,7 +2075,14 @@ class TaskGraph:
             self.status = TaskGraphStatus.CANCELLED.value
         elif counts[TaskNodeStatus.BLOCKED.value] > 0:
             self.status = TaskGraphStatus.BLOCKED.value
-        elif (counts[TaskNodeStatus.COMPLETED_VERIFIED.value] + counts[TaskNodeStatus.COMPLETED_UNVERIFIED.value]) == total:
+        elif (counts[TaskNodeStatus.COMPLETED_VERIFIED.value] + counts[TaskNodeStatus.COMPLETED_UNVERIFIED.value]) == total or (
+            active_total > 0
+            and non_superseded_cancelled == 0
+            and (
+                counts[TaskNodeStatus.COMPLETED_VERIFIED.value] + counts[TaskNodeStatus.COMPLETED_UNVERIFIED.value]
+            )
+            == active_total
+        ):
             self.status = TaskGraphStatus.COMPLETED_UNVERIFIED.value
         else:
             self.status = TaskGraphStatus.PENDING.value
@@ -1921,6 +2243,12 @@ for _tg_meth_name in (
     "get_blocked_nodes",
     "get_failed_nodes",
     "get_unverified_nodes",
+    "begin_node_recovery",
+    "end_node_recovery",
+    "get_blocked_dependents",
+    "record_node_recovery_state",
+    "prepare_node_for_retry",
+    "add_corrective_node",
 ):
     _orig_tg_fn = getattr(TaskGraph, _tg_meth_name, None)
     if callable(_orig_tg_fn):
@@ -2045,6 +2373,25 @@ def reconstruct_task_graph_from_records(
                 st["verification_failed"] = False
             elif ev.status == VerificationStatus.VERIFICATION_FAILED.value:
                 st["verification_failed"] = True
+        elif et == LedgerEventType.RECOVERY_ATTEMPT.value:
+            rs = dict(st.get("recovery_state") or {"recovery_version": RECOVERY_STATE_VERSION, "attempt_count": 0, "recovery_history": []})
+            att_n = int(meta.get("attempt") or 0)
+            rs["attempt_count"] = max(int(rs.get("attempt_count") or 0), att_n)
+            if meta.get("recovery_decision"):
+                rs["recovery_decision"] = str(meta["recovery_decision"])
+            if ev.status:
+                rs["recovery_status"] = str(ev.status)
+            if meta.get("failure_category"):
+                rs["previous_failure_category"] = str(meta["failure_category"])
+            if meta.get("retry_deadline") is not None:
+                rs["retry_deadline"] = float(meta["retry_deadline"])
+            if isinstance(meta.get("may_have_side_effect"), bool):
+                rs["may_have_side_effect"] = meta["may_have_side_effect"]
+            if isinstance(meta.get("reconciliation_required"), bool):
+                rs["reconciliation_required"] = meta["reconciliation_required"]
+            if meta.get("next_recovery_action"):
+                rs["next_recovery_action"] = str(meta["next_recovery_action"])
+            st["recovery_state"] = rs
 
     pa_by_cid: Dict[str, Any] = {}
     for pa in pending_actions:
@@ -2202,6 +2549,7 @@ def reconstruct_task_graph_from_records(
                 blocked_reason=blk_reason,
                 order_index=order_idx,
                 external_source=ext_src,
+                recovery_state=ev_d.get("recovery_state") if ev_d else None,
             )
         )
 

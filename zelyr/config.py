@@ -155,6 +155,12 @@ Returns:
     disabled_plugins: list[str] = field(default_factory=list)
     model_usage_counts: dict = field(default_factory=dict)
 
+    # Verification-Driven Graph Recovery Policy (trusted application configuration)
+    graph_recovery_max_attempts: int = 2
+    graph_recovery_backoff_base_seconds: float = 0.05
+    graph_recovery_backoff_max_seconds: float = 2.0
+    graph_recovery_deadline_seconds: float = 120.0
+
     @classmethod
     def from_dict(cls, config_dict: dict) -> 'ZelyrConfig':
         """Create config from dictionary."""
@@ -229,6 +235,10 @@ Returns:
             'disabled_plugins': self.disabled_plugins,
             'model_usage_counts': self.model_usage_counts,
             'show_thinking': self.show_thinking,
+            'graph_recovery_max_attempts': self.graph_recovery_max_attempts,
+            'graph_recovery_backoff_base_seconds': self.graph_recovery_backoff_base_seconds,
+            'graph_recovery_backoff_max_seconds': self.graph_recovery_backoff_max_seconds,
+            'graph_recovery_deadline_seconds': self.graph_recovery_deadline_seconds,
         }
 
     def get_effective_num_ctx(self, caller_override: Optional[Any] = None) -> int:

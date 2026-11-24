@@ -1214,6 +1214,8 @@ def cmd_execution(args: argparse.Namespace) -> None:
                 verify_outcomes=True,
             )
             if getattr(args, "json", False):
+                from zelyr.engine.recovery import build_graph_recovery_overview
+
                 print(
                     json.dumps(
                         {
@@ -1221,6 +1223,11 @@ def cmd_execution(args: argparse.Namespace) -> None:
                             "resumability_status": assess_g.resumability_status,
                             "can_resume": assess_g.can_resume,
                             "task_graph": assess_g.task_graph.to_dict() if assess_g.task_graph is not None else None,
+                            "recovery_overview": (
+                                build_graph_recovery_overview(assess_g.task_graph)
+                                if assess_g.task_graph is not None
+                                else None
+                            ),
                         },
                         indent=2,
                     )
@@ -1374,24 +1381,66 @@ def _print_task_graph_view(assessment: Any, *, empty_notice: Optional[str] = Non
             locks_s = f" locks=[{','.join(c_res)}]" if c_res else ""
             ver_req_s = f" verify_req={node.verification_requirement}" if getattr(node, "verification_requirement", None) else ""
             exp_out_s = f" outcome={node.expected_outcome!r}" if getattr(node, "expected_outcome", None) else ""
+            rs = getattr(node, "recovery_state", None) or {}
+            rec_s = ""
+            if isinstance(rs, dict) and rs:
+                att_c = int(rs.get("attempt_count") or 0)
+                max_a = rs.get("max_attempts")
+                att_str = f"{att_c}/{max_a}" if max_a is not None else str(att_c)
+                rec_st = rs.get("recovery_status") or "-"
+                rec_dec = rs.get("recovery_decision") or "-"
+                nxt_act = rs.get("next_recovery_action") or "-"
+                rec_s = f" rec_status={rec_st} decision={rec_dec} attempts={att_str} next_action={nxt_act}"
             blk = f" reason={node.blocked_reason}" if node.blocked_reason else ""
             fail = f" err={(node.failure_info or {}).get('error')}" if node.failure_info and not blk else ""
             print(
                 f"  - [{node.order_index}] {node.node_id} exec={node.execution_status} "
                 f"verify={node.verification_status}{owner_s}{locks_s} proposals=[{props}] deps=[{deps}] "
-                f"desc={node.description!r}{exp_out_s}{ver_req_s}{blk}{fail}"
+                f"desc={node.description!r}{exp_out_s}{ver_req_s}{rec_s}{blk}{fail}"
             )
+    from zelyr.engine.recovery import build_graph_recovery_overview
+
+    rec_ov = build_graph_recovery_overview(tg)
     blocked_nodes = tg.get_blocked_nodes() if hasattr(tg, "get_blocked_nodes") else []
     if blocked_nodes:
         print("Blocked Nodes:")
         for bn in blocked_nodes:
-            print(f"  - {bn.node_id}: {bn.blocked_reason or 'blocked'}")
+            deps_str = ",".join(bn.dependency_ids) if bn.dependency_ids else "-"
+            print(f"  - {bn.node_id} (deps=[{deps_str}]): {bn.blocked_reason or 'blocked'}")
     failed_nodes = tg.get_failed_nodes() if hasattr(tg, "get_failed_nodes") else []
     if failed_nodes:
         print("Failed Prerequisites:")
         for fn in failed_nodes:
+            rs = getattr(fn, "recovery_state", None) or {}
             err_s = (fn.failure_info or {}).get("error") or fn.blocked_reason or "failed"
-            print(f"  - {fn.node_id}: {err_s} (recoverable={fn.recoverable})")
+            att_c = int(rs.get("attempt_count") or 0) if isinstance(rs, dict) else 0
+            rec_st = rs.get("recovery_status") if isinstance(rs, dict) and rs.get("recovery_status") else "unassessed"
+            rec_dec = rs.get("recovery_decision") if isinstance(rs, dict) and rs.get("recovery_decision") else "-"
+            nxt_act = rs.get("next_recovery_action") if isinstance(rs, dict) and rs.get("next_recovery_action") else "-"
+            print(
+                f"  - {fn.node_id}: {err_s} (recoverable={fn.recoverable}, recovery_status={rec_st}, "
+                f"decision={rec_dec}, attempts={att_c}, next_action={nxt_act})"
+            )
+    if rec_ov.get("failed_nodes") or rec_ov.get("recovering_nodes") or rec_ov.get("blocked_dependents"):
+        print(
+            f"Recovery Status:     total_attempts={rec_ov.get('total_attempts', 0)} "
+            f"failed={len(rec_ov.get('failed_nodes', []))} "
+            f"recovering={len(rec_ov.get('recovering_nodes', []))} "
+            f"blocked_dependents={len(rec_ov.get('blocked_dependents', []))}"
+        )
+        for rn in rec_ov.get("recovering_nodes", []):
+            print(
+                f"  - {rn['node_id']}: status={rn.get('recovery_status') or '-'} "
+                f"decision={rn.get('recovery_decision') or '-'} "
+                f"attempts={rn.get('attempt_count', 0)}"
+                f"{'/' + str(rn['max_attempts']) if rn.get('max_attempts') is not None else ''} "
+                f"next_action={rn.get('next_recovery_action') or '-'}"
+            )
+        if rec_ov.get("blocked_dependents"):
+            print("Blocked Dependents:")
+            for bd in rec_ov["blocked_dependents"]:
+                b_pre = ",".join(bd.get("blocking_prerequisites") or []) or "-"
+                print(f"  - {bd['node_id']} (blocked_by=[{b_pre}]): {bd.get('reason') or 'blocked'}")
 
 
 def _print_checkpoint_assessment(
