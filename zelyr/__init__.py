@@ -53,11 +53,22 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     # Memory
     "SyncMemoryStore": ("zelyr.memory", "SyncMemoryStore"),
     # Planning
+    "CompiledPlanBundle": ("zelyr.planning", "CompiledPlanBundle"),
     "ExecutionPlan": ("zelyr.planning", "ExecutionPlan"),
+    "PlanCompilationError": ("zelyr.planning", "PlanCompilationError"),
+    "PlanCompiler": ("zelyr.planning", "PlanCompiler"),
+    "PlanConfirmationRequiredError": ("zelyr.planning", "PlanConfirmationRequiredError"),
     "PlanError": ("zelyr.planning", "PlanError"),
     "PlanStep": ("zelyr.planning", "PlanStep"),
+    "PlanValidationError": ("zelyr.planning", "PlanValidationError"),
+    "PlannedTaskNode": ("zelyr.planning", "PlannedTaskNode"),
     "StepStatus": ("zelyr.planning", "StepStatus"),
+    "StructuredPlan": ("zelyr.planning", "StructuredPlan"),
     "TaskPlanner": ("zelyr.planning", "TaskPlanner"),
+    "UnsupportedPlanVersionError": ("zelyr.planning", "UnsupportedPlanVersionError"),
+    "compile_structured_plan_to_task_graph": ("zelyr.planning", "compile_structured_plan_to_task_graph"),
+    "parse_structured_plan": ("zelyr.planning", "parse_structured_plan"),
+    "replan_task_graph": ("zelyr.planning", "replan_task_graph"),
     # Agents
     "BaseAgent": ("zelyr.agents", "BaseAgent"),
     "AgentResult": ("zelyr.agents", "AgentResult"),
@@ -103,11 +114,22 @@ __all__ = [
     "OllamaConfig",
     "SyncMemoryStore",
     # Planning
+    "CompiledPlanBundle",
     "ExecutionPlan",
+    "PlanCompilationError",
+    "PlanCompiler",
+    "PlanConfirmationRequiredError",
     "PlanError",
     "PlanStep",
+    "PlanValidationError",
+    "PlannedTaskNode",
     "StepStatus",
+    "StructuredPlan",
     "TaskPlanner",
+    "UnsupportedPlanVersionError",
+    "compile_structured_plan_to_task_graph",
+    "parse_structured_plan",
+    "replan_task_graph",
     # Agents
     "BaseAgent",
     "AgentResult",
@@ -165,7 +187,24 @@ if TYPE_CHECKING:
     from zelyr.core import Engine, EventBus, Event, Registry, ExecutionContext
     from zelyr.llm import OllamaClient, OllamaConfig
     from zelyr.memory import SyncMemoryStore
-    from zelyr.planning import ExecutionPlan, PlanError, PlanStep, StepStatus, TaskPlanner
+    from zelyr.planning import (
+        CompiledPlanBundle,
+        ExecutionPlan,
+        PlanCompilationError,
+        PlanCompiler,
+        PlanConfirmationRequiredError,
+        PlanError,
+        PlanStep,
+        PlanValidationError,
+        PlannedTaskNode,
+        StepStatus,
+        StructuredPlan,
+        TaskPlanner,
+        UnsupportedPlanVersionError,
+        compile_structured_plan_to_task_graph,
+        parse_structured_plan,
+        replan_task_graph,
+    )
     from zelyr.agents import BaseAgent, AgentResult, OrchestratorAgent, ShellAgent
     from zelyr.tools import (
         BaseTool,

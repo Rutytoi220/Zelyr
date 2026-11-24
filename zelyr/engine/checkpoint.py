@@ -2037,6 +2037,22 @@ class CheckpointManager:
         requires_explicit = False
         planning_state = dict(cp.planning_state) if cp is not None else dict(rec.metadata or {})
 
+        raw_plan_ver = planning_state.get("plan_version")
+        if raw_plan_ver is not None:
+            from zelyr.planning.compiler import SUPPORTED_PLAN_VERSIONS
+
+            if isinstance(raw_plan_ver, bool) or not isinstance(raw_plan_ver, int) or raw_plan_ver not in SUPPORTED_PLAN_VERSIONS:
+                blocking_reasons.append(f"Unsupported persisted plan version: {raw_plan_ver!r}.")
+
+        if (
+            task_graph is not None
+            and planning_state.get("requires_confirmation")
+            and not planning_state.get("plan_confirmed")
+            and not explicit_resume
+        ):
+            requires_explicit = True
+            blocking_reasons.append("Compiled task plan awaits explicit confirmation before execution (--confirm).")
+
         # Never trust stale completed statuses vs abandoned/already-done statuses
         if rec.status == ExecutionStatus.ABANDONED.value:
             blocking_reasons.append("Task has been explicitly abandoned and cannot be resumed.")

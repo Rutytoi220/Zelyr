@@ -41,6 +41,21 @@ _FORBIDDEN_GRAPH_KEYS: frozenset[str] = frozenset(
         "allowed_tools_grant",
         "_caller_ring",
         "_allowed_tools",
+        "caller_ring",
+        "allowed_tools",
+        "task_local_scope",
+        "auth_ctx",
+        "auth_context",
+        "permissions",
+        "privileges",
+        "bypass_auth",
+        "bypass_confirmation",
+        "skip_authorization",
+        "skip_verification",
+        "unrestricted_tools",
+        "workspace_root",
+        "filesystem_root",
+        "sandbox_root",
     }
 )
 
@@ -175,9 +190,18 @@ def compute_task_graph_digest(payload: Dict[str, Any]) -> str:
             continue
         nid = str(n.get("node_id") or "")
         extra_n = {}
-        for k in ("reserved_by", "reservation_id", "reserved_at", "conflict_resources", "exclusive_resource"):
+        for k in (
+            "reserved_by",
+            "reservation_id",
+            "reserved_at",
+            "conflict_resources",
+            "exclusive_resource",
+            "expected_outcome",
+            "verification_requirement",
+            "timeout_seconds",
+        ):
             val = n.get(k)
-            if val:
+            if val is not None and val != "" and val != []:
                 extra_n[k] = val
         if nid and extra_n:
             node_res_meta[nid] = extra_n
@@ -496,6 +520,9 @@ class TaskNode:
     reserved_at: Optional[float] = None
     conflict_resources: List[str] = field(default_factory=list)
     exclusive_resource: Optional[str] = None
+    expected_outcome: str = ""
+    verification_requirement: Optional[str] = None
+    timeout_seconds: Optional[float] = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -531,6 +558,12 @@ class TaskNode:
             out["conflict_resources"] = [str(r) for r in self.conflict_resources if str(r).strip()]
         if self.exclusive_resource is not None:
             out["exclusive_resource"] = _sanitize_graph_text(self.exclusive_resource, max_bytes=128)
+        if self.expected_outcome:
+            out["expected_outcome"] = _sanitize_graph_text(self.expected_outcome, max_bytes=512)
+        if self.verification_requirement is not None:
+            out["verification_requirement"] = _sanitize_graph_text(self.verification_requirement, max_bytes=256)
+        if self.timeout_seconds is not None:
+            out["timeout_seconds"] = float(self.timeout_seconds)
         return out
 
     @classmethod
@@ -584,6 +617,17 @@ class TaskNode:
         excl_res = data.get("exclusive_resource")
         if excl_res is not None and (not isinstance(excl_res, str) or not excl_res.strip()):
             raise CorruptedTaskGraphError(f"TaskNode '{nid}' has invalid exclusive_resource: {excl_res!r}.")
+        exp_out = data.get("expected_outcome", "")
+        if not isinstance(exp_out, str):
+            raise CorruptedTaskGraphError(f"TaskNode '{nid}' expected_outcome must be a string.")
+        ver_req = data.get("verification_requirement")
+        if ver_req is not None and not isinstance(ver_req, str):
+            raise CorruptedTaskGraphError(f"TaskNode '{nid}' verification_requirement must be a string or null.")
+        tout_s = data.get("timeout_seconds")
+        if tout_s is not None and (
+            isinstance(tout_s, bool) or not isinstance(tout_s, (int, float)) or float(tout_s) <= 0.0
+        ):
+            raise CorruptedTaskGraphError(f"TaskNode '{nid}' has invalid timeout_seconds: {tout_s!r}.")
 
         now = time.time()
         return cls(
@@ -606,6 +650,9 @@ class TaskNode:
             reserved_at=float(res_at) if res_at is not None else None,
             conflict_resources=[str(c).strip() for c in raw_cres],
             exclusive_resource=_sanitize_graph_text(excl_res, max_bytes=128) if excl_res else None,
+            expected_outcome=_sanitize_graph_text(exp_out, max_bytes=512) if exp_out else "",
+            verification_requirement=_sanitize_graph_text(ver_req, max_bytes=256) if ver_req else None,
+            timeout_seconds=float(tout_s) if tout_s is not None else None,
             created_at=float(data.get("created_at") or now),
             updated_at=float(data.get("updated_at") or now),
         )

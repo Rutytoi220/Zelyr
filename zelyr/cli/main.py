@@ -705,6 +705,157 @@ async def _execute_headless_run(
     return 0
 
 
+async def _execute_planned_headless_run(
+    prompt: str,
+    *,
+    model_override: Optional[str] = None,
+    output_json: bool = False,
+    orchestrator: Optional[Any] = None,
+    verify_spec: Optional[str] = None,
+    base_url_override: Optional[str] = None,
+    plan_only: bool = False,
+    confirmed: Optional[bool] = None,
+    max_concurrency: int = 1,
+    db_path: Optional[str] = None,
+) -> int:
+    """Compile a complex objective into a TaskGraph, present review summary, and execute if permitted."""
+    from zelyr.agents.native_orchestrator import NativeOrchestrator
+    from zelyr.config import ZelyrConfig, get_config
+    from zelyr.core.plugins import get_tool_schemas, load_plugins
+    from zelyr.engine.execution_ledger import CentralExecutionLedger
+    from zelyr.planning.compiler import PlanConfirmationRequiredError, PlanError
+    from zelyr.tool_registry import ToolRegistry
+
+    clean_prompt = (prompt or "").strip()
+    if not clean_prompt:
+        sys.stderr.write("Error: prompt cannot be empty.\n")
+        sys.stderr.flush()
+        return 1
+
+    if isinstance(max_concurrency, bool) or not isinstance(max_concurrency, int) or max_concurrency < 1:
+        sys.stderr.write(f"Error: --max-concurrency must be an integer >= 1 (got {max_concurrency!r}).\n")
+        sys.stderr.flush()
+        return 1
+
+    load_plugins()
+    base_cfg = getattr(orchestrator, "config", None) or get_config()
+    active_model = model_override or getattr(base_cfg, "ollama_model", "qwen2.5-coder:7b")
+    ledger, owns_ledger = (
+        (CentralExecutionLedger(db_path=db_path), True)
+        if db_path
+        else _open_cli_ledger(None)
+    )
+    try:
+        if orchestrator is not None:
+            orch = orchestrator
+            if getattr(orch, "central_ledger", None) is None:
+                orch.central_ledger = ledger
+        else:
+            run_cfg = None
+            if base_url_override:
+                run_cfg = ZelyrConfig.from_dict(base_cfg.to_dict()) if hasattr(base_cfg, "to_dict") else ZelyrConfig()
+                run_cfg.ollama_base_url = (
+                    base_cfg.get_effective_ollama_base_url(base_url_override)
+                    if hasattr(base_cfg, "get_effective_ollama_base_url")
+                    else base_url_override.rstrip("/")
+                )
+            orch = NativeOrchestrator(
+                config=run_cfg,
+                tool_registry=ToolRegistry(),
+                central_ledger=ledger,
+                max_concurrency=max_concurrency,
+            )
+        schemas = getattr(orch, "tool_schemas", None) or get_tool_schemas(0)
+
+        def _cli_confirm(bundle_obj: Any) -> bool:
+            if not output_json:
+                print(bundle_obj.summary_text)
+            if not sys.stdin.isatty():
+                return False
+            try:
+                from rich.prompt import Confirm
+
+                return Confirm.ask("Execute this compiled plan?", default=False)
+            except (EOFError, KeyboardInterrupt):
+                return False
+
+        eff_confirmed: Optional[bool] = confirmed
+        eff_cb = None
+        if not plan_only and eff_confirmed is None:
+            if sys.stdin.isatty():
+                eff_cb = _cli_confirm
+            else:
+                eff_confirmed = False
+
+        try:
+            res = await orch.run_planned_task(
+                clean_prompt,
+                central_ledger=ledger,
+                tool_schemas=schemas,
+                max_concurrency=max_concurrency,
+                acceptance_criteria=verify_spec,
+                confirmed=eff_confirmed,
+                confirm_callback=eff_cb,
+                plan_only=plan_only,
+                model=active_model,
+            )
+        except PlanConfirmationRequiredError as exc:
+            b_obj = getattr(exc, "bundle", None)
+            if output_json:
+                out_err: Dict[str, Any] = {
+                    "status": "awaiting_confirmation",
+                    "executed": False,
+                    "error": str(exc),
+                }
+                if b_obj is not None:
+                    out_err["execution_id"] = b_obj.task_graph.execution_id
+                    out_err["graph_id"] = b_obj.task_graph.graph_id
+                    out_err["task_graph"] = b_obj.task_graph.to_dict()
+                    out_err["parallel_batches"] = b_obj.parallel_batches
+                    out_err["summary_text"] = b_obj.summary_text
+                print(json.dumps(out_err, indent=2))
+            else:
+                if b_obj is not None:
+                    print(b_obj.summary_text)
+                sys.stderr.write(f"{exc}\nRe-run with --confirm / --yes to execute.\n")
+                sys.stderr.flush()
+            return 2
+        except PlanError as exc:
+            sys.stderr.write(f"Plan compilation error: {exc}\n")
+            sys.stderr.flush()
+            return 1
+
+        if output_json:
+            bundle = res.get("bundle")
+            out_payload = {
+                "execution_id": res.get("execution_id"),
+                "graph_id": res.get("graph_id"),
+                "executed": bool(res.get("executed", False)),
+                "status": res.get("graph_status") or res.get("status"),
+                "task_graph": res["task_graph"].to_dict() if res.get("task_graph") is not None else None,
+            }
+            if bundle is not None:
+                out_payload["parallel_batches"] = bundle.parallel_batches
+                out_payload["independent_node_ids"] = bundle.independent_node_ids
+                out_payload["summary_text"] = bundle.summary_text
+            if res.get("executed"):
+                out_payload["results"] = res.get("results", [])
+            print(json.dumps(out_payload, indent=2))
+        else:
+            bundle = res.get("bundle")
+            if bundle is not None:
+                print(bundle.summary_text)
+            if res.get("executed"):
+                print(f"Execution '{res.get('execution_id')}' finished with graph status: {res.get('graph_status')}")
+
+        if res.get("executed") and res.get("graph_status") in ("failed", "blocked", "cancelled"):
+            return 2
+        return 0
+    finally:
+        if owns_ledger:
+            ledger.close()
+
+
 def cmd_run(args: argparse.Namespace) -> None:
     """Execute a one-shot prompt headlessly via NativeOrchestrator and exit."""
     prompt: str = getattr(args, "prompt", "")
@@ -712,6 +863,25 @@ def cmd_run(args: argparse.Namespace) -> None:
     output_json: bool = bool(getattr(args, "json", False))
     verify_spec: Optional[str] = getattr(args, "verify", None)
     base_url_override: Optional[str] = getattr(args, "base_url", None)
+
+    if getattr(args, "plan", False) or getattr(args, "plan_only", False):
+        eff_confirmed: Optional[bool] = True if getattr(args, "confirm", False) else None
+        exit_code = asyncio.run(
+            _execute_planned_headless_run(
+                prompt=prompt,
+                model_override=model_override,
+                output_json=output_json,
+                verify_spec=verify_spec,
+                base_url_override=base_url_override,
+                plan_only=bool(getattr(args, "plan_only", False)),
+                confirmed=eff_confirmed,
+                max_concurrency=int(getattr(args, "max_concurrency", 1) or 1),
+                db_path=getattr(args, "db_path", None),
+            )
+        )
+        if exit_code != 0:
+            sys.exit(exit_code)
+        return
 
     exit_code = asyncio.run(
         _execute_headless_run(
@@ -1173,6 +1343,18 @@ def _print_task_graph_view(assessment: Any, *, empty_notice: Optional[str] = Non
     print(f"Running Nodes:       {running_desc}")
     print(f"Ready Nodes:         {ready_desc}")
     print(f"Next Eligible Node:  {next_node.node_id if next_node is not None else 'none'}")
+    try:
+        from zelyr.planning.compiler import _compute_parallel_batches
+
+        waves = _compute_parallel_batches(tg)
+        if waves:
+            wave_parts = [
+                f"W{i + 1}[{','.join(w)}]{'(parallel)' if len(w) > 1 else ''}"
+                for i, w in enumerate(waves)
+            ]
+            print(f"Execution Waves:     {' -> '.join(wave_parts)}")
+    except Exception:
+        pass
     active_res = getattr(tg, "active_reservations", None) or {}
     if active_res:
         print(f"Active Reservations ({len(active_res)}):")
@@ -1190,12 +1372,14 @@ def _print_task_graph_view(assessment: Any, *, empty_notice: Optional[str] = Non
             owner_s = f" owner={node.reserved_by}" if getattr(node, "reserved_by", None) else ""
             c_res = getattr(node, "conflict_resources", None) or []
             locks_s = f" locks=[{','.join(c_res)}]" if c_res else ""
+            ver_req_s = f" verify_req={node.verification_requirement}" if getattr(node, "verification_requirement", None) else ""
+            exp_out_s = f" outcome={node.expected_outcome!r}" if getattr(node, "expected_outcome", None) else ""
             blk = f" reason={node.blocked_reason}" if node.blocked_reason else ""
             fail = f" err={(node.failure_info or {}).get('error')}" if node.failure_info and not blk else ""
             print(
                 f"  - [{node.order_index}] {node.node_id} exec={node.execution_status} "
                 f"verify={node.verification_status}{owner_s}{locks_s} proposals=[{props}] deps=[{deps}] "
-                f"desc={node.description!r}{blk}{fail}"
+                f"desc={node.description!r}{exp_out_s}{ver_req_s}{blk}{fail}"
             )
     blocked_nodes = tg.get_blocked_nodes() if hasattr(tg, "get_blocked_nodes") else []
     if blocked_nodes:
@@ -1889,6 +2073,40 @@ def _build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Deterministic outcome assertion formatted as CHECK:TARGET[:EXPECTED]",
+    )
+    p_run.add_argument(
+        "--plan",
+        action="store_true",
+        default=False,
+        help="Compile the prompt into a validated TaskGraph and execute via graph scheduler",
+    )
+    p_run.add_argument(
+        "--plan-only",
+        "--inspect-plan",
+        dest="plan_only",
+        action="store_true",
+        default=False,
+        help="Compile and display the proposed TaskGraph plan without executing it",
+    )
+    p_run.add_argument(
+        "--confirm",
+        "--yes",
+        "-y",
+        action="store_true",
+        default=False,
+        help="Explicitly confirm executing a compiled mutating task plan",
+    )
+    p_run.add_argument(
+        "--max-concurrency",
+        type=int,
+        default=1,
+        help="Maximum concurrent independent graph nodes to execute (default: 1)",
+    )
+    p_run.add_argument(
+        "--db-path",
+        type=str,
+        default=None,
+        help="Override execution ledger SQLite DB path",
     )
 
     # ── Legacy commands (backwards-compatible) ──────────────────────────────

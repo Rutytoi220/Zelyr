@@ -1,5 +1,28 @@
-"""Deterministic task-planning primitives for Zelyr."""
+"""Deterministic task-planning primitives and plan-to-graph compiler for Zelyr."""
 
+from zelyr.planning.compiler import (
+    DEFAULT_MAX_NODE_TIMEOUT_SECONDS,
+    FORBIDDEN_PLAN_CONCURRENCY_KEYS,
+    FORBIDDEN_PLAN_SECURITY_KEYS,
+    MIN_NODE_TIMEOUT_SECONDS,
+    STRUCTURED_PLAN_VERSION,
+    SUPPORTED_PLAN_VERSIONS,
+    CompiledPlanBundle,
+    PlanCompilationError,
+    PlanCompiler,
+    PlanConfirmationRequiredError,
+    PlannedTaskNode,
+    PlanValidationError,
+    StructuredPlan,
+    UnsupportedPlanVersionError,
+    build_planner_prompt,
+    compile_structured_plan_to_task_graph,
+    compute_structured_plan_digest,
+    extract_plan_json,
+    format_plan_summary,
+    parse_structured_plan,
+    replan_task_graph,
+)
 from zelyr.planning.planner import (
     ExecutionPlan,
     PlanError,
@@ -9,9 +32,30 @@ from zelyr.planning.planner import (
 )
 
 __all__ = [
+    "DEFAULT_MAX_NODE_TIMEOUT_SECONDS",
+    "FORBIDDEN_PLAN_CONCURRENCY_KEYS",
+    "FORBIDDEN_PLAN_SECURITY_KEYS",
+    "MIN_NODE_TIMEOUT_SECONDS",
+    "STRUCTURED_PLAN_VERSION",
+    "SUPPORTED_PLAN_VERSIONS",
+    "CompiledPlanBundle",
     "ExecutionPlan",
+    "PlanCompilationError",
+    "PlanCompiler",
+    "PlanConfirmationRequiredError",
     "PlanError",
     "PlanStep",
+    "PlanValidationError",
+    "PlannedTaskNode",
     "StepStatus",
+    "StructuredPlan",
     "TaskPlanner",
+    "UnsupportedPlanVersionError",
+    "build_planner_prompt",
+    "compile_structured_plan_to_task_graph",
+    "compute_structured_plan_digest",
+    "extract_plan_json",
+    "format_plan_summary",
+    "parse_structured_plan",
+    "replan_task_graph",
 ]

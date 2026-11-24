@@ -4813,9 +4813,33 @@ class NativeOrchestrator:
             if is_failed and not err_msg:
                 err_msg = str(raw_payload.get("detail") or raw_payload.get("output") or "Tool execution failed")
 
-            # Outcome verification matching node acceptance criteria or target
+            # Outcome verification matching node acceptance criteria, verification_requirement, or target
+            _SUPPORTED_OUTCOME_CHECKS = frozenset(
+                {
+                    "file_exists",
+                    "exists",
+                    "file_contains",
+                    "contains",
+                    "file_checksum",
+                    "checksum",
+                    "sha256",
+                    "file_json",
+                    "json",
+                    "process_running",
+                    "port_listening",
+                    "command_output",
+                }
+            )
             node_spec = proposal.get("acceptance_criteria")
             node_criteria = list(parse_acceptance_criteria(str(node_spec))) if node_spec else []
+            if not node_criteria and node_cur is not None and getattr(node_cur, "verification_requirement", None):
+                for crit in parse_acceptance_criteria(str(node_cur.verification_requirement)):
+                    if (
+                        isinstance(crit, dict)
+                        and str(crit.get("check") or "").strip().lower() in _SUPPORTED_OUTCOME_CHECKS
+                        and str(crit.get("target") or "").strip()
+                    ):
+                        node_criteria.append(crit)
             tool_target = _extract_action_target(func_name, func_args) or (
                 str(raw_payload.get("target")) if isinstance(raw_payload.get("target"), str) else None
             )
@@ -5504,7 +5528,14 @@ class NativeOrchestrator:
                             idempotency_suffix=f"reserve:{rid}",
                         )
 
-                        eff_timeout = float(eff_node_timeouts.get(node.node_id, eff_default_timeout))
+                        max_allowed_t = float(default_node_timeout) if default_node_timeout is not None else 600.0
+                        node_hint_t = getattr(node, "timeout_seconds", None)
+                        if node.node_id in eff_node_timeouts:
+                            eff_timeout = float(eff_node_timeouts[node.node_id])
+                        elif node_hint_t is not None:
+                            eff_timeout = max(0.05, min(float(node_hint_t), max_allowed_t))
+                        else:
+                            eff_timeout = eff_default_timeout
                         worker_coro = self._run_reserved_graph_node(
                             graph=graph,
                             node_id=node.node_id,
@@ -5610,4 +5641,300 @@ class NativeOrchestrator:
             "task_graph": graph,
             "turn_ledger": eff_ledger,
         }
+
+    async def plan_to_graph(
+        self,
+        objective: str,
+        *,
+        execution_id: Optional[str] = None,
+        central_ledger: Optional[Any] = None,
+        turn_ledger: Optional[Any] = None,
+        stream_provider: Optional[Any] = None,
+        tool_schemas: Optional[List[Dict[str, Any]]] = None,
+        tool_registry: Optional[Any] = None,
+        max_concurrency: Optional[int] = None,
+        max_plan_retries: int = 2,
+        workspace_root: Optional[Union[str, Path]] = None,
+        caller_ring: Optional[int] = None,
+        allowed_tools: Optional[Iterable[str]] = None,
+        task_local_scope: Optional[Any] = None,
+        require_confirmation: Optional[bool] = None,
+        confirmed: bool = False,
+        model: Optional[str] = None,
+        persist_checkpoint: bool = True,
+    ) -> Any:
+        """Compile a natural-language objective into a validated TaskGraph without executing it."""
+        from zelyr.engine.execution_ledger import TurnExecutionLedger, get_default_central_ledger
+        from zelyr.planning.compiler import PlanCompiler
+
+        eff_max_conc = (
+            max_concurrency
+            if max_concurrency is not None
+            else getattr(self, "max_concurrency", 1)
+        )
+        eff_central = (
+            central_ledger
+            or getattr(self, "central_ledger", None)
+            or (getattr(turn_ledger, "_central_ledger", None) if turn_ledger is not None else None)
+            or get_default_central_ledger()
+        )
+        eff_caller_ring = caller_ring if caller_ring is not None else getattr(self, "caller_ring", None)
+        eff_allowed_raw = allowed_tools if allowed_tools is not None else getattr(self, "allowed_tools", None)
+        eff_allowed = list(eff_allowed_raw) if eff_allowed_raw is not None else None
+        eff_schemas = tool_schemas if tool_schemas is not None else getattr(self, "tool_schemas", None)
+        eff_registry = tool_registry if tool_registry is not None else getattr(self, "tool_registry", None)
+        eff_scope = task_local_scope if task_local_scope is not None else getattr(self, "task_local_scope", None)
+        eff_sp = stream_provider or getattr(self, "stream_provider", None) or getattr(self, "model_provider", None)
+
+        cfg = self._active_config()
+        eff_model = model or getattr(cfg, "ollama_model", None)
+        eff_base_url = getattr(cfg, "ollama_base_url", "http://127.0.0.1:11434")
+        env_ctx = ""
+        try:
+            env_ctx = self.get_planning_environment_context(
+                caller_ring=eff_caller_ring,
+                allowed_tools=eff_allowed,
+            )
+        except Exception:
+            env_ctx = ""
+
+        async def _planner_stream(req_payload: dict):
+            async for ev in self._stream_model_events(req_payload, base_url=eff_base_url, stream_provider=eff_sp):
+                yield ev
+
+        compiler = PlanCompiler(max_plan_retries=max_plan_retries)
+        eff_turn = turn_ledger or TurnExecutionLedger(
+            execution_id=execution_id,
+            central_ledger=eff_central,
+            caller_ring=eff_caller_ring,
+            task_local_scoped=bool(eff_scope is not None),
+            source_component="plan_compiler",
+        )
+        bundle = await compiler.compile_from_objective(
+            objective,
+            stream_provider=_planner_stream,
+            execution_id=execution_id,
+            central_ledger=eff_central,
+            turn_ledger=eff_turn,
+            max_concurrency=eff_max_conc,
+            max_plan_retries=max_plan_retries,
+            model=eff_model,
+            tool_schemas=eff_schemas,
+            tool_registry=eff_registry,
+            workspace_root=workspace_root,
+            environment_context=env_ctx,
+            require_confirmation=require_confirmation,
+            confirmed=confirmed,
+            caller_ring=eff_caller_ring,
+            task_local_scoped=bool(eff_scope is not None),
+            persist_checkpoint=persist_checkpoint,
+        )
+        self.current_ledger = eff_turn
+        return bundle
+
+    async def run_planned_task(
+        self,
+        objective: str,
+        *,
+        execution_id: Optional[str] = None,
+        central_ledger: Optional[Any] = None,
+        turn_ledger: Optional[Any] = None,
+        stream_provider: Optional[Any] = None,
+        tool_schemas: Optional[List[Dict[str, Any]]] = None,
+        tool_executor: Optional[Callable[[str, dict], Awaitable[Any]]] = None,
+        tool_registry: Optional[Any] = None,
+        max_concurrency: Optional[int] = None,
+        max_plan_retries: int = 2,
+        workspace_root: Optional[Union[str, Path]] = None,
+        caller_ring: Optional[int] = None,
+        allowed_tools: Optional[Iterable[str]] = None,
+        task_local_scope: Optional[Any] = None,
+        acceptance_criteria: Optional[str] = None,
+        require_confirmation: Optional[bool] = None,
+        confirmed: Optional[bool] = None,
+        confirm_callback: Optional[Callable[[Any], Any]] = None,
+        plan_only: bool = False,
+        node_timeouts: Optional[Dict[str, float]] = None,
+        default_node_timeout: Optional[float] = None,
+        model: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Compile objective into a validated TaskGraph, gate confirmation/policy, and execute."""
+        from zelyr.engine.checkpoint import CheckpointManager
+        from zelyr.engine.execution_ledger import (
+            ExecutionStatus,
+            LedgerEventType,
+            TurnExecutionLedger,
+            VerificationStatus,
+            get_default_central_ledger,
+        )
+        from zelyr.planning.compiler import PlanConfirmationRequiredError
+
+        eff_central = central_ledger or getattr(self, "central_ledger", None) or get_default_central_ledger()
+        eff_caller_ring = caller_ring if caller_ring is not None else getattr(self, "caller_ring", None)
+        eff_allowed_raw = allowed_tools if allowed_tools is not None else getattr(self, "allowed_tools", None)
+        eff_allowed = list(eff_allowed_raw) if eff_allowed_raw is not None else None
+        eff_scope = task_local_scope if task_local_scope is not None else getattr(self, "task_local_scope", None)
+        eff_turn = turn_ledger or TurnExecutionLedger(
+            execution_id=execution_id,
+            central_ledger=eff_central,
+            caller_ring=eff_caller_ring,
+            task_local_scoped=bool(eff_scope is not None),
+            source_component="plan_compiler",
+        )
+
+        bundle = await self.plan_to_graph(
+            objective,
+            execution_id=execution_id,
+            central_ledger=eff_central,
+            turn_ledger=eff_turn,
+            stream_provider=stream_provider,
+            tool_schemas=tool_schemas,
+            tool_registry=tool_registry,
+            max_concurrency=max_concurrency,
+            max_plan_retries=max_plan_retries,
+            workspace_root=workspace_root,
+            caller_ring=eff_caller_ring,
+            allowed_tools=eff_allowed,
+            task_local_scope=eff_scope,
+            require_confirmation=require_confirmation,
+            confirmed=bool(confirmed is True),
+            model=model,
+            persist_checkpoint=True,
+        )
+        eff_exec_id = bundle.task_graph.execution_id
+
+        if plan_only:
+            return {
+                "status": "planned",
+                "executed": False,
+                "execution_id": eff_exec_id,
+                "graph_id": bundle.task_graph.graph_id,
+                "bundle": bundle,
+                "task_graph": bundle.task_graph,
+                "summary_text": bundle.summary_text,
+                "results": [],
+            }
+
+        eff_require_conf = require_confirmation if require_confirmation is not None else bundle.requires_confirmation
+        is_permitted = True
+        if eff_require_conf:
+            if confirmed is True:
+                is_permitted = True
+            elif confirmed is False:
+                is_permitted = False
+            elif confirm_callback is not None:
+                cb_res = confirm_callback(bundle)
+                is_permitted = bool(await cb_res if inspect.isawaitable(cb_res) else cb_res)
+            elif require_confirmation is True:
+                # Explicit require_confirmation=True always fails closed unless confirmed=True or callback approves
+                is_permitted = False
+            else:
+                from zelyr.compat import get_env
+
+                if get_env("AUTOPILOT") == "1" or get_env("TESTING") == "1":
+                    is_permitted = True
+                else:
+                    is_permitted = False
+
+        if not is_permitted:
+            eff_central.record_event(
+                eff_exec_id,
+                LedgerEventType.AUTHORIZATION_DECISION,
+                status="denied",
+                caller_ring=eff_caller_ring,
+                task_local_scoped=bool(eff_scope is not None),
+                metadata={
+                    "reason": "plan_confirmation_required",
+                    "graph_id": bundle.task_graph.graph_id,
+                    "plan_id": bundle.structured_plan.plan_id,
+                },
+                idempotency_key=f"{eff_exec_id}:plan_confirm:denied",
+            )
+            CheckpointManager.capture_checkpoint(
+                eff_central,
+                eff_exec_id,
+                turn_ledger=eff_turn,
+                status=ExecutionStatus.INITIALIZED,
+                verification_status=VerificationStatus.NOT_VERIFIED,
+                task_prompt=bundle.structured_plan.objective,
+                planning_state={
+                    "plan_id": bundle.structured_plan.plan_id,
+                    "plan_version": bundle.structured_plan.plan_version,
+                    "plan_digest": bundle.structured_plan.plan_digest,
+                    "plan_confirmed": False,
+                    "requires_confirmation": True,
+                    "max_concurrency": bundle.task_graph.max_concurrency,
+                    "acceptance_criteria": acceptance_criteria,
+                },
+                pending_actions=bundle.proposals,
+                task_graph=bundle.task_graph,
+                emit_event=False,
+            )
+            raise PlanConfirmationRequiredError(
+                f"Execution of plan '{bundle.structured_plan.plan_id}' ({eff_exec_id}) requires explicit confirmation.",
+                bundle=bundle,
+            )
+
+        bundle.confirmed = True
+        eff_central.record_event(
+            eff_exec_id,
+            LedgerEventType.AUTHORIZATION_DECISION,
+            status="allowed",
+            caller_ring=eff_caller_ring,
+            task_local_scoped=bool(eff_scope is not None),
+            metadata={
+                "reason": "plan_confirmed",
+                "graph_id": bundle.task_graph.graph_id,
+                "plan_id": bundle.structured_plan.plan_id,
+            },
+            idempotency_key=f"{eff_exec_id}:plan_confirm:allowed",
+        )
+        exec_res = await self.execute_task_graph(
+            bundle.task_graph,
+            bundle.proposals,
+            max_concurrency=bundle.task_graph.max_concurrency,
+            execution_id=eff_exec_id,
+            central_ledger=eff_central,
+            turn_ledger=eff_turn,
+            tool_schemas=tool_schemas,
+            tool_executor=tool_executor,
+            caller_ring=eff_caller_ring,
+            allowed_tools=eff_allowed,
+            task_local_scope=eff_scope,
+            acceptance_criteria=acceptance_criteria,
+            node_timeouts=node_timeouts,
+            default_node_timeout=default_node_timeout,
+            task_prompt=bundle.structured_plan.objective,
+        )
+        exec_res["bundle"] = bundle
+        exec_res["executed"] = True
+        return exec_res
+
+    def replan_graph(
+        self,
+        graph: Any,
+        replan_payload: Union[str, Dict[str, Any]],
+        *,
+        central_ledger: Optional[Any] = None,
+        turn_ledger: Optional[Any] = None,
+        known_proposals: Optional[Any] = None,
+        workspace_root: Optional[Union[str, Path]] = None,
+        checkpoint: bool = True,
+    ) -> Any:
+        """Apply a validated incremental replan while preserving verified nodes & ledger history."""
+        from zelyr.planning.compiler import replan_task_graph
+
+        eff_central = central_ledger or getattr(self, "central_ledger", None)
+        eff_turn = turn_ledger or getattr(self, "current_ledger", None)
+        return replan_task_graph(
+            graph,
+            replan_payload,
+            central_ledger=eff_central,
+            turn_ledger=eff_turn,
+            known_proposals=known_proposals,
+            workspace_root=workspace_root,
+            tool_schemas=getattr(self, "tool_schemas", None),
+            tool_registry=getattr(self, "tool_registry", None),
+            checkpoint=checkpoint,
+        )
 
