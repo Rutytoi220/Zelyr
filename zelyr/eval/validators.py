@@ -6,7 +6,7 @@ import json
 import re
 import sqlite3
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 from zelyr.eval.types import ValidationResult
 
@@ -315,5 +315,83 @@ def validate_tool_updated(tool_name: str, min_version_marker: str) -> ValidatorF
         tools_dir = getattr(context, "tools_directory", getattr(context, "tools_dir", Path(".")))
         ok, reason = assert_tool_updated(tools_dir, tool_name, min_version_marker)
         return ValidationResult(ok, reason)
+    return _val
+
+
+TASK2_DEFAULT_SEMANTIC_FACT_GROUPS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("language", (r"\bpython\b",)),
+    (
+        "entrypoint",
+        (
+            r"cli\.py",
+            r"greeter\.cli:main",
+            r"greeter/cli\.py",
+            r"(?:script|command|entry\s*point|bin)\s*[:=\-]?\s*[`'\"]?greet[`'\"]?",
+        ),
+    ),
+    ("test_framework", (r"\bpytest\b",)),
+)
+
+
+def assert_response_semantic_facts(
+    response_text: str,
+    *,
+    required_fact_groups: Optional[Sequence[Tuple[str, Sequence[str]]]] = None,
+    forbidden_patterns: Sequence[str] = (),
+) -> Tuple[bool, str]:
+    """Validate an agent response semantically using equivalent fact-group matchers."""
+    text = str(response_text or "")
+    if not text.strip():
+        return False, "Empty response text"
+
+    for pat in forbidden_patterns:
+        if re.search(pat, text, flags=re.IGNORECASE):
+            return False, f"Response matched forbidden pattern: {pat}"
+
+    groups = (
+        TASK2_DEFAULT_SEMANTIC_FACT_GROUPS
+        if required_fact_groups is None
+        else required_fact_groups
+    )
+    missing: List[str] = []
+    matched_facts: Dict[str, str] = {}
+    for label, alternatives in groups:
+        found: Optional[str] = None
+        for alt in alternatives:
+            m = re.search(alt, text, flags=re.IGNORECASE)
+            if m:
+                found = m.group(0)
+                break
+        if found is None:
+            missing.append(label)
+        else:
+            matched_facts[label] = found
+
+    if missing:
+        return False, f"Missing required semantic facts: {', '.join(missing)}"
+    return True, f"Semantic facts verified ({len(matched_facts)} group(s) matched)"
+
+
+def validate_response_semantic_facts(
+    required_fact_groups: Optional[Sequence[Tuple[str, Sequence[str]]]] = None,
+    *,
+    forbidden_patterns: Sequence[str] = (),
+) -> ValidatorFn:
+    """Validator factory verifying semantic response equivalence (e.g. Task 2 entrypoint formats)."""
+
+    def _val(context: Any) -> ValidationResult:
+        text = ""
+        for attr in ("response_text", "final_answer", "response", "assistant_response", "output"):
+            val = getattr(context, attr, None)
+            if isinstance(val, str) and val.strip():
+                text = val
+                break
+        ok, reason = assert_response_semantic_facts(
+            text,
+            required_fact_groups=required_fact_groups,
+            forbidden_patterns=forbidden_patterns,
+        )
+        return ValidationResult(ok, reason)
+
     return _val
 

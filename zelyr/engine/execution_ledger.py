@@ -2874,6 +2874,506 @@ def is_read_only_diagnostic_failures_only(
     return True
 
 
+def compute_policy_compliance(
+    prompt: str,
+    ledger: Optional[Any],
+) -> Dict[str, Any]:
+    """Summarize whether an execution respected explicit user prohibitions."""
+    clean_prompt = str(prompt or "")
+    prohibited_targets = extract_prohibited_targets(clean_prompt, ledger=ledger)
+    global_prohib = extract_global_mutation_prohibition(clean_prompt)
+    has_prohibitions = bool(
+        prohibited_targets
+        or global_prohib.get("no_file_modifications")
+        or global_prohib.get("no_mutating_commands")
+    )
+    if not has_prohibitions:
+        return {
+            "has_prohibitions": False,
+            "compliant": True,
+            "prohibited_attempts_blocked": 0,
+            "prohibited_violations": 0,
+            "status": "not_applicable",
+        }
+
+    records: List[ActionRecord] = []
+    if ledger is not None:
+        raw_order = getattr(ledger, "_order", None)
+        raw_records = getattr(ledger, "_records", None)
+        if isinstance(raw_order, list) and isinstance(raw_records, dict):
+            records = [raw_records[cid] for cid in raw_order if cid in raw_records]
+
+    allow_tests = bool(
+        global_prohib.get("is_test_diagnostic")
+        and not global_prohib.get("no_mutating_commands")
+    )
+    blocked = 0
+    violations = 0
+
+    for rec in records:
+        rej = str(getattr(rec, "rejection_reason", None) or "")
+        err = str(getattr(rec, "error", None) or "")
+        if rec.state in (ActionState.FAILED, ActionState.REJECTED) and (
+            "prohibited_by_user" in rej or "prohibited_by_user" in err
+        ):
+            blocked += 1
+            continue
+
+        if rec.state not in (
+            ActionState.SUCCESS,
+            ActionState.VERIFIED,
+            ActionState.OBSERVED,
+            ActionState.PARTIALLY_COMPLETED,
+        ):
+            continue
+
+        args = rec.arguments if isinstance(rec.arguments, dict) else {}
+        if global_prohib.get("no_file_modifications") or global_prohib.get("no_mutating_commands"):
+            is_mut, _ = is_mutating_tool_call(
+                rec.tool_name,
+                args,
+                allow_read_only_tests=allow_tests,
+            )
+            if is_mut:
+                violations += 1
+                continue
+
+        if prohibited_targets and not _is_inspection_action(rec.tool_name, args):
+            cand_targets: List[str] = []
+            direct_t = _extract_action_target(rec.tool_name, args)
+            if direct_t:
+                cand_targets.append(direct_t)
+            for k in ("path", "filepath", "file", "target", "filename", "dst", "destination", "src", "source"):
+                val = args.get(k)
+                if val and isinstance(val, str) and val.strip():
+                    cand_targets.append(canonicalize_target(val.strip()))
+            cmd_txt = str(args.get("command") or args.get("cmd") or "")
+            if cmd_txt:
+                is_mut_cmd, _ = is_mutating_tool_call(
+                    rec.tool_name,
+                    args,
+                    allow_read_only_tests=allow_tests,
+                )
+                if is_mut_cmd:
+                    cand_targets.extend(extract_file_targets_from_text(cmd_txt))
+            if any(
+                targets_match(ct, pt, prohibited_targets, allow_dir_containment=True)
+                for ct in cand_targets
+                for pt in prohibited_targets
+            ):
+                violations += 1
+
+    compliant = violations == 0
+    return {
+        "has_prohibitions": True,
+        "compliant": compliant,
+        "prohibited_attempts_blocked": blocked,
+        "prohibited_violations": violations,
+        "status": "compliant" if compliant else "violated",
+    }
+
+
+@dataclass(frozen=True)
+class RootOutcomeResolution:
+    """Authoritative final execution, verification, policy, and CLI exit status decision."""
+
+    execution_status: ExecutionStatus
+    verification_status: VerificationStatus
+    error: Optional[str] = None
+    interruption_reason: Optional[str] = None
+    diagnostic_failures_only: bool = False
+    policy_compliance: Dict[str, Any] = field(default_factory=dict)
+    v_results: List[Tuple[str, str, Any]] = field(default_factory=list)
+    all_v_ok: bool = False
+    has_unresolved: bool = False
+    verified_targets: List[str] = field(default_factory=list)
+    exit_code: int = 0
+
+
+def resolve_root_execution_outcome(
+    *,
+    prompt: str,
+    ledger: Optional[Any],
+    final_text: str = "",
+    acceptance_spec: Optional[Any] = None,
+    v_results: Optional[List[Tuple[str, str, Any]]] = None,
+    was_cancelled: bool = False,
+    was_timed_out: bool = False,
+    caught_exc: Optional[BaseException] = None,
+    provider_error: Optional[str] = None,
+    is_truncated: bool = False,
+    model_error: Optional[str] = None,
+    reached_step_limit: bool = False,
+    invalid_verify_spec_error: Optional[str] = None,
+) -> RootOutcomeResolution:
+    """Resolve one consistent outcome across orchestrator, CLI exit code, and CentralExecutionLedger."""
+    import asyncio
+
+    total_acts = int(ledger.total_actions()) if (ledger is not None and hasattr(ledger, "total_actions")) else 0
+    unresolved_fn = getattr(ledger, "unresolved_failures", None) if ledger is not None else None
+    unresolved_recs: List[ActionRecord] = list(unresolved_fn()) if callable(unresolved_fn) else []
+    if callable(unresolved_fn):
+        has_unresolved = bool(unresolved_recs)
+    elif ledger is not None and hasattr(ledger, "has_unresolved_failures"):
+        has_unresolved = bool(ledger.has_unresolved_failures())
+    else:
+        has_unresolved = False
+
+    verified_targets = (
+        list(ledger.get_verified_targets())
+        if (ledger is not None and hasattr(ledger, "get_verified_targets"))
+        else []
+    )
+    has_verified = bool(
+        (ledger is not None and hasattr(ledger, "verified_actions") and ledger.verified_actions())
+        or verified_targets
+    )
+    policy_compliance = compute_policy_compliance(prompt, ledger)
+    has_ver_fail_unresolved = any(getattr(r, "verification_failed", False) for r in unresolved_recs)
+
+    eff_v_results: List[Tuple[str, str, Any]] = list(v_results) if v_results is not None else []
+    eff_invalid_spec = invalid_verify_spec_error
+    if v_results is None and acceptance_spec is not None and not eff_invalid_spec:
+        if isinstance(acceptance_spec, str) and not acceptance_spec.strip():
+            eff_invalid_spec = "Empty verification specification provided."
+        else:
+            parsed_specs = parse_acceptance_criteria(acceptance_spec)
+            if parsed_specs:
+                from zelyr.engine.verifier import OutcomeVerifier
+
+                for item in parsed_specs:
+                    chk = item.get("check", "")
+                    tgt = item.get("target", "")
+                    vr = OutcomeVerifier.verify(
+                        check=chk,
+                        target=tgt,
+                        expected=item.get("expected"),
+                    )
+                    eff_v_results.append((chk, tgt, vr))
+            else:
+                eff_invalid_spec = f"Unable to parse verification specification: '{acceptance_spec}'"
+
+    all_v_ok = bool(eff_v_results) and all(bool(getattr(vr, "success", False)) for _, _, vr in eff_v_results)
+    for _, vt, vr in eff_v_results:
+        if getattr(vr, "success", False) and vt and vt not in verified_targets:
+            verified_targets.append(vt)
+
+    # If a full post-run verification suite just ran and all criteria passed, prior intermediate
+    # draft verification_failed annotations on otherwise-succeeded actions are superseded.
+    if eff_v_results and all_v_ok and unresolved_recs:
+        unresolved_recs = [
+            r
+            for r in unresolved_recs
+            if (
+                r.state in (ActionState.FAILED, ActionState.CANCELLED, ActionState.PARTIALLY_COMPLETED)
+                or not getattr(r, "verification_failed", False)
+            )
+        ]
+        has_unresolved = bool(unresolved_recs)
+        has_ver_fail_unresolved = any(getattr(r, "verification_failed", False) for r in unresolved_recs)
+
+    diagnostic_failures_only = False
+    if (
+        has_unresolved
+        and acceptance_spec is None
+        and not eff_v_results
+        and not eff_invalid_spec
+        and not reached_step_limit
+        and not is_truncated
+        and not model_error
+        and not was_cancelled
+        and not was_timed_out
+        and not provider_error
+        and caught_exc is None
+        and unresolved_recs
+        and is_read_only_diagnostic_failures_only(prompt, ledger, final_text)
+    ):
+        diagnostic_failures_only = True
+        has_unresolved = False
+
+    if was_cancelled or isinstance(caught_exc, asyncio.CancelledError):
+        return RootOutcomeResolution(
+            execution_status=ExecutionStatus.CANCELLED,
+            verification_status=VerificationStatus.INTERRUPTED,
+            error="Task cancelled",
+            interruption_reason="user_cancelled",
+            diagnostic_failures_only=False,
+            policy_compliance=policy_compliance,
+            v_results=eff_v_results,
+            all_v_ok=all_v_ok,
+            has_unresolved=has_unresolved,
+            verified_targets=verified_targets,
+            exit_code=1,
+        )
+
+    if was_timed_out or isinstance(caught_exc, (TimeoutError, asyncio.TimeoutError)):
+        is_task_to = isinstance(caught_exc, (TimeoutError, asyncio.TimeoutError))
+        return RootOutcomeResolution(
+            execution_status=ExecutionStatus.TIMED_OUT,
+            verification_status=VerificationStatus.INTERRUPTED,
+            error=(str(caught_exc) if is_task_to else "Tool execution timed out"),
+            interruption_reason=("task_timeout" if is_task_to else "tool_timeout"),
+            diagnostic_failures_only=False,
+            policy_compliance=policy_compliance,
+            v_results=eff_v_results,
+            all_v_ok=all_v_ok,
+            has_unresolved=has_unresolved,
+            verified_targets=verified_targets,
+            exit_code=1,
+        )
+
+    if provider_error:
+        return RootOutcomeResolution(
+            execution_status=ExecutionStatus.INTERRUPTED,
+            verification_status=VerificationStatus.INTERRUPTED,
+            error=str(provider_error),
+            interruption_reason="provider_failure",
+            diagnostic_failures_only=False,
+            policy_compliance=policy_compliance,
+            v_results=eff_v_results,
+            all_v_ok=all_v_ok,
+            has_unresolved=has_unresolved,
+            verified_targets=verified_targets,
+            exit_code=1,
+        )
+
+    if caught_exc is not None:
+        return RootOutcomeResolution(
+            execution_status=ExecutionStatus.INTERRUPTED,
+            verification_status=VerificationStatus.INTERRUPTED,
+            error=str(caught_exc) or type(caught_exc).__name__,
+            interruption_reason=f"exception:{type(caught_exc).__name__}",
+            diagnostic_failures_only=False,
+            policy_compliance=policy_compliance,
+            v_results=eff_v_results,
+            all_v_ok=all_v_ok,
+            has_unresolved=has_unresolved,
+            verified_targets=verified_targets,
+            exit_code=1,
+        )
+
+    if eff_invalid_spec:
+        return RootOutcomeResolution(
+            execution_status=ExecutionStatus.FAILED,
+            verification_status=VerificationStatus.VERIFICATION_FAILED,
+            error=eff_invalid_spec,
+            interruption_reason="invalid_verification_spec",
+            diagnostic_failures_only=False,
+            policy_compliance=policy_compliance,
+            v_results=eff_v_results,
+            all_v_ok=False,
+            has_unresolved=has_unresolved,
+            verified_targets=verified_targets,
+            exit_code=2,
+        )
+
+    if model_error:
+        is_prov = model_error.startswith(("⚠️ [Connection Error]", "⚠️ [API Error]", "⚠️ [Request Error]"))
+        is_trunc_err = "truncated" in model_error.lower()
+        return RootOutcomeResolution(
+            execution_status=(ExecutionStatus.INTERRUPTED if is_prov else ExecutionStatus.FAILED),
+            verification_status=(VerificationStatus.INTERRUPTED if (is_prov or is_trunc_err) else VerificationStatus.NOT_VERIFIED),
+            error=model_error,
+            interruption_reason=("provider_failure" if is_prov else "model_error"),
+            diagnostic_failures_only=False,
+            policy_compliance=policy_compliance,
+            v_results=eff_v_results,
+            all_v_ok=all_v_ok,
+            has_unresolved=has_unresolved,
+            verified_targets=verified_targets,
+            exit_code=1,
+        )
+
+    if is_truncated:
+        return RootOutcomeResolution(
+            execution_status=ExecutionStatus.INTERRUPTED,
+            verification_status=VerificationStatus.INTERRUPTED,
+            error="Model generation reached token length limit before completion.",
+            interruption_reason="output_truncated",
+            diagnostic_failures_only=False,
+            policy_compliance=policy_compliance,
+            v_results=eff_v_results,
+            all_v_ok=all_v_ok,
+            has_unresolved=has_unresolved,
+            verified_targets=verified_targets,
+            exit_code=1,
+        )
+
+    if eff_v_results and not all_v_ok:
+        failed_descs = [
+            f"{chk}:{tgt}: {getattr(vr, 'error', None) or 'failed'}"
+            for chk, tgt, vr in eff_v_results
+            if not getattr(vr, "success", False)
+        ]
+        return RootOutcomeResolution(
+            execution_status=ExecutionStatus.FAILED,
+            verification_status=VerificationStatus.VERIFICATION_FAILED,
+            error="; ".join(failed_descs)[:512] or "Post-run outcome verification failed",
+            interruption_reason="verification_failed",
+            diagnostic_failures_only=False,
+            policy_compliance=policy_compliance,
+            v_results=eff_v_results,
+            all_v_ok=False,
+            has_unresolved=has_unresolved,
+            verified_targets=verified_targets,
+            exit_code=2,
+        )
+
+    if reached_step_limit:
+        if all_v_ok and not has_unresolved:
+            step_ver = VerificationStatus.VERIFIED
+        elif has_ver_fail_unresolved:
+            step_ver = VerificationStatus.VERIFICATION_FAILED
+        elif detect_false_success(final_text, has_unresolved=has_unresolved):
+            step_ver = VerificationStatus.CLAIMED_UNVERIFIED
+        else:
+            step_ver = VerificationStatus.NOT_VERIFIED
+        return RootOutcomeResolution(
+            execution_status=ExecutionStatus.FAILED,
+            verification_status=step_ver,
+            error="Reached maximum autonomous ReAct steps before task completion.",
+            interruption_reason="step_limit_exceeded",
+            diagnostic_failures_only=False,
+            policy_compliance=policy_compliance,
+            v_results=eff_v_results,
+            all_v_ok=all_v_ok,
+            has_unresolved=has_unresolved,
+            verified_targets=verified_targets,
+            exit_code=2,
+        )
+
+    if policy_compliance.get("has_prohibitions") and not policy_compliance.get("compliant"):
+        return RootOutcomeResolution(
+            execution_status=ExecutionStatus.FAILED,
+            verification_status=(VerificationStatus.VERIFIED if all_v_ok else VerificationStatus.NOT_VERIFIED),
+            error="Executed action violated explicit user prohibition.",
+            interruption_reason="policy_violation",
+            diagnostic_failures_only=False,
+            policy_compliance=policy_compliance,
+            v_results=eff_v_results,
+            all_v_ok=all_v_ok,
+            has_unresolved=has_unresolved,
+            verified_targets=verified_targets,
+            exit_code=2,
+        )
+
+    if has_ver_fail_unresolved:
+        return RootOutcomeResolution(
+            execution_status=ExecutionStatus.FAILED,
+            verification_status=VerificationStatus.VERIFICATION_FAILED,
+            error="Outcome verification failed",
+            interruption_reason="verification_failed",
+            diagnostic_failures_only=False,
+            policy_compliance=policy_compliance,
+            v_results=eff_v_results,
+            all_v_ok=all_v_ok,
+            has_unresolved=True,
+            verified_targets=verified_targets,
+            exit_code=2,
+        )
+
+    if has_unresolved:
+        err_rec = unresolved_recs[-1].error if unresolved_recs else "Unresolved action failure"
+        if eff_v_results and all_v_ok:
+            ver_st = VerificationStatus.VERIFIED
+        elif detect_false_success(final_text, has_unresolved=True):
+            ver_st = VerificationStatus.CLAIMED_UNVERIFIED
+        else:
+            ver_st = VerificationStatus.NOT_VERIFIED
+        return RootOutcomeResolution(
+            execution_status=ExecutionStatus.FAILED,
+            verification_status=ver_st,
+            error=err_rec,
+            interruption_reason="unresolved_failure",
+            diagnostic_failures_only=False,
+            policy_compliance=policy_compliance,
+            v_results=eff_v_results,
+            all_v_ok=all_v_ok,
+            has_unresolved=True,
+            verified_targets=verified_targets,
+            exit_code=2,
+        )
+
+    if eff_v_results and all_v_ok:
+        return RootOutcomeResolution(
+            execution_status=ExecutionStatus.COMPLETED,
+            verification_status=VerificationStatus.VERIFIED,
+            error=None,
+            interruption_reason=None,
+            diagnostic_failures_only=False,
+            policy_compliance=policy_compliance,
+            v_results=eff_v_results,
+            all_v_ok=True,
+            has_unresolved=False,
+            verified_targets=verified_targets,
+            exit_code=0,
+        )
+
+    if has_verified:
+        return RootOutcomeResolution(
+            execution_status=ExecutionStatus.COMPLETED,
+            verification_status=VerificationStatus.VERIFIED,
+            error=None,
+            interruption_reason=None,
+            diagnostic_failures_only=False,
+            policy_compliance=policy_compliance,
+            v_results=eff_v_results,
+            all_v_ok=all_v_ok,
+            has_unresolved=False,
+            verified_targets=verified_targets,
+            exit_code=0,
+        )
+
+    if total_acts > 0:
+        ver_st = (
+            VerificationStatus.CLAIMED_UNVERIFIED
+            if (acceptance_spec and detect_false_success(final_text, has_unresolved=False))
+            else VerificationStatus.NOT_VERIFIED
+        )
+        return RootOutcomeResolution(
+            execution_status=ExecutionStatus.COMPLETED_UNVERIFIED,
+            verification_status=ver_st,
+            error=None,
+            interruption_reason=None,
+            diagnostic_failures_only=diagnostic_failures_only,
+            policy_compliance=policy_compliance,
+            v_results=eff_v_results,
+            all_v_ok=all_v_ok,
+            has_unresolved=False,
+            verified_targets=verified_targets,
+            exit_code=0,
+        )
+
+    if acceptance_spec:
+        return RootOutcomeResolution(
+            execution_status=ExecutionStatus.FAILED,
+            verification_status=VerificationStatus.NOT_VERIFIED,
+            error="Task ended without executing or verifying required acceptance criteria",
+            interruption_reason="unfulfilled_criteria",
+            diagnostic_failures_only=False,
+            policy_compliance=policy_compliance,
+            v_results=eff_v_results,
+            all_v_ok=False,
+            has_unresolved=False,
+            verified_targets=verified_targets,
+            exit_code=2,
+        )
+
+    return RootOutcomeResolution(
+        execution_status=ExecutionStatus.COMPLETED,
+        verification_status=VerificationStatus.NOT_VERIFIED,
+        error=None,
+        interruption_reason=None,
+        diagnostic_failures_only=False,
+        policy_compliance=policy_compliance,
+        v_results=eff_v_results,
+        all_v_ok=False,
+        has_unresolved=False,
+        verified_targets=verified_targets,
+        exit_code=0,
+    )
+
+
 def has_imperative_action_intent(prompt: str) -> bool:
     """Check if user prompt explicitly requests machine host actuation."""
     lower = prompt.lower()
@@ -4597,7 +5097,7 @@ class CentralExecutionLedger:
         emit_terminal_event: bool = True,
         strict: Optional[bool] = None,
     ) -> Optional[ExecutionRecord]:
-        """Finalize an execution record and emit its terminal lifecycle event."""
+        """Finalize an execution record and emit its terminal lifecycle event idempotently."""
         now = time.time()
         status_str = status.value if isinstance(status, ExecutionStatus) else str(status)
         ver_str = (
@@ -4611,7 +5111,50 @@ class CentralExecutionLedger:
         any_red = bool(sum_red or err_red or meta_red)
         any_trunc = bool(sum_trunc or err_trunc or meta_trunc)
 
-        if emit_terminal_event:
+        _terminal_statuses = {
+            ExecutionStatus.COMPLETED.value,
+            ExecutionStatus.COMPLETED_UNVERIFIED.value,
+            ExecutionStatus.FAILED.value,
+            ExecutionStatus.CANCELLED.value,
+            ExecutionStatus.TIMED_OUT.value,
+            ExecutionStatus.INTERRUPTED.value,
+            ExecutionStatus.ABANDONED.value,
+        }
+        existing_rec = self.get_execution(execution_id)
+        if existing_rec is None:
+            return None
+
+        existing_events = self.get_events(execution_id)
+        last_term_seq = max(
+            (ev.sequence_number for ev in existing_events if ev.event_type == LedgerEventType.TASK_TERMINATED.value),
+            default=0,
+        )
+        last_res_seq = max(
+            (ev.sequence_number for ev in existing_events if ev.event_type == LedgerEventType.TASK_RESUMED.value),
+            default=0,
+        )
+        resume_epoch = sum(
+            1 for ev in existing_events if ev.event_type == LedgerEventType.TASK_RESUMED.value
+        )
+
+        if existing_rec.status in _terminal_statuses and existing_rec.completed_at is not None:
+            if last_term_seq > last_res_seq:
+                return existing_rec
+            eff_ver_existing = ver_str or existing_rec.verification_status
+            meta_unchanged = all(
+                k in existing_rec.metadata and existing_rec.metadata[k] == v
+                for k, v in safe_meta.items()
+            )
+            if (
+                existing_rec.status == status_str
+                and existing_rec.verification_status == eff_ver_existing
+                and (safe_summary is None or existing_rec.final_summary == safe_summary)
+                and (safe_error is None or existing_rec.error == safe_error)
+                and meta_unchanged
+            ):
+                return existing_rec
+
+        if emit_terminal_event and last_term_seq <= last_res_seq:
             term_meta = dict(safe_meta)
             if safe_summary:
                 term_meta["summary"] = safe_summary
@@ -4619,13 +5162,18 @@ class CentralExecutionLedger:
                 term_meta["error"] = safe_error
             if ver_str:
                 term_meta["verification_status"] = ver_str
+            idem_key = (
+                f"{execution_id}:terminated:epoch{resume_epoch}"
+                if resume_epoch > 0
+                else f"{execution_id}:terminated"
+            )
             try:
                 self.record_event(
                     execution_id,
                     LedgerEventType.TASK_TERMINATED,
                     status=status_str,
                     metadata=term_meta,
-                    idempotency_key=f"{execution_id}:terminated:{status_str}",
+                    idempotency_key=idem_key,
                     execution_status=status_str,
                     verification_status=ver_str,
                     strict=strict,
@@ -4736,6 +5284,35 @@ class CentralExecutionLedger:
                 except Exception as exc:
                     self._record_persistence_failure("get_execution", exc, execution_id=execution_id, strict=False)
             return self._memory_executions.get(execution_id)
+
+    def list_child_executions(self, parent_execution_id: str) -> List[ExecutionRecord]:
+        """List persisted or in-memory child executions ordered chronologically by creation time."""
+        parent_id = str(parent_execution_id or "").strip()
+        if not parent_id:
+            return []
+        with self._lock:
+            conn = self._ensure_connection(raise_on_error=False, execution_id=parent_id)
+            if conn is not None:
+                try:
+                    rows = conn.execute(
+                        "SELECT * FROM executions WHERE parent_execution_id = ? ORDER BY created_at ASC, execution_id ASC",
+                        (parent_id,),
+                    ).fetchall()
+                    return [ExecutionRecord.from_row(r) for r in rows]
+                except Exception as exc:
+                    self._record_persistence_failure(
+                        "list_child_executions",
+                        exc,
+                        execution_id=parent_id,
+                        strict=False,
+                    )
+            children = [
+                rec
+                for rec in self._memory_executions.values()
+                if rec.parent_execution_id == parent_id
+            ]
+            children.sort(key=lambda r: (r.created_at, r.execution_id))
+            return children
 
     def find_execution_by_prefix(self, prefix: str) -> Tuple[Optional[ExecutionRecord], List[str]]:
         """Resolve an execution ID or unique prefix match."""

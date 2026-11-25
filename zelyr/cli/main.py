@@ -532,6 +532,8 @@ async def _execute_headless_run(
     final_answer = ""
 
     is_truncated = False
+    headless_exc: Optional[BaseException] = None
+    was_cancelled = False
     try:
         max_steps = getattr(orch, "max_steps", 5)
         for step_idx in range(max_steps):
@@ -541,6 +543,7 @@ async def _execute_headless_run(
 
             if (step_idx > 0 or getattr(orch, "_preserve_current_ledger", False)) and getattr(orch, "current_ledger", None) is not None:
                 payload["_reuse_current_ledger"] = True
+            payload["_defer_root_finalization"] = True
             async for chunk in orch.generate_stream(payload):
                 choices = chunk.get("choices", [])
                 if not choices:
@@ -735,200 +738,228 @@ async def _execute_headless_run(
 
             final_answer = clean_step
             break
+    except asyncio.CancelledError as exc:
+        was_cancelled = True
+        headless_exc = exc
+        if hasattr(orch, "current_ledger") and orch.current_ledger is not None and orch.current_ledger.has_pending_proposals():
+            orch.current_ledger.discard_pending_proposals(reason="cancelled")
     except Exception as exc:
+        headless_exc = exc
         if hasattr(orch, "current_ledger") and orch.current_ledger is not None and orch.current_ledger.has_pending_proposals():
             orch.current_ledger.discard_pending_proposals(reason="headless_error")
-        sys.stderr.write(f"Error executing headless run: {exc}\n")
-        sys.stderr.flush()
-        return 1
     finally:
-        orch.execute_tool = original_raw_execute
-        if owns_cli_ledger and cli_ledger is not None and verify_spec is None:
-            cli_ledger.close()
-            cli_ledger = None
+        payload.pop("_defer_root_finalization", None)
+        orch.execute_tool = original_execute if original_execute is not None else original_raw_execute
 
     reached_step_limit = "[Notice: Reached maximum autonomous ReAct steps" in (final_answer or "")
+    is_model_err = final_answer.startswith((
+        "⚠️ [Connection Error]",
+        "⚠️ [API Error]",
+        "⚠️ [Request Error]",
+        "⚠️ [Model Error]",
+    ))
 
-    if final_answer.startswith("⚠️ [Connection Error]") or final_answer.startswith("⚠️ [API Error]") or final_answer.startswith("⚠️ [Request Error]") or final_answer.startswith("⚠️ [Model Error]"):
-        sys.stderr.write(f"{final_answer}\n")
-        sys.stderr.flush()
-        if owns_cli_ledger and cli_ledger is not None:
-            cli_ledger.close()
-            cli_ledger = None
-        if output_json:
-            from zelyr.engine.execution_ledger import TurnExecutionLedger
-            payload_dict = {
-                "prompt": clean_prompt,
-                "model": active_model,
-                "response": final_answer,
-                "tool_calls": tool_calls_emitted,
-                "error": final_answer,
-            }
-            if hasattr(orch, "current_ledger") and orch.current_ledger is not None:
-                payload_dict["execution_ledger"] = orch.current_ledger.to_dict()
+    try:
+        v_results = []
+        invalid_verify_spec_error: Optional[str] = None
+        if not was_cancelled and headless_exc is None and not is_model_err and not is_truncated and verify_spec is not None:
+            if not verify_spec.strip():
+                invalid_verify_spec_error = "Empty verification specification provided."
             else:
-                payload_dict["execution_ledger"] = TurnExecutionLedger().to_dict()
-            sys.stdout.write(json.dumps(payload_dict) + "\n")
-            sys.stdout.flush()
-        return 1
+                from zelyr.engine.execution_ledger import parse_acceptance_criteria
+                from zelyr.engine.verifier import OutcomeVerifier
 
-    if is_truncated:
-        sys.stderr.write("⚠️ [Model Truncated] Generation reached token length limit before completion.\n")
-        sys.stderr.flush()
-        if owns_cli_ledger and cli_ledger is not None:
-            cli_ledger.close()
-            cli_ledger = None
-        if output_json:
-            from zelyr.engine.execution_ledger import TurnExecutionLedger
-            payload_dict = {
-                "prompt": clean_prompt,
-                "model": active_model,
-                "response": final_answer,
-                "tool_calls": tool_calls_emitted,
-                "truncated": True,
-            }
-            if hasattr(orch, "current_ledger") and orch.current_ledger is not None:
-                payload_dict["execution_ledger"] = orch.current_ledger.to_dict()
-            else:
-                payload_dict["execution_ledger"] = TurnExecutionLedger().to_dict()
-            sys.stdout.write(json.dumps(payload_dict) + "\n")
-            sys.stdout.flush()
-        else:
-            sys.stdout.write(final_answer.rstrip("\n") + "\n")
-            sys.stdout.flush()
-        return 1
+                parsed_specs = parse_acceptance_criteria(verify_spec)
+                if parsed_specs:
+                    for item in parsed_specs:
+                        v_res = OutcomeVerifier.verify(
+                            check=item.get("check", ""),
+                            target=item.get("target", ""),
+                            expected=item.get("expected"),
+                        )
+                        v_results.append((item.get("check", ""), item.get("target", ""), v_res))
+                else:
+                    invalid_verify_spec_error = f"Unable to parse verification specification: '{verify_spec}'"
 
-    v_results = []
-    if verify_spec is not None:
-        if not verify_spec.strip():
-            if owns_cli_ledger and cli_ledger is not None:
-                cli_ledger.close()
-                cli_ledger = None
-            err_msg = "[verification failed] Empty verification specification provided.\n"
-            sys.stdout.write(err_msg)
-            sys.stderr.write(err_msg)
-            return 2
-        from zelyr.engine.execution_ledger import parse_acceptance_criteria
-        from zelyr.engine.verifier import OutcomeVerifier
-
-        parsed_specs = parse_acceptance_criteria(verify_spec)
-        if parsed_specs:
-            for item in parsed_specs:
-                v_res = OutcomeVerifier.verify(
-                    check=item.get("check", ""),
-                    target=item.get("target", ""),
-                    expected=item.get("expected"),
-                )
-                v_results.append((item.get("check", ""), item.get("target", ""), v_res))
-        else:
-            if owns_cli_ledger and cli_ledger is not None:
-                cli_ledger.close()
-                cli_ledger = None
-            err_msg = f"[verification failed] Unable to parse verification specification: '{verify_spec}'\n"
-            sys.stdout.write(err_msg)
-            sys.stderr.write(err_msg)
-            return 2
-
-    ledger = getattr(orch, "current_ledger", None)
-    has_unresolved_ledger = False
-    unresolved_recs: List[Any] = []
-    if ledger is not None:
-        unresolved_fn = getattr(ledger, "unresolved_failures", None)
-        if callable(unresolved_fn):
-            unresolved_recs = list(unresolved_fn())
-            has_unresolved_ledger = bool(unresolved_recs)
-        else:
-            has_fn = getattr(ledger, "has_unresolved_failures", None)
-            has_unresolved_ledger = bool(has_fn()) if callable(has_fn) else False
-
-    diagnostic_failures_only = False
-    if has_unresolved_ledger and verify_spec is None and not reached_step_limit and unresolved_recs:
-        from zelyr.engine.execution_ledger import is_read_only_diagnostic_failures_only
-        if is_read_only_diagnostic_failures_only(clean_prompt, ledger, final_answer):
-            diagnostic_failures_only = True
-            has_unresolved_ledger = False
-
-    if ledger is not None and getattr(ledger, "_central_ledger", None) is not None and getattr(ledger, "_execution_id", None):
+        ledger = getattr(orch, "current_ledger", None)
         from zelyr.engine.execution_ledger import (
-            ExecutionStatus,
             LedgerEventType,
+            TurnExecutionLedger,
             VerificationStatus,
+            resolve_root_execution_outcome,
         )
 
-        c_ledger = ledger._central_ledger
-        c_exec_id = ledger._execution_id
-        if v_results:
-            all_v_ok = all(res.success for _, _, res in v_results)
-            for v_check, v_target, v_res in v_results:
-                c_ledger.record_event(
-                    c_exec_id,
-                    LedgerEventType.VERIFICATION_RECORDED,
-                    status=VerificationStatus.VERIFIED.value if v_res.success else VerificationStatus.VERIFICATION_FAILED.value,
-                    metadata={"check": v_check, "target": v_target, "error": getattr(v_res, "error", None)},
-                )
-            if all_v_ok and not has_unresolved_ledger and not reached_step_limit:
-                ledger.set_verification_status(VerificationStatus.VERIFIED)
-                c_ledger.finalize_execution(
-                    c_exec_id,
-                    status=ExecutionStatus.COMPLETED,
-                    verification_status=VerificationStatus.VERIFIED,
-                    final_summary=final_answer,
-                )
-            else:
-                ledger.set_verification_status(VerificationStatus.VERIFICATION_FAILED)
-                c_ledger.finalize_execution(
-                    c_exec_id,
-                    status=ExecutionStatus.FAILED,
-                    verification_status=VerificationStatus.VERIFICATION_FAILED,
-                    error="Post-run outcome verification failed",
-                    final_summary=final_answer,
-                )
+        res_outcome = resolve_root_execution_outcome(
+            prompt=clean_prompt,
+            ledger=ledger,
+            final_text=final_answer,
+            acceptance_spec=verify_spec,
+            v_results=(v_results if verify_spec is not None and not invalid_verify_spec_error and not is_model_err and not is_truncated and not was_cancelled and headless_exc is None else None),
+            was_cancelled=was_cancelled,
+            was_timed_out=bool(isinstance(headless_exc, (TimeoutError, asyncio.TimeoutError))),
+            caught_exc=headless_exc,
+            is_truncated=is_truncated,
+            model_error=(final_answer if is_model_err else None),
+            reached_step_limit=reached_step_limit,
+            invalid_verify_spec_error=invalid_verify_spec_error,
+        )
 
-    if owns_cli_ledger and cli_ledger is not None:
-        cli_ledger.close()
-        cli_ledger = None
+        if ledger is not None and getattr(ledger, "_central_ledger", None) is not None and getattr(ledger, "_execution_id", None):
+            c_ledger = ledger._central_ledger
+            c_exec_id = ledger._execution_id
+            ledger.set_verification_status(res_outcome.verification_status)
+            if res_outcome.v_results and not c_ledger.get_events(
+                c_exec_id, event_type=LedgerEventType.VERIFICATION_RECORDED.value
+            ):
+                for v_check, v_target, v_res in res_outcome.v_results:
+                    c_ledger.record_event(
+                        c_exec_id,
+                        LedgerEventType.VERIFICATION_RECORDED,
+                        status=VerificationStatus.VERIFIED.value if v_res.success else VerificationStatus.VERIFICATION_FAILED.value,
+                        metadata={"check": v_check, "target": v_target, "error": getattr(v_res, "error", None)},
+                    )
 
-    if output_json:
-        from zelyr.engine.execution_ledger import TurnExecutionLedger
+            from zelyr.engine.checkpoint import CheckpointManager
 
-        payload_dict = {
-            "prompt": clean_prompt,
-            "model": active_model,
-            "response": final_answer,
-            "tool_calls": tool_calls_emitted,
-        }
-        if reached_step_limit:
-            payload_dict["step_limit_exceeded"] = True
-        if diagnostic_failures_only:
-            payload_dict["diagnostic_test_failed"] = True
-        if v_results:
-            all_success = all(res.success for _, _, res in v_results)
-            if len(v_results) == 1:
-                payload_dict["verification"] = v_results[0][2].to_dict()
-            else:
-                payload_dict["verification"] = {
-                    "success": all_success,
-                    "checks": [res.to_dict() for _, _, res in v_results],
+            cp_err: Optional[str] = None
+            try:
+                cp_saved = CheckpointManager.capture_checkpoint(
+                    c_ledger,
+                    c_exec_id,
+                    turn_ledger=ledger,
+                    status=res_outcome.execution_status,
+                    verification_status=res_outcome.verification_status,
+                    task_prompt=clean_prompt,
+                    planning_state={
+                        "max_steps": getattr(orch, "max_steps", 5),
+                        "acceptance_criteria": verify_spec,
+                        "model": active_model,
+                        "interruption_reason": res_outcome.interruption_reason,
+                        "policy_compliance": res_outcome.policy_compliance,
+                        "last_assistant_text": final_answer[:512] if final_answer else None,
+                    },
+                    pending_proposals=getattr(ledger, "_active_pending_queue", None),
+                    emit_event=False,
+                    strict=None,
+                )
+                if cp_saved is None and c_ledger.has_persistence_errors():
+                    cp_err = "Checkpoint persistence failed; state could not be durably saved."
+            except Exception as exc:
+                cp_err = f"Checkpoint persistence failed: {exc}"
+                if getattr(c_ledger, "raise_on_persistence_error", False):
+                    raise
+
+            total_acts = int(ledger.total_actions()) if hasattr(ledger, "total_actions") else len(tool_calls_emitted)
+            fin_meta: Dict[str, Any] = {
+                "total_actions": total_acts,
+                "verified_targets": res_outcome.verified_targets,
+                "checkpoint_saved": cp_err is None,
+            }
+            if res_outcome.interruption_reason:
+                fin_meta["interruption_reason"] = res_outcome.interruption_reason
+            if res_outcome.diagnostic_failures_only:
+                fin_meta["diagnostic_test_failed"] = True
+            if res_outcome.policy_compliance.get("has_prohibitions"):
+                fin_meta["policy_compliance"] = res_outcome.policy_compliance
+            if cp_err:
+                fin_meta["checkpoint_error"] = cp_err
+
+            c_ledger.finalize_execution(
+                c_exec_id,
+                status=res_outcome.execution_status,
+                verification_status=res_outcome.verification_status,
+                final_summary=final_answer[:1024] if final_answer else None,
+                error=res_outcome.error,
+                metadata=fin_meta,
+            )
+
+        if was_cancelled and headless_exc is not None:
+            raise headless_exc
+
+        if headless_exc is not None:
+            sys.stderr.write(f"Error executing headless run: {headless_exc}\n")
+            sys.stderr.flush()
+            return 1
+
+        if is_model_err:
+            sys.stderr.write(f"{final_answer}\n")
+            sys.stderr.flush()
+            if output_json:
+                payload_dict = {
+                    "prompt": clean_prompt,
+                    "model": active_model,
+                    "response": final_answer,
+                    "tool_calls": tool_calls_emitted,
+                    "error": final_answer,
+                    "execution_ledger": ledger.to_dict() if ledger is not None else TurnExecutionLedger().to_dict(),
                 }
-        if ledger is not None:
-            payload_dict["execution_ledger"] = ledger.to_dict()
-        else:
-            payload_dict["execution_ledger"] = TurnExecutionLedger().to_dict()
-        json_out = json.dumps(payload_dict)
-        sys.stdout.write(json_out.rstrip("\n") + "\n")
-        sys.stdout.flush()
-        if reached_step_limit:
+                if res_outcome.policy_compliance.get("has_prohibitions"):
+                    payload_dict["policy_compliance"] = res_outcome.policy_compliance
+                sys.stdout.write(json.dumps(payload_dict) + "\n")
+                sys.stdout.flush()
+            return 1
+
+        if is_truncated:
+            sys.stderr.write("⚠️ [Model Truncated] Generation reached token length limit before completion.\n")
+            sys.stderr.flush()
+            if output_json:
+                payload_dict = {
+                    "prompt": clean_prompt,
+                    "model": active_model,
+                    "response": final_answer,
+                    "tool_calls": tool_calls_emitted,
+                    "truncated": True,
+                    "execution_ledger": ledger.to_dict() if ledger is not None else TurnExecutionLedger().to_dict(),
+                }
+                if res_outcome.policy_compliance.get("has_prohibitions"):
+                    payload_dict["policy_compliance"] = res_outcome.policy_compliance
+                sys.stdout.write(json.dumps(payload_dict) + "\n")
+                sys.stdout.flush()
+            else:
+                sys.stdout.write(final_answer.rstrip("\n") + "\n")
+                sys.stdout.flush()
+            return 1
+
+        if invalid_verify_spec_error:
+            err_msg = f"[verification failed] {invalid_verify_spec_error}\n"
+            sys.stdout.write(err_msg)
+            sys.stderr.write(err_msg)
             return 2
-        if v_results and not all(res.success for _, _, res in v_results):
-            return 2
-        if has_unresolved_ledger:
-            return 2
-    else:
+
+        if output_json:
+            payload_dict = {
+                "prompt": clean_prompt,
+                "model": active_model,
+                "response": final_answer,
+                "tool_calls": tool_calls_emitted,
+            }
+            if reached_step_limit:
+                payload_dict["step_limit_exceeded"] = True
+            if res_outcome.diagnostic_failures_only:
+                payload_dict["diagnostic_test_failed"] = True
+            if res_outcome.policy_compliance.get("has_prohibitions"):
+                payload_dict["policy_compliance"] = res_outcome.policy_compliance
+            if res_outcome.v_results:
+                if len(res_outcome.v_results) == 1:
+                    payload_dict["verification"] = res_outcome.v_results[0][2].to_dict()
+                else:
+                    payload_dict["verification"] = {
+                        "success": res_outcome.all_v_ok,
+                        "checks": [res.to_dict() for _, _, res in res_outcome.v_results],
+                    }
+            payload_dict["execution_ledger"] = (
+                ledger.to_dict() if ledger is not None else TurnExecutionLedger().to_dict()
+            )
+            json_out = json.dumps(payload_dict)
+            sys.stdout.write(json_out.rstrip("\n") + "\n")
+            sys.stdout.flush()
+            return res_outcome.exit_code
+
         sys.stdout.write(final_answer.rstrip("\n") + "\n")
         sys.stdout.flush()
         any_failed = False
-        if v_results:
-            for v_check, v_target, v_res in v_results:
+        if res_outcome.v_results:
+            for v_check, v_target, v_res in res_outcome.v_results:
                 if v_res.success:
                     sys.stdout.write(f"[verified] {v_check} on {v_target}: PASS\n")
                     sys.stdout.flush()
@@ -941,9 +972,9 @@ async def _execute_headless_run(
                     sys.stderr.flush()
         total_rec = int(getattr(ledger, "total_recovery_attempts", 0) or 0) if ledger is not None else 0
         total_acts = int(ledger.total_actions()) if ledger is not None and hasattr(ledger, "total_actions") else len(tool_calls_emitted)
-        if v_results:
+        if res_outcome.v_results:
             ver_status_str = "FAIL" if any_failed else "PASS"
-        elif diagnostic_failures_only:
+        elif res_outcome.diagnostic_failures_only:
             ver_status_str = "DIAGNOSTIC_TEST_FAILED"
         elif ledger is not None and getattr(ledger, "verified_actions", None) and ledger.verified_actions():
             ver_status_str = "VERIFIED"
@@ -951,7 +982,7 @@ async def _execute_headless_run(
             ver_status_str = "NOT_RUN"
         if reached_step_limit:
             outcome_str = "step_limit_exceeded"
-        elif any_failed or has_unresolved_ledger:
+        elif res_outcome.exit_code != 0 or any_failed or res_outcome.has_unresolved:
             outcome_str = "failed"
         else:
             outcome_str = "completed"
@@ -960,10 +991,11 @@ async def _execute_headless_run(
             f"(steps={exec_step_counter}, actions={total_acts}, recoveries={total_rec})\n"
         )
         sys.stderr.flush()
-        if reached_step_limit or any_failed or has_unresolved_ledger:
-            return 2
-
-    return 0
+        return res_outcome.exit_code
+    finally:
+        if owns_cli_ledger and cli_ledger is not None:
+            cli_ledger.close()
+            cli_ledger = None
 
 
 async def _execute_planned_headless_run(

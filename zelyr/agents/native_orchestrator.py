@@ -364,6 +364,8 @@ class NativeOrchestrator:
     FILE_TOOL_ALIASES = {
         "read_file",
         "view_file",
+        "list_tree",
+        "list_dir",
     }
 
     VERIFY_TOOL_ALIASES = {
@@ -512,6 +514,8 @@ class NativeOrchestrator:
                     args["action"] = "patch"
                 elif "content" in args:
                     args["action"] = "write"
+                elif raw_orig in ("list_tree", "list_dir"):
+                    args["action"] = "list_tree"
                 elif raw_orig in cls.FILE_TOOL_ALIASES or "action" not in args:
                     args["action"] = "read"
             if "path" not in args:
@@ -1371,6 +1375,7 @@ class NativeOrchestrator:
         )
 
         reuse_current = bool(payload.pop("_reuse_current_ledger", False))
+        defer_root_finalization = bool(payload.pop("_defer_root_finalization", False))
         eff_ledger = (
             ledger
             if ledger is not None
@@ -1601,81 +1606,37 @@ class NativeOrchestrator:
                         ExecutionStatus.ABANDONED.value,
                     )
                 )
-                if not already_finalized:
+                if not already_finalized and not defer_root_finalization:
+                    from zelyr.engine.execution_ledger import resolve_root_execution_outcome
+
                     root_meta = getattr(eff_ledger, "_root_meta", {}) or {}
                     final_text = "".join(collected_out)
-                    all_records = [eff_ledger._records[cid] for cid in eff_ledger._order]
-                    has_ver_fail = any(getattr(r, "verification_failed", False) for r in all_records)
-                    has_unresolved = eff_ledger.has_unresolved_failures()
-                    if has_unresolved and not acceptance_spec:
-                        from zelyr.engine.execution_ledger import is_read_only_diagnostic_failures_only
-                        if is_read_only_diagnostic_failures_only(user_prompt, eff_ledger, final_text):
-                            has_unresolved = False
-                    has_verified = bool(eff_ledger.verified_actions() or eff_ledger.get_verified_targets())
                     total_acts = eff_ledger.total_actions()
-                    interruption_reason: Optional[str] = None
-
-                    if (
-                        was_cancelled
-                        or getattr(self, "_cancelled", False)
-                        or payload.get("cancelled", False)
-                        or root_meta.get("cancelled")
-                    ):
-                        final_status = ExecutionStatus.CANCELLED
-                        ver_status = VerificationStatus.INTERRUPTED
-                        err_msg = "Task cancelled"
-                        interruption_reason = "user_cancelled"
-                    elif (root_meta.get("timed_out") and has_unresolved) or isinstance(caught_exc, (TimeoutError, asyncio.TimeoutError)):
-                        final_status = ExecutionStatus.TIMED_OUT
-                        ver_status = VerificationStatus.INTERRUPTED
-                        err_msg = str(caught_exc) if isinstance(caught_exc, (TimeoutError, asyncio.TimeoutError)) else (root_meta.get("error") or "Tool execution timed out")
-                        interruption_reason = "task_timeout" if isinstance(caught_exc, (TimeoutError, asyncio.TimeoutError)) else "tool_timeout"
-                    elif root_meta.get("connection_error") or root_meta.get("provider_error"):
-                        final_status = ExecutionStatus.INTERRUPTED
-                        ver_status = VerificationStatus.INTERRUPTED
-                        err_msg = str(root_meta.get("provider_error") or root_meta.get("error") or "Model provider failure")
-                        interruption_reason = "provider_failure"
-                    elif caught_exc is not None:
-                        final_status = ExecutionStatus.INTERRUPTED
-                        ver_status = VerificationStatus.INTERRUPTED
-                        err_msg = str(caught_exc) or type(caught_exc).__name__
-                        interruption_reason = f"exception:{type(caught_exc).__name__}"
-                    elif has_ver_fail:
-                        final_status = ExecutionStatus.FAILED
-                        ver_status = VerificationStatus.VERIFICATION_FAILED
-                        err_msg = "Outcome verification failed"
-                        interruption_reason = "verification_failed"
-                    elif has_unresolved:
-                        ver_status = (
-                            VerificationStatus.CLAIMED_UNVERIFIED
-                            if detect_false_success(final_text, has_unresolved=True)
-                            else VerificationStatus.NOT_VERIFIED
-                        )
-                        final_status = ExecutionStatus.FAILED
-                        unresolved = eff_ledger.unresolved_failures()
-                        err_msg = unresolved[-1].error if unresolved else "Unresolved action failure"
-                        interruption_reason = "unresolved_failure"
-                    elif has_verified:
-                        final_status = ExecutionStatus.COMPLETED
-                        ver_status = VerificationStatus.VERIFIED
-                        err_msg = None
-                    elif total_acts > 0:
-                        if acceptance_spec and detect_false_success(final_text, has_unresolved=False):
-                            ver_status = VerificationStatus.CLAIMED_UNVERIFIED
-                        else:
-                            ver_status = VerificationStatus.NOT_VERIFIED
-                        final_status = ExecutionStatus.COMPLETED_UNVERIFIED
-                        err_msg = None
-                    else:
-                        if acceptance_spec:
-                            final_status = ExecutionStatus.FAILED
-                            ver_status = VerificationStatus.NOT_VERIFIED
-                            err_msg = "Task ended without executing or verifying required acceptance criteria"
-                            interruption_reason = "unfulfilled_criteria"
-                        else:
-                            final_status = ExecutionStatus.COMPLETED
-                            ver_status = VerificationStatus.NOT_VERIFIED
-                            err_msg = None
+                    prov_err = (
+                        str(root_meta.get("provider_error") or root_meta.get("error") or "Model provider failure")
+                        if (root_meta.get("connection_error") or root_meta.get("provider_error"))
+                        else None
+                    )
+                    res_outcome = resolve_root_execution_outcome(
+                        prompt=user_prompt,
+                        ledger=eff_ledger,
+                        final_text=final_text,
+                        acceptance_spec=acceptance_spec,
+                        was_cancelled=bool(
+                            was_cancelled
+                            or getattr(self, "_cancelled", False)
+                            or payload.get("cancelled", False)
+                            or root_meta.get("cancelled")
+                        ),
+                        was_timed_out=bool((root_meta.get("timed_out") and eff_ledger.has_unresolved_failures()) or isinstance(caught_exc, (TimeoutError, asyncio.TimeoutError))),
+                        caught_exc=caught_exc,
+                        provider_error=prov_err,
+                        is_truncated=(getattr(self, "last_finish_reason", None) in ("length", "max_tokens") and not final_text.strip()),
+                    )
+                    final_status = res_outcome.execution_status
+                    ver_status = res_outcome.verification_status
+                    err_msg = res_outcome.error
+                    interruption_reason = res_outcome.interruption_reason
 
                     eff_ledger.set_verification_status(ver_status)
                     from zelyr.engine.checkpoint import CheckpointManager
@@ -1697,6 +1658,7 @@ class NativeOrchestrator:
                                 "acceptance_criteria": acceptance_spec,
                                 "model": payload.get("model"),
                                 "interruption_reason": interruption_reason,
+                                "policy_compliance": res_outcome.policy_compliance,
                                 "last_assistant_text": final_text[:512] if final_text else None,
                             },
                             pending_proposals=getattr(eff_ledger, "_active_pending_queue", None),
@@ -1714,7 +1676,12 @@ class NativeOrchestrator:
                                 verification_status=ver_status,
                                 final_summary=final_text[:1024] if final_text else None,
                                 error=err_msg,
-                                metadata={"total_actions": total_acts, "verified_targets": eff_ledger.get_verified_targets(), "checkpoint_saved": False},
+                                metadata={
+                                    "total_actions": total_acts,
+                                    "verified_targets": res_outcome.verified_targets,
+                                    "checkpoint_saved": False,
+                                    **({"policy_compliance": res_outcome.policy_compliance} if res_outcome.policy_compliance.get("has_prohibitions") else {}),
+                                },
                             )
                             raise
 
@@ -1722,19 +1689,38 @@ class NativeOrchestrator:
                         root_meta["checkpoint_failed"] = True
                         root_meta["checkpoint_error"] = cp_err
 
+                    if res_outcome.v_results and not (
+                        central_ledger.get_events(exec_id, event_type=LedgerEventType.VERIFICATION_RECORDED.value)
+                    ):
+                        for v_check, v_target, v_res in res_outcome.v_results:
+                            central_ledger.record_event(
+                                exec_id,
+                                LedgerEventType.VERIFICATION_RECORDED,
+                                status=VerificationStatus.VERIFIED.value if v_res.success else VerificationStatus.VERIFICATION_FAILED.value,
+                                metadata={"check": v_check, "target": v_target, "error": getattr(v_res, "error", None)},
+                            )
+
+                    fin_meta: Dict[str, Any] = {
+                        "total_actions": total_acts,
+                        "verified_targets": res_outcome.verified_targets,
+                        "checkpoint_saved": not bool(root_meta.get("checkpoint_failed")),
+                    }
+                    if interruption_reason:
+                        fin_meta["interruption_reason"] = interruption_reason
+                    if res_outcome.diagnostic_failures_only:
+                        fin_meta["diagnostic_test_failed"] = True
+                    if res_outcome.policy_compliance.get("has_prohibitions"):
+                        fin_meta["policy_compliance"] = res_outcome.policy_compliance
+                    if cp_err:
+                        fin_meta["checkpoint_error"] = cp_err
+
                     central_ledger.finalize_execution(
                         exec_id,
                         status=final_status,
                         verification_status=ver_status,
                         final_summary=final_text[:1024] if final_text else None,
                         error=err_msg,
-                        metadata={
-                            "total_actions": total_acts,
-                            "verified_targets": eff_ledger.get_verified_targets(),
-                            "checkpoint_saved": not bool(root_meta.get("checkpoint_failed")),
-                            **({"interruption_reason": interruption_reason} if interruption_reason else {}),
-                            **({"checkpoint_error": cp_err} if cp_err else {}),
-                        },
+                        metadata=fin_meta,
                     )
 
     async def _generate_stream_core(

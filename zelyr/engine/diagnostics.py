@@ -85,6 +85,7 @@ class ExecutionLifecycleReport:
     resumability: Dict[str, Any] = field(default_factory=dict)
     persistence_errors: List[Dict[str, Any]] = field(default_factory=list)
     timeline_summary: Dict[str, Any] = field(default_factory=dict)
+    child_executions: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -387,11 +388,41 @@ class ExecutionLifecycleDiagnostics:
             out_k = str(entry.get("outcome") or "").lower()
             outcome_counts[out_k] = outcome_counts.get(out_k, 0) + 1
 
+        prohib_comp = None
+        if isinstance(record.metadata, dict) and isinstance(record.metadata.get("policy_compliance"), dict):
+            prohib_comp = _safe_diag_dict(record.metadata["policy_compliance"], max_bytes=1024)
+        elif isinstance(planning_state.get("policy_compliance"), dict):
+            prohib_comp = _safe_diag_dict(planning_state["policy_compliance"], max_bytes=1024)
+        else:
+            from zelyr.engine.execution_ledger import (
+                extract_global_mutation_prohibition,
+                extract_prohibited_targets,
+            )
+            prompt_str = str(record.task_prompt or "")
+            p_targets = extract_prohibited_targets(prompt_str)
+            g_prohib = extract_global_mutation_prohibition(prompt_str)
+            if p_targets or g_prohib.get("no_file_modifications") or g_prohib.get("no_mutating_commands"):
+                blocked_cnt = sum(
+                    1
+                    for ev in events
+                    if ev.event_type == LedgerEventType.TOOL_EXECUTION_RESULT.value
+                    and isinstance(ev.metadata, dict)
+                    and "prohibited_by_user" in str(ev.metadata.get("rejection_reason") or ev.metadata.get("error") or "")
+                )
+                prohib_comp = {
+                    "has_prohibitions": True,
+                    "compliant": True,
+                    "prohibited_attempts_blocked": blocked_cnt,
+                    "prohibited_violations": 0,
+                    "status": "compliant",
+                }
+
         policy_info = {
             "decision_count": len(pol_entries),
             "outcome_counts": outcome_counts,
             "decisions": list(reversed(pol_entries)),  # chronological for lifecycle trace
             "resume_reauthorization_checks": _safe_diag_dict(assessment.authorization_checks),
+            **({"prohibition_compliance": prohib_comp} if prohib_comp else {}),
         }
 
         # ── 5. Verification vs Reported-Only vs Failed/Uncertain ───────────────
@@ -549,6 +580,26 @@ class ExecutionLifecycleDiagnostics:
             "environment_diff": _safe_diag_dict(assessment.environment_diff, max_bytes=2048),
         }
 
+        child_recs = (
+            ledger.list_child_executions(record.execution_id)
+            if hasattr(ledger, "list_child_executions")
+            else []
+        )
+        child_executions_out = [
+            {
+                "execution_id": ch.execution_id,
+                "parent_execution_id": ch.parent_execution_id,
+                "status": ch.status,
+                "verification_status": ch.verification_status,
+                "task_prompt": _safe_diag_text(ch.task_prompt, max_len=256) or "",
+                "error": _safe_diag_text(ch.error, max_len=256),
+                "created_at": ch.created_at,
+                "completed_at": ch.completed_at,
+            }
+            for ch in child_recs
+        ]
+        verification_info["child_execution_count"] = len(child_executions_out)
+
         timeline_summary = {
             "event_count": len(events),
             "event_type_counts": event_type_counts,
@@ -570,6 +621,7 @@ class ExecutionLifecycleDiagnostics:
             resumability=resumability_info,
             persistence_errors=persistence_errors,
             timeline_summary=timeline_summary,
+            child_executions=child_executions_out,
         )
 
 
@@ -667,6 +719,12 @@ def format_execution_lifecycle_report(report: ExecutionLifecycleReport) -> str:
         f"  Policy:        {pol.get('decision_count', 0)} decision(s) "
         f"(allow={oc.get('allow', 0)}, require_confirmation={oc.get('require_confirmation', 0)}, deny={oc.get('deny', 0)})"
     )
+    pc = pol.get("prohibition_compliance")
+    if isinstance(pc, dict) and pc.get("has_prohibitions"):
+        lines.append(
+            f"  Prohibitions:  status={pc.get('status')} blocked={pc.get('prohibited_attempts_blocked', 0)} "
+            f"violations={pc.get('prohibited_violations', 0)}"
+        )
     for pd in pol.get("decisions") or []:
         lines.append(
             f"    - {pd.get('outcome')} tool={pd.get('tool_id')} risk={pd.get('risk_level')} "
@@ -680,6 +738,14 @@ def format_execution_lifecycle_report(report: ExecutionLifecycleReport) -> str:
         f"failed_or_uncertain={ver.get('failed_or_uncertain_count', 0)}  "
         f"untrusted_claim={ver.get('has_unverified_assistant_claim', False)}"
     )
+
+    if report.child_executions:
+        lines.append(f"  Children:      {len(report.child_executions)} child execution(s)")
+        for ch in report.child_executions:
+            lines.append(
+                f"    - {ch.get('execution_id')} status={ch.get('status')} "
+                f"verification={ch.get('verification_status')}"
+            )
 
     # Recovery
     lines.append(
