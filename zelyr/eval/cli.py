@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -142,6 +143,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Output directory for distributed evaluation reports and transcripts.",
     )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["concurrent", "sequential", "comparison"],
+        default="concurrent",
+        help="Distributed execution mode (concurrent across workers, sequential baseline, or cross-model comparison).",
+    )
+    parser.add_argument(
+        "--suite",
+        type=str,
+        choices=["all", "s1_s10", "compat", "smoke"],
+        default="all",
+        help="Distributed evaluation task suite subset to execute.",
+    )
+    parser.add_argument(
+        "--max-tasks",
+        type=int,
+        default=None,
+        help="Optional cap on number of tasks selected for the distributed run.",
+    )
+    parser.add_argument(
+        "--no-unload",
+        action="store_true",
+        default=False,
+        help="Skip unloading eval-loaded models after completion (preloaded models are never unloaded).",
+    )
     return parser
 
 
@@ -221,9 +248,9 @@ def run_benchmark_cli(args_list: Optional[List[str]] = None) -> int:
         from zelyr.eval.distributed import (
             DistributedEvalRunner,
             ModelMetadata,
-            TaskAssignment,
             WorkerSnapshot,
             build_compatibility_suite,
+            build_matrix_assignments,
             build_standard_s_suite,
             load_worker_configs,
         )
@@ -249,13 +276,23 @@ def run_benchmark_cli(args_list: Optional[List[str]] = None) -> int:
         if args.base_url and not args.workers_config and workers:
             workers[0].endpoint = args.base_url.rstrip("/")
 
-        tasks = build_standard_s_suite() + build_compatibility_suite()
+        if args.suite == "s1_s10":
+            tasks = build_standard_s_suite()
+        elif args.suite == "compat":
+            tasks = build_compatibility_suite()
+        elif args.suite == "smoke":
+            tasks = [t for t in build_standard_s_suite() if t.task_id == "S1"]
+        else:
+            tasks = build_standard_s_suite() + build_compatibility_suite()
+
         if args.task:
             target_filter = args.task.strip()
             tasks = [t for t in tasks if target_filter == t.task_id or target_filter in t.task_id]
             if not tasks:
                 print(f"Error: No distributed tasks matched identifier '{args.task}'.", file=sys.stderr)
                 return 1
+        if args.max_tasks is not None and args.max_tasks > 0:
+            tasks = tasks[: args.max_tasks]
 
         offline_mock = bool(args.mock or not args.live)
 
@@ -266,6 +303,13 @@ def run_benchmark_cli(args_list: Optional[List[str]] = None) -> int:
                     digest="mock-digest",
                     size_bytes=1_000_000_000,
                     capabilities=["completion", "tools"],
+                    context_length=32768,
+                    compatibility={
+                        "workflow_compatible": True,
+                        "workflow": "react_tools",
+                        "overall_status": "available",
+                        "capabilities": {"native_tool_calling": {"status": "AVAILABLE"}},
+                    },
                 )
                 for m in (w.model_allowlist or [model])
             }
@@ -275,9 +319,18 @@ def run_benchmark_cli(args_list: Optional[List[str]] = None) -> int:
                 healthy=True,
                 version="mock",
                 installed_models=installed,
+                compatibility_by_model={m: dict(meta.compatibility) for m, meta in installed.items()},
+                resource_info={
+                    "host_ram_total_bytes": None,
+                    "host_ram_available_bytes": None,
+                    "unknown_metrics": ["host_ram_total", "host_ram_available"],
+                },
             )
 
         async def _mock_executor(w, m, task, ws, case):
+            t0 = time.time()
+            await asyncio.sleep(0.02)
+            t1 = time.time()
             return {
                 "exit_code": task.expected_exit_code if isinstance(task.expected_exit_code, int) else 0,
                 "cli_json_valid": True,
@@ -295,7 +348,22 @@ def run_benchmark_cli(args_list: Optional[List[str]] = None) -> int:
                     ],
                 },
                 "verifier_checks": [{"check": "mock", "target": task.task_id, "success": True}],
-                "telemetry": {"turn_metrics": []},
+                "telemetry": {
+                    "turn_metrics": [],
+                    "inference_intervals": [
+                        {
+                            "turn": 1,
+                            "model": m,
+                            "endpoint": w.endpoint,
+                            "start_ts": t0,
+                            "first_chunk_ts": round(t0 + 0.005, 6),
+                            "end_ts": t1,
+                            "duration_seconds": round(t1 - t0, 4),
+                            "first_chunk_latency_seconds": 0.005,
+                            "chunk_count": 1,
+                        }
+                    ],
+                },
             }
 
         runner = DistributedEvalRunner(
@@ -312,19 +380,25 @@ def run_benchmark_cli(args_list: Optional[List[str]] = None) -> int:
         )
         snaps = asyncio.run(runner.discover_workers())
 
-        assignments: List[TaskAssignment] = []
+        models_by_worker = {}
         for w in workers:
             snap = snaps.get(w.worker_id)
-            target_models = (
-                list(w.model_allowlist)
-                if w.model_allowlist
-                else (list(snap.installed_models.keys()) if snap and snap.healthy else [model])
-            )
-            for m in target_models:
-                for t in tasks:
-                    assignments.append(TaskAssignment(worker_id=w.worker_id, model=m, task=t))
+            if w.model_allowlist:
+                models_by_worker[w.worker_id] = list(w.model_allowlist)
+            elif snap and snap.healthy and snap.installed_models:
+                models_by_worker[w.worker_id] = sorted(snap.installed_models.keys())
+            else:
+                models_by_worker[w.worker_id] = [model]
 
-        run_out = asyncio.run(runner.execute_assignments(assignments, concurrent=True, unload_after=True))
+        assignments = build_matrix_assignments(
+            workers,
+            snaps,
+            tasks,
+            models_by_worker=models_by_worker,
+            mode=args.mode,
+        )
+
+        run_out = asyncio.run(runner.run_mode(args.mode, assignments, unload_after=not args.no_unload))
         paths = generate_distributed_reports(run_out, runner.output_dir)
         if not args.quiet:
             print(paths["distributed_summary_md"].read_text(encoding="utf-8"))

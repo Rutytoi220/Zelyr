@@ -91,11 +91,21 @@ def compute_model_metrics(results: List[DistributedTaskResult]) -> Dict[str, Any
                     if entry.get("size_vram") is not None:
                         ps_vram_sizes.append(int(entry["size_vram"]))
 
+    first_chunk_lats: List[float] = []
+    inf_interval_count = 0
+    for r in results:
+        ivs = getattr(r, "inference_intervals", None) or []
+        inf_interval_count += len(ivs)
+        for iv in ivs:
+            if isinstance(iv, dict) and iv.get("first_chunk_latency_seconds") is not None:
+                first_chunk_lats.append(float(iv["first_chunk_latency_seconds"]))
+
     avg_dur = round(statistics.mean(executed_durations), 3) if executed_durations else None
     med_dur = round(statistics.median(executed_durations), 3) if executed_durations else None
     p95_dur = _compute_p95(executed_durations)
     avg_wait = round(statistics.mean(queue_wait_vals), 3) if queue_wait_vals else None
     max_wait = round(max(queue_wait_vals), 3) if queue_wait_vals else None
+    avg_first_chunk = round(statistics.mean(first_chunk_lats), 3) if first_chunk_lats else None
 
     measured_usage = (
         {
@@ -133,6 +143,8 @@ def compute_model_metrics(results: List[DistributedTaskResult]) -> Dict[str, Any
         "p95_duration_s": p95_dur,
         "average_queued_wait_s": avg_wait,
         "max_queued_wait_s": max_wait,
+        "avg_first_chunk_latency_s": avg_first_chunk,
+        "inference_intervals_count": inf_interval_count,
         "context_usage_prompt_tokens_max": max(prompt_eval_vals) if prompt_eval_vals else None,
         "measured_token_usage": measured_usage,
         "estimated_token_usage": estimated_usage,
@@ -156,8 +168,25 @@ def generate_distributed_reports(
 
     results: List[DistributedTaskResult] = list(run_output.get("results") or [])
     scheduler_stats = dict(run_output.get("scheduler_stats") or {})
-    snapshots = dict(run_output.get("snapshots") or {})
+    raw_snapshots = dict(run_output.get("snapshots") or {})
+    snapshots: Dict[str, Any] = {}
+    for wid, snap in raw_snapshots.items():
+        if isinstance(snap, dict):
+            s_copy = dict(snap)
+            if s_copy.get("endpoint"):
+                s_copy["endpoint"] = _scrub_url_userinfo(str(s_copy["endpoint"]))
+            if s_copy.get("error"):
+                s_copy["error"] = _redact_secrets(str(s_copy["error"]))
+            snapshots[wid] = s_copy
+        else:
+            snapshots[wid] = snap
     cleanup = list(run_output.get("cleanup") or [])
+    execution_mode = str(
+        run_output.get("execution_mode")
+        or ("concurrent" if scheduler_stats.get("peak_simultaneous_workers", 0) > 1 else "sequential")
+    )
+    overlap_proof = dict(run_output.get("overlap_proof") or {})
+    cross_comparison = dict(run_output.get("comparison") or {})
 
     grouped: Dict[str, List[DistributedTaskResult]] = {}
     for r in results:
@@ -174,6 +203,8 @@ def generate_distributed_reports(
         metrics["model_digest"] = group[0].model_digest
         metrics["endpoint"] = _scrub_url_userinfo(group[0].endpoint)
         metrics["model_settings"] = group[0].model_settings
+        snap_compat = ((snapshots.get(wid) or {}).get("compatibility_by_model") or {}).get(mod)
+        metrics["compatibility"] = dict(getattr(group[0], "compatibility", None) or snap_compat or {})
         per_model_summary[key] = metrics
 
         safe_wid = _sanitize_artifact_segment(wid, "worker")
@@ -217,11 +248,33 @@ def generate_distributed_reports(
             rd["error_detail"] = _redact_secrets(str(rd["error_detail"]))
         serialized_results.append(rd)
 
+    worker_snapshots_summary: Dict[str, Any] = {}
+    for wid, snap in sorted(snapshots.items()):
+        if not isinstance(snap, dict):
+            continue
+        installed = snap.get("installed_models") or {}
+        res_info = dict(snap.get("resource_info") or {})
+        worker_snapshots_summary[wid] = {
+            "worker_id": wid,
+            "endpoint": _scrub_url_userinfo(str(snap.get("endpoint") or "")),
+            "healthy": bool(snap.get("healthy")),
+            "version": snap.get("version"),
+            "installed_models_count": len(installed) if isinstance(installed, dict) else 0,
+            "pre_loaded_models": list(snap.get("pre_loaded_models") or []),
+            "unknown_metrics": list(res_info.get("unknown_metrics") or []),
+            "compatibility_by_model": dict(snap.get("compatibility_by_model") or {}),
+            "error": _redact_secrets(str(snap["error"])) if snap.get("error") else None,
+        }
+
     report_doc = {
         "report_version": "1.4",
         "benchmark_version": "1.4",
         "title": title,
+        "execution_mode": execution_mode,
         "overall": overall_metrics,
+        "overlap_proof": overlap_proof,
+        "cross_model_comparison": cross_comparison,
+        "worker_snapshots_summary": worker_snapshots_summary,
         "per_model": per_model_summary,
         "results": serialized_results,
         "cleanup": cleanup,
@@ -235,9 +288,11 @@ def generate_distributed_reports(
     md_lines = [
         f"# {title}",
         "",
+        f"- **Execution mode:** `{execution_mode}`",
         f"- **Concurrency forms observed:** {', '.join(scheduler_stats.get('observed_concurrency_forms') or ['none'])}",
         f"- **Peak simultaneous active workers:** {scheduler_stats.get('peak_simultaneous_workers', 0)}",
         f"- **Peak concurrency by worker:** `{json.dumps(scheduler_stats.get('peak_concurrency_by_worker') or {})}`",
+        f"- **Verified cross-machine inference overlap:** {bool(overlap_proof.get('verified_cross_machine_inference_overlap', False))} ({overlap_proof.get('total_inference_intervals_recorded', 0)} inference interval(s) recorded)",
         f"- **Cleanup status:** {'PASS' if cleanup_ok else 'FAIL'} (errors={cleanup_error_count})",
         "",
         "## Per-Model Summary",
@@ -278,6 +333,58 @@ def generate_distributed_reports(
             f"| {r.worker_id} | `{r.model}` | {r.task_id} | **{r.status.value}** | {r.exit_code} | "
             f"{r.duration_seconds:.2f} | {len(r.tool_calls)} | {det} |"
         )
+
+    if worker_snapshots_summary:
+        md_lines.extend([
+            "",
+            "## Worker Discovery & Resource Telemetry",
+            "",
+            "| Worker | Endpoint | Healthy | Version | Models | Preloaded | Unknown Host Metrics |",
+            "|---|---|---|---|---:|---|---|",
+        ])
+        for wid, ws_info in sorted(worker_snapshots_summary.items()):
+            unk = ", ".join(ws_info.get("unknown_metrics") or []) or "none"
+            pre = ", ".join(ws_info.get("pre_loaded_models") or []) or "none"
+            md_lines.append(
+                f"| {wid} | `{ws_info.get('endpoint', '')}` | {ws_info.get('healthy')} | "
+                f"{ws_info.get('version') or 'N/A'} | {ws_info.get('installed_models_count', 0)} | {pre} | {unk} |"
+            )
+
+    if overlap_proof:
+        md_lines.extend([
+            "",
+            "## Cross-Machine Concurrency & Inference Overlap Proof",
+            "",
+            f"- **Verified cross-machine inference overlap:** {bool(overlap_proof.get('verified_cross_machine_inference_overlap', False))}",
+            f"- **Verified cross-machine task overlap:** {bool(overlap_proof.get('verified_cross_machine_task_overlap', False))}",
+        ])
+        inf_pairs = list(overlap_proof.get("cross_machine_inference_overlap_pairs") or [])
+        if inf_pairs:
+            md_lines.extend([
+                "",
+                "| Worker A | Model A | Task A | Worker B | Model B | Task B | Overlap (s) |",
+                "|---|---|---|---|---|---|---:|",
+            ])
+            for p in inf_pairs[:10]:
+                md_lines.append(
+                    f"| {p['worker_a']} | `{p['model_a']}` | {p['task_a']} | "
+                    f"{p['worker_b']} | `{p['model_b']}` | {p['task_b']} | {p['overlap_seconds']:.4f} |"
+                )
+
+    if cross_comparison:
+        fair = cross_comparison.get("fair_comparison", True)
+        diffs = list(cross_comparison.get("parity_differences") or [])
+        md_lines.extend([
+            "",
+            "## Cross-Model Comparison & Parity Check",
+            "",
+            f"- **Configuration parity across shared tasks:** {'EQUAL' if fair else 'DIFFERENCES DETECTED'}",
+        ])
+        for d in diffs:
+            md_lines.append(
+                f"- `{d['task_id']}`: num_ctx={d.get('num_ctx_values')}, "
+                f"read_timeout={d.get('read_timeout_values')}, clamped={d.get('context_clamped_targets')}"
+            )
 
     summary_md_path = out_dir / "distributed_summary.md"
     summary_md_path.write_text("\n".join(md_lines) + "\n", encoding="utf-8")

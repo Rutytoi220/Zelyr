@@ -1,8 +1,8 @@
 """Isolated subprocess worker for Zelyr distributed evaluation tasks.
 
 Executes a single benchmark task inside an isolated temporary workspace using
-real `_execute_headless_run`, `NativeOrchestrator`, tool execution, `TurnExecutionLedger`,
-and `OutcomeVerifier`.
+real `_execute_headless_run`, `NativeOrchestrator`, isolated `CentralExecutionLedger`,
+`ExecutionPolicyEngine`, `TurnExecutionLedger`, and `OutcomeVerifier`.
 """
 
 from __future__ import annotations
@@ -16,23 +16,61 @@ import os
 from pathlib import Path
 import shutil
 import sys
+import tempfile
+import time
 from typing import Any, Dict, List, Optional
 
 from zelyr.agents.native_orchestrator import NativeOrchestrator
 from zelyr.cli.main import _execute_headless_run
-from zelyr.config import ZelyrConfig
-from zelyr.engine.execution_ledger import parse_acceptance_criteria
+from zelyr.config import ZelyrConfig, get_config, initialize_directories, set_config
+from zelyr.engine.error_classifier import _redact_secrets
+from zelyr.engine.execution_ledger import (
+    CentralExecutionLedger,
+    get_default_central_ledger,
+    parse_acceptance_criteria,
+    reset_default_central_ledger,
+)
+from zelyr.engine.execution_policy import (
+    ConfirmationStore,
+    ExecutionPolicyConfig,
+    ExecutionPolicyEngine,
+    query_policy_history,
+    sanitize_policy_metadata,
+)
 from zelyr.engine.verifier import OutcomeVerifier
 
 
+_WORKER_ENV_KEYS = (
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "ZELYR_CONFIG_DIR",
+    "ZELYR_LEDGER_DB",
+    "AXIOM_CONFIG_DIR",
+    "ZELYR_TESTING",
+    "ZELYR_AUTOPILOT",
+    "QT_QPA_PLATFORM",
+    "ZELYR_OLLAMA_BASE_URL",
+    "AXIOM_OLLAMA_BASE_URL",
+    "ZELYR_NUM_CTX",
+    "AXIOM_NUM_CTX",
+    "ZELYR_OLLAMA_KEEP_ALIVE",
+    "AXIOM_OLLAMA_KEEP_ALIVE",
+    "ZELYR_OLLAMA_READ_TIMEOUT",
+    "AXIOM_OLLAMA_READ_TIMEOUT",
+)
+
+
 def _attach_stream_telemetry(orch: NativeOrchestrator) -> Dict[str, Any]:
-    """Capture Ollama terminal chunk timings, token counters, and thinking tokens non-invasively."""
+    """Capture Ollama terminal chunk timings, token counters, thinking tokens, and live inference intervals."""
     telemetry: Dict[str, Any] = {
         "turn_metrics": [],
+        "inference_intervals": [],
         "thinking_chunks": 0,
         "thinking_chars": 0,
     }
     orig_parser = orch._parse_stream_line_to_events
+    orig_stream_events = orch._stream_model_events
 
     def tapped_parser(line: str):
         stripped = (line or "").strip()
@@ -59,7 +97,42 @@ def _attach_stream_telemetry(orch: NativeOrchestrator) -> Dict[str, Any]:
                 pass
         return orig_parser(line)
 
+    async def tapped_stream_events(payload: dict, base_url: str, stream_provider: Optional[Any] = None):
+        turn_idx = len(telemetry["inference_intervals"]) + 1
+        start_wall = time.time()
+        start_mon = time.monotonic()
+        first_chunk_wall: Optional[float] = None
+        first_chunk_mon: Optional[float] = None
+        chunk_count = 0
+        interval_rec: Dict[str, Any] = {
+            "turn": turn_idx,
+            "model": str(payload.get("model") or ""),
+            "endpoint": _redact_secrets(str(base_url or "")),
+            "start_ts": start_wall,
+            "first_chunk_ts": None,
+            "end_ts": None,
+            "duration_seconds": 0.0,
+            "first_chunk_latency_seconds": None,
+            "chunk_count": 0,
+        }
+        try:
+            async for item in orig_stream_events(payload, base_url, stream_provider=stream_provider):
+                if first_chunk_wall is None:
+                    first_chunk_wall = time.time()
+                    first_chunk_mon = time.monotonic()
+                    interval_rec["first_chunk_ts"] = first_chunk_wall
+                    interval_rec["first_chunk_latency_seconds"] = round(first_chunk_mon - start_mon, 4)
+                chunk_count += 1
+                yield item
+        finally:
+            end_wall = time.time()
+            interval_rec["end_ts"] = end_wall
+            interval_rec["duration_seconds"] = round(max(0.0, time.monotonic() - start_mon), 4)
+            interval_rec["chunk_count"] = chunk_count
+            telemetry["inference_intervals"].append(interval_rec)
+
     orch._parse_stream_line_to_events = tapped_parser  # type: ignore[method-assign]
+    orch._stream_model_events = tapped_stream_events  # type: ignore[method-assign]
     return telemetry
 
 
@@ -75,6 +148,9 @@ async def _run_worker(spec: Dict[str, Any]) -> Dict[str, Any]:
             "files_on_disk": {},
             "verifier_checks": [],
             "execution_ledger": {},
+            "ledger_transitions": [],
+            "policy_decisions": [],
+            "checkpoint_snapshot": None,
             "messages_transcript": [],
             "telemetry": {},
         }
@@ -91,41 +167,118 @@ async def _run_worker(spec: Dict[str, Any]) -> Dict[str, Any]:
                 "files_on_disk": {},
                 "verifier_checks": [],
                 "execution_ledger": {},
+                "ledger_transitions": [],
+                "policy_decisions": [],
+                "checkpoint_snapshot": None,
                 "messages_transcript": [],
                 "telemetry": {},
             }
 
+    prev_env = {k: os.environ.get(k) for k in _WORKER_ENV_KEYS}
+    prev_cfg = get_config()
+    prev_cwd = Path.cwd()
+
+    ws = Path(spec["workspace_dir"]).resolve()
+    ws.mkdir(parents=True, exist_ok=True)
+
+    raw_state_dir = spec.get("isolated_state_dir")
+    owns_state_dir = False
+    if isinstance(raw_state_dir, str) and raw_state_dir.strip():
+        state_root = Path(raw_state_dir).resolve()
+        state_root.mkdir(parents=True, exist_ok=True)
+    else:
+        state_root = Path(tempfile.mkdtemp(prefix=f"zdist_wstate_{os.getpid()}_")).resolve()
+        owns_state_dir = True
+
+    isolated_home = state_root / "home"
+    isolated_cfg = state_root / "config"
+    isolated_xdg_cfg = state_root / "xdg_config"
+    isolated_xdg_data = state_root / "xdg_data"
+    for d in (isolated_home, isolated_cfg, isolated_xdg_cfg, isolated_xdg_data):
+        d.mkdir(parents=True, exist_ok=True)
+
+    eff_ctx = int(spec.get("num_ctx", 8192))
+    eff_keep_alive = str(spec.get("keep_alive", "5m"))
+    eff_read_timeout = float(spec.get("read_timeout", 1800.0))
+
+    # Clear inherited endpoint/context overrides so worker strictly hits its assigned endpoint.
+    for clear_key in (
+        "AXIOM_CONFIG_DIR",
+        "AXIOM_OLLAMA_BASE_URL",
+        "AXIOM_NUM_CTX",
+        "AXIOM_OLLAMA_KEEP_ALIVE",
+        "AXIOM_OLLAMA_READ_TIMEOUT",
+    ):
+        os.environ.pop(clear_key, None)
+
+    os.environ["HOME"] = str(isolated_home)
+    os.environ["XDG_CONFIG_HOME"] = str(isolated_xdg_cfg)
+    os.environ["XDG_DATA_HOME"] = str(isolated_xdg_data)
+    os.environ["ZELYR_CONFIG_DIR"] = str(isolated_cfg)
+    os.environ["ZELYR_LEDGER_DB"] = str(isolated_cfg / "worker_executions.db")
     os.environ["ZELYR_TESTING"] = "1"
     os.environ["ZELYR_AUTOPILOT"] = "1"
     os.environ["QT_QPA_PLATFORM"] = "offscreen"
+    os.environ["ZELYR_OLLAMA_BASE_URL"] = spec["endpoint"]
+    os.environ["ZELYR_NUM_CTX"] = str(eff_ctx)
+    os.environ["ZELYR_OLLAMA_KEEP_ALIVE"] = eff_keep_alive
+    os.environ["ZELYR_OLLAMA_READ_TIMEOUT"] = str(eff_read_timeout)
 
-    prev_cwd = Path.cwd()
-    ws = Path(spec["workspace_dir"]).resolve()
-    ws.mkdir(parents=True, exist_ok=True)
-    os.chdir(ws)
-
+    central_ledger: Optional[CentralExecutionLedger] = None
     try:
+        initialize_directories(isolated_cfg)
+        reset_default_central_ledger()
+        os.chdir(ws)
+
+        policy_mode = str(spec.get("policy_mode") or "basic").strip().lower()
         cfg = ZelyrConfig(
             ollama_base_url=spec["endpoint"],
-            ollama_num_ctx=int(spec.get("num_ctx", 8192)),
-            ollama_keep_alive=spec.get("keep_alive", "5m"),
-            ollama_read_timeout=float(spec.get("read_timeout", 1800.0)),
+            ollama_num_ctx=eff_ctx,
+            ollama_keep_alive=eff_keep_alive,
+            ollama_read_timeout=eff_read_timeout,
             ollama_model=spec["model"],
+            execution_policy_mode=policy_mode,
         )
+        set_config(cfg)
+
+        central_ledger = get_default_central_ledger(db_path=isolated_cfg / "worker_executions.db")
+        conf_store = ConfirmationStore(db_path=isolated_cfg / "worker_confirmations.db")
+        pol_cfg = ExecutionPolicyConfig(
+            policy_mode=policy_mode,
+            resource_restrictions={
+                "enforce_workspace_containment": True,
+                "workspace_root": str(ws),
+            },
+        )
+        pol_engine = ExecutionPolicyEngine(config=pol_cfg, confirmation_store=conf_store)
+
         raw_allowed = spec.get("allowed_tools")
         allowed_tools = [str(t) for t in raw_allowed] if isinstance(raw_allowed, list) else None
         raw_ring = spec.get("caller_ring")
         caller_ring = int(raw_ring) if raw_ring is not None else None
-        orch = NativeOrchestrator(config=cfg, caller_ring=caller_ring, allowed_tools=allowed_tools)
+
+        orch = NativeOrchestrator(
+            config=cfg,
+            caller_ring=caller_ring,
+            allowed_tools=allowed_tools,
+            central_ledger=central_ledger,
+        )
+        orch.workspace_root = ws
+        orch.execution_policy_config = pol_cfg
+        orch.execution_policy_engine = pol_engine
+        orch.confirmation_store = conf_store
         orch.max_steps = int(spec.get("max_steps", 8))
         orch.max_replanning_attempts = int(spec.get("max_replanning", 2))
         telemetry = _attach_stream_telemetry(orch)
 
         model_options = dict(spec.get("model_options") or {})
+        spec_think = spec.get("think") if "think" in spec else None
         captured_payloads: List[Dict[str, Any]] = []
         orig_generate_stream = orch.generate_stream
 
         async def instrumented_generate_stream(payload: dict, *args: Any, **kwargs: Any):
+            if spec_think is not None and "think" not in payload:
+                payload["think"] = bool(spec_think)
             if model_options:
                 opts = dict(payload.get("options") or {})
                 opts.update(model_options)
@@ -154,12 +307,12 @@ async def _run_worker(spec: Dict[str, Any]) -> Dict[str, Any]:
                     verify_spec=spec.get("verify_spec"),
                 )
         except Exception as exc:
-            worker_error = f"{type(exc).__name__}: {exc}"
+            worker_error = f"{type(exc).__name__}: {_redact_secrets(str(exc))}"
             stderr_buf.write(f"\nWorker exception: {worker_error}\n")
             exit_code = 1
 
         raw_stdout = stdout_buf.getvalue()
-        raw_stderr = stderr_buf.getvalue()
+        raw_stderr = _redact_secrets(stderr_buf.getvalue())
 
         cli_json: Dict[str, Any] = {}
         cli_json_valid = False
@@ -195,11 +348,57 @@ async def _run_worker(spec: Dict[str, Any]) -> Dict[str, Any]:
                 for item in parse_acceptance_criteria(verify_spec)
             ]
 
+        turn_ledger = getattr(orch, "current_ledger", None)
         ledger_dict = (
-            orch.current_ledger.to_dict()
-            if getattr(orch, "current_ledger", None) is not None
+            turn_ledger.to_dict()
+            if turn_ledger is not None
             else cli_json.get("execution_ledger", {})
         )
+        exec_id = getattr(turn_ledger, "_execution_id", None) if turn_ledger is not None else None
+        ledger_transitions: List[Dict[str, Any]] = []
+        policy_decisions: List[Dict[str, Any]] = []
+        checkpoint_snapshot: Optional[Dict[str, Any]] = None
+        if central_ledger is not None:
+            if exec_id:
+                try:
+                    ledger_transitions = [
+                        {
+                            "sequence_number": ev.sequence_number,
+                            "event_type": ev.event_type,
+                            "tool_id": ev.tool_id,
+                            "correlation_id": ev.correlation_id,
+                            "status": ev.status,
+                            "timestamp": ev.timestamp,
+                            "error_type": ev.error_type,
+                        }
+                        for ev in central_ledger.get_events(exec_id)
+                    ]
+                except Exception:
+                    ledger_transitions = []
+            try:
+                hist = query_policy_history(central_ledger, execution_id=exec_id, limit=200)
+                entries = list(hist.get("entries") or [])
+                if not entries and exec_id:
+                    hist_all = query_policy_history(central_ledger, execution_id=None, limit=200)
+                    entries = list(hist_all.get("entries") or [])
+                policy_decisions = entries
+            except Exception:
+                policy_decisions = []
+            if exec_id:
+                try:
+                    raw_cp = central_ledger.get_latest_checkpoint(exec_id, verify_integrity=False)
+                    if isinstance(raw_cp, dict):
+                        checkpoint_snapshot = sanitize_policy_metadata({
+                            "checkpoint_id": raw_cp.get("checkpoint_id"),
+                            "checkpoint_seq": raw_cp.get("checkpoint_seq"),
+                            "status": raw_cp.get("status"),
+                            "verification_status": raw_cp.get("verification_status"),
+                            "last_event_seq": raw_cp.get("last_event_seq"),
+                            "verified_targets": raw_cp.get("verified_targets"),
+                        })
+                except Exception:
+                    checkpoint_snapshot = None
+
         messages_transcript = captured_payloads[0].get("messages", []) if captured_payloads else []
 
         return {
@@ -211,14 +410,37 @@ async def _run_worker(spec: Dict[str, Any]) -> Dict[str, Any]:
             "files_on_disk": files_on_disk,
             "verifier_checks": verifier_checks,
             "execution_ledger": ledger_dict,
+            "ledger_transitions": ledger_transitions,
+            "policy_decisions": policy_decisions,
+            "checkpoint_snapshot": checkpoint_snapshot,
             "messages_transcript": messages_transcript,
             "telemetry": telemetry,
         }
     finally:
+        if central_ledger is not None:
+            try:
+                central_ledger.close()
+            except Exception:
+                pass
+        try:
+            reset_default_central_ledger()
+        except Exception:
+            pass
+        try:
+            set_config(prev_cfg)
+        except Exception:
+            pass
+        for k, old_v in prev_env.items():
+            if old_v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old_v
         try:
             os.chdir(prev_cwd)
         except Exception:
             pass
+        if owns_state_dir:
+            shutil.rmtree(state_root, ignore_errors=True)
 
 
 def main() -> None:
