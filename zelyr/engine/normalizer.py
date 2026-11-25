@@ -13,6 +13,7 @@ import json
 import math
 import os
 import re
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 APPROVED_CANONICAL_ALIASES: Dict[str, Dict[str, str]] = {
@@ -188,29 +189,34 @@ def _is_sensitive_param_path(param_path: str) -> bool:
     return False
 
 
-def _redact_sensitive_text(text: str) -> str:
-    """Scrub secret tokens, credentials, and sensitive env values from diagnostic text."""
-    result = str(text)
-    for pattern, replacement in _TEXT_SECRET_PATTERNS:
-        result = pattern.sub(replacement, result)
+_NON_SECRET_ENV_SUFFIXES: tuple[str, ...] = (
+    "_SOCK",
+    "_SOCKET",
+    "_DIR",
+    "_DIRECTORY",
+    "_PATH",
+    "_FILE",
+    "_PID",
+    "_UID",
+    "_GID",
+    "_PORT",
+    "_HOST",
+    "_URL",
+    "_URI",
+)
+_NORM_ENV_CACHE_LOCK = threading.RLock()
+_NORM_ENV_CACHE_DATA: Optional[Dict[Any, Any]] = None
+_NORM_ENV_CACHE_SECRETS: tuple[str, ...] = ()
 
-    # Scrub non-trivial secret values currently present in environment variables.
+
+def _get_sensitive_env_secrets() -> tuple[str, ...]:
+    global _NORM_ENV_CACHE_DATA, _NORM_ENV_CACHE_SECRETS
+    env_data = getattr(os.environ, "_data", None)
+    if isinstance(env_data, dict):
+        with _NORM_ENV_CACHE_LOCK:
+            if _NORM_ENV_CACHE_DATA is not None and env_data == _NORM_ENV_CACHE_DATA:
+                return _NORM_ENV_CACHE_SECRETS
     env_secrets: List[str] = []
-    _NON_SECRET_ENV_SUFFIXES = (
-        "_SOCK",
-        "_SOCKET",
-        "_DIR",
-        "_DIRECTORY",
-        "_PATH",
-        "_FILE",
-        "_PID",
-        "_UID",
-        "_GID",
-        "_PORT",
-        "_HOST",
-        "_URL",
-        "_URI",
-    )
     for k, v in os.environ.items():
         if not v or len(v) < 6:
             continue
@@ -220,11 +226,25 @@ def _redact_sensitive_text(text: str) -> str:
         if any(marker in k_up for marker in _ENV_SECRET_KEY_MARKERS):
             if v.strip().lower() not in _BENIGN_ENV_VALUES:
                 env_secrets.append(v)
-    if env_secrets:
-        env_secrets.sort(key=len, reverse=True)
-        for secret_val in env_secrets:
-            if secret_val in result:
-                result = result.replace(secret_val, "[REDACTED:env_secret]")
+    env_secrets.sort(key=len, reverse=True)
+    result = tuple(env_secrets)
+    if isinstance(env_data, dict):
+        with _NORM_ENV_CACHE_LOCK:
+            _NORM_ENV_CACHE_DATA = env_data.copy()
+            _NORM_ENV_CACHE_SECRETS = result
+    return result
+
+
+def _redact_sensitive_text(text: str) -> str:
+    """Scrub secret tokens, credentials, and sensitive env values from diagnostic text."""
+    result = str(text)
+    for pattern, replacement in _TEXT_SECRET_PATTERNS:
+        result = pattern.sub(replacement, result)
+
+    # Scrub non-trivial secret values currently present in environment variables.
+    for secret_val in _get_sensitive_env_secrets():
+        if secret_val in result:
+            result = result.replace(secret_val, "[REDACTED:env_secret]")
 
     return result
 

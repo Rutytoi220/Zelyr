@@ -314,7 +314,9 @@ class ModelMatrixEvaluator:
         try:
             from unittest.mock import patch
             with patch("zelyr.agents.native_orchestrator.execute_tool", side_effect=mock_execute), \
-                 patch.object(orch, "get_active_window_context", return_value=None):
+                 patch.object(orch, "get_active_window_context", return_value=None), \
+                 patch.object(orch, "get_active_window", return_value=None), \
+                 patch.object(NativeOrchestrator, "get_active_window_sync", return_value=None):
                 async for chunk in orch.generate_stream(payload, stream_provider=mock_stream):
                     choices = chunk.get("choices", [])
                     if choices and choices[0].get("delta", {}).get("content"):

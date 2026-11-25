@@ -11,7 +11,9 @@ from __future__ import annotations
 import asyncio
 from dataclasses import asdict, dataclass, field
 import enum
+import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -19,7 +21,8 @@ import shutil
 import sys
 import tempfile
 import time
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+import urllib.parse
 
 import httpx
 
@@ -38,6 +41,33 @@ def _sanitize_artifact_segment(value: str, fallback: str = "item") -> str:
 def _scrub_url_userinfo(url: str) -> str:
     """Remove embedded userinfo credentials from URLs before serializing reports."""
     return _redact_secrets(str(url or ""))
+
+
+def _normalize_endpoint(url: str) -> str:
+    """Normalize HTTP/HTTPS worker endpoints canonically for distinct-host evidence checks."""
+    cleaned = _scrub_url_userinfo(url).strip()
+    if not cleaned:
+        return ""
+    try:
+        parts = urllib.parse.urlsplit(cleaned)
+    except Exception:
+        return cleaned.rstrip("/").lower()
+    scheme = (parts.scheme or "http").lower()
+    host = (parts.hostname or "").lower()
+    if host in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
+        host = "127.0.0.1"
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    if port is not None and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
+        netloc = f"{host}:{port}"
+    else:
+        netloc = host
+    path = (parts.path or "").rstrip("/")
+    return f"{scheme}://{netloc}{path}" if netloc else cleaned.rstrip("/").lower()
 
 
 class DistributedTaskStatus(str, enum.Enum):
@@ -202,6 +232,7 @@ class DistributedTaskSpec:
     model_options: Dict[str, Any] = field(default_factory=dict)
     allowed_tools: Optional[List[str]] = None
     caller_ring: Optional[int] = None
+    fixture_version: str = "1.4"
 
     def __post_init__(self) -> None:
         if not isinstance(self.task_id, str) or not self.task_id.strip():
@@ -268,11 +299,64 @@ class DistributedTaskResult:
     ledger_transitions: List[Dict[str, Any]] = field(default_factory=list)
     policy_decisions: List[Dict[str, Any]] = field(default_factory=list)
     compatibility: Dict[str, Any] = field(default_factory=dict)
+    execution_id: Optional[str] = None
+    failure_category: Optional[str] = None
+    uncertain_side_effects: bool = False
+    mutated_targets_uncertain: List[str] = field(default_factory=list)
+    fixture_version: str = "1.4"
+    configuration_fingerprint: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
         d["status"] = self.status.value
         return d
+
+
+def compute_configuration_fingerprint(
+    *,
+    model: str,
+    model_digest: str,
+    model_settings: Mapping[str, Any] | Dict[str, Any],
+    task: DistributedTaskSpec,
+    worker: Optional[WorkerConfig] = None,
+    model_meta: Optional[ModelMetadata] = None,
+    compatibility: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Compute a deterministic canonical configuration fingerprint for parity checks."""
+    caps = list(model_meta.capabilities) if model_meta else []
+    native_status = str(
+        (((compatibility or {}).get("capabilities") or {}).get("native_tool_calling") or {}).get("status") or ""
+    ).upper()
+    if "tools" in caps or native_status == "AVAILABLE":
+        tool_protocol = "native_tools"
+    elif native_status == "UNAVAILABLE":
+        tool_protocol = "fallback_text"
+    else:
+        tool_protocol = "unknown"
+
+    payload = {
+        "model": model,
+        "model_digest": model_digest,
+        "family": model_meta.family if model_meta else "",
+        "parameter_size": model_meta.parameter_size if model_meta else "",
+        "quantization_level": model_meta.quantization_level if model_meta else "",
+        "capabilities": sorted(caps),
+        "tool_protocol": tool_protocol,
+        "num_ctx": model_settings.get("num_ctx"),
+        "configured_num_ctx": model_settings.get("configured_num_ctx"),
+        "context_clamped_to_model": bool(model_settings.get("context_clamped_to_model")),
+        "think": model_settings.get("think", "default"),
+        "model_options": {**dict(task.model_options or {}), **dict(model_settings.get("model_options") or {})},
+        "read_timeout": model_settings.get("read_timeout"),
+        "keep_alive": model_settings.get("keep_alive"),
+        "policy_mode": worker.policy_mode if worker else "basic",
+        "allowed_tools": worker.allowed_tools if worker and worker.allowed_tools is not None else task.allowed_tools,
+        "caller_ring": worker.caller_ring if worker and worker.caller_ring is not None else task.caller_ring,
+        "max_steps": task.max_steps,
+        "max_replanning": task.max_replanning,
+    }
+    raw = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
 def load_worker_configs(
@@ -555,20 +639,32 @@ class ResourceAwareScheduler:
         if wait_seconds > prev:
             self.max_queued_wait_by_worker[worker_id] = round(wait_seconds, 3)
 
-    def preflight_assignment(self, assignment: TaskAssignment) -> Tuple[Optional[DistributedTaskStatus], Optional[str]]:
-        """Validate worker health, allowlist, model presence, capabilities, and static budget."""
+    def preflight_assignment_detail(
+        self,
+        assignment: TaskAssignment,
+    ) -> Tuple[Optional[DistributedTaskStatus], Optional[str], Optional[str]]:
+        """Validate worker health, allowlist, model presence, capabilities, and budget with granular category."""
         worker = self.workers.get(assignment.worker_id)
         if worker is None:
-            return DistributedTaskStatus.UNAVAILABLE, f"Unknown worker_id '{assignment.worker_id}' (no silent reroute)."
+            return (
+                DistributedTaskStatus.UNAVAILABLE,
+                "WORKER_UNAVAILABLE",
+                f"Unknown worker_id '{assignment.worker_id}' (no silent reroute).",
+            )
 
         snap = self.snapshots.get(assignment.worker_id)
         if snap is None or not snap.healthy:
             detail = snap.error if snap else "No health snapshot"
-            return DistributedTaskStatus.UNAVAILABLE, f"Worker '{assignment.worker_id}' unavailable: {detail}"
+            return (
+                DistributedTaskStatus.UNAVAILABLE,
+                "WORKER_UNAVAILABLE",
+                f"Worker '{assignment.worker_id}' unavailable: {detail}",
+            )
 
         if worker.model_allowlist and assignment.model not in worker.model_allowlist:
             return (
                 DistributedTaskStatus.UNAVAILABLE,
+                "MODEL_UNAVAILABLE",
                 f"Model '{assignment.model}' is not in worker '{worker.worker_id}' allowlist {worker.model_allowlist}.",
             )
 
@@ -576,6 +672,7 @@ class ResourceAwareScheduler:
         if meta is None:
             return (
                 DistributedTaskStatus.UNAVAILABLE,
+                "MODEL_UNAVAILABLE",
                 f"Model '{assignment.model}' is not installed on worker '{worker.worker_id}'.",
             )
 
@@ -584,6 +681,7 @@ class ResourceAwareScheduler:
             if missing_caps:
                 return (
                     DistributedTaskStatus.UNSUPPORTED,
+                    "UNSUPPORTED",
                     f"Model '{assignment.model}' lacks required capabilities {missing_caps} (has {meta.capabilities}).",
                 )
         elif (
@@ -599,6 +697,7 @@ class ResourceAwareScheduler:
         ):
             return (
                 DistributedTaskStatus.UNSUPPORTED,
+                "UNSUPPORTED",
                 f"Model '{assignment.model}' compatibility diagnostics reported native tool calling unavailable.",
             )
 
@@ -607,10 +706,16 @@ class ResourceAwareScheduler:
             if est_needed > worker.memory_budget_bytes:
                 return (
                     DistributedTaskStatus.UNAVAILABLE,
+                    "RESOURCE_LIMIT",
                     f"Model '{assignment.model}' est. footprint {est_needed}B exceeds worker budget {worker.memory_budget_bytes}B.",
                 )
 
-        return None, None
+        return None, None, None
+
+    def preflight_assignment(self, assignment: TaskAssignment) -> Tuple[Optional[DistributedTaskStatus], Optional[str]]:
+        """Validate worker health, allowlist, model presence, capabilities, and static budget."""
+        status, _cat, reason = self.preflight_assignment_detail(assignment)
+        return status, reason
 
     def _would_exceed_budget(self, worker: WorkerConfig, snap: WorkerSnapshot, incoming_model: str, current_ps: List[Dict[str, Any]]) -> bool:
         """Check if launching `incoming_model` concurrently violates worker memory budget."""
@@ -1072,6 +1177,8 @@ async def default_subprocess_executor(
     spec_file = isolated_state_dir / "_worker_spec.json"
     out_file = isolated_state_dir / "_worker_out.json"
     spec_payload = {
+        "worker_id": worker.worker_id,
+        "task_id": task.task_id,
         "endpoint": worker.endpoint,
         "model": model,
         "num_ctx": settings["num_ctx"],
@@ -1295,6 +1402,108 @@ def _detect_prohibited_mutation_violation(
     return None
 
 
+_MUTATING_ACTIONS = frozenset({"write", "append", "delete", "edit", "rollback", "create", "remove", "mkdir"})
+
+
+def _extract_uncertain_mutating_targets(raw_out: Any) -> List[str]:
+    """Identify mutating tool calls whose side effects remain ambiguous on timeout or cancellation."""
+    if not isinstance(raw_out, dict):
+        return []
+    ledger = raw_out.get("execution_ledger")
+    if not isinstance(ledger, dict):
+        return []
+    records = ledger.get("records")
+    if not isinstance(records, list):
+        return []
+    hits: List[str] = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        state = str(rec.get("state") or "").lower()
+        if state not in ("dispatched", "started", "executed", "success", "verified", "partially_completed", "unknown", "observed"):
+            continue
+        tool = str(rec.get("tool_name") or "").strip()
+        args = rec.get("arguments") if isinstance(rec.get("arguments"), dict) else {}
+        action = str(args.get("action") or "").lower()
+        is_mutating = False
+        if tool == "manage_workspace_file" and action in _MUTATING_ACTIONS:
+            is_mutating = True
+        elif tool in ("execute_command", "run_command", "shell", "apply_patch", "write_file", "edit_file"):
+            is_mutating = True
+        elif action in _MUTATING_ACTIONS:
+            is_mutating = True
+        if is_mutating:
+            target = str(args.get("path") or args.get("target") or args.get("command") or tool)
+            if target and target not in hits:
+                hits.append(_redact_secrets(target)[:120])
+    return hits
+
+
+def _classify_task_outcome_detail(
+    assign: TaskAssignment,
+    case: Dict[str, Any],
+    raw_out: Any,
+) -> Dict[str, Any]:
+    """Classify outcome with fine-grained failure taxonomy and mutating-action uncertainty."""
+    raw_err = str(raw_out.get("raw_stderr") or raw_out.get("worker_error") or "") if isinstance(raw_out, dict) else ""
+    mut_targets = _extract_uncertain_mutating_targets(raw_out)
+
+    if isinstance(raw_out, dict) and raw_out.get("cancelled") is True:
+        return {
+            "status": DistributedTaskStatus.CANCELLED,
+            "error_classification": "CANCELLED",
+            "failure_category": "CANCELLED",
+            "error_detail": str(raw_out.get("worker_error") or "Worker task cancelled before completion."),
+            "uncertain_side_effects": bool(mut_targets),
+            "mutated_targets_uncertain": mut_targets,
+        }
+
+    status, err_cls, err_detail = _classify_task_outcome(assign, case, raw_out)
+    uncertain = bool(mut_targets) and status in (
+        DistributedTaskStatus.TIMEOUT,
+        DistributedTaskStatus.CANCELLED,
+        DistributedTaskStatus.ERROR,
+    )
+    if uncertain and status == DistributedTaskStatus.TIMEOUT and err_detail:
+        err_detail = f"{err_detail} (uncertain side effects on mutating targets: {', '.join(mut_targets)})"
+
+    low_err = f"{raw_err}\n{err_detail or ''}".lower()
+    if status == DistributedTaskStatus.PASS:
+        f_cat = "PASS"
+    elif status == DistributedTaskStatus.FAIL:
+        f_cat = "FAIL"
+    elif status == DistributedTaskStatus.TIMEOUT:
+        f_cat = "TIMEOUT"
+    elif status == DistributedTaskStatus.CANCELLED:
+        f_cat = "CANCELLED"
+    elif status == DistributedTaskStatus.UNVERIFIED:
+        f_cat = "UNVERIFIED"
+    elif status == DistributedTaskStatus.UNSUPPORTED:
+        f_cat = "UNSUPPORTED"
+    elif status == DistributedTaskStatus.FALSE_SUCCESS:
+        f_cat = "FALSE_SUCCESS"
+    elif status == DistributedTaskStatus.ERROR:
+        if any(tok in low_err for tok in ("out of memory", "oom", "cuda error", "context length exceeded", "insufficient memory", "vram")):
+            f_cat = "RESOURCE_LIMIT"
+            if err_cls == "COMMUNICATION_OR_WORKER_ERROR":
+                err_cls = "RESOURCE_LIMIT"
+        elif any(tok in low_err for tok in ("connecterror", "connecttimeout", "connection refused", "name or service not known", "remoteprotocolerror", "unreachable", "connection error")):
+            f_cat = "WORKER_UNAVAILABLE"
+        else:
+            f_cat = "ERROR"
+    else:
+        f_cat = status.value
+
+    return {
+        "status": status,
+        "error_classification": err_cls,
+        "failure_category": f_cat,
+        "error_detail": err_detail,
+        "uncertain_side_effects": uncertain,
+        "mutated_targets_uncertain": mut_targets if uncertain else [],
+    }
+
+
 def _classify_task_outcome(
     assign: TaskAssignment,
     case: Dict[str, Any],
@@ -1316,7 +1525,11 @@ def _classify_task_outcome(
             f"Task exceeded timeout {assign.task.timeout_seconds}s",
         )
 
-    if "ReadTimeout" in raw_err or "Timeout" in raw_err:
+    is_connect_failure = any(
+        tok in raw_err
+        for tok in ("ConnectTimeout", "ConnectError", "ConnectionRefused", "Connection refused", "Name or service not known", "unreachable")
+    )
+    if ("ReadTimeout" in raw_err or "Timeout" in raw_err) and not is_connect_failure:
         return (
             DistributedTaskStatus.TIMEOUT,
             "HTTP_READ_TIMEOUT",
@@ -1471,11 +1684,32 @@ def _classify_task_outcome(
     )
 
 
+def _validate_interval(start_val: Any, end_val: Any) -> Tuple[bool, Optional[str]]:
+    """Reject missing, boolean, non-finite, non-positive, or inverted/zero-duration timestamps."""
+    if isinstance(start_val, bool) or isinstance(end_val, bool):
+        return False, "boolean_timestamp"
+    if not isinstance(start_val, (int, float)) or not isinstance(end_val, (int, float)):
+        return False, "non_numeric_timestamp"
+    s = float(start_val)
+    e = float(end_val)
+    if not (math.isfinite(s) and math.isfinite(e)):
+        return False, "non_finite_timestamp"
+    if s <= 0.0 or e <= 0.0:
+        return False, "non_positive_timestamp"
+    if e < s:
+        return False, "negative_duration"
+    if e == s:
+        return False, "zero_duration"
+    return True, None
+
+
 def compute_interval_overlaps(results: List[DistributedTaskResult]) -> Dict[str, Any]:
     """Verify actual overlapping model inference and task execution intervals across workers.
 
-    Distinct-worker/distinct-endpoint overlaps establish empirically that models executed
-    concurrently across independent machines rather than merely queueing sequentially.
+    Strictly validates timestamps, enforces distinct worker IDs and distinct normalized
+    endpoints, rejects clock anomalies and boundary-touching windows, and classifies
+    evidence explicitly as verified_cross_machine_inference_overlap,
+    verified_cross_machine_task_overlap_only, no_overlap_observed, or insufficient_evidence.
     """
     skipped_statuses = {
         DistributedTaskStatus.UNAVAILABLE,
@@ -1484,74 +1718,166 @@ def compute_interval_overlaps(results: List[DistributedTaskResult]) -> Dict[str,
     }
     inf_records: List[Dict[str, Any]] = []
     task_records: List[Dict[str, Any]] = []
+    rejected_inf_count = 0
+    clock_anomalies: List[Dict[str, Any]] = []
+    validation_errors: List[Dict[str, Any]] = []
+    valid_inf_worker_endpoints: Set[Tuple[str, str]] = set()
+    valid_task_worker_endpoints: Set[Tuple[str, str]] = set()
 
     for r in results:
         if r.status in skipped_statuses:
             continue
-        if r.end_timestamp > r.start_timestamp:
+        assign_key = r.assignment_id or f"{r.worker_id}::{r.model}::{r.task_id}::trial{r.trial_index}"
+        norm_task_ep = _normalize_endpoint(r.endpoint)
+        t_ok, t_err = _validate_interval(r.start_timestamp, r.end_timestamp)
+        if t_ok:
             task_records.append({
                 "worker_id": r.worker_id,
-                "endpoint": r.endpoint,
+                "endpoint": _scrub_url_userinfo(r.endpoint),
+                "norm_endpoint": norm_task_ep,
+                "execution_id": r.execution_id or "",
+                "assignment_key": assign_key,
                 "model": r.model,
                 "task_id": r.task_id,
                 "start_ts": float(r.start_timestamp),
                 "end_ts": float(r.end_timestamp),
             })
+            if norm_task_ep:
+                valid_task_worker_endpoints.add((r.worker_id, norm_task_ep))
+        elif t_err == "negative_duration":
+            clock_anomalies.append({
+                "kind": "task_window",
+                "worker_id": r.worker_id,
+                "task_id": r.task_id,
+                "reason": t_err,
+            })
+
         for iv in (r.inference_intervals or []):
             if not isinstance(iv, dict):
+                rejected_inf_count += 1
+                validation_errors.append({
+                    "worker_id": r.worker_id,
+                    "task_id": r.task_id,
+                    "reason": "non_dict_interval",
+                })
                 continue
             s = iv.get("start_ts")
             e = iv.get("end_ts")
-            if isinstance(s, (int, float)) and isinstance(e, (int, float)) and float(e) > float(s):
-                inf_records.append({
+            iv_ok, iv_err = _validate_interval(s, e)
+            if not iv_ok:
+                rejected_inf_count += 1
+                entry = {
                     "worker_id": r.worker_id,
-                    "endpoint": str(iv.get("endpoint") or r.endpoint),
-                    "model": str(iv.get("model") or r.model),
                     "task_id": r.task_id,
                     "turn": iv.get("turn"),
-                    "start_ts": float(s),
-                    "end_ts": float(e),
+                    "reason": iv_err,
+                }
+                if iv_err in ("negative_duration", "non_positive_timestamp", "non_finite_timestamp"):
+                    clock_anomalies.append({"kind": "inference_interval", **entry})
+                validation_errors.append(entry)
+                continue
+            iv_ep = str(iv.get("endpoint") or r.endpoint)
+            norm_iv_ep = _normalize_endpoint(iv_ep)
+            if not norm_iv_ep:
+                rejected_inf_count += 1
+                validation_errors.append({
+                    "worker_id": r.worker_id,
+                    "task_id": r.task_id,
+                    "turn": iv.get("turn"),
+                    "reason": "missing_endpoint",
                 })
+                continue
+            inf_records.append({
+                "worker_id": r.worker_id,
+                "endpoint": _scrub_url_userinfo(iv_ep),
+                "norm_endpoint": norm_iv_ep,
+                "execution_id": r.execution_id or "",
+                "assignment_key": assign_key,
+                "model": str(iv.get("model") or r.model),
+                "task_id": r.task_id,
+                "turn": iv.get("turn"),
+                "start_ts": float(s),
+                "end_ts": float(e),
+            })
+            valid_inf_worker_endpoints.add((r.worker_id, norm_iv_ep))
 
-    def _find_overlaps(items: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    def _find_overlaps(items: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int]:
         cross_pairs: List[Dict[str, Any]] = []
         same_pairs: List[Dict[str, Any]] = []
+        rejected_same_ep = 0
         for i in range(len(items)):
             a = items[i]
             for j in range(i + 1, len(items)):
                 b = items[j]
+                if a["assignment_key"] == b["assignment_key"]:
+                    continue
+                if a["execution_id"] and b["execution_id"] and a["execution_id"] == b["execution_id"]:
+                    continue
                 ov_start = max(a["start_ts"], b["start_ts"])
                 ov_end = min(a["end_ts"], b["end_ts"])
+                # Strictly positive overlap required (exact boundary touch a_end == b_start is not overlap).
                 if ov_end <= ov_start:
                     continue
+                same_ep = bool(a["norm_endpoint"] == b["norm_endpoint"])
                 pair_info = {
                     "worker_a": a["worker_id"],
                     "endpoint_a": a["endpoint"],
+                    "norm_endpoint_a": a["norm_endpoint"],
                     "model_a": a["model"],
                     "task_a": a["task_id"],
                     "worker_b": b["worker_id"],
                     "endpoint_b": b["endpoint"],
+                    "norm_endpoint_b": b["norm_endpoint"],
                     "model_b": b["model"],
                     "task_b": b["task_id"],
                     "overlap_seconds": round(ov_end - ov_start, 4),
                     "overlap_window": [round(ov_start, 4), round(ov_end, 4)],
-                    "same_endpoint": bool(a["endpoint"] and b["endpoint"] and a["endpoint"] == b["endpoint"]),
+                    "same_endpoint": same_ep,
                 }
                 if a["worker_id"] != b["worker_id"]:
+                    if same_ep:
+                        rejected_same_ep += 1
                     cross_pairs.append(pair_info)
                 else:
                     same_pairs.append(pair_info)
-        return cross_pairs, same_pairs
+        return cross_pairs, same_pairs, rejected_same_ep
 
-    cross_inf, same_inf = _find_overlaps(inf_records)
-    cross_task, same_task = _find_overlaps(task_records)
+    cross_inf, same_inf, rej_same_ep_inf = _find_overlaps(inf_records)
+    cross_task, same_task, _ = _find_overlaps(task_records)
     distinct_cross_inf = [p for p in cross_inf if not p["same_endpoint"]]
     distinct_cross_task = [p for p in cross_task if not p["same_endpoint"]]
 
+    has_cross_inf = len(distinct_cross_inf) > 0
+    has_cross_task = len(distinct_cross_task) > 0
+    distinct_valid_inf_endpoints = {ep for _, ep in valid_inf_worker_endpoints}
+    distinct_valid_inf_workers = {w for w, _ in valid_inf_worker_endpoints}
+    insufficient_evidence = len(distinct_valid_inf_workers) < 2 or len(distinct_valid_inf_endpoints) < 2
+    no_overlap_observed = (not has_cross_inf) and (not insufficient_evidence)
+
+    if has_cross_inf:
+        evidence_status = "verified_cross_machine_inference_overlap"
+    elif insufficient_evidence and has_cross_task:
+        evidence_status = "verified_cross_machine_task_overlap_only"
+    elif has_cross_task and not has_cross_inf:
+        evidence_status = "no_overlap_observed" if not insufficient_evidence else "verified_cross_machine_task_overlap_only"
+    elif insufficient_evidence:
+        evidence_status = "insufficient_evidence"
+    else:
+        evidence_status = "no_overlap_observed"
+
     return {
+        "evidence_status": evidence_status,
         "total_inference_intervals_recorded": len(inf_records),
-        "verified_cross_machine_inference_overlap": len(distinct_cross_inf) > 0,
-        "verified_cross_machine_task_overlap": len(distinct_cross_task) > 0,
+        "rejected_inference_intervals_count": rejected_inf_count,
+        "rejected_same_endpoint_overlaps_count": rej_same_ep_inf,
+        "verified_cross_machine_inference_overlap": has_cross_inf,
+        "verified_cross_machine_task_overlap": has_cross_task,
+        "no_overlap_observed": no_overlap_observed,
+        "insufficient_evidence": insufficient_evidence,
+        "distinct_valid_inference_workers": sorted(distinct_valid_inf_workers),
+        "distinct_valid_inference_endpoints": sorted(distinct_valid_inf_endpoints),
+        "clock_anomalies": clock_anomalies[:20],
+        "interval_validation_errors": validation_errors[:20],
         "cross_machine_inference_overlap_pairs": distinct_cross_inf[:20],
         "same_machine_inference_overlap_pairs": same_inf[:20],
         "cross_machine_task_overlap_pairs": distinct_cross_task[:20],
@@ -1564,8 +1890,9 @@ def build_cross_model_comparison(
     results: List[DistributedTaskResult],
     *,
     snapshots: Optional[Dict[str, WorkerSnapshot]] = None,
+    workers: Optional[Dict[str, WorkerConfig]] = None,
 ) -> Dict[str, Any]:
-    """Compare models across identical tasks while flagging any execution parameter differences."""
+    """Compare models across separated Functional, Configuration, and Performance dimensions."""
     assign_by_id: Dict[str, TaskAssignment] = {}
     for a in assignments:
         aid = a.assignment_id or f"{a.worker_id}::{a.model}::{a.task.task_id}::trial{a.trial_index}"
@@ -1573,98 +1900,351 @@ def build_cross_model_comparison(
 
     by_target: Dict[str, Dict[str, Any]] = {}
     by_task: Dict[str, List[Dict[str, Any]]] = {}
+    incompatible_targets: List[Dict[str, Any]] = []
+    seen_endpoints: Set[str] = set()
+    seen_vram_modes: Set[str] = set()
+    seen_families: Set[str] = set()
+    seen_models: Set[str] = set()
 
     for r in results:
         target_key = f"{r.worker_id}::{r.model}"
+        aid = r.assignment_id or f"{r.worker_id}::{r.model}::{r.task_id}::trial{r.trial_index}"
+        assign = assign_by_id.get(aid)
+        snap = snapshots.get(r.worker_id) if snapshots else None
+        model_meta = snap.installed_models.get(r.model) if snap else None
+        worker_cfg = workers.get(r.worker_id) if workers else None
+        compat = dict(r.compatibility or {})
+        if not compat and snap:
+            compat = dict(snap.compatibility_by_model.get(r.model) or {})
+
+        rm = r.resource_measurements or {}
+        eff_ctx = (r.model_settings or {}).get("num_ctx")
+        think_val = (r.model_settings or {}).get("think", "default")
+        model_opts = {
+            **dict(assign.task.model_options or {} if assign else {}),
+            **dict((r.model_settings or {}).get("model_options") or {}),
+        }
+        caps = list(model_meta.capabilities) if model_meta else []
+        native_status = str(
+            ((compat.get("capabilities") or {}).get("native_tool_calling") or {}).get("status") or ""
+        ).upper()
+        if "tools" in caps or native_status == "AVAILABLE":
+            tool_protocol = "native_tools"
+        elif native_status == "UNAVAILABLE":
+            tool_protocol = "fallback_text"
+        else:
+            tool_protocol = "unknown"
+
+        cfg_fp = r.configuration_fingerprint or (
+            compute_configuration_fingerprint(
+                model=r.model,
+                model_digest=r.model_digest,
+                model_settings=r.model_settings or {},
+                task=assign.task,
+                worker=worker_cfg,
+                model_meta=model_meta,
+                compatibility=compat,
+            )
+            if assign
+            else ""
+        )
+
+        norm_ep = _normalize_endpoint(r.endpoint)
+        if norm_ep:
+            seen_endpoints.add(norm_ep)
+        seen_models.add(r.model)
+        if model_meta and model_meta.family:
+            seen_families.add(model_meta.family)
+        for ps_key in ("ps_before", "ps_after"):
+            for pe in (rm.get(ps_key) or []):
+                if pe.get("name") == r.model and pe.get("size_vram") is not None:
+                    seen_vram_modes.add("gpu" if int(pe["size_vram"]) > 0 else "cpu_only")
+
         t_bucket = by_target.setdefault(target_key, {
             "worker_id": r.worker_id,
             "model": r.model,
             "model_digest": r.model_digest,
-            "endpoint": r.endpoint,
+            "model_family": model_meta.family if model_meta else "",
+            "parameter_size": model_meta.parameter_size if model_meta else "",
+            "quantization_level": model_meta.quantization_level if model_meta else "",
+            "endpoint": _scrub_url_userinfo(r.endpoint),
             "total": 0,
             "passed": 0,
             "unsupported": 0,
             "unavailable": 0,
+            "trials_per_task": {},
             "durations": [],
+            "first_chunk_lats": [],
+            "inf_durations": [],
+            "tool_durations_ms": [],
+            "prompt_tokens_measured": [],
+            "eval_tokens_measured": [],
+            "estimated_tokens": [],
+            "ps_size_bytes": [],
+            "ps_vram_bytes": [],
             "num_ctx_values": set(),
+            "fingerprints": set(),
             "status_by_task": {},
         })
         t_bucket["total"] += 1
+        t_bucket["trials_per_task"][r.task_id] = t_bucket["trials_per_task"].get(r.task_id, 0) + 1
+        if cfg_fp:
+            t_bucket["fingerprints"].add(cfg_fp)
         if r.status == DistributedTaskStatus.PASS:
             t_bucket["passed"] += 1
         elif r.status == DistributedTaskStatus.UNSUPPORTED:
             t_bucket["unsupported"] += 1
+            incompatible_targets.append({
+                "worker_id": r.worker_id,
+                "model": r.model,
+                "task_id": r.task_id,
+                "status": r.status.value,
+                "failure_category": r.failure_category or "UNSUPPORTED",
+                "reason": r.error_detail,
+            })
         elif r.status == DistributedTaskStatus.UNAVAILABLE:
             t_bucket["unavailable"] += 1
-        else:
-            pass
+            incompatible_targets.append({
+                "worker_id": r.worker_id,
+                "model": r.model,
+                "task_id": r.task_id,
+                "status": r.status.value,
+                "failure_category": r.failure_category or "UNAVAILABLE",
+                "reason": r.error_detail,
+            })
         if r.status not in (DistributedTaskStatus.UNAVAILABLE, DistributedTaskStatus.UNSUPPORTED):
             t_bucket["durations"].append(float(r.duration_seconds))
-        eff_ctx = (r.model_settings or {}).get("num_ctx")
+        for iv in (r.inference_intervals or []):
+            if isinstance(iv, dict):
+                if iv.get("first_chunk_latency_seconds") is not None:
+                    t_bucket["first_chunk_lats"].append(float(iv["first_chunk_latency_seconds"]))
+                if iv.get("duration_seconds") is not None:
+                    t_bucket["inf_durations"].append(float(iv["duration_seconds"]))
+        for tr in (r.ledger_transitions or []):
+            if isinstance(tr, dict):
+                meta = tr.get("metadata") or {}
+                if isinstance(meta, dict) and meta.get("duration_ms") is not None:
+                    t_bucket["tool_durations_ms"].append(float(meta["duration_ms"]))
+        mtu = r.measured_token_usage or rm.get("measured_token_usage")
+        if isinstance(mtu, dict):
+            if mtu.get("prompt_eval_count_max") is not None:
+                t_bucket["prompt_tokens_measured"].append(int(mtu["prompt_eval_count_max"]))
+            if mtu.get("eval_count_sum") is not None:
+                t_bucket["eval_tokens_measured"].append(int(mtu["eval_count_sum"]))
+        etu = r.estimated_token_usage or rm.get("estimated_token_usage")
+        if isinstance(etu, dict) and etu.get("estimated_tokens_approx") is not None:
+            t_bucket["estimated_tokens"].append(int(etu["estimated_tokens_approx"]))
+        for ps_key in ("ps_before", "ps_after"):
+            for pe in (rm.get(ps_key) or []):
+                if pe.get("name") == r.model:
+                    if pe.get("size") is not None:
+                        t_bucket["ps_size_bytes"].append(int(pe["size"]))
+                    if pe.get("size_vram") is not None:
+                        t_bucket["ps_vram_bytes"].append(int(pe["size_vram"]))
         if eff_ctx is not None:
             t_bucket["num_ctx_values"].add(int(eff_ctx))
         t_bucket["status_by_task"][r.task_id] = r.status.value
 
-        aid = r.assignment_id or f"{r.worker_id}::{r.model}::{r.task_id}::trial{r.trial_index}"
-        assign = assign_by_id.get(aid)
-        compat = dict(r.compatibility or {})
-        if not compat and snapshots and r.worker_id in snapshots:
-            compat = dict((snapshots[r.worker_id].compatibility_by_model.get(r.model)) or {})
+        policy_mode_val = worker_cfg.policy_mode if worker_cfg else "basic"
+        eff_tools = worker_cfg.allowed_tools if worker_cfg and worker_cfg.allowed_tools is not None else (
+            assign.task.allowed_tools if assign else None
+        )
+        eff_ring = worker_cfg.caller_ring if worker_cfg and worker_cfg.caller_ring is not None else (
+            assign.task.caller_ring if assign else None
+        )
         by_task.setdefault(r.task_id, []).append({
             "worker_id": r.worker_id,
+            "endpoint": _scrub_url_userinfo(r.endpoint),
+            "norm_endpoint": norm_ep,
             "model": r.model,
+            "model_digest": r.model_digest,
+            "model_family": model_meta.family if model_meta else "",
+            "parameter_size": model_meta.parameter_size if model_meta else "",
+            "quantization_level": model_meta.quantization_level if model_meta else "",
+            "execution_id": r.execution_id,
             "status": r.status.value,
+            "failure_category": r.failure_category or r.status.value,
             "duration_seconds": r.duration_seconds,
             "num_ctx": eff_ctx,
             "context_clamped": bool((r.model_settings or {}).get("context_clamped_to_model")),
+            "think": think_val,
+            "model_options": model_opts,
+            "tool_protocol": tool_protocol,
             "read_timeout": (r.model_settings or {}).get("read_timeout"),
             "keep_alive": (r.model_settings or {}).get("keep_alive"),
             "max_steps": assign.task.max_steps if assign else None,
             "max_replanning": assign.task.max_replanning if assign else None,
-            "allowed_tools": assign.task.allowed_tools if assign else None,
+            "expected_exit_code": assign.task.expected_exit_code if assign else 0,
+            "fixture_version": r.fixture_version or (assign.task.fixture_version if assign else "1.4"),
+            "allowed_tools": eff_tools,
+            "caller_ring": eff_ring,
+            "policy_mode": policy_mode_val,
+            "configuration_fingerprint": cfg_fp,
             "error_classification": r.error_classification,
             "workflow_compatible": compat.get("workflow_compatible") if "workflow_compatible" in compat else compat.get("compatible"),
         })
 
     targets_summary: Dict[str, Any] = {}
+    perf_targets: Dict[str, Any] = {}
+    min_trials_observed: Optional[int] = None
     for k, b in sorted(by_target.items()):
         durs = b["durations"]
+        eligible_n = b["total"] - b["unsupported"] - b["unavailable"]
+        t_counts = list(b["trials_per_task"].values())
+        if t_counts:
+            t_min = min(t_counts)
+            min_trials_observed = t_min if min_trials_observed is None else min(min_trials_observed, t_min)
+        avg_dur = round(sum(durs) / len(durs), 3) if durs else None
+        avg_fcl = round(sum(b["first_chunk_lats"]) / len(b["first_chunk_lats"]), 3) if b["first_chunk_lats"] else None
+        sum_inf = round(sum(b["inf_durations"]), 3) if b["inf_durations"] else None
+        avg_tool_ms = round(sum(b["tool_durations_ms"]) / len(b["tool_durations_ms"]), 3) if b["tool_durations_ms"] else None
         targets_summary[k] = {
             "worker_id": b["worker_id"],
             "model": b["model"],
             "model_digest": b["model_digest"],
+            "model_family": b["model_family"],
+            "parameter_size": b["parameter_size"],
+            "quantization_level": b["quantization_level"],
             "endpoint": b["endpoint"],
             "total": b["total"],
+            "eligible": eligible_n,
             "passed": b["passed"],
             "unsupported": b["unsupported"],
             "unavailable": b["unavailable"],
             "pass_rate": round(b["passed"] / b["total"], 4) if b["total"] else 0.0,
-            "avg_duration_seconds": round(sum(durs) / len(durs), 3) if durs else None,
+            "pass_rate_eligible": round(b["passed"] / eligible_n, 4) if eligible_n > 0 else None,
+            "avg_duration_seconds": avg_dur,
             "num_ctx_values": sorted(b["num_ctx_values"]),
+            "configuration_fingerprints": sorted(b["fingerprints"]),
             "status_by_task": b["status_by_task"],
         }
+        perf_targets[k] = {
+            "worker_id": b["worker_id"],
+            "model": b["model"],
+            "measured_wall_clock_duration_s": avg_dur,
+            "measured_first_chunk_latency_s": avg_fcl,
+            "measured_inference_interval_duration_s": sum_inf,
+            "measured_tool_execution_duration_ms": avg_tool_ms,
+            "measured_prompt_tokens_max": max(b["prompt_tokens_measured"]) if b["prompt_tokens_measured"] else None,
+            "measured_eval_tokens_sum": sum(b["eval_tokens_measured"]) if b["eval_tokens_measured"] else None,
+            "measured_ps_size_bytes_max": max(b["ps_size_bytes"]) if b["ps_size_bytes"] else None,
+            "measured_ps_vram_bytes_max": max(b["ps_vram_bytes"]) if b["ps_vram_bytes"] else None,
+            "estimated_tokens_approx_sum": sum(b["estimated_tokens"]) if b["estimated_tokens"] else None,
+        }
 
+    functional_differences: List[Dict[str, Any]] = []
+    configuration_differences: List[Dict[str, Any]] = []
     parity_differences: List[Dict[str, Any]] = []
+
     for task_id, entries in sorted(by_task.items()):
         if len(entries) < 2:
             continue
+        # Functional parity: same task fixture, verifier expectations, tool permissions, and orchestration bounds
+        fixtures = {str(e["fixture_version"]) for e in entries}
+        exp_rcs = {repr(e["expected_exit_code"]) for e in entries}
+        tools_perms = {repr(e["allowed_tools"]) for e in entries}
+        rings = {e["caller_ring"] for e in entries}
+        pols = {e["policy_mode"] for e in entries}
+        steps = {e["max_steps"] for e in entries if e["max_steps"] is not None}
+        replans = {e["max_replanning"] for e in entries if e["max_replanning"] is not None}
+        if len(fixtures) > 1 or len(exp_rcs) > 1 or len(tools_perms) > 1 or len(rings) > 1 or len(pols) > 1 or len(steps) > 1 or len(replans) > 1:
+            functional_differences.append({
+                "task_id": task_id,
+                "fixture_versions": sorted(fixtures),
+                "expected_exit_codes": sorted(exp_rcs),
+                "allowed_tools_sets": sorted(tools_perms),
+                "caller_rings": sorted(str(x) for x in rings),
+                "policy_modes": sorted(pols),
+                "max_steps_values": sorted(steps),
+                "max_replanning_values": sorted(replans),
+            })
+
+        # Configuration parity: context budget, think, options, protocol, timeout, compatibility
         ctxs = {e["num_ctx"] for e in entries if e["num_ctx"] is not None}
         timeouts = {e["read_timeout"] for e in entries if e["read_timeout"] is not None}
-        steps = {e["max_steps"] for e in entries if e["max_steps"] is not None}
-        if len(ctxs) > 1 or len(timeouts) > 1 or len(steps) > 1 or any(e["context_clamped"] for e in entries):
+        thinks = {repr(e["think"]) for e in entries}
+        opts_vals = {json.dumps(e["model_options"], sort_keys=True, default=str) for e in entries}
+        protocols = {e["tool_protocol"] for e in entries}
+        compats = {e["workflow_compatible"] for e in entries if e["workflow_compatible"] is not None}
+        clamped_targets = [f"{e['worker_id']}::{e['model']}" for e in entries if e["context_clamped"]]
+        if len(ctxs) > 1 or len(timeouts) > 1 or len(thinks) > 1 or len(opts_vals) > 1 or len(protocols) > 1 or len(compats) > 1 or clamped_targets:
+            configuration_differences.append({
+                "task_id": task_id,
+                "num_ctx_values": sorted(ctxs),
+                "read_timeout_values": sorted(timeouts),
+                "think_values": sorted(thinks),
+                "model_options_variants": sorted(opts_vals),
+                "tool_protocols": sorted(protocols),
+                "workflow_compatible_values": sorted(str(x) for x in compats),
+                "context_clamped_targets": clamped_targets,
+            })
+
+        if len(ctxs) > 1 or len(timeouts) > 1 or len(steps) > 1 or len(thinks) > 1 or len(opts_vals) > 1 or len(protocols) > 1 or clamped_targets:
             parity_differences.append({
                 "task_id": task_id,
                 "num_ctx_values": sorted(ctxs),
                 "read_timeout_values": sorted(timeouts),
                 "max_steps_values": sorted(steps),
-                "context_clamped_targets": [f"{e['worker_id']}::{e['model']}" for e in entries if e["context_clamped"]],
+                "think_values": sorted(thinks),
+                "tool_protocols": sorted(protocols),
+                "context_clamped_targets": clamped_targets,
             })
+
+    func_equal = len(functional_differences) == 0
+    cfg_equal = len(configuration_differences) == 0
+    hw_heterogeneous = len(seen_endpoints) > 1 or len(seen_vram_modes) > 1
+    model_heterogeneous = len(seen_models) > 1 or len(seen_families) > 1
+
+    limitations: List[str] = []
+    if (min_trials_observed or 0) < 2:
+        limitations.append("Single-trial evaluation (n=1 per target/task); unsuitable for statistically reliable latency ranking.")
+    if not func_equal:
+        limitations.append("Functional task permissions, orchestration bounds, or fixtures differed across targets.")
+    if not cfg_equal:
+        limitations.append("Model/runtime configurations differed across targets (e.g., num_ctx, think, timeout, or tool protocol).")
+    if hw_heterogeneous:
+        limitations.append(
+            f"Heterogeneous workers/hardware compared across endpoints {sorted(seen_endpoints)} "
+            f"(accelerator modes observed: {sorted(seen_vram_modes) or ['unknown']})."
+        )
+    if model_heterogeneous:
+        limitations.append("Multiple distinct models/families evaluated; latency reflects hardware+model+thinking differences.")
+    if incompatible_targets:
+        limitations.append(f"{len(incompatible_targets)} incompatible/unavailable target run(s) excluded from reasoning failure rate.")
+
+    perf_comparable = bool(
+        func_equal
+        and cfg_equal
+        and not hw_heterogeneous
+        and not incompatible_targets
+        and (min_trials_observed or 0) >= 2
+        and len(by_target) >= 2
+    )
 
     return {
         "targets": targets_summary,
         "by_task": by_task,
-        "fair_comparison": len(parity_differences) == 0,
+        "fair_comparison": func_equal and cfg_equal and len(parity_differences) == 0,
         "parity_differences": parity_differences,
+        "functional_parity": {
+            "equal": func_equal,
+            "differences": functional_differences,
+            "incompatible_targets": incompatible_targets,
+        },
+        "configuration_parity": {
+            "equal": cfg_equal,
+            "differences": configuration_differences,
+            "hardware_heterogeneous": hw_heterogeneous,
+            "model_heterogeneous": model_heterogeneous,
+        },
+        "performance_comparison": {
+            "comparable": perf_comparable,
+            "ranking_allowed": perf_comparable,
+            "min_trials_observed": min_trials_observed or 0,
+            "limitations": limitations,
+            "targets": perf_targets,
+        },
+        "comparison_limitations": limitations,
     }
 
 
@@ -1808,8 +2388,17 @@ class DistributedEvalRunner:
                 if worker
                 else {}
             )
+            cfg_fp = compute_configuration_fingerprint(
+                model=assign.model,
+                model_digest=digest,
+                model_settings=settings,
+                task=assign.task,
+                worker=worker,
+                model_meta=model_meta,
+                compatibility=compat,
+            )
 
-            pre_status, pre_reason = scheduler.preflight_assignment(assign)
+            pre_status, pre_cat, pre_reason = scheduler.preflight_assignment_detail(assign)
             if pre_status is not None:
                 return DistributedTaskResult(
                     model=assign.model,
@@ -1822,7 +2411,8 @@ class DistributedEvalRunner:
                     start_timestamp=t_queued,
                     end_timestamp=time.time(),
                     duration_seconds=0.0,
-                    error_classification=pre_status.value,
+                    error_classification=pre_cat or pre_status.value,
+                    failure_category=pre_cat or pre_status.value,
                     error_detail=_redact_secrets(pre_reason or ""),
                     model_settings=settings,
                     concurrency_mode="skipped",
@@ -1830,6 +2420,8 @@ class DistributedEvalRunner:
                     trial_index=assign.trial_index,
                     matrix_entry_id=assign.matrix_entry_id,
                     compatibility=compat,
+                    fixture_version=assign.task.fixture_version,
+                    configuration_fingerprint=cfg_fp,
                 )
 
             assert worker is not None
@@ -1864,8 +2456,8 @@ class DistributedEvalRunner:
                 scheduler.record_queue_wait(worker.worker_id, wait_seconds)
                 safe_raw_out: Dict[str, Any] = raw_out if isinstance(raw_out, dict) else {"raw_value": repr(raw_out)}
 
-                status, err_cls, err_detail = _classify_task_outcome(assign, case, raw_out)
-                if status == DistributedTaskStatus.TIMEOUT:
+                detail = _classify_task_outcome_detail(assign, case, raw_out)
+                if detail["status"] == DistributedTaskStatus.TIMEOUT:
                     scheduler.record_timeout(worker.worker_id)
 
                 res = self._finalize_and_save_transcript(
@@ -1873,7 +2465,7 @@ class DistributedEvalRunner:
                     digest=digest,
                     endpoint=endpoint,
                     settings=settings,
-                    status=status,
+                    status=detail["status"],
                     start_ts=t_exec_start,
                     end_ts=t_end,
                     dur=dur,
@@ -1881,55 +2473,71 @@ class DistributedEvalRunner:
                     ps_before=ps_before,
                     ps_after=ps_after,
                     concurrency_mode=concurrency_mode,
-                    error_cls=err_cls,
-                    error_detail=err_detail,
+                    error_cls=detail["error_classification"],
+                    error_detail=detail["error_detail"],
                     compat=compat,
+                    failure_category=detail["failure_category"],
+                    uncertain_side_effects=detail["uncertain_side_effects"],
+                    mutated_targets_uncertain=detail["mutated_targets_uncertain"],
+                    configuration_fingerprint=cfg_fp,
                 )
                 res.resource_measurements["queued_wait_seconds"] = wait_seconds
                 return res
             except asyncio.CancelledError:
                 t_end = time.time()
                 t_ref = t_exec_start if t_exec_start is not None else t_queued
-                return DistributedTaskResult(
-                    model=assign.model,
-                    model_digest=digest,
-                    worker_id=assign.worker_id,
+                return self._finalize_and_save_transcript(
+                    assign=assign,
+                    digest=digest,
                     endpoint=endpoint,
-                    task_id=assign.task.task_id,
-                    category=assign.task.category,
+                    settings=settings,
                     status=DistributedTaskStatus.CANCELLED,
-                    start_timestamp=t_ref,
-                    end_timestamp=t_end,
-                    duration_seconds=round(t_end - t_ref, 3),
-                    error_classification="CANCELLED",
-                    error_detail="Task cancelled before completion.",
-                    model_settings=settings,
+                    start_ts=t_ref,
+                    end_ts=t_end,
+                    dur=round(t_end - t_ref, 3),
+                    raw_out={"exit_code": None, "cancelled": True, "execution_ledger": {"records": []}, "telemetry": {}},
+                    ps_before=[],
+                    ps_after=[],
                     concurrency_mode=concurrency_mode,
-                    assignment_id=assign.assignment_id,
-                    trial_index=assign.trial_index,
-                    matrix_entry_id=assign.matrix_entry_id,
+                    error_cls="CANCELLED",
+                    error_detail="Task cancelled before completion.",
+                    compat=compat,
+                    failure_category="CANCELLED",
+                    uncertain_side_effects=False,
+                    mutated_targets_uncertain=[],
+                    configuration_fingerprint=cfg_fp,
                 )
             except Exception as exc:
                 t_end = time.time()
                 t_ref = t_exec_start if t_exec_start is not None else t_queued
-                return DistributedTaskResult(
-                    model=assign.model,
-                    model_digest=digest,
-                    worker_id=assign.worker_id,
+                exc_cls = type(exc).__name__
+                exc_msg = _redact_secrets(str(exc))
+                low_exc = f"{exc_cls} {exc_msg}".lower()
+                f_cat = (
+                    "WORKER_UNAVAILABLE"
+                    if any(k in low_exc for k in ("connect", "unreachable", "refused", "remoteprotocol"))
+                    else "ERROR"
+                )
+                return self._finalize_and_save_transcript(
+                    assign=assign,
+                    digest=digest,
                     endpoint=endpoint,
-                    task_id=assign.task.task_id,
-                    category=assign.task.category,
+                    settings=settings,
                     status=DistributedTaskStatus.ERROR,
-                    start_timestamp=t_ref,
-                    end_timestamp=t_end,
-                    duration_seconds=round(t_end - t_ref, 3),
-                    error_classification=type(exc).__name__,
-                    error_detail=_redact_secrets(str(exc)),
-                    model_settings=settings,
+                    start_ts=t_ref,
+                    end_ts=t_end,
+                    dur=round(t_end - t_ref, 3),
+                    raw_out={"exit_code": None, "worker_error": f"{exc_cls}: {exc_msg}", "execution_ledger": {"records": []}, "telemetry": {}},
+                    ps_before=[],
+                    ps_after=[],
                     concurrency_mode=concurrency_mode,
-                    assignment_id=assign.assignment_id,
-                    trial_index=assign.trial_index,
-                    matrix_entry_id=assign.matrix_entry_id,
+                    error_cls=exc_cls,
+                    error_detail=exc_msg,
+                    compat=compat,
+                    failure_category=f_cat,
+                    uncertain_side_effects=False,
+                    mutated_targets_uncertain=[],
+                    configuration_fingerprint=cfg_fp,
                 )
             finally:
                 if slot_acquired:
@@ -1997,7 +2605,12 @@ class DistributedEvalRunner:
 
         cleanup_ok = all(rec.get("cleanup_ok", not rec.get("errors")) for rec in cleanup_records)
         overlap_proof = compute_interval_overlaps(results)
-        comparison = build_cross_model_comparison(dedup_assignments, results, snapshots=self.snapshots)
+        comparison = build_cross_model_comparison(
+            dedup_assignments,
+            results,
+            snapshots=self.snapshots,
+            workers=self.workers,
+        )
         return {
             "execution_mode": effective_mode,
             "results": results,
@@ -2035,9 +2648,14 @@ class DistributedEvalRunner:
         error_cls: Optional[str],
         error_detail: Optional[str],
         compat: Optional[Dict[str, Any]] = None,
+        failure_category: Optional[str] = None,
+        uncertain_side_effects: bool = False,
+        mutated_targets_uncertain: Optional[List[str]] = None,
+        configuration_fingerprint: str = "",
     ) -> DistributedTaskResult:
         raw_ledger = raw_out.get("execution_ledger")
         ledger = raw_ledger if isinstance(raw_ledger, dict) else {}
+        exec_id = raw_out.get("execution_id") or ledger.get("execution_id") or None
         raw_records = ledger.get("records")
         records = [r for r in raw_records if isinstance(r, dict)] if isinstance(raw_records, list) else []
         raw_cli_json = raw_out.get("cli_json")
@@ -2109,16 +2727,25 @@ class DistributedEvalRunner:
         safe_stderr = _redact_secrets(str(raw_out.get("raw_stderr") or ""))
 
         t_path = self.transcripts_dir / f"{safe_wid}__{safe_model}__{safe_tid}__{int(start_ts * 1000)}.json"
+        mut_list = list(mutated_targets_uncertain or [])
         transcript_doc = {
             "assignment_id": assign.assignment_id,
             "trial_index": assign.trial_index,
             "matrix_entry_id": assign.matrix_entry_id,
+            "execution_id": exec_id,
             "worker_id": assign.worker_id,
             "endpoint": safe_endpoint,
             "model": assign.model,
             "model_digest": digest,
             "task_id": assign.task.task_id,
+            "fixture_version": assign.task.fixture_version,
             "status": status.value,
+            "failure_category": failure_category or status.value,
+            "error_classification": error_cls,
+            "error_detail": safe_error_detail,
+            "uncertain_side_effects": bool(uncertain_side_effects),
+            "mutated_targets_uncertain": mut_list,
+            "configuration_fingerprint": configuration_fingerprint,
             "start_timestamp": start_ts,
             "end_timestamp": end_ts,
             "duration_seconds": dur,
@@ -2135,6 +2762,7 @@ class DistributedEvalRunner:
             "execution_ledger": ledger,
             "ledger_transitions": ledger_transitions,
             "policy_decisions": policy_decisions,
+            "checkpoint_snapshot": raw_out.get("checkpoint_snapshot"),
             "messages_transcript": raw_transcript_msgs,
             "raw_stderr": safe_stderr,
         }
@@ -2173,4 +2801,10 @@ class DistributedEvalRunner:
             ledger_transitions=ledger_transitions,
             policy_decisions=policy_decisions,
             compatibility=compat_dict,
+            execution_id=exec_id,
+            failure_category=failure_category or status.value,
+            uncertain_side_effects=bool(uncertain_side_effects),
+            mutated_targets_uncertain=mut_list,
+            fixture_version=assign.task.fixture_version,
+            configuration_fingerprint=configuration_fingerprint,
         )

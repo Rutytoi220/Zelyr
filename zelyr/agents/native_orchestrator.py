@@ -1363,7 +1363,16 @@ class NativeOrchestrator:
             get_default_central_ledger,
         )
 
-        eff_ledger = ledger if ledger is not None else TurnExecutionLedger()
+        reuse_current = bool(payload.pop("_reuse_current_ledger", False))
+        eff_ledger = (
+            ledger
+            if ledger is not None
+            else (
+                getattr(self, "current_ledger", None)
+                if reuse_current and getattr(self, "current_ledger", None) is not None
+                else TurnExecutionLedger()
+            )
+        )
         self.current_ledger = eff_ledger
 
         eff_caller_ring = payload.get("caller_ring") if "caller_ring" in payload else getattr(self, "caller_ring", None)

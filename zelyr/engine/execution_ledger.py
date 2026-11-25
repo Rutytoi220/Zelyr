@@ -103,8 +103,19 @@ _NON_SECRET_ENV_NAMES = frozenset({
 })
 
 
-def _collect_sensitive_env_values() -> List[str]:
+_SENSITIVE_ENV_CACHE_LOCK = threading.RLock()
+_SENSITIVE_ENV_CACHE_DATA: Optional[Dict[Any, Any]] = None
+_SENSITIVE_ENV_CACHE_VALUES: Tuple[str, ...] = ()
+
+
+def _collect_sensitive_env_values() -> Tuple[str, ...]:
     """Collect non-trivial secret environment values for dynamic scrubbing."""
+    global _SENSITIVE_ENV_CACHE_DATA, _SENSITIVE_ENV_CACHE_VALUES
+    env_data = getattr(os.environ, "_data", None)
+    if isinstance(env_data, dict):
+        with _SENSITIVE_ENV_CACHE_LOCK:
+            if _SENSITIVE_ENV_CACHE_DATA is not None and env_data == _SENSITIVE_ENV_CACHE_DATA:
+                return _SENSITIVE_ENV_CACHE_VALUES
     secrets: List[str] = []
     for k, v in os.environ.items():
         if not v or not isinstance(v, str) or k in _NON_SECRET_ENV_NAMES:
@@ -115,7 +126,12 @@ def _collect_sensitive_env_values() -> List[str]:
             if len(stripped) >= 8 and not stripped.startswith(("/", "~")):
                 secrets.append(stripped)
     secrets.sort(key=len, reverse=True)
-    return secrets
+    result = tuple(secrets)
+    if isinstance(env_data, dict):
+        with _SENSITIVE_ENV_CACHE_LOCK:
+            _SENSITIVE_ENV_CACHE_DATA = env_data.copy()
+            _SENSITIVE_ENV_CACHE_VALUES = result
+    return result
 
 
 def _redact_sensitive_text(text: Optional[str]) -> Optional[str]:

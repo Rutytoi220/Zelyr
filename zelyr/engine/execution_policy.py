@@ -2287,7 +2287,11 @@ def _prepare_direct_policy_context(
     act_ctx = get_active_execution_context()
     eff_exec_id = execution_id or (getattr(act_ctx, "execution_id", None) if act_ctx else None)
     eff_node_id = node_id or (getattr(act_ctx, "node_id", None) if act_ctx else None)
-    eff_central = getattr(act_ctx, "central_ledger", None) if act_ctx else None
+    eff_central = (
+        (getattr(act_ctx, "central_ledger", None) or getattr(act_ctx, "ledger", None))
+        if act_ctx
+        else None
+    )
     eff_corr = getattr(act_ctx, "correlation_id", None) if act_ctx else None
 
     args_map = dict(arguments) if isinstance(arguments, Mapping) else {}

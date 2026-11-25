@@ -12,6 +12,79 @@ from zelyr.engine.error_classifier import _redact_secrets
 from zelyr.eval.distributed import DistributedTaskResult, DistributedTaskStatus, _sanitize_artifact_segment, _scrub_url_userinfo
 
 
+_KNOWN_FAILURE_CATEGORIES = (
+    "PASS",
+    "FAIL",
+    "FALSE_SUCCESS",
+    "TIMEOUT",
+    "CANCELLED",
+    "UNSUPPORTED",
+    "WORKER_UNAVAILABLE",
+    "MODEL_UNAVAILABLE",
+    "RESOURCE_LIMIT",
+    "ERROR",
+    "UNVERIFIED",
+    "UNAVAILABLE",
+)
+
+
+def _failure_category_counts(results: List[DistributedTaskResult]) -> Dict[str, int]:
+    """Compute non-conflating failure category counts across all results."""
+    cat_counts: Dict[str, int] = {k: 0 for k in _KNOWN_FAILURE_CATEGORIES}
+    for r in results:
+        cat = str(getattr(r, "failure_category", None) or r.status.value)
+        cat_counts[cat] = cat_counts.get(cat, 0) + 1
+    return cat_counts
+
+
+def _build_run_integrity_record(
+    r: DistributedTaskResult,
+    *,
+    cross_comparison: Dict[str, Any],
+    overlap_proof: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Build compact per-run integrity record without inventing missing fields."""
+    by_task = cross_comparison.get("by_task") or {}
+    task_entries = by_task.get(r.task_id) or []
+    multi_target = len(task_entries) >= 2
+    func_p = (cross_comparison.get("functional_parity") or {}).get("equal")
+    cfg_p = (cross_comparison.get("configuration_parity") or {}).get("equal")
+    perf_cmp = (cross_comparison.get("performance_comparison") or {}).get("comparable")
+    ivs = list(getattr(r, "inference_intervals", None) or [])
+    inf_durs = [
+        float(iv["duration_seconds"])
+        for iv in ivs
+        if isinstance(iv, dict) and iv.get("duration_seconds") is not None
+    ]
+    return {
+        "worker_id": r.worker_id,
+        "endpoint": _scrub_url_userinfo(r.endpoint),
+        "model": r.model,
+        "model_digest": r.model_digest or None,
+        "task_id": r.task_id,
+        "fixture_version": getattr(r, "fixture_version", None) or "1.4",
+        "execution_id": getattr(r, "execution_id", None),
+        "start_timestamp": r.start_timestamp,
+        "end_timestamp": r.end_timestamp,
+        "duration_seconds": r.duration_seconds,
+        "configuration_fingerprint": getattr(r, "configuration_fingerprint", None) or None,
+        "verification_result": r.verification_result,
+        "functional_parity": bool(func_p) if (multi_target and func_p is not None) else None,
+        "configuration_parity": bool(cfg_p) if (multi_target and cfg_p is not None) else None,
+        "performance_comparability": bool(perf_cmp) if (multi_target and perf_cmp is not None) else (False if multi_target else None),
+        "concurrency_evidence": {
+            "concurrency_mode": r.concurrency_mode,
+            "inference_intervals_count": len(ivs),
+            "measured_inference_duration_s": round(sum(inf_durs), 4) if inf_durs else None,
+            "overlap_evidence_status": overlap_proof.get("evidence_status"),
+        },
+        "error_classification": r.error_classification,
+        "failure_category": getattr(r, "failure_category", None) or r.status.value,
+        "uncertain_side_effects": bool(getattr(r, "uncertain_side_effects", False)),
+        "mutated_targets_uncertain": list(getattr(r, "mutated_targets_uncertain", None) or []),
+    }
+
+
 def _compute_p95(values: List[float]) -> Optional[float]:
     """Compute P95 only when sample size supports it (n >= 20)."""
     if len(values) < 20:
@@ -216,6 +289,11 @@ def generate_distributed_reports(
             rd["endpoint"] = _scrub_url_userinfo(rd.get("endpoint", ""))
             if rd.get("error_detail"):
                 rd["error_detail"] = _redact_secrets(str(rd["error_detail"]))
+            rd["integrity"] = _build_run_integrity_record(
+                r,
+                cross_comparison=cross_comparison,
+                overlap_proof=overlap_proof,
+            )
             serialized_group.append(rd)
         m_path.write_text(
             json.dumps(
@@ -246,7 +324,49 @@ def generate_distributed_reports(
         rd["endpoint"] = _scrub_url_userinfo(rd.get("endpoint", ""))
         if rd.get("error_detail"):
             rd["error_detail"] = _redact_secrets(str(rd["error_detail"]))
+        rd["integrity"] = _build_run_integrity_record(
+            r,
+            cross_comparison=cross_comparison,
+            overlap_proof=overlap_proof,
+        )
         serialized_results.append(rd)
+
+    sc_all = overall_metrics["status_counts"]
+    cat_counts = _failure_category_counts(results)
+    func_parity = cross_comparison.get("functional_parity") or {}
+    cfg_parity = cross_comparison.get("configuration_parity") or {}
+    perf_cmp = cross_comparison.get("performance_comparison") or {}
+    comp_limitations = list(
+        cross_comparison.get("comparison_limitations")
+        or perf_cmp.get("limitations")
+        or []
+    )
+    benchmark_integrity = {
+        "total_tasks": overall_metrics["total_tasks"],
+        "independently_verified_passes": sc_all.get("PASS", 0),
+        "failures": sc_all.get("FAIL", 0) + sc_all.get("FALSE_SUCCESS", 0),
+        "false_successes": sc_all.get("FALSE_SUCCESS", 0),
+        "timeouts": sc_all.get("TIMEOUT", 0),
+        "cancelled": sc_all.get("CANCELLED", 0),
+        "unverified": sc_all.get("UNVERIFIED", 0),
+        "unsupported_tasks": sc_all.get("UNSUPPORTED", 0),
+        "worker_errors": sc_all.get("ERROR", 0) + sc_all.get("UNAVAILABLE", 0),
+        "failure_category_counts": cat_counts,
+        "cross_machine_overlap_evidence": {
+            "evidence_status": overlap_proof.get("evidence_status"),
+            "verified_cross_machine_inference_overlap": bool(overlap_proof.get("verified_cross_machine_inference_overlap", False)),
+            "verified_cross_machine_task_overlap": bool(overlap_proof.get("verified_cross_machine_task_overlap", False)),
+            "no_overlap_observed": bool(overlap_proof.get("no_overlap_observed", False)),
+            "insufficient_evidence": bool(overlap_proof.get("insufficient_evidence", False)),
+            "overlap_pairs_count": len(overlap_proof.get("cross_machine_inference_overlap_pairs") or []),
+            "rejected_inference_intervals_count": overlap_proof.get("rejected_inference_intervals_count", 0),
+            "rejected_same_endpoint_overlaps_count": overlap_proof.get("rejected_same_endpoint_overlaps_count", 0),
+        },
+        "functional_parity_equal": func_parity.get("equal"),
+        "configuration_parity_equal": cfg_parity.get("equal"),
+        "performance_comparable": perf_cmp.get("comparable"),
+        "comparison_limitations": comp_limitations,
+    }
 
     worker_snapshots_summary: Dict[str, Any] = {}
     for wid, snap in sorted(snapshots.items()):
@@ -271,6 +391,7 @@ def generate_distributed_reports(
         "benchmark_version": "1.4",
         "title": title,
         "execution_mode": execution_mode,
+        "benchmark_integrity": benchmark_integrity,
         "overall": overall_metrics,
         "overlap_proof": overlap_proof,
         "cross_model_comparison": cross_comparison,
@@ -324,14 +445,17 @@ def generate_distributed_reports(
         "",
         "## Individual Task Results",
         "",
-        "| Worker | Model | Task | Status | Exit | Duration (s) | Tools | Error / Detail |",
-        "|---|---|---|---|---:|---:|---:|---|",
+        "| Worker | Model | Task | Execution ID | Config FP | Status | Category | Exit | Duration (s) | Tools | Error / Detail |",
+        "|---|---|---|---|---|---|---|---:|---:|---:|---|",
     ])
     for r in results:
         det = _redact_secrets((r.error_detail or "").replace("\n", " ").replace("|", "/"))[:90]
+        exec_disp = (getattr(r, "execution_id", None) or "-")[:18]
+        fp_disp = (getattr(r, "configuration_fingerprint", None) or "-")[:12]
+        cat_disp = getattr(r, "failure_category", None) or r.status.value
         md_lines.append(
-            f"| {r.worker_id} | `{r.model}` | {r.task_id} | **{r.status.value}** | {r.exit_code} | "
-            f"{r.duration_seconds:.2f} | {len(r.tool_calls)} | {det} |"
+            f"| {r.worker_id} | `{r.model}` | {r.task_id} | `{exec_disp}` | `{fp_disp}` | **{r.status.value}** | "
+            f"{cat_disp} | {r.exit_code} | {r.duration_seconds:.2f} | {len(r.tool_calls)} | {det} |"
         )
 
     if worker_snapshots_summary:
@@ -355,8 +479,12 @@ def generate_distributed_reports(
             "",
             "## Cross-Machine Concurrency & Inference Overlap Proof",
             "",
+            f"- **Evidence status:** `{overlap_proof.get('evidence_status', 'unknown')}`",
             f"- **Verified cross-machine inference overlap:** {bool(overlap_proof.get('verified_cross_machine_inference_overlap', False))}",
             f"- **Verified cross-machine task overlap:** {bool(overlap_proof.get('verified_cross_machine_task_overlap', False))}",
+            f"- **No overlap observed:** {bool(overlap_proof.get('no_overlap_observed', False))}",
+            f"- **Insufficient evidence:** {bool(overlap_proof.get('insufficient_evidence', False))}",
+            f"- **Rejected/anomalous intervals:** {overlap_proof.get('rejected_inference_intervals_count', 0)} (same-endpoint rejected: {overlap_proof.get('rejected_same_endpoint_overlaps_count', 0)})",
         ])
         inf_pairs = list(overlap_proof.get("cross_machine_inference_overlap_pairs") or [])
         if inf_pairs:
@@ -373,18 +501,35 @@ def generate_distributed_reports(
 
     if cross_comparison:
         fair = cross_comparison.get("fair_comparison", True)
+        f_eq = (cross_comparison.get("functional_parity") or {}).get("equal", fair)
+        c_eq = (cross_comparison.get("configuration_parity") or {}).get("equal", fair)
+        p_cmp = (cross_comparison.get("performance_comparison") or {}).get("comparable", False)
         diffs = list(cross_comparison.get("parity_differences") or [])
         md_lines.extend([
             "",
-            "## Cross-Model Comparison & Parity Check",
+            "## Cross-Model Comparison & Integrity",
             "",
-            f"- **Configuration parity across shared tasks:** {'EQUAL' if fair else 'DIFFERENCES DETECTED'}",
+            f"- **Functional parity across shared tasks:** {'EQUAL' if f_eq else 'DIFFERENCES DETECTED'}",
+            f"- **Configuration parity across shared tasks:** {'EQUAL' if c_eq else 'DIFFERENCES DETECTED'}",
+            f"- **Performance comparability (latency ranking allowed):** {'COMPARABLE' if p_cmp else 'NOT COMPARABLE (see limitations)'}",
         ])
         for d in diffs:
             md_lines.append(
                 f"- `{d['task_id']}`: num_ctx={d.get('num_ctx_values')}, "
-                f"read_timeout={d.get('read_timeout_values')}, clamped={d.get('context_clamped_targets')}"
+                f"read_timeout={d.get('read_timeout_values')}, think={d.get('think_values')}, clamped={d.get('context_clamped_targets')}"
             )
+        for lim in comp_limitations:
+            md_lines.append(f"- Limitation: {lim}")
+
+    md_lines.extend([
+        "",
+        "## Benchmark Integrity Overview",
+        "",
+        f"- **Total tasks:** {benchmark_integrity['total_tasks']} | **Verified passes:** {benchmark_integrity['independently_verified_passes']} | "
+        f"**Failures:** {benchmark_integrity['failures']} | **Timeouts:** {benchmark_integrity['timeouts']} | "
+        f"**Cancelled:** {benchmark_integrity['cancelled']} | **Unverified:** {benchmark_integrity['unverified']} | "
+        f"**Unsupported:** {benchmark_integrity['unsupported_tasks']} | **Worker/Infra errors:** {benchmark_integrity['worker_errors']}",
+    ])
 
     summary_md_path = out_dir / "distributed_summary.md"
     summary_md_path.write_text("\n".join(md_lines) + "\n", encoding="utf-8")

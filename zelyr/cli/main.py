@@ -370,6 +370,8 @@ async def _execute_headless_run(
             step_tcs: List[Dict[str, Any]] = []
             last_finish_reason: Optional[str] = None
 
+            if (step_idx > 0 or getattr(orch, "_preserve_current_ledger", False)) and getattr(orch, "current_ledger", None) is not None:
+                payload["_reuse_current_ledger"] = True
             async for chunk in orch.generate_stream(payload):
                 choices = chunk.get("choices", [])
                 if not choices:
