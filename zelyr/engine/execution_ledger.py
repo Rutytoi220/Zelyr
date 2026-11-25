@@ -679,6 +679,132 @@ def extract_prohibited_targets(prompt: str, ledger: Optional[Any] = None) -> Lis
     return found
 
 
+_GLOBAL_NO_FILE_MOD_PATTERNS = (
+    re.compile(
+        r"\b(?:do\s+not|don'?t|never|must\s+not|should\s+not|shall\s+not|cannot|can'?t|may\s+not|avoid|refrain\s+from|without)\s+"
+        r"(?:ever\s+)?(?:any\s+)?(?:modify|modifying|edit|editing|change|changing|alter|altering|write(?:\s+to)?|writing(?:\s+to)?|"
+        r"create|creating|delete|deleting|remove|removing|touch|touching|patch|patching|update|updating|overwrite|overwriting|mutate|mutating)\s+"
+        r"(?:anything|any\s+(?:files?|directories?|dirs?|folders?|paths?|code)|files?|the\s+(?:repo|repository|project|workspace|codebase))\b",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:leave|keep)\s+(?:all\s+files|everything|the\s+(?:repo|repository|project|workspace|codebase))\s+"
+        r"(?:untouched|alone|unchanged|intact|unmodified|as[\s\-]is)\b",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(r"\bread[\s\-]?only\s+(?:inspection|mode|analysis)\b", flags=re.IGNORECASE),
+)
+
+_GLOBAL_NO_MUTATING_CMD_PATTERNS = (
+    re.compile(
+        r"\b(?:do\s+not|don'?t|never|must\s+not|should\s+not|cannot|can'?t|avoid|refrain\s+from|without)\b[^.;\n]{0,80}"
+        r"\b(?:run|running|execute|executing|use|using)\s+"
+        r"(?:any\s+)?mutating\s+(?:shell\s+)?(?:commands?|tools?|actions?)\b",
+        flags=re.IGNORECASE,
+    ),
+)
+
+_DIAGNOSTIC_TEST_INTENT_RE = re.compile(
+    r"\b(?:run|execute)\s+(?:the\s+)?(?:existing\s+)?(?:test\s+suite|tests|pytest|unittest)\b|"
+    r"\bwhether\s+(?:the\s+)?tests\s+pass\s+or\s+fail\b",
+    flags=re.IGNORECASE,
+)
+
+_MUTATING_SHELL_OP_PATTERNS = (
+    re.compile(r"(?:^|[^0-9])>{1,2}|<<"),
+    re.compile(r"\|\s*tee\b", flags=re.IGNORECASE),
+    re.compile(r"\b(?:rm|unlink|mv|cp|touch|mkdir|rmdir|truncate|chmod|chown|chgrp|ln|dd|install)\b"),
+    re.compile(r"\b(?:sed|perl)\s+-[^\s]*i"),
+    re.compile(r"\b(?:pip|pip3|uv\s+pip)\s+(?:install|uninstall)\b"),
+    re.compile(r"\buv\s+(?:add|remove|sync)\b"),
+    re.compile(r"\bpython(?:3(?:\.\d+)?)?\s+-m\s+venv\b|\bvirtualenv\b"),
+    re.compile(r"\bgit\s+(?:add|commit|reset|checkout|clean|rm|mv|switch|restore|apply|cherry-pick|rebase|merge|tag\s+-)\b"),
+    re.compile(r"\bpython(?:3(?:\.\d+)?)?\s+-c\b[^\n]*(?:open\s*\(|write_text|write_bytes|mkdir|unlink|rmdir|rmtree)"),
+)
+
+_DIAGNOSTIC_TEST_CMD_RE = re.compile(
+    r"(?:^|(?:&&|\|\||;)\s*)(?:PYTHONPATH=[^\s]+\s+)?(?:\S*/)?(?:pytest|py\.test|python(?:3(?:\.\d+)?)?\s+-m\s+(?:pytest|unittest)|ruff\s+check|mypy)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _strip_fenced_and_quoted(prompt: str) -> str:
+    """Remove fenced code blocks and backtick/quoted literals to inspect imperative prompt instructions."""
+    if not prompt:
+        return ""
+    cleaned = re.sub(r"```.*?```", " ", prompt, flags=re.DOTALL)
+    cleaned = re.sub(r"`[^`]*`", " ", cleaned)
+    return cleaned
+
+
+def extract_global_mutation_prohibition(prompt: str) -> Dict[str, bool]:
+    """Detect workspace-wide read-only / no-mutation directives without false positives on code blocks."""
+    cleaned = _strip_fenced_and_quoted(prompt)
+    if not cleaned:
+        return {"no_file_modifications": False, "no_mutating_commands": False, "is_test_diagnostic": False}
+
+    no_file_mod = any(pat.search(cleaned) for pat in _GLOBAL_NO_FILE_MOD_PATTERNS)
+    no_mut_cmd = any(pat.search(cleaned) for pat in _GLOBAL_NO_MUTATING_CMD_PATTERNS)
+    is_test_diag = bool(no_file_mod and _DIAGNOSTIC_TEST_INTENT_RE.search(cleaned))
+    return {
+        "no_file_modifications": no_file_mod,
+        "no_mutating_commands": no_mut_cmd,
+        "is_test_diagnostic": is_test_diag,
+    }
+
+
+def is_diagnostic_test_command(tool_name: str, arguments: Dict[str, Any]) -> bool:
+    """Return True if tool call runs a non-mutating test/lint command (e.g. pytest, unittest, ruff check)."""
+    if (tool_name or "").lower() not in ("execute_command", "bash", "sh"):
+        return False
+    cmd = str((arguments or {}).get("command") or (arguments or {}).get("cmd") or "").strip()
+    if not cmd:
+        return False
+    if any(pat.search(cmd) for pat in _MUTATING_SHELL_OP_PATTERNS):
+        return False
+    return bool(_DIAGNOSTIC_TEST_CMD_RE.search(cmd))
+
+
+def is_mutating_tool_call(
+    tool_name: str,
+    arguments: Dict[str, Any],
+    *,
+    allow_read_only_tests: bool = False,
+) -> Tuple[bool, str]:
+    """Return (is_mutating, reason) for enforcing workspace-wide read-only prohibitions."""
+    t_lower = (tool_name or "").lower().strip()
+    args = arguments if isinstance(arguments, dict) else {}
+
+    if t_lower == "manage_workspace_file":
+        act = str(args.get("action") or "read").strip().lower()
+        if act in ("read", "view", "list", "list_tree", "stat", "exists", "inspect", "check"):
+            return False, ""
+        return True, f"manage_workspace_file action '{act}' mutates workspace state"
+
+    if t_lower in ("file_write", "write_file", "file_edit", "edit_file", "craft_tool", "create_tool", "manage_tools"):
+        return True, f"tool '{t_lower}' mutates files or plugins"
+
+    if t_lower in ("execute_command", "bash", "sh"):
+        cmd = str(args.get("command") or args.get("cmd") or "").strip()
+        if not cmd:
+            return False, ""
+        if any(pat.search(cmd) for pat in _MUTATING_SHELL_OP_PATTERNS):
+            return True, f"shell command performs write/mutation: {cmd[:80]}"
+        if _is_inspection_action(t_lower, args):
+            return False, ""
+        if allow_read_only_tests and is_diagnostic_test_command(t_lower, args):
+            return False, ""
+        return True, f"shell command '{cmd[:80]}' is not in the read-only inspection set"
+
+    if _is_inspection_action(t_lower, args):
+        return False, ""
+    if t_lower in ("remember_fact", "verify_outcome", "query_system_journal", "inspect_network", "web_search", "fetch_web_page"):
+        return False, ""
+    if t_lower == "manage_system_clipboard":
+        return str(args.get("action", "read")).lower() != "read", "clipboard write"
+    return True, f"tool '{t_lower}' may mutate host state"
+
+
 def extract_file_targets_from_text(text: str) -> List[str]:
     """Extract file path candidates mentioned in prompt or text."""
     if not text:
@@ -890,10 +1016,12 @@ def _is_action_resolved_by_later(failed: ActionRecord, later: ActionRecord) -> b
             # Different targets never resolve each other
             return False
         # Same target: operations must be compatible (e.g. write resolves write, append resolves append,
+        # write/patch/edit/update on the same file resolve each other,
         # or any non-inspection corrective mutation/verification resolves a verification_failed state)
         if op_failed == op_later:
             return True
-        if op_failed in ("write", "overwrite") and op_later in ("write", "overwrite"):
+        edit_write_ops = ("write", "overwrite", "patch", "edit", "update", "replace", "create")
+        if op_failed in edit_write_ops and op_later in edit_write_ops:
             return True
         if (getattr(failed, "verification_failed", False) or later.verified or later.state == ActionState.VERIFIED) and not later_is_inspect:
             return True
@@ -2281,6 +2409,7 @@ class TurnExecutionLedger:
                 or "unconfirmed_by_model" in str(rec.error)
                 or "superseded_by_model" in str(rec.error)
                 or "abandoned_by_model" in str(rec.error)
+                or "reconfirmed_and_dispatched" in str(rec.error)
             ):
                 continue
 
@@ -2587,7 +2716,7 @@ FALSE_SUCCESS_PATTERNS = [
 ]
 
 TRUTHFUL_FAILURE_PATTERNS = [
-    r"\b(failed|failure)\b",
+    r"\b(fail|fails|failing|failed|failure)\b",
     r"\b(unable to|could not|cannot|can't)\b",
     r"\berror\b",
     r"\bnot found\b",
@@ -2653,6 +2782,26 @@ INACTION_JUSTIFICATION_PATTERNS = [
 ]
 
 
+_PROSPECTIVE_ACTION_PROSE_PATTERNS = (
+    re.compile(
+        r"\b(?:let['’]?s|let\s+us|we['’]?ll|i['’]?ll|i\s+will|we\s+will|now,?\s+let['’]?s|next,?\s+let['’]?s)\s+"
+        r"(?:fix|write|update|patch|edit|modify|change|implement|create|run|re-?run|test|verify|start\s+by)\b",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bhere['’]?s\s+(?:a|the)\s+(?:revised|updated|fixed|corrected|patched)\b",
+        flags=re.IGNORECASE,
+    ),
+)
+
+
+def has_prospective_action_prose(text: str) -> bool:
+    """Return True when text narrates planned/unexecuted code changes or next tool steps instead of terminal reporting."""
+    if not text:
+        return False
+    return any(pat.search(text) for pat in _PROSPECTIVE_ACTION_PROSE_PATTERNS)
+
+
 def is_truthful_failure_report(text: str) -> bool:
     """Check if model text truthfully acknowledges a failure or inability to proceed without evasion."""
     lower = text.lower()
@@ -2661,6 +2810,9 @@ def is_truthful_failure_report(text: str) -> bool:
         return False
 
     if any(re.search(p, lower) for p in APOLOGY_OR_DELEGATION_PATTERNS) or detect_consultant_deferral(text):
+        return False
+
+    if has_prospective_action_prose(text):
         return False
 
     cleaned_lower = re.sub(
@@ -2978,6 +3130,8 @@ _NON_TASK_CONTEXT_CLAUSE_RE = re.compile(
 def _is_requested_mutation_target(user_prompt: str, target_path: str) -> bool:
     """Return True when target_path is requested for creation/mutation inside an active task clause."""
     if not user_prompt or not target_path:
+        return False
+    if extract_global_mutation_prohibition(user_prompt).get("no_file_modifications"):
         return False
     ft_name = Path(target_path).name
     if not ft_name:

@@ -22,6 +22,7 @@ import sqlite3
 import threading
 import time
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
+import urllib.parse
 
 from zelyr.engine.execution_ledger import (
     LedgerEventType,
@@ -187,6 +188,9 @@ _WORKSPACE_REVERSIBLE_WRITE_ACTIONS: Set[str] = {
     "create",
     "append",
     "rollback",
+    "mkdir",
+    "create_directory",
+    "create_dir",
 }
 
 _DESTRUCTIVE_ACTIONS: Set[str] = {
@@ -1751,6 +1755,7 @@ class ExecutionPolicyEngine:
         restrictions = self.config.resource_restrictions or {}
         denied_prefixes = [str(p).lower() for p in (restrictions.get("denied_path_prefixes") or []) if p]
         denied_hosts = {str(h).lower() for h in (restrictions.get("denied_hosts") or []) if h}
+        allowed_hosts = {str(h).strip().lower().rstrip(".") for h in (restrictions.get("allowed_hosts") or []) if str(h).strip()}
         enforce_ws = bool(restrictions.get("enforce_workspace_containment", False))
         restricted_ws = restrictions.get("workspace_root") or ws_path
         restricted_ws_path = Path(restricted_ws).expanduser().resolve(strict=False) if restricted_ws else None
@@ -1783,6 +1788,18 @@ class ExecutionPolicyEngine:
                     )
 
         url_val = str(eff_args.get("url") or eff_args.get("endpoint") or "").strip().lower()
+        if url_val and tid in {"interact_with_browser", "playwright_web", "browser", "fetch_web_page", "http_fetch"} and url_val != "about:blank":
+            scheme_pfx = url_val.split(":", 1)[0] if ":" in url_val else ""
+            if scheme_pfx and scheme_pfx not in {"http", "https"} and ("://" in url_val or not url_val.split(":", 1)[1].isdigit()):
+                rule_ids.append("rule4:disallowed_url_scheme")
+                return _finalize(
+                    PolicyDecisionOutcome.DENY,
+                    f"Policy denied '{tid}': URL scheme '{scheme_pfx}:' is restricted by security policy.",
+                    reason_code="disallowed_url_scheme",
+                    precedence_stage="rule4:resource_restriction",
+                    determining_rule_id="rule4:disallowed_url_scheme",
+                    remediation="Use an approved http:// or https:// URL.",
+                )
         if url_val and denied_hosts:
             for dh in denied_hosts:
                 if dh in url_val:
@@ -1795,6 +1812,23 @@ class ExecutionPolicyEngine:
                         determining_rule_id="rule4:denied_host",
                         remediation="Target an approved host/endpoint.",
                     )
+        if url_val and url_val != "about:blank" and allowed_hosts:
+            parsed_url = urllib.parse.urlparse(url_val if "://" in url_val else f"https://{url_val}")
+            target_host = (parsed_url.hostname or "").strip().lower().rstrip(".")
+            host_ok = bool(target_host) and any(
+                (target_host == ah or target_host == ah.lstrip("*.") or (ah.startswith((".", "*.")) and target_host.endswith("." + ah.lstrip("*."))))
+                for ah in allowed_hosts
+            )
+            if not host_ok:
+                rule_ids.append("rule4:host_not_in_allowlist")
+                return _finalize(
+                    PolicyDecisionOutcome.DENY,
+                    f"Policy denied '{tid}': target host '{target_host}' is not in allowed_hosts.",
+                    reason_code="host_not_in_allowlist",
+                    precedence_stage="rule4:resource_restriction",
+                    determining_rule_id="rule4:host_not_in_allowlist",
+                    remediation="Target an allowed host configured in resource_restrictions.allowed_hosts.",
+                )
 
         # Evaluate override outcomes AFTER hard security & resource restrictions (Rules 1-4 stay supreme!).
         base_outcome: Optional[PolicyDecisionOutcome] = None

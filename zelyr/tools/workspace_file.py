@@ -9,8 +9,10 @@ Provides atomic and safe file operations:
 
 from __future__ import annotations
 
+import ast
 import fnmatch
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -43,6 +45,53 @@ def get_last_modified_file() -> Optional[Path]:
     return _last_modified_file
 
 
+def _unescape_double_escaped_text(text: str, suffix: str = "") -> str:
+    """Repair literal \\n / \\t sequences when a model double-escapes multiline text onto one line."""
+    if not text or "\n" in text or "\r" in text or "\\n" not in text:
+        return text
+    suffix_l = suffix.lower()
+    is_python = suffix_l == ".py"
+    if is_python:
+        try:
+            ast.parse(text)
+            return text
+        except SyntaxError:
+            pass
+    markers = ("\\n    ", "\\ndef ", "\\nclass ", "\\nimport ", "\\nfrom ", "\\nif ", "\\nreturn ", "\\n#")
+    if text.count("\\n") < 2 and not any(m in text for m in markers):
+        return text
+    decoded = re.sub(r"(?<!\\)\\r\\n", "\n", text)
+    decoded = re.sub(r"(?<!\\)\\n", "\n", decoded)
+    decoded = re.sub(r"(?<!\\)\\t", "\t", decoded)
+    if is_python:
+        try:
+            ast.parse(decoded)
+            return decoded
+        except SyntaxError:
+            if any(m in text for m in markers):
+                return decoded
+            return text
+    return decoded
+
+
+def _validate_python_syntax(content: str, target_path: Path, action_label: str) -> Optional[ToolResult]:
+    """Return an error ToolResult if a .py file has a SyntaxError, else None."""
+    if target_path.suffix.lower() != ".py":
+        return None
+    try:
+        ast.parse(content, filename=str(target_path))
+        return None
+    except SyntaxError as exc:
+        return ToolResult(
+            False,
+            error=(
+                f"{action_label} aborted: {target_path.name} has Python SyntaxError "
+                f"at line {exc.lineno}: {exc.msg}. Fix syntax/indentation and retry; "
+                f"file was left unmodified."
+            ),
+        )
+
+
 class ManageWorkspaceFileTool(BaseTool):
     """Safely reads, writes, patches, rolls back, and inspects files in the workspace with atomic backups."""
 
@@ -51,9 +100,12 @@ class ManageWorkspaceFileTool(BaseTool):
             tool_id="manage_workspace_file",
             name="manage_workspace_file",
             description=(
-                "Tier 1 Safe Workspace File Operations: Inspect, edit, and revert repository files with atomic backups. "
-                "Actions: 'read' (read lines up to max_lines), 'write' (atomic write with backup), "
-                "'patch' (strict single-occurrence replacement with backup), 'rollback' (atomic restore from latest backup), "
+                "Tier 1 Safe Workspace File Operations: Inspect, create, edit, and revert repository files with atomic backups. "
+                "Actions: 'read' (read lines up to max_lines; returns tree if target is a directory), "
+                "'write' (atomic write creating parent dirs with backup), "
+                "'patch' (strict single-occurrence replacement with backup), "
+                "'mkdir' / 'create_directory' (create directory with parents), "
+                "'rollback' (atomic restore from latest backup), "
                 "'list_tree' (tree up to depth 3 respecting .gitignore)."
             ),
         )
@@ -61,13 +113,13 @@ class ManageWorkspaceFileTool(BaseTool):
             ToolParameter(
                 name="action",
                 type="string",
-                description="File action: 'read', 'write', 'patch', 'rollback', 'list_tree'.",
+                description="File action: 'read', 'write', 'patch', 'mkdir', 'rollback', 'list_tree'.",
                 required=True,
             ),
             ToolParameter(
                 name="path",
                 type="string",
-                description="Target file or directory path (resolves relative to repo root or absolute).",
+                description="Target file or directory path relative to current workspace root (or absolute).",
                 required=False,
                 default="",
             ),
@@ -102,7 +154,7 @@ class ManageWorkspaceFileTool(BaseTool):
             ToolParameter(
                 name="cwd",
                 type="string",
-                description="Optional directory to resolve relative paths against.",
+                description="Optional directory override; omit unless intentionally resolving relative paths outside workspace root.",
                 required=False,
                 default=None,
             ),
@@ -112,7 +164,8 @@ class ManageWorkspaceFileTool(BaseTool):
         base_dir = cwd if cwd is not None else Path.cwd()
         if not path_str or path_str.strip() == "":
             return base_dir
-        p = Path(path_str.strip())
+        expanded = os.path.expanduser(path_str.strip()) if path_str.strip().startswith("~") else path_str.strip()
+        p = Path(expanded)
         if p.is_absolute():
             return p.resolve()
         return (base_dir / p).resolve()
@@ -179,15 +232,41 @@ class ManageWorkspaceFileTool(BaseTool):
         merged = dict(params or {})
         merged.update(kwargs)
 
-        action = str(merged.get("action") or "read").strip().lower()
+        raw_action = str(merged.get("action") or "").strip().lower()
+        if not raw_action:
+            if "search_text" in merged or "replace_text" in merged:
+                raw_action = "patch"
+            elif "content" in merged:
+                raw_action = "write"
+            else:
+                raw_action = "read"
+        action = raw_action
         path_str = str(merged.get("path") or "").strip()
         cwd_param = merged.get("cwd")
-        cwd_dir = Path(cwd_param).resolve() if cwd_param else None
+        cwd_clean = str(cwd_param).strip() if cwd_param is not None else ""
+        cwd_dir = (
+            Path(os.path.expanduser(cwd_clean)).resolve()
+            if cwd_clean
+            else None
+        )
         target_path = self._resolve_path(path_str, cwd=cwd_dir)
 
         if action == "read":
             if not target_path.exists():
                 return ToolResult(False, error=f"File not found: {target_path}")
+            if target_path.is_dir():
+                patterns = self._load_gitignore_patterns(target_path)
+                tree_items = self._build_tree(target_path, target_path, patterns, depth=1, max_depth=3)
+                return ToolResult(
+                    True,
+                    output={
+                        "root": str(target_path),
+                        "depth": 3,
+                        "entries": tree_items,
+                        "count": len(tree_items),
+                        "note": "Path is a directory; returned directory listing (use action='read' on a file path to read file contents).",
+                    },
+                )
             if not target_path.is_file():
                 return ToolResult(False, error=f"Path is not a regular file: {target_path}")
 
@@ -220,7 +299,13 @@ class ManageWorkspaceFileTool(BaseTool):
             if not path_str:
                 return ToolResult(False, error="Target path must be provided for write action.")
 
-            content = str(merged.get("content", ""))
+            content = _unescape_double_escaped_text(
+                str(merged.get("content", "")),
+                suffix=target_path.suffix,
+            )
+            syntax_err = _validate_python_syntax(content, target_path, "Write")
+            if syntax_err is not None:
+                return syntax_err
             backup_path = self._create_backup(target_path)
 
             try:
@@ -251,6 +336,11 @@ class ManageWorkspaceFileTool(BaseTool):
 
             try:
                 current_content = target_path.read_text(encoding="utf-8", errors="replace")
+                if "\n" in current_content and "\n" not in search_text and "\\n" in search_text:
+                    unescaped_search = _unescape_double_escaped_text(search_text, suffix=target_path.suffix)
+                    if unescaped_search in current_content:
+                        search_text = unescaped_search
+                        replace_text = _unescape_double_escaped_text(replace_text, suffix=target_path.suffix)
                 count = current_content.count(search_text)
 
                 if count == 0:
@@ -264,8 +354,12 @@ class ManageWorkspaceFileTool(BaseTool):
                         error=f"Patch aborted: search_text appeared {count} times in {target_path.name}. Patch requires exact single occurrence to prevent accidental corruption.",
                     )
 
-                backup_path = self._create_backup(target_path)
                 new_content = current_content.replace(search_text, replace_text, 1)
+                syntax_err = _validate_python_syntax(new_content, target_path, "Patch")
+                if syntax_err is not None:
+                    return syntax_err
+
+                backup_path = self._create_backup(target_path)
                 target_path.write_text(new_content, encoding="utf-8")
                 _last_modified_file = target_path
 
@@ -336,6 +430,22 @@ class ManageWorkspaceFileTool(BaseTool):
             except Exception as e:
                 return ToolResult(False, error=f"Failed to restore file {target_path} from backup: {e}")
 
+        elif action in ("mkdir", "create_directory", "create_dir"):
+            if not path_str:
+                return ToolResult(False, error="Target directory path must be provided for mkdir action.")
+            try:
+                target_path.mkdir(parents=True, exist_ok=True)
+                return ToolResult(
+                    True,
+                    output={
+                        "path": str(target_path),
+                        "created": True,
+                        "message": f"Directory ready: {target_path}",
+                    },
+                )
+            except Exception as e:
+                return ToolResult(False, error=f"Failed to create directory {target_path}: {e}")
+
         elif action in ("list_tree", "tree", "list"):
             if not target_path.exists():
                 return ToolResult(False, error=f"Directory does not exist: {target_path}")
@@ -358,5 +468,5 @@ class ManageWorkspaceFileTool(BaseTool):
         else:
             return ToolResult(
                 False,
-                error=f"Unsupported file action: '{action}'. Supported actions: read, write, patch, list_tree.",
+                error=f"Unsupported file action: '{action}'. Supported actions: read, write, patch, mkdir, rollback, list_tree.",
             )

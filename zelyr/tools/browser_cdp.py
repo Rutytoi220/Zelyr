@@ -33,10 +33,11 @@ TOOL_SCHEMA = {
     "function": {
         "name": "interact_with_browser",
         "description": (
-            "Tier 2 Semantic UI Automation: Browser and tab automation via direct Chrome DevTools Protocol (CDP) "
-            "and Zelyr WebExtension bridge. Use 'click_element' with 'element_id' from get_page_snapshot. "
-            "Actions: 'get_page_snapshot', 'click_element', 'fill_element', 'scroll_page', 'navigate_url', "
-            "'capture_tab_screenshot', 'switch_tab', 'list_tabs', 'open_tab', 'close_tab', 'evaluate_script', 'click', 'type', 'get_dom'."
+            "Tier 2 Semantic UI Automation: Browser and tab automation via direct Chrome DevTools Protocol (CDP), "
+            "Native Messaging host, and Zelyr WebExtension bridge. Use 'click_element' with 'element_id' from get_page_snapshot. "
+            "Actions: 'get_page_snapshot', 'extract_page_content', 'get_active_tab', 'click_element', 'fill_element', "
+            "'scroll_page', 'navigate_url', 'capture_tab_screenshot', 'switch_tab', 'list_tabs', 'open_tab', 'close_tab', "
+            "'evaluate_script', 'click', 'type', 'get_dom'."
         ),
         "parameters": {
             "type": "object",
@@ -44,9 +45,9 @@ TOOL_SCHEMA = {
                 "action": {
                     "type": "string",
                     "description": (
-                        "The browser action: 'get_page_snapshot', 'click_element', 'fill_element', 'scroll_page', "
-                        "'navigate_url', 'capture_tab_screenshot', 'switch_tab', 'list_tabs', 'open_tab', 'close_tab', "
-                        "'evaluate_script', 'click', 'type', 'get_dom'."
+                        "The browser action: 'get_page_snapshot', 'extract_page_content', 'get_active_tab', 'click_element', "
+                        "'fill_element', 'scroll_page', 'navigate_url', 'capture_tab_screenshot', 'switch_tab', 'list_tabs', "
+                        "'open_tab', 'close_tab', 'evaluate_script', 'click', 'type', 'get_dom'."
                     ),
                 },
                 "element_id": {
@@ -270,6 +271,72 @@ class InteractWithBrowserTool(BaseTool):
                 if resp.get("id") == req_id:
                     return resp
 
+    def _format_extension_result(self, action: str, params: Dict[str, Any], ext_res: Any) -> ToolResult:
+        """Normalize WebSocket bridge or Native Messaging extension reply into a ToolResult."""
+        res_dict = ext_res.output if hasattr(ext_res, "output") and isinstance(ext_res.output, dict) else (
+            ext_res if isinstance(ext_res, dict) else {}
+        )
+        ok = bool(getattr(ext_res, "success", res_dict.get("success", False)))
+        if ok:
+            if action == "capture_tab_screenshot":
+                import base64
+                from pathlib import Path
+
+                raw_data = res_dict.get("data_url") or res_dict.get("data") or ""
+                b64_bytes = raw_data.split(",", 1)[1] if "," in raw_data else raw_data
+                screenshot_path = "/tmp/zelyr_tab_capture.png"
+                try:
+                    if b64_bytes:
+                        img_bytes = base64.b64decode(b64_bytes)
+                        Path(screenshot_path).write_bytes(img_bytes)
+                    return ToolResult(
+                        True,
+                        output={
+                            "screenshot_path": screenshot_path,
+                            "format": res_dict.get("format", "png"),
+                            "length": res_dict.get("length", len(raw_data)),
+                        },
+                    )
+                except Exception as save_err:
+                    return ToolResult(False, error=f"Failed saving screenshot: {save_err}")
+            return ToolResult(True, output=res_dict or ext_res)
+
+        error_msg = getattr(ext_res, "error", None) or res_dict.get("error") or "Extension command failed"
+        remedy_hint = getattr(ext_res, "remedy_hint", None) or res_dict.get("remedy_hint")
+        allowed_actions = getattr(ext_res, "allowed_actions", None) or res_dict.get("allowed_actions") or []
+
+        if action in ("click_element", "fill_element"):
+            elem_id = params.get("element_id")
+            if "ambiguous" in error_msg.lower():
+                if not remedy_hint:
+                    remedy_hint = "Call get_page_snapshot to re-index unique element IDs."
+                if not allowed_actions:
+                    allowed_actions = ["get_page_snapshot"]
+            else:
+                if elem_id is not None and ("not found" in error_msg.lower() or not error_msg or "Element not found" in error_msg):
+                    error_msg = f"Element ID {elem_id} not found on page."
+                if not remedy_hint:
+                    remedy_hint = "Call get_page_snapshot to refresh element IDs, or scroll_page down if the element is below the viewport."
+                if not allowed_actions:
+                    allowed_actions = ["get_page_snapshot", "scroll_page"]
+        elif action == "switch_tab":
+            target_url = params.get("query") or params.get("url") or "<url>"
+            if "open_tabs" in res_dict:
+                tabs_summary = ", ".join([f"'{t.get('title') or t.get('url')}'" for t in res_dict["open_tabs"]])
+                error_msg = f"{error_msg}. Open tabs: [{tabs_summary}]. Hint: Use action='open_tab' to open a new tab."
+            if not remedy_hint:
+                remedy_hint = f"Call list_tabs to see valid targets, or open_tab with url='{target_url}' to launch it."
+            if not allowed_actions:
+                allowed_actions = ["list_tabs", "open_tab"]
+
+        return ToolResult(
+            False,
+            error=error_msg,
+            remedy_hint=remedy_hint,
+            allowed_actions=allowed_actions,
+            metadata={"open_tabs": res_dict.get("open_tabs", [])} if "open_tabs" in res_dict else None,
+        )
+
     async def execute(self, params: Optional[Dict[str, Any]] = None, **kwargs: Any) -> ToolResult:
         if params is None:
             params = {}
@@ -281,10 +348,23 @@ class InteractWithBrowserTool(BaseTool):
         expression = str(params.get("expression", "") or "").strip()
         tab_id = str(params.get("tab_id", "") or "").strip()
 
+        # Validate URL schemes/hosts early for browser navigation/open actions
+        if action in ("open_tab", "new_tab", "navigate_url", "navigate") or (action == "manage_browser_tabs" and params.get("url")):
+            candidate_url = str(params.get("url") or params.get("query") or params.get("target") or "").strip()
+            if candidate_url:
+                from zelyr.tools.browser_native_host import validate_browser_url
+                ok_url, url_reason = validate_browser_url(candidate_url)
+                if not ok_url:
+                    return ToolResult(
+                        False,
+                        error=url_reason,
+                        output={"status": "error", "error_type": "POLICY_DENIED", "error": url_reason},
+                    )
+
         # Only route to legacy CDP if explicitly requested by unit test fixtures via internal keyword argument _force_cdp=True
         force_cdp = bool(params.get("_force_cdp", False))
 
-        # Tier 2 WebExtension Bridge is primary for browser automation (100% default).
+        # Tier 2 WebExtension Bridge / Native Messaging is primary for browser automation.
         if not force_cdp:
             try:
                 from zelyr.tools.browser_extension import get_bridge
@@ -295,115 +375,66 @@ class InteractWithBrowserTool(BaseTool):
                     except Exception:
                         pass
 
+                ext_params = {k: v for k, v in params.items() if k not in ("action", "_force_cdp")}
                 if bridge.is_connected():
-                    ext_params = {k: v for k, v in params.items() if k not in ("action", "_force_cdp")}
                     ext_res = await bridge.send_command(action, **ext_params)
-                    if ext_res.success:
-                        if action == "capture_tab_screenshot":
-                            import base64
-                            from pathlib import Path
-                            raw_data = ext_res.get("data_url") or ext_res.get("data") or ""
-                            if "," in raw_data:
-                                b64_bytes = raw_data.split(",", 1)[1]
-                            else:
-                                b64_bytes = raw_data
-                            screenshot_path = "/tmp/zelyr_tab_capture.png"
-                            try:
-                                if b64_bytes:
-                                    img_bytes = base64.b64decode(b64_bytes)
-                                    Path(screenshot_path).write_bytes(img_bytes)
-                                return ToolResult(
-                                    True,
-                                    output={
-                                        "screenshot_path": screenshot_path,
-                                        "format": ext_res.get("format", "png"),
-                                        "length": ext_res.get("length", len(raw_data)),
-                                    },
-                                )
-                            except Exception as save_err:
-                                return ToolResult(False, error=f"Failed saving screenshot: {save_err}")
-                        return ToolResult(True, output=ext_res.output or ext_res)
-                    error_msg = ext_res.error or "Extension command failed"
-                    remedy_hint = ext_res.remedy_hint if hasattr(ext_res, "remedy_hint") else ext_res.get("remedy_hint")
-                    allowed_actions = ext_res.allowed_actions if hasattr(ext_res, "allowed_actions") else (ext_res.get("allowed_actions") or [])
+                    return self._format_extension_result(action, params, ext_res)
 
-                    if action in ("click_element", "fill_element"):
-                        elem_id = params.get("element_id")
-                        if "ambiguous" in error_msg.lower():
-                            if not remedy_hint:
-                                remedy_hint = "Call get_page_snapshot to re-index unique element IDs."
-                            if not allowed_actions:
-                                allowed_actions = ["get_page_snapshot"]
-                        else:
-                            if elem_id is not None and ("not found" in error_msg.lower() or not ext_res.error or "Element not found" in error_msg):
-                                error_msg = f"Element ID {elem_id} not found on page."
-                            if not remedy_hint:
-                                remedy_hint = "Call get_page_snapshot to refresh element IDs, or scroll_page down if the element is below the viewport."
-                            if not allowed_actions:
-                                allowed_actions = ["get_page_snapshot", "scroll_page"]
-                    elif action == "switch_tab":
-                        target_url = params.get("query") or params.get("url") or "<url>"
-                        if "open_tabs" in ext_res:
-                            tabs_summary = ", ".join([f"'{t.get('title') or t.get('url')}'" for t in ext_res["open_tabs"]])
-                            error_msg = f"{error_msg}. Open tabs: [{tabs_summary}]. Hint: Use action='open_tab' to open a new tab."
-                        if not remedy_hint:
-                            remedy_hint = f"Call list_tabs to see valid targets, or open_tab with url='{target_url}' to launch it."
-                        if not allowed_actions:
-                            allowed_actions = ["list_tabs", "open_tab"]
+                # Fallback 1: Chromium/Chrome Native Messaging host over user-private AF_UNIX IPC
+                try:
+                    from zelyr.tools.browser_native_host import NativeBrowserClient
+                    native_client = NativeBrowserClient()
+                    if native_client.is_socket_present() and await native_client.is_available():
+                        native_res = await native_client.send_command(action, **ext_params)
+                        return self._format_extension_result(action, params, native_res)
+                except Exception:
+                    pass
 
-                    return ToolResult(
-                        False,
-                        error=error_msg,
-                        remedy_hint=remedy_hint,
-                        allowed_actions=allowed_actions,
-                        metadata={"open_tabs": ext_res.get("open_tabs", [])} if "open_tabs" in ext_res else None,
-                    )
+                # Fallback 2: Direct CDP if available or injected
+                port = int(params.get("port") or 9222)
+                cdp = self.cdp_client or CDPBrowserClient(port=port)
+                cdp_ready = False
+                if self.cdp_client is not None:
+                    cdp_ready = True
                 else:
-                    # WebExtension not connected. Attempt direct CDP fallback if available or injected.
-                    port = int(params.get("port") or 9222)
-                    cdp = self.cdp_client or CDPBrowserClient(port=port)
-                    cdp_ready = False
-                    if self.cdp_client is not None:
-                        cdp_ready = True
-                    else:
-                        try:
-                            cdp_ready = await cdp.is_available()
-                        except Exception:
-                            cdp_ready = False
+                    try:
+                        cdp_ready = await cdp.is_available()
+                    except Exception:
+                        cdp_ready = False
 
-                    if cdp_ready:
-                        return await self._execute_cdp(cdp, action, params, selector, text, expression, tab_id)
+                if cdp_ready:
+                    return await self._execute_cdp(cdp, action, params, selector, text, expression, tab_id)
 
-                    elem_id = params.get("element_id")
-                    target_url = params.get("query") or params.get("url") or "<url>"
-                    base_err = (
-                        f"No browser extension connected on ws://{bridge.host}:{bridge.port}. "
-                        "Ensure the Zelyr extension is loaded in Zen Browser (about:debugging) or Chromium. "
-                        "Do not ask for --remote-debugging-port flags."
-                    )
-                    if action in ("click_element", "fill_element"):
-                        return ToolResult(
-                            False,
-                            error=base_err,
-                            remedy_hint="Call get_page_snapshot to refresh element IDs, or scroll_page down if the element is below the viewport.",
-                            allowed_actions=["get_page_snapshot", "scroll_page"],
-                            output={"status": "error", "error_type": "BROWSER_UNAVAILABLE", "error": base_err},
-                        )
-                    elif action == "switch_tab":
-                        return ToolResult(
-                            False,
-                            error=base_err,
-                            remedy_hint=f"Call list_tabs to see valid targets, or open_tab with url='{target_url}' to launch it.",
-                            allowed_actions=["list_tabs", "open_tab"],
-                            output={"status": "error", "error_type": "BROWSER_UNAVAILABLE", "error": base_err},
-                        )
+                target_url = params.get("query") or params.get("url") or "<url>"
+                base_err = (
+                    f"No browser extension connected on ws://{bridge.host}:{bridge.port} "
+                    "or Native Messaging host socket. Ensure the Zelyr extension is loaded in "
+                    "Chromium/Zen Browser (and run 'zelyr browser install-host' for Chromium Native Messaging). "
+                    "Do not ask for --remote-debugging-port flags."
+                )
+                if action in ("click_element", "fill_element"):
                     return ToolResult(
                         False,
                         error=base_err,
-                        remedy_hint="Ensure the browser extension is running or use Tier 1 execute_command or manage_desktop_window.",
-                        allowed_actions=["execute_command", "manage_desktop_window"],
+                        remedy_hint="Call get_page_snapshot to refresh element IDs, or scroll_page down if the element is below the viewport.",
+                        allowed_actions=["get_page_snapshot", "scroll_page"],
                         output={"status": "error", "error_type": "BROWSER_UNAVAILABLE", "error": base_err},
                     )
+                elif action == "switch_tab":
+                    return ToolResult(
+                        False,
+                        error=base_err,
+                        remedy_hint=f"Call list_tabs to see valid targets, or open_tab with url='{target_url}' to launch it.",
+                        allowed_actions=["list_tabs", "open_tab"],
+                        output={"status": "error", "error_type": "BROWSER_UNAVAILABLE", "error": base_err},
+                    )
+                return ToolResult(
+                    False,
+                    error=base_err,
+                    remedy_hint="Ensure the browser extension is running or use Tier 1 execute_command or manage_desktop_window.",
+                    allowed_actions=["execute_command", "manage_desktop_window"],
+                    output={"status": "error", "error_type": "BROWSER_UNAVAILABLE", "error": base_err},
+                )
             except ConnectionResetError:
                 return ToolResult(
                     False,

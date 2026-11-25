@@ -31,6 +31,7 @@ HISTORICAL_TEMPLATE_HASHES: Dict[str, Set[str]] = {
         "015fc4c94b4085015605b9f04f33ade5ead868b928d1879e2ead3d41f1ebe7ac",  # v1 (subprocess.run baseline, unescaped)
         "ead3aa6b79254f2a587b991c314262683641b3f39a18a6ce3ae25d9476d62627",  # v2 (asyncio.create_subprocess_exec Day 2)
         "f06413f020b18cd892ea1c3e692f48d1527ee1691419963bee230f3aa04a263c",  # v3 (PTY and non-interactive isolation)
+        "6e3e4395c75b3ce65f73362ed9f03007118fd63cce2606f36a4d4b922b60f837",  # v4 (before cwd schema clarification)
     },
 }
 
@@ -49,12 +50,12 @@ _EXECUTE_COMMAND_TEMPLATE = (
     '    "type": "function",\n'
     '    "function": {\n'
     '        "name": "execute_command",\n'
-    '        "description": "Executes a shell command via bash and returns stdout and stderr.",\n'
+    '        "description": "Executes a shell command via bash in the active workspace and returns stdout and stderr.",\n'
     '        "parameters": {\n'
     '            "type": "object",\n'
     '            "properties": {\n'
     '                "command": {"type": "string", "description": "Command to execute"},\n'
-    '                "cwd": {"type": "string", "description": "Optional working directory for execution"},\n'
+    '                "cwd": {"type": "string", "description": "Optional working directory override (omit to execute in the current workspace root)"},\n'
     '                "pty": {\n'
     '                    "type": "boolean",\n'
     '                    "description": "Execute inside a pseudo-terminal (TTY). Enable for commands requiring a controlling terminal or checking isatty().",\n'
@@ -76,6 +77,8 @@ _EXECUTE_COMMAND_TEMPLATE = (
     "async def execute(command: str = '', timeout: float = 60.0, pty: bool = False, cwd: str = None, **kwargs) -> str:\n"
     "    if cwd is None:\n"
     '        cwd = kwargs.get("cwd")\n'
+    "    if isinstance(cwd, str):\n"
+    "        cwd = cwd.strip() or None\n"
     "    env = os.environ.copy()\n"
     '    env.setdefault("PAGER", "cat")\n'
     '    env.setdefault("TERM", "dumb")\n'

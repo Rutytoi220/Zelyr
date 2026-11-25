@@ -29,6 +29,7 @@ import json
 import asyncio
 import argparse
 import subprocess
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # ---------------------------------------------------------------------------
@@ -238,6 +239,110 @@ def cmd_server(_args: argparse.Namespace) -> None:
 
 
 
+def _redact_cli_args(args: Any, *, verbose: bool = False) -> str:
+    """Serialize tool arguments with secret redaction and concise previews for CLI visibility."""
+    from zelyr.engine.normalizer import _is_sensitive_param_path, _redact_sensitive_text
+
+    def _clean(val: Any, key_path: str = "") -> Any:
+        if _is_sensitive_param_path(key_path):
+            return "[REDACTED]"
+        if isinstance(val, dict):
+            return {
+                str(k): _clean(v, f"{key_path}.{k}" if key_path else str(k))
+                for k, v in val.items()
+            }
+        if isinstance(val, list):
+            items = [_clean(v, f"{key_path}[]") for v in (val if verbose else val[:8])]
+            if not verbose and len(val) > 8:
+                items.append(f"... (+{len(val) - 8} more)")
+            return items
+        if isinstance(val, str):
+            scrubbed = _redact_sensitive_text(val)
+            if not verbose and len(scrubbed) > 120:
+                one_line = scrubbed.replace("\n", "\\n")
+                return f"{one_line[:90]}... ({len(scrubbed)} chars)"
+            return scrubbed
+        return val
+
+    try:
+        cleaned = _clean(args if isinstance(args, dict) else {"value": args})
+        rendered = json.dumps(cleaned, ensure_ascii=False)
+    except Exception:
+        rendered = _redact_sensitive_text(str(args))
+    if not verbose and len(rendered) > 220:
+        return rendered[:217] + "..."
+    return rendered
+
+
+def _summarize_cli_tool_result(res_text: str, *, verbose: bool = False) -> tuple[str, Optional[int], str]:
+    """Return concise (status_label, exit_code, redacted_summary) from raw tool output."""
+    from zelyr.engine.normalizer import _redact_sensitive_text
+
+    text = (res_text or "").strip()
+    exit_code: Optional[int] = None
+    status_label = "ok"
+    summary = ""
+
+    if text.startswith("Exit code "):
+        lines = text.splitlines()
+        head = lines[0].strip()
+        try:
+            exit_code = int(head.split("Exit code ", 1)[1].split()[0])
+        except Exception:
+            exit_code = None
+        if exit_code is not None and exit_code != 0:
+            status_label = "error"
+        body = " | ".join(line.strip() for line in lines[1:] if line.strip())
+        summary = body or head
+    elif text.startswith("{") and text.endswith("}"):
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                if parsed.get("success") is False or str(parsed.get("status", "")).lower() in ("error", "failed", "rejected", "denied"):
+                    status_label = "error"
+                exit_val = parsed.get("exit_code")
+                err_msg = parsed.get("error") or parsed.get("detail")
+                out_obj = parsed.get("output") if "output" in parsed else parsed.get("result")
+                if isinstance(out_obj, dict):
+                    if exit_val is None and isinstance(out_obj.get("exit_code"), int):
+                        exit_val = out_obj.get("exit_code")
+                    if "output" in out_obj and out_obj["output"] is not None:
+                        if not err_msg and out_obj.get("error"):
+                            err_msg = out_obj.get("error")
+                        out_obj = out_obj["output"]
+                if isinstance(exit_val, int):
+                    exit_code = exit_val
+                    if exit_val != 0:
+                        status_label = "error"
+                if err_msg:
+                    summary = str(err_msg)
+                elif isinstance(out_obj, dict):
+                    if "message" in out_obj:
+                        summary = str(out_obj["message"])
+                    elif "entries" in out_obj:
+                        entries = out_obj.get("entries") or []
+                        names = [e.get("name") for e in entries[:8] if isinstance(e, dict) and e.get("name")]
+                        extra = f" (+{len(entries) - len(names)} more)" if len(entries) > len(names) else ""
+                        summary = f"{len(entries)} entries: {', '.join(names)}{extra}"
+                    elif "lines_read" in out_obj:
+                        summary = f"read {out_obj.get('lines_read')}/{out_obj.get('total_lines')} lines from {Path(str(out_obj.get('path', ''))).name}"
+                    else:
+                        summary = json.dumps(out_obj, ensure_ascii=False)
+                else:
+                    summary = str(out_obj if out_obj is not None else parsed.get("status") or "ok")
+        except Exception:
+            summary = text
+    else:
+        if any(marker in text.lower() for marker in ("error:", "tool execution failed", "unsupported file action")):
+            status_label = "error"
+        summary = " | ".join(line.strip() for line in text.splitlines() if line.strip())
+
+    scrubbed = _redact_sensitive_text(summary or status_label)
+    if not verbose and len(scrubbed) > 160:
+        scrubbed = scrubbed[:157] + "..."
+    return status_label, exit_code, scrubbed
+
+
 async def _execute_headless_run(
     prompt: str,
     model_override: Optional[str] = None,
@@ -245,12 +350,19 @@ async def _execute_headless_run(
     orchestrator: Optional[Any] = None,
     verify_spec: Optional[str] = None,
     base_url_override: Optional[str] = None,
+    max_steps: Optional[int] = None,
+    db_path: Optional[str] = None,
+    verbose: bool = False,
 ) -> int:
     """Execute a one-shot prompt headlessly via NativeOrchestrator."""
     import re
     from zelyr.agents.native_orchestrator import NativeOrchestrator
     from zelyr.config import ZelyrConfig, get_config
     from zelyr.core.plugins import filter_tool_schemas_by_tier, get_tool_schemas, load_plugins
+    from zelyr.engine.execution_ledger import (
+        extract_global_mutation_prohibition,
+        is_diagnostic_test_command,
+    )
 
     clean_prompt = (prompt or "").strip()
     if not clean_prompt:
@@ -262,8 +374,13 @@ async def _execute_headless_run(
     active_model = model_override or getattr(base_cfg, "ollama_model", "qwen2.5-coder:7b")
 
     load_plugins()
+    cli_ledger = None
+    owns_cli_ledger = False
+    eff_max_steps = max_steps if max_steps is not None else (getattr(orchestrator, "max_steps", 5) if orchestrator is not None else 12)
     if orchestrator is not None:
         orch = orchestrator
+        if max_steps is not None:
+            orch.max_steps = max_steps
         if base_url_override and getattr(orch, "config", None) is None:
             run_cfg = ZelyrConfig.from_dict(base_cfg.to_dict()) if hasattr(base_cfg, "to_dict") else ZelyrConfig()
             run_cfg.ollama_base_url = base_cfg.get_effective_ollama_base_url(base_url_override) if hasattr(base_cfg, "get_effective_ollama_base_url") else base_url_override.rstrip("/")
@@ -273,7 +390,12 @@ async def _execute_headless_run(
         if base_url_override:
             run_cfg = ZelyrConfig.from_dict(base_cfg.to_dict()) if hasattr(base_cfg, "to_dict") else ZelyrConfig()
             run_cfg.ollama_base_url = base_cfg.get_effective_ollama_base_url(base_url_override) if hasattr(base_cfg, "get_effective_ollama_base_url") else base_url_override.rstrip("/")
-        orch = NativeOrchestrator(config=run_cfg)
+        cli_ledger, owns_cli_ledger = _open_cli_ledger(db_path)
+        orch = NativeOrchestrator(
+            config=run_cfg,
+            central_ledger=cli_ledger,
+            max_steps=eff_max_steps,
+        )
     tier = orch.route_tier(clean_prompt)
     dynamic_tools = filter_tool_schemas_by_tier(get_tool_schemas(0), tier)
 
@@ -290,10 +412,21 @@ async def _execute_headless_run(
     original_raw_execute = getattr(orch, "_execute_tool", None)
     original_execute = orch.execute_tool
     tool_calls_emitted: List[Dict[str, Any]] = []
+    exec_step_counter = 0
+
+    if not output_json:
+        p_preview = clean_prompt.replace("\n", " ")
+        if not verbose and len(p_preview) > 120:
+            p_preview = p_preview[:117] + "..."
+        sys.stderr.write(f"[task] {p_preview} | model={active_model} | cwd={Path.cwd()}\n")
+        sys.stderr.flush()
 
     async def headless_execute_tool(name: str, **kwargs: Any) -> str:
+        nonlocal exec_step_counter
         from zelyr.tool_registry import authorize_and_validate_tool_call, canonicalize_tool_invocation
 
+        exec_step_counter += 1
+        step_no = exec_step_counter
         clean_name = NativeOrchestrator.normalize_tool_name(name)
         clean_name, norm_kwargs = canonicalize_tool_invocation(clean_name, kwargs)
         norm_kwargs = NativeOrchestrator.normalize_tool_arguments(
@@ -310,6 +443,11 @@ async def _execute_headless_run(
             argument_source="model",
         )
         if not decision.allowed:
+            tool_calls_emitted.append({"name": clean_name, "arguments": norm_kwargs, "status": "blocked"})
+            if not output_json:
+                sys.stderr.write(f"[step {step_no}] tool={clean_name} args={_redact_cli_args(norm_kwargs, verbose=verbose)}\n")
+                sys.stderr.write(f"[result {step_no}] tool={clean_name} status=blocked reason={decision.reason or 'authorization_denied'}\n")
+                sys.stderr.flush()
             return json.dumps({
                 "success": False,
                 "error": decision.detail,
@@ -350,14 +488,38 @@ async def _execute_headless_run(
             source_surface="cli.headless_execute_tool",
         )
         if not pol_dec.allowed:
+            tool_calls_emitted.append({"name": clean_name, "arguments": norm_kwargs, "status": "blocked"})
+            if not output_json:
+                sys.stderr.write(f"[step {step_no}] tool={clean_name} args={_redact_cli_args(norm_kwargs, verbose=verbose)}\n")
+                sys.stderr.write(f"[result {step_no}] tool={clean_name} status=blocked reason={pol_dec.reason}\n")
+                sys.stderr.flush()
             return json.dumps(pol_dec.to_tool_error_payload())
 
+        cur_ledger = getattr(orch, "current_ledger", None)
+        rec_attempts = int(getattr(cur_ledger, "total_recovery_attempts", 0) or 0) if cur_ledger is not None else 0
         if not output_json:
-            sys.stderr.write(f"[tool] {clean_name} {json.dumps(norm_kwargs)}\n")
+            has_real_unres = bool(
+                cur_ledger is not None
+                and any(
+                    (getattr(getattr(r, "state", None), "value", None) == "failed" or getattr(r, "verification_failed", False))
+                    for r in cur_ledger.unresolved_failures()
+                )
+            )
+            if rec_attempts > 0 or has_real_unres:
+                sys.stderr.write(f"[recovery] attempt={max(1, rec_attempts)} tool={clean_name}\n")
+            sys.stderr.write(f"[step {step_no}] tool={clean_name} args={_redact_cli_args(norm_kwargs, verbose=verbose)}\n")
             sys.stderr.flush()
+
         with authorized_policy_context(pol_dec):
             res = await original_execute(clean_name, **norm_kwargs)
-        return str(res)
+        res_str = str(res)
+        r_status, r_exit, r_summary = _summarize_cli_tool_result(res_str, verbose=verbose)
+        tool_calls_emitted.append({"name": clean_name, "arguments": norm_kwargs, "status": r_status})
+        if not output_json:
+            exit_tag = f"exit={r_exit} " if r_exit is not None else ""
+            sys.stderr.write(f"[result {step_no}] tool={clean_name} status={r_status} {exit_tag}summary={r_summary}\n")
+            sys.stderr.flush()
+        return res_str
 
     orch.execute_tool = headless_execute_tool
     final_answer = ""
@@ -419,7 +581,6 @@ async def _execute_headless_run(
                     fn_args = NativeOrchestrator.normalize_tool_arguments(
                         fn_name, fn_args, original_name=raw_fb_name, active_schemas=dynamic_tools
                     )
-                    tool_calls_emitted.append({"name": fn_name, "arguments": fn_args})
                     obs = await headless_execute_tool(fn_name, **fn_args)
                     call_id = f"call_headless_fallback_{step_idx}"
                     framed_obs = NativeOrchestrator.format_tool_observation(fn_name, obs)
@@ -575,10 +736,18 @@ async def _execute_headless_run(
         return 1
     finally:
         orch.execute_tool = original_raw_execute
+        if owns_cli_ledger and cli_ledger is not None and verify_spec is None:
+            cli_ledger.close()
+            cli_ledger = None
+
+    reached_step_limit = "[Notice: Reached maximum autonomous ReAct steps" in (final_answer or "")
 
     if final_answer.startswith("⚠️ [Connection Error]") or final_answer.startswith("⚠️ [API Error]") or final_answer.startswith("⚠️ [Request Error]") or final_answer.startswith("⚠️ [Model Error]"):
         sys.stderr.write(f"{final_answer}\n")
         sys.stderr.flush()
+        if owns_cli_ledger and cli_ledger is not None:
+            cli_ledger.close()
+            cli_ledger = None
         if output_json:
             from zelyr.engine.execution_ledger import TurnExecutionLedger
             payload_dict = {
@@ -599,6 +768,9 @@ async def _execute_headless_run(
     if is_truncated:
         sys.stderr.write("⚠️ [Model Truncated] Generation reached token length limit before completion.\n")
         sys.stderr.flush()
+        if owns_cli_ledger and cli_ledger is not None:
+            cli_ledger.close()
+            cli_ledger = None
         if output_json:
             from zelyr.engine.execution_ledger import TurnExecutionLedger
             payload_dict = {
@@ -622,6 +794,9 @@ async def _execute_headless_run(
     v_results = []
     if verify_spec is not None:
         if not verify_spec.strip():
+            if owns_cli_ledger and cli_ledger is not None:
+                cli_ledger.close()
+                cli_ledger = None
             err_msg = "[verification failed] Empty verification specification provided.\n"
             sys.stdout.write(err_msg)
             sys.stderr.write(err_msg)
@@ -639,6 +814,9 @@ async def _execute_headless_run(
                 )
                 v_results.append((item.get("check", ""), item.get("target", ""), v_res))
         else:
+            if owns_cli_ledger and cli_ledger is not None:
+                cli_ledger.close()
+                cli_ledger = None
             err_msg = f"[verification failed] Unable to parse verification specification: '{verify_spec}'\n"
             sys.stdout.write(err_msg)
             sys.stderr.write(err_msg)
@@ -646,12 +824,49 @@ async def _execute_headless_run(
 
     ledger = getattr(orch, "current_ledger", None)
     has_unresolved_ledger = False
+    unresolved_recs: List[Any] = []
     if ledger is not None:
-        has_fn = getattr(ledger, "has_unresolved_failures", None)
-        if callable(has_fn):
-            has_unresolved_ledger = bool(has_fn())
+        unresolved_fn = getattr(ledger, "unresolved_failures", None)
+        if callable(unresolved_fn):
+            unresolved_recs = list(unresolved_fn())
+            has_unresolved_ledger = bool(unresolved_recs)
         else:
-            has_unresolved_ledger = bool(ledger.unresolved_failures())
+            has_fn = getattr(ledger, "has_unresolved_failures", None)
+            has_unresolved_ledger = bool(has_fn()) if callable(has_fn) else False
+
+    diagnostic_failures_only = False
+    if has_unresolved_ledger and verify_spec is None and not reached_step_limit and unresolved_recs:
+        from zelyr.engine.execution_ledger import (
+            _extract_action_target,
+            _is_inspection_action,
+            detect_false_success,
+        )
+        global_prohib = extract_global_mutation_prohibition(clean_prompt)
+        if (
+            global_prohib.get("no_file_modifications")
+            and global_prohib.get("is_test_diagnostic")
+            and bool(final_answer.strip())
+            and not detect_false_success(final_answer, has_unresolved=True)
+        ):
+            succ_read_names = set()
+            for sr in (ledger.successful_actions() if hasattr(ledger, "successful_actions") else []):
+                if _is_inspection_action(sr.tool_name, sr.arguments):
+                    t_s = _extract_action_target(sr.tool_name, sr.arguments)
+                    if t_s:
+                        succ_read_names.add(Path(t_s).name)
+
+            def _is_resolved_diag_rec(rec: Any) -> bool:
+                if is_diagnostic_test_command(rec.tool_name, rec.arguments):
+                    return True
+                if _is_inspection_action(rec.tool_name, rec.arguments):
+                    t_f = _extract_action_target(rec.tool_name, rec.arguments)
+                    if t_f and Path(t_f).name in succ_read_names:
+                        return True
+                return False
+
+            if all(_is_resolved_diag_rec(r) for r in unresolved_recs):
+                diagnostic_failures_only = True
+                has_unresolved_ledger = False
 
     if ledger is not None and getattr(ledger, "_central_ledger", None) is not None and getattr(ledger, "_execution_id", None):
         from zelyr.engine.execution_ledger import (
@@ -671,7 +886,7 @@ async def _execute_headless_run(
                     status=VerificationStatus.VERIFIED.value if v_res.success else VerificationStatus.VERIFICATION_FAILED.value,
                     metadata={"check": v_check, "target": v_target, "error": getattr(v_res, "error", None)},
                 )
-            if all_v_ok and not has_unresolved_ledger:
+            if all_v_ok and not has_unresolved_ledger and not reached_step_limit:
                 ledger.set_verification_status(VerificationStatus.VERIFIED)
                 c_ledger.finalize_execution(
                     c_exec_id,
@@ -689,6 +904,10 @@ async def _execute_headless_run(
                     final_summary=final_answer,
                 )
 
+    if owns_cli_ledger and cli_ledger is not None:
+        cli_ledger.close()
+        cli_ledger = None
+
     if output_json:
         from zelyr.engine.execution_ledger import TurnExecutionLedger
 
@@ -698,6 +917,10 @@ async def _execute_headless_run(
             "response": final_answer,
             "tool_calls": tool_calls_emitted,
         }
+        if reached_step_limit:
+            payload_dict["step_limit_exceeded"] = True
+        if diagnostic_failures_only:
+            payload_dict["diagnostic_test_failed"] = True
         if v_results:
             all_success = all(res.success for _, _, res in v_results)
             if len(v_results) == 1:
@@ -714,6 +937,8 @@ async def _execute_headless_run(
         json_out = json.dumps(payload_dict)
         sys.stdout.write(json_out.rstrip("\n") + "\n")
         sys.stdout.flush()
+        if reached_step_limit:
+            return 2
         if v_results and not all(res.success for _, _, res in v_results):
             return 2
         if has_unresolved_ledger:
@@ -721,8 +946,8 @@ async def _execute_headless_run(
     else:
         sys.stdout.write(final_answer.rstrip("\n") + "\n")
         sys.stdout.flush()
+        any_failed = False
         if v_results:
-            any_failed = False
             for v_check, v_target, v_res in v_results:
                 if v_res.success:
                     sys.stdout.write(f"[verified] {v_check} on {v_target}: PASS\n")
@@ -734,9 +959,28 @@ async def _execute_headless_run(
                     sys.stdout.flush()
                     sys.stderr.write(err_msg)
                     sys.stderr.flush()
-            if any_failed:
-                return 2
-        if has_unresolved_ledger:
+        total_rec = int(getattr(ledger, "total_recovery_attempts", 0) or 0) if ledger is not None else 0
+        total_acts = int(ledger.total_actions()) if ledger is not None and hasattr(ledger, "total_actions") else len(tool_calls_emitted)
+        if v_results:
+            ver_status_str = "FAIL" if any_failed else "PASS"
+        elif diagnostic_failures_only:
+            ver_status_str = "DIAGNOSTIC_TEST_FAILED"
+        elif ledger is not None and getattr(ledger, "verified_actions", None) and ledger.verified_actions():
+            ver_status_str = "VERIFIED"
+        else:
+            ver_status_str = "NOT_RUN"
+        if reached_step_limit:
+            outcome_str = "step_limit_exceeded"
+        elif any_failed or has_unresolved_ledger:
+            outcome_str = "failed"
+        else:
+            outcome_str = "completed"
+        sys.stderr.write(
+            f"[verification] {ver_status_str} | [outcome] {outcome_str} "
+            f"(steps={exec_step_counter}, actions={total_acts}, recoveries={total_rec})\n"
+        )
+        sys.stderr.flush()
+        if reached_step_limit or any_failed or has_unresolved_ledger:
             return 2
 
     return 0
@@ -927,6 +1171,9 @@ def cmd_run(args: argparse.Namespace) -> None:
             output_json=output_json,
             verify_spec=verify_spec,
             base_url_override=base_url_override,
+            max_steps=getattr(args, "max_steps", None),
+            db_path=getattr(args, "db_path", None),
+            verbose=bool(getattr(args, "verbose", False)),
         )
     )
     if exit_code != 0:
@@ -1684,6 +1931,50 @@ def _print_execution_diagnostics(
     print(format_execution_lifecycle_report(report))
     if report.persistence_errors or not report.found:
         sys.exit(1)
+
+
+def cmd_browser(args: argparse.Namespace) -> None:
+    """Install or inspect Chromium Native Messaging host and browser bridge status."""
+    from pathlib import Path
+    from zelyr.tools.browser_native_host import (
+        get_native_host_status,
+        install_native_messaging_host,
+    )
+
+    sub = getattr(args, "browser_cmd", None)
+    user_data_dir = Path(args.user_data_dir) if getattr(args, "user_data_dir", None) else None
+    output_json = bool(getattr(args, "json", False))
+
+    if sub == "install-host":
+        allowed_hosts = None
+        if getattr(args, "allowed_hosts", None):
+            allowed_hosts = [h.strip() for h in str(args.allowed_hosts).split(",") if h.strip()]
+        res = install_native_messaging_host(
+            extension_id=getattr(args, "extension_id", None),
+            user_data_dir=user_data_dir,
+            allowed_hosts=allowed_hosts,
+        )
+        if output_json:
+            print(json.dumps(res, indent=2))
+        else:
+            print(f"Installed Native Messaging host '{res['host_name']}':")
+            print(f"  Extension Dir:   {res['extension_dir']}")
+            print(f"  Extension ID:    {res['extension_id']}")
+            print(f"  Allowed Origins: {', '.join(res['allowed_origins'])}")
+            print(f"  Manifest Path:   {res['manifest_path']}")
+            print(f"  Launcher Path:   {res['launcher_path']}")
+        return
+
+    status = get_native_host_status(user_data_dir=user_data_dir)
+    if output_json:
+        print(json.dumps(status, indent=2))
+        return
+    print(f"Browser Native Host Status ({status['host_name']}):")
+    print(f"  Extension Dir:      {status['extension_dir']} (exists={status['extension_exists']})")
+    print(f"  Unpacked Ext ID:    {status['extension_id']}")
+    print(f"  Manifest Path:      {status['manifest_path']} (installed={status['manifest_installed']})")
+    print(f"  Allowed Origins:    {status['allowed_origins'] or '(none)'}")
+    print(f"  Native IPC Socket:  {status['socket_path']} (active={status['socket_present']})")
 
 
 def cmd_diagnose(args: argparse.Namespace) -> None:
@@ -2667,6 +2958,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override execution ledger SQLite DB path",
     )
+    p_run.add_argument(
+        "--max-steps",
+        type=int,
+        default=12,
+        help="Maximum autonomous ReAct steps for headless execution (default: 12)",
+    )
+    p_run.add_argument(
+        "--verbose",
+        action="store_true",
+        default=False,
+        help="Display detailed un-truncated operational traces on stderr",
+    )
 
     # ── Legacy commands (backwards-compatible) ──────────────────────────────
     p_send = sub.add_parser("send", help="Send a prompt to the daemon")
@@ -3068,6 +3371,23 @@ def _build_parser() -> argparse.ArgumentParser:
     p_pol_hist.add_argument("--db-path", type=str, default=None, help="Override execution ledger SQLite DB path")
     p_pol_hist.add_argument("--json", action="store_true", default=False, help="Output structured JSON")
 
+    # ── Browser Extension & Native Messaging host ────────────────────────────
+    p_browser = sub.add_parser(
+        "browser",
+        help="Install or inspect Chromium Native Messaging host and extension bridge status",
+    )
+    browser_sub = p_browser.add_subparsers(dest="browser_cmd")
+
+    p_br_install = browser_sub.add_parser("install-host", help="Install user-scoped Chromium NativeMessagingHosts manifest")
+    p_br_install.add_argument("--extension-id", type=str, default=None, help="Override Chromium extension ID")
+    p_br_install.add_argument("--user-data-dir", type=str, default=None, help="Target custom Chromium user-data-dir")
+    p_br_install.add_argument("--allowed-hosts", type=str, default=None, help="Comma-separated host allowlist for native bridge")
+    p_br_install.add_argument("--json", action="store_true", default=False, help="Output structured JSON")
+
+    p_br_status = browser_sub.add_parser("status", help="Inspect browser extension and Native Messaging host status")
+    p_br_status.add_argument("--user-data-dir", type=str, default=None, help="Inspect custom Chromium user-data-dir")
+    p_br_status.add_argument("--json", action="store_true", default=False, help="Output structured JSON")
+
     return parser
 
 
@@ -3130,6 +3450,11 @@ def main() -> None:
             cmd_policy(args)
         else:
             parser.parse_args(["policy", "--help"])
+    elif args.command == "browser":
+        if getattr(args, "browser_cmd", None):
+            cmd_browser(args)
+        else:
+            parser.parse_args(["browser", "--help"])
     elif args.command == "model":
         if getattr(args, "model_cmd", None) == "check":
             cmd_model(args)

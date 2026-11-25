@@ -67,6 +67,7 @@ TIER_1_PATTERNS = [
     r"\b(network|gateway|ip\s+address|interfaces|tailscale|dns|ping|vpn|wifi)\b",
     r"\b(media|music|playerctl|playback|volume|track|song|mpris)\b",
     r"\b(file|files|patch|rollback|undo|backup)\b",
+    r"\b(repository|repo|project|codebase|directory|folder|tests?|pytest|unittest|entrypoint|pyproject|bug|diff|git)\b",
     r"\b(command|bash|shell|terminal|exec|run command|cli|uptime|hostname|uname|kernel|distro|cpu|memory|disk|df|lsblk)\b",
 ]
 
@@ -74,7 +75,9 @@ TIER_1_PATTERNS = [
 TIER_2_PATTERNS = [
     r"\b(browser|chrome|chromium|brave|zen|firefox|monkeytype|gemini|youtube|electron|google|bing|duckduckgo)\b",
     r"\b(dom|html|css selector|website|webpage|web page|web app|tab|url|href)\b",
-    r"\b(inspect|evaluate|javascript|js)\b",
+    r"\b(evaluate_script|javascript|js)\b",
+    r"\b(?:inspect|evaluate)\s+(?:the\s+|this\s+|current\s+)?(?:dom|element|elements|page|webpage|web\s+page|tab|tabs|selector|css|html|script)\b",
+    r"\b(?:inspect|evaluate)\s+(?:in\s+)?(?:browser|chrome|chromium|firefox|zen|brave)\b",
     r"\b(scroll|scroll_page|extract_page_content|extract\s+page|page\s+content|markdown|read\s+article|pin\s+tab|duplicate\s+tab|reload\s+tab)\b",
     r"\b(open_tab|switch_tab|navigate_url|click_element|fill_element|get_page_snapshot)\b",
     r"\b(web_search|fetch_web_page|web search|search the web|search web)\b",

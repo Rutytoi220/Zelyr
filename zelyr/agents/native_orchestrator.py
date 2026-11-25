@@ -506,8 +506,14 @@ class NativeOrchestrator:
                         break
 
         elif clean_name == "manage_workspace_file":
-            if raw_orig in cls.FILE_TOOL_ALIASES or "action" not in args:
-                args.setdefault("action", "read")
+            raw_act = str(args.get("action") or "").strip()
+            if not raw_act:
+                if "search_text" in args or "replace_text" in args:
+                    args["action"] = "patch"
+                elif "content" in args:
+                    args["action"] = "write"
+                elif raw_orig in cls.FILE_TOOL_ALIASES or "action" not in args:
+                    args["action"] = "read"
             if "path" not in args:
                 for alt_key in ("file_path", "filepath", "file", "filename"):
                     if alt_key in args:
@@ -914,6 +920,7 @@ class NativeOrchestrator:
                 "write", "overwrite", "create", "append", "patch", "edit", "modify",
                 "update", "replace", "rollback", "delete", "remove", "unlink", "rm",
                 "truncate", "move", "rename", "copy", "cp", "touch", "alter", "change",
+                "mkdir", "create_directory", "create_dir",
             ):
                 for k in ("path", "filepath", "file", "target", "filename", "src", "source"):
                     val = func_args.get(k)
@@ -2753,6 +2760,49 @@ class NativeOrchestrator:
                 }
                 return
 
+            # Thinking-only emission guard: some reasoning models emit only <think>...</think>
+            # with empty visible output and stop. Nudge once to emit a visible final response.
+            if (
+                not clean_text
+                and ("<think>" in full_text or "</think>" in full_text)
+                and not is_retry
+                and depth < eff_max_depth - 1
+                and not getattr(self, "_cancelled", False)
+                and not payload.get("cancelled", False)
+            ):
+                buffered_chunks.clear()
+                collected_assistant_text.clear()
+                payload.setdefault("messages", []).append({
+                    "role": "user",
+                    "content": (
+                        "[SYSTEM NOTICE: Empty Visible Response] You placed your output only inside "
+                        "<think> reasoning with no visible final answer. Provide a concise, grounded "
+                        "visible response now based strictly on your observed tool results "
+                        "(do not place the final answer inside <think>)."
+                    ),
+                })
+                payload.setdefault("options", {})["temperature"] = 0.1
+                payload["temperature"] = 0.1
+                async for retry_chunk in self.generate_stream(
+                    payload,
+                    depth=depth + 1,
+                    is_retry=True,
+                    stream_provider=eff_stream_provider,
+                    tool_schemas=eff_tool_schemas,
+                    tool_executor=eff_tool_executor,
+                    db_path=eff_db_path,
+                    max_depth=eff_max_depth,
+                    turn_tool_history=curr_tool_history,
+                    actual_step_count=actual_step_count,
+                    ledger=eff_ledger,
+                    enable_cycle_detection=eff_cycle_detection,
+                    replanning_attempts=replanning_attempts,
+                    max_replanning_attempts=eff_max_replanning,
+                    task_local_scope=eff_task_local_scope,
+                ):
+                    yield retry_chunk
+                return
+
             # 1. Authoritative Runtime Invariants: Unresolved Failure Gate
             unresolved_exec_for_gate = [
                 r for r in eff_ledger.unresolved_failures()
@@ -2923,6 +2973,7 @@ class NativeOrchestrator:
                                 f"[ACTUATOR RECOVERY REQUIRED: {err_type}]\n"
                                 f"The action '{failed_tool}' failed with error: {failed_error}.\n"
                                 f"Do NOT ask the user to investigate, verify files, or run commands.\n"
+                                f"Do NOT write proposed code blocks in prose or say 'Let's fix/write...'; invoke a tool call directly.\n"
                                 f"You possess full host capabilities to inspect and resolve this state.\n"
                                 f"Remedy Hint: {remedy}\n"
                                 f"Allowed Actions: {allowed_act_str}\n"
@@ -3409,11 +3460,6 @@ class NativeOrchestrator:
                         or (func_lower == "manage_workspace_file" and str(func_args.get("action", "")).lower() in ("read", "view", "list", "list_tree", "stat", "exists", "inspect", "check"))
                     )
 
-                    has_prior_success = (
-                        (curr_tool_history and curr_tool_history[-1][0] == fingerprint and curr_tool_history[-1][1] == "success")
-                        or (hasattr(eff_ledger, "has_identical_successful_action") and eff_ledger.has_identical_successful_action(func_name, canonical_args))
-                    )
-
                     # Check if action mutates any already-verified resource
                     from zelyr.engine.execution_ledger import (
                         _is_inspection_action,
@@ -3421,10 +3467,42 @@ class NativeOrchestrator:
                         criterion_applies_to_target,
                         extract_file_targets_from_text,
                         has_remaining_explicit_steps,
+                        is_diagnostic_test_command,
                         parse_acceptance_criteria,
                         targets_match,
                     )
                     from zelyr.engine.verifier import OutcomeVerifier
+
+                    is_test_or_verify_cmd = is_diagnostic_test_command(func_name, func_args) or func_lower in (
+                        "verify_outcome",
+                        "verify_state",
+                        "check_state",
+                    )
+                    cycle_history = curr_tool_history
+                    last_mut_idx = -1
+                    if is_test_or_verify_cmd and curr_tool_history:
+                        for idx_h, (h_fp, h_st) in enumerate(curr_tool_history):
+                            if h_st != "success":
+                                continue
+                            h_name, h_canon = h_fp
+                            try:
+                                h_args = json.loads(h_canon) if isinstance(h_canon, str) and h_canon.startswith("{") else {}
+                            except Exception:
+                                h_args = {}
+                            if not _is_inspection_action(h_name, h_args) and not is_diagnostic_test_command(h_name, h_args):
+                                last_mut_idx = idx_h
+                        if last_mut_idx >= 0:
+                            cycle_history = curr_tool_history[last_mut_idx + 1 :]
+
+                    if is_test_or_verify_cmd and last_mut_idx >= 0:
+                        has_prior_success = any(
+                            p_fp == fingerprint and p_st == "success" for p_fp, p_st in cycle_history
+                        )
+                    else:
+                        has_prior_success = (
+                            (curr_tool_history and curr_tool_history[-1][0] == fingerprint and curr_tool_history[-1][1] == "success")
+                            or (hasattr(eff_ledger, "has_identical_successful_action") and eff_ledger.has_identical_successful_action(func_name, canonical_args))
+                        )
 
                     mutated_targets = self._get_mutation_targets(
                         func_name, func_args, eff_ledger.get_verified_targets()
@@ -3522,26 +3600,29 @@ class NativeOrchestrator:
                             f"Action '{func_name}' with identical parameters has already succeeded. "
                             "Do not repeat completed actions; provide the final response or proceed to the next distinct step."
                         )
-                    elif curr_tool_history and curr_tool_history[-1][0] == fingerprint and curr_tool_history[-1][1] == "error":
+                    elif cycle_history and cycle_history[-1][0] == fingerprint and cycle_history[-1][1] == "error":
                         # Identical Retry After Error: immediate preceding had same fingerprint and ended in error
                         rejection_reason = "cycle_detected"
                         rejection_detail = "Identical tool call retry after immediate failure is blocked. Alter parameters or explain the limitation."
-                    elif sum(1 for prior_fp, _ in curr_tool_history if prior_fp == fingerprint) >= 2:
-                        # Identical Call Ceiling: attempted for the 3rd time
+                    elif (
+                        sum(1 for prior_fp, _ in cycle_history if prior_fp == fingerprint) >= 2
+                        or sum(1 for prior_fp, _ in curr_tool_history if prior_fp == fingerprint) >= 8
+                    ):
+                        # Identical Call Ceiling: attempted for the 3rd time without intervening state change
                         rejection_reason = "cycle_detected"
                         rejection_detail = "Identical tool call ceiling reached (attempted 3 or more times). Alter parameters or explain the limitation."
-                    elif len(curr_tool_history) >= 3:
+                    elif len(cycle_history) >= 3:
                         # Alternating Failure Loop: A -> B -> A -> B where both A and B returned error
-                        A_prev = curr_tool_history[-1][0]
-                        B_prev = curr_tool_history[-2][0]
-                        A_init = curr_tool_history[-3][0]
+                        A_prev = cycle_history[-1][0]
+                        B_prev = cycle_history[-2][0]
+                        A_init = cycle_history[-3][0]
                         if (
                             fingerprint == B_prev
                             and A_prev == A_init
                             and A_prev != B_prev
-                            and curr_tool_history[-1][1] == "error"
-                            and curr_tool_history[-2][1] == "error"
-                            and curr_tool_history[-3][1] == "error"
+                            and cycle_history[-1][1] == "error"
+                            and cycle_history[-2][1] == "error"
+                            and cycle_history[-3][1] == "error"
                         ):
                             rejection_reason = "cycle_detected"
                             rejection_detail = "Alternating failure cycle detected (A -> B -> A -> B). Alter approach or explain limitation."
@@ -3670,10 +3751,14 @@ class NativeOrchestrator:
                                     rejection_detail = gn.blocked_reason or f"TaskGraph node '{gn.node_id}' is {gn.execution_status} and cannot execute."
                                     break
 
-                # Runtime-enforced user prohibitions: an explicit "do not create/write/delete <path>"
-                # in the user's own request cannot be overridden by model-proposed tool calls.
+                # Runtime-enforced user prohibitions: explicit target bans AND workspace-wide read-only directives
+                # cannot be overridden by model-proposed tool calls.
                 if rejection_reason is None:
-                    from zelyr.engine.execution_ledger import targets_match
+                    from zelyr.engine.execution_ledger import (
+                        extract_global_mutation_prohibition,
+                        is_mutating_tool_call,
+                        targets_match,
+                    )
                     _user_text = " ".join(
                         (m.get("content") if isinstance(m.get("content"), str) else "")
                         for m in payload.get("messages", [])
@@ -3700,6 +3785,25 @@ class NativeOrchestrator:
                                 f"The user explicitly prohibited mutating '{prohibited_hit[0]}'. "
                                 f"The call to '{func_name}' is blocked; do not retry it."
                             )
+
+                    if rejection_reason is None:
+                        global_prohib = extract_global_mutation_prohibition(_user_text)
+                        if global_prohib["no_file_modifications"] or global_prohib["no_mutating_commands"]:
+                            allow_tests = bool(
+                                global_prohib["is_test_diagnostic"]
+                                and not global_prohib["no_mutating_commands"]
+                            )
+                            is_mut, mut_reason = is_mutating_tool_call(
+                                func_name,
+                                func_args,
+                                allow_read_only_tests=allow_tests,
+                            )
+                            if is_mut:
+                                rejection_reason = "prohibited_by_user"
+                                rejection_detail = (
+                                    f"The user explicitly prohibited modifying files or running mutating commands ({mut_reason}). "
+                                    f"The call to '{func_name}' is blocked; use read-only inspection only and do not retry mutations."
+                                )
 
                 # Centralized Unified Execution Policy gate right before dispatch
                 pol_dec: Any = None

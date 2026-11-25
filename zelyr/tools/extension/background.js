@@ -5,14 +5,20 @@
  */
 
 const WS_URL = "ws://127.0.0.1:41144";
+const NATIVE_HOST_NAME = "ai.zelyr.browser_host";
 let socket = null;
+let nativePort = null;
 let reconnectTimer = null;
+let nativeReconnectTimer = null;
 let pingTimer = null;
 const INITIAL_RECONNECT_DELAY = 1000; // 1000ms initial reconnect delay (legacy 2000)
 const MAX_RECONNECT_DELAY = 10000;    // 10000ms max reconnect delay (legacy 5000)
+const MAX_NATIVE_RECONNECT_DELAY = 30000;
 const RECONNECT_MULTIPLIER = 1.5;
 const PING_INTERVAL_MS = 10000; // 10 seconds
 let reconnectDelay = INITIAL_RECONNECT_DELAY;
+let nativeReconnectDelay = INITIAL_RECONNECT_DELAY;
+const _replyTransports = new Map();
 
 function log(msg, ...args) {
   console.log(`[Zelyr Extension] ${msg}`, ...args);
@@ -81,6 +87,7 @@ function connect() {
         log("Invalid command payload:", event.data);
         return;
       }
+      _replyTransports.set(msg.id, "ws");
       await handleCommand(msg);
     } catch (err) {
       log("Error processing message:", err);
@@ -113,6 +120,62 @@ function scheduleReconnect() {
   }, reconnectDelay);
 }
 
+function connectNativeHost() {
+  if (typeof chrome === "undefined" || !chrome.runtime || typeof chrome.runtime.connectNative !== "function") {
+    return;
+  }
+  if (nativePort) {
+    return;
+  }
+  try {
+    log(`Connecting to Native Messaging host '${NATIVE_HOST_NAME}'...`);
+    nativePort = chrome.runtime.connectNative(NATIVE_HOST_NAME);
+  } catch (err) {
+    log("Native messaging connection failed:", err);
+    scheduleNativeReconnect();
+    return;
+  }
+
+  nativeReconnectDelay = INITIAL_RECONNECT_DELAY;
+  if (nativeReconnectTimer) {
+    clearTimeout(nativeReconnectTimer);
+    nativeReconnectTimer = null;
+  }
+
+  nativePort.onMessage.addListener(async (msg) => {
+    try {
+      if (!msg) return;
+      if (msg.type === "pong" || msg.action === "pong") {
+        return;
+      }
+      if (!msg.id || !msg.action) {
+        log("Invalid native command payload:", msg);
+        return;
+      }
+      _replyTransports.set(msg.id, "native");
+      await handleCommand(msg);
+    } catch (err) {
+      log("Error processing native message:", err);
+    }
+  });
+
+  nativePort.onDisconnect.addListener(() => {
+    const err = chrome.runtime && chrome.runtime.lastError ? chrome.runtime.lastError.message : "disconnected";
+    log(`Native messaging host disconnected: ${err}`);
+    nativePort = null;
+    scheduleNativeReconnect();
+  });
+}
+
+function scheduleNativeReconnect() {
+  if (nativeReconnectTimer) return;
+  nativeReconnectTimer = setTimeout(() => {
+    nativeReconnectTimer = null;
+    nativeReconnectDelay = Math.min(Math.round(nativeReconnectDelay * RECONNECT_MULTIPLIER), MAX_NATIVE_RECONNECT_DELAY);
+    connectNativeHost();
+  }, nativeReconnectDelay);
+}
+
 function sendReply(data) {
   if (typeof global !== "undefined" && typeof global.__zelyrSendReplyHook === "function") {
     try {
@@ -120,10 +183,29 @@ function sendReply(data) {
       return;
     } catch (_) {}
   }
+  const msgId = data && data.id ? data.id : null;
+  const transport = msgId ? _replyTransports.get(msgId) : null;
+  if (msgId) {
+    _replyTransports.delete(msgId);
+  }
+  if (transport === "native" && nativePort) {
+    try {
+      nativePort.postMessage(data);
+      return;
+    } catch (err) {
+      log("Failed to post reply over native port:", err);
+    }
+  }
   if (socket && socket.readyState === WebSocket.OPEN) {
     socket.send(JSON.stringify(data));
+  } else if (nativePort) {
+    try {
+      nativePort.postMessage(data);
+    } catch (err) {
+      log("Cannot send reply over native port:", err);
+    }
   } else {
-    log("Cannot send reply: socket not open", data);
+    log("Cannot send reply: no active transport open", data);
   }
 }
 
@@ -928,14 +1010,14 @@ async function handleCommand(msg) {
               success: true,
               result: `Clicked <${el.tagName.toLowerCase()}> element (${sel})`,
               tagName: el.tagName,
-              id: el.id,
+              dom_id: el.id,
             };
           },
           args: [selector],
         });
 
         const execResult = results && results[0] ? results[0].result : { success: false, error: "Script execution produced no result" };
-        sendReply({ id, action: "click", selector, ...execResult });
+        sendReply({ ...execResult, id, action: "click", selector });
         break;
       }
 
@@ -980,7 +1062,7 @@ async function handleCommand(msg) {
         });
 
         const execResult = results && results[0] ? results[0].result : { success: false, error: "Script execution produced no result" };
-        sendReply({ id, action: "type", selector, ...execResult });
+        sendReply({ ...execResult, id, action: "type", selector });
         break;
       }
 
@@ -1004,7 +1086,7 @@ async function handleCommand(msg) {
         });
 
         const execResult = results && results[0] ? results[0].result : { success: false, error: "Script execution produced no result" };
-        sendReply({ id, success: true, action: "get_dom", ...execResult });
+        sendReply({ success: true, ...execResult, id, action: "get_dom" });
         break;
       }
 
@@ -1228,7 +1310,7 @@ async function handleCommand(msg) {
         });
 
         const execResult = results && results[0] ? results[0].result : { success: false, error: "Snapshot script produced no result" };
-        sendReply({ id, success: true, action: "get_page_snapshot", ...execResult });
+        sendReply({ success: true, ...execResult, id, action: "get_page_snapshot" });
         break;
       }
 
@@ -1614,7 +1696,7 @@ async function handleCommand(msg) {
         });
 
         const execResult = results && results[0] ? results[0].result : { success: false, error: "Click script execution produced no result" };
-        sendReply({ id, action: "click_element", ...execResult });
+        sendReply({ ...execResult, id, action: "click_element" });
         break;
       }
 
@@ -2063,7 +2145,7 @@ async function handleCommand(msg) {
         });
 
         const execResult = results && results[0] ? results[0].result : { success: false, error: "Fill script execution produced no result" };
-        sendReply({ id, action: "fill_element", ...execResult });
+        sendReply({ ...execResult, id, action: "fill_element" });
         break;
       }
 
@@ -2298,7 +2380,7 @@ async function handleCommand(msg) {
         });
 
         const execResult = results && results[0] ? results[0].result : { success: false, error: "Scroll execution produced no result" };
-        sendReply({ id, action: "scroll_page", ...execResult });
+        sendReply({ ...execResult, id, action: "scroll_page" });
         break;
       }
 
@@ -2450,7 +2532,7 @@ async function handleCommand(msg) {
         });
 
         const execResult = results && results[0] ? results[0].result : { success: false, error: "Content extraction script produced no result" };
-        sendReply({ id, action: "extract_page_content", ...execResult });
+        sendReply({ ...execResult, id, action: "extract_page_content" });
         break;
       }
 
@@ -2482,7 +2564,7 @@ async function handleCommand(msg) {
           });
 
           const execResult = results && results[0] ? results[0].result : { success: false, error: "Script execution produced no result" };
-          sendReply({ id, action: "evaluate_script", ...execResult });
+          sendReply({ ...execResult, id, action: "evaluate_script" });
         } catch (err) {
           sendReply({ id, success: false, action: "evaluate_script", error: `Failed to evaluate script: ${err.message || String(err)}` });
         }
@@ -2607,11 +2689,18 @@ async function handleCommand(msg) {
 // Start connection immediately on extension load
 if (typeof chrome !== "undefined" && chrome.runtime) {
   connect();
+  connectNativeHost();
   if (chrome.runtime.onStartup) {
-    chrome.runtime.onStartup.addListener(() => connect());
+    chrome.runtime.onStartup.addListener(() => {
+      connect();
+      connectNativeHost();
+    });
   }
   if (chrome.runtime.onInstalled) {
-    chrome.runtime.onInstalled.addListener(() => connect());
+    chrome.runtime.onInstalled.addListener(() => {
+      connect();
+      connectNativeHost();
+    });
   }
 }
 
@@ -2621,9 +2710,12 @@ if (typeof chrome !== "undefined" && chrome.alarms) {
     chrome.alarms.create("zelyr_keep_alive", { periodInMinutes: 0.33 }); // Every ~20s
     chrome.alarms.onAlarm.addListener((alarm) => {
       if (alarm.name === "zelyr_keep_alive") {
-        log("Keep-alive alarm triggered: ensuring WebSocket link is active");
+        log("Keep-alive alarm triggered: ensuring browser bridge links are active");
         if (!socket || socket.readyState !== WebSocket.OPEN) {
           connect();
+        }
+        if (!nativePort) {
+          connectNativeHost();
         }
       }
     });

@@ -348,6 +348,14 @@ class RuntimeEnvironmentManifest:
             pass
 
         try:
+            from zelyr.tools.browser_native_host import NativeBrowserClient
+
+            if NativeBrowserClient().is_socket_present():
+                return True
+        except Exception:
+            pass
+
+        try:
             with socket.create_connection(("127.0.0.1", 9222), timeout=0.05):
                 return True
         except (OSError, socket.timeout):
@@ -1525,24 +1533,32 @@ class RuntimeEnvironmentManifest:
         except Exception:
             pass
 
+        native_host_connected = False
+        try:
+            from zelyr.tools.browser_native_host import NativeBrowserClient
+
+            native_host_connected = bool(NativeBrowserClient().is_socket_present())
+        except Exception:
+            pass
+
         playwright_installed = _is_module_importable("playwright")
         browser_limitations: List[str] = []
         if eff_browser:
             browser_status = CapabilityStatus.AVAILABLE.value
-            browser_details = "Active browser automation channel (WebExtension bridge or CDP 9222)."
+            browser_details = "Active browser automation channel (WebExtension bridge, Native Messaging host, or CDP 9222)."
         elif bridge_listening or playwright_installed:
             browser_status = CapabilityStatus.DEGRADED.value
             browser_details = (
                 "Browser bridge or Playwright installed, but no active browser session is connected."
             )
             browser_limitations.append(
-                "No connected BrowserExtensionBridge client and CDP port 9222 is closed."
+                "No connected BrowserExtensionBridge/Native Messaging client and CDP port 9222 is closed."
             )
         else:
             browser_status = CapabilityStatus.UNAVAILABLE.value
-            browser_details = "No browser extension bridge, CDP endpoint, or Playwright runtime detected."
+            browser_details = "No browser extension bridge, native messaging host, CDP endpoint, or Playwright runtime detected."
             browser_limitations.append(
-                "Connect the Zelyr browser extension or launch Chromium with --remote-debugging-port=9222."
+                "Connect the Zelyr browser extension (or install Chromium native host via 'zelyr browser install-host') or launch Chromium with --remote-debugging-port=9222."
             )
 
         browser_integration = {
@@ -1551,6 +1567,7 @@ class RuntimeEnvironmentManifest:
             "source": "detected",
             "bridge_listening": bridge_listening,
             "bridge_connected": bridge_connected,
+            "native_host_connected": native_host_connected,
             "playwright_installed": playwright_installed,
             "details": browser_details,
             "limitations": browser_limitations,
