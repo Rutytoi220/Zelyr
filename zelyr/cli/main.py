@@ -292,8 +292,15 @@ def _summarize_cli_tool_result(res_text: str, *, verbose: bool = False) -> tuple
             exit_code = None
         if exit_code is not None and exit_code != 0:
             status_label = "error"
-        body = " | ".join(line.strip() for line in lines[1:] if line.strip())
-        summary = body or head
+            if len(lines) > 2:
+                from zelyr.engine.observation_framing import ObservationFramingEngine
+
+                summary = ObservationFramingEngine._summarize_multiline_error(
+                    "\n".join(lines[1:]), max_chars=160
+                )
+        if not summary:
+            body = " | ".join(line.strip() for line in lines[1:] if line.strip())
+            summary = body or head
     elif text.startswith("{") and text.endswith("}"):
         try:
             parsed = json.loads(text)
@@ -836,37 +843,10 @@ async def _execute_headless_run(
 
     diagnostic_failures_only = False
     if has_unresolved_ledger and verify_spec is None and not reached_step_limit and unresolved_recs:
-        from zelyr.engine.execution_ledger import (
-            _extract_action_target,
-            _is_inspection_action,
-            detect_false_success,
-        )
-        global_prohib = extract_global_mutation_prohibition(clean_prompt)
-        if (
-            global_prohib.get("no_file_modifications")
-            and global_prohib.get("is_test_diagnostic")
-            and bool(final_answer.strip())
-            and not detect_false_success(final_answer, has_unresolved=True)
-        ):
-            succ_read_names = set()
-            for sr in (ledger.successful_actions() if hasattr(ledger, "successful_actions") else []):
-                if _is_inspection_action(sr.tool_name, sr.arguments):
-                    t_s = _extract_action_target(sr.tool_name, sr.arguments)
-                    if t_s:
-                        succ_read_names.add(Path(t_s).name)
-
-            def _is_resolved_diag_rec(rec: Any) -> bool:
-                if is_diagnostic_test_command(rec.tool_name, rec.arguments):
-                    return True
-                if _is_inspection_action(rec.tool_name, rec.arguments):
-                    t_f = _extract_action_target(rec.tool_name, rec.arguments)
-                    if t_f and Path(t_f).name in succ_read_names:
-                        return True
-                return False
-
-            if all(_is_resolved_diag_rec(r) for r in unresolved_recs):
-                diagnostic_failures_only = True
-                has_unresolved_ledger = False
+        from zelyr.engine.execution_ledger import is_read_only_diagnostic_failures_only
+        if is_read_only_diagnostic_failures_only(clean_prompt, ledger, final_answer):
+            diagnostic_failures_only = True
+            has_unresolved_ledger = False
 
     if ledger is not None and getattr(ledger, "_central_ledger", None) is not None and getattr(ledger, "_execution_id", None):
         from zelyr.engine.execution_ledger import (

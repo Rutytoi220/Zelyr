@@ -71,6 +71,21 @@ async def test_workspace_file_mkdir_dir_read_unescape_syntax_and_action_inferenc
     assert "entries" in res_dir_read.output
     assert "directory" in res_dir_read.output.get("note", "").lower()
 
+    # Bare '/' path outside '/' fails cleanly instead of walking root filesystem
+    res_root_guard = await tool.execute({"action": "list_tree", "path": "/"})
+    assert not res_root_guard.success
+    assert "root filesystem" in (res_root_guard.error or "").lower()
+
+    # Large directory trees are bounded cleanly instead of blowing context window
+    big_dir = tmp_path / "big"
+    big_dir.mkdir()
+    for idx in range(150):
+        (big_dir / f"f_{idx:03d}.txt").write_text("x", encoding="utf-8")
+    res_bounded = await tool.execute({"action": "list_tree", "path": str(big_dir)})
+    assert res_bounded.success
+    assert res_bounded.output["truncated"] is True
+    assert res_bounded.output["count"] <= 120
+
     # Double-escaped newlines from smaller local models get decoded cleanly
     py_path = tmp_path / "mod.py"
     res_write = await tool.execute({
@@ -121,6 +136,22 @@ def test_ledger_global_prohibitions_and_diagnostic_helpers() -> None:
     assert has_prospective_action_prose("Let's fix this bug now:\n```python\nx = 1\n```") is True
     assert is_truthful_failure_report("Let's fix this bug cleanly in app.py") is False
     assert is_truthful_failure_report("The test failed because permission was denied.") is True
+
+    from zelyr.engine.execution_ledger import is_read_only_diagnostic_failures_only
+    diag_ledger = TurnExecutionLedger(execution_id="exec_diag_only")
+    diag_ledger.record_proposed("d1", "manage_workspace_file", {"action": "read", "path": "calc.py"})
+    diag_ledger.record_validated("d1")
+    diag_ledger.record_dispatched("d1")
+    diag_ledger.record_observation("d1", status="success", output="def add(a, b): return a - b")
+    diag_ledger.record_proposed("d2", "execute_command", {"command": "pytest -v"})
+    diag_ledger.record_validated("d2")
+    diag_ledger.record_dispatched("d2")
+    diag_ledger.record_observation("d2", output="1 failed", status="error", exit_code=1, error="1 failed")
+    assert is_read_only_diagnostic_failures_only(
+        "Inspect this project and run pytest -v. Explain why tests fail without modifying any files.",
+        diag_ledger,
+        "1 test failed in test_calc.py because add() returns a - b instead of a + b.",
+    ) is True
 
     ledger = TurnExecutionLedger(execution_id="exec_compat_1")
     ledger.record_proposed("c1", "manage_workspace_file", {"action": "patch", "path": "app.py"})
@@ -244,6 +275,56 @@ async def test_orchestrator_readonly_guard_cycle_reset_and_thinking_retry() -> N
     joined = "".join(c.get("choices", [{}])[0].get("delta", {}).get("content", "") for c in think_chunks)
     assert think_turn == 2
     assert "Visible final explanation." in joined
+
+    # 4. Mid-task thinking truncation after prior tool calls retries once concisely
+    len_turn = 0
+
+    async def mid_task_len_stream(p):
+        nonlocal len_turn
+        len_turn += 1
+        if len_turn == 1:
+            tc = {"id": "lt1", "index": 0, "type": "function", "function": {"name": "manage_workspace_file", "arguments": {"action": "read", "path": "a.py"}}}
+            yield {"choices": [{"delta": {"tool_calls": [tc]}, "finish_reason": "stop"}]}
+        elif len_turn == 2:
+            yield {"choices": [{"delta": {"reasoning_content": "Long unfinished thought..."}, "finish_reason": "length"}]}
+        else:
+            yield {"choices": [{"delta": {"content": "Recovered concisely after length limit."}, "finish_reason": "stop"}]}
+
+    async def read_mock_runner(name, args):
+        return json.dumps({"status": "ok", "content": "x = 1"})
+
+    orch4 = NativeOrchestrator(
+        stream_provider=mid_task_len_stream,
+        tool_executor=read_mock_runner,
+    )
+    orch4.max_steps = 5
+    len_chunks = [c async for c in orch4.generate_stream({"messages": [{"role": "user", "content": "Read a.py"}], "tools": tools_list})]
+    joined_len = "".join(c.get("choices", [{}])[0].get("delta", {}).get("content", "") for c in len_chunks)
+    assert len_turn == 3
+    assert "Recovered concisely after length limit." in joined_len
+
+    # 5. Final turn at depth == max_depth - 1 after actions retries synthesis if only <think> was emitted
+    late_turn = 0
+
+    async def late_think_only_stream(p):
+        nonlocal late_turn
+        late_turn += 1
+        if late_turn == 1:
+            tc = {"id": "lt2", "index": 0, "type": "function", "function": {"name": "manage_workspace_file", "arguments": {"action": "read", "path": "a.py"}}}
+            yield {"choices": [{"delta": {"tool_calls": [tc]}, "finish_reason": "stop"}]}
+        elif late_turn == 2:
+            yield {"choices": [{"delta": {"reasoning_content": "All done inside think only."}, "finish_reason": "stop"}]}
+        else:
+            assert not p.get("tools"), "Synthesis retry at depth ceiling must disable tools"
+            yield {"choices": [{"delta": {"content": "Final grounded summary visible."}, "finish_reason": "stop"}]}
+
+    orch5 = NativeOrchestrator(stream_provider=late_think_only_stream, tool_executor=read_mock_runner)
+    orch5.max_steps = 2
+    orch5.max_depth = 2
+    late_chunks = [c async for c in orch5.generate_stream({"messages": [{"role": "user", "content": "Read a.py"}], "tools": tools_list})]
+    late_joined = "".join(c.get("choices", [{}])[0].get("delta", {}).get("content", "") for c in late_chunks)
+    assert late_turn == 3
+    assert "Final grounded summary visible." in late_joined
 
 
 @pytest.mark.asyncio
@@ -419,3 +500,118 @@ async def test_native_host_framing_origin_url_policy_and_cli(tmp_path: Path) -> 
                 pass
         await asyncio.wait_for(host_task, timeout=3.0)
         t_resp.join(timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_multiline_error_framing_write_preview_and_verifier_snippet(tmp_path: Path, monkeypatch) -> None:
+    from zelyr.engine.observation_framing import ObservationFramingEngine
+    from zelyr.engine.verifier import verify_command_output
+    from zelyr.tools.workspace_file import ManageWorkspaceFileTool
+
+    # 1. Multiline command failures preserve failure lines instead of first banner line
+    pytest_fail = (
+        "Exit code 1\n"
+        "============================= test session starts ==============================\n"
+        ">       with pytest.raises(ValueError):\n"
+        "E       Failed: DID NOT RAISE ValueError\n"
+        "FAILED tests/test_versioning.py::test_invalid - Failed: DID NOT RAISE ValueError\n"
+        "1 failed, 3 passed in 0.02s"
+    )
+    framed = ObservationFramingEngine.frame_observation("execute_command", pytest_fail)
+    parsed = ObservationFramingEngine.parse_observation(framed)
+    assert "test session starts" not in parsed["error"]
+    assert "FAILED tests/test_versioning.py::test_invalid" in parsed["error"]
+    assert "1 failed, 3 passed" in parsed["error"]
+    assert "DID NOT RAISE ValueError" in parsed["output"]
+
+    from zelyr.cli.main import _summarize_cli_tool_result
+    cli_st, cli_ec, cli_sum = _summarize_cli_tool_result(pytest_fail, verbose=False)
+    assert cli_st == "error" and cli_ec == 1
+    assert "test session starts" not in cli_sum
+    assert "FAILED tests/test_versioning.py::test_invalid" in cli_sum
+
+    # 2. WorkspaceFileTool write includes bounded preview metadata like patch
+    wf = ManageWorkspaceFileTool()
+    f_py = tmp_path / "mod.py"
+    w_res = await wf.execute({"action": "write", "path": str(f_py), "content": "x = 1\ny = 2\n", "cwd": str(tmp_path)})
+    assert w_res.success is True
+    assert w_res.output["line_count"] == 2
+    assert w_res.output["written_content"] == "x = 1\ny = 2\n"
+
+    # 3. verify_command_output includes compact output snippet on mismatch
+    v_res = verify_command_output("echo failure_reason_xyz", "expected_pattern_abc", cwd=str(tmp_path))
+    assert v_res.success is False
+    assert v_res.error is not None
+    assert "Expected pattern 'expected_pattern_abc' not found in command output" in v_res.error
+    assert "failure_reason_xyz" in v_res.error
+
+    # 4. Mutating file edits surface unmatched command_output acceptance failures immediately
+    t_script = tmp_path / "fail_script.py"
+    seen_tool_contents: list[str] = []
+    orch = NativeOrchestrator(max_steps=4)
+    monkeypatch.setattr(orch, "get_active_window_context", AsyncMock(return_value=None))
+
+    async def wf_exec(name: str, **kwargs):
+        res = await wf.execute(dict(kwargs))
+        return res.to_dict() if hasattr(res, "to_dict") else res
+
+    turn = 0
+
+    async def stream_cmd_verify(payload: dict):
+        nonlocal turn
+        turn += 1
+        for msg in payload.get("messages", []):
+            if msg.get("role") == "tool" and isinstance(msg.get("content"), str):
+                seen_tool_contents.append(msg["content"])
+        if turn == 1:
+            yield {
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "id": "call_wf_1",
+                            "type": "function",
+                            "function": {
+                                "name": "manage_workspace_file",
+                                "arguments": json.dumps({
+                                    "action": "write",
+                                    "path": str(t_script),
+                                    "content": "print('STILL_BAD')\n",
+                                }),
+                            },
+                        }]
+                    }
+                }]
+            }
+        elif turn == 2:
+            yield {
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "id": "call_wf_2",
+                            "type": "function",
+                            "function": {
+                                "name": "manage_workspace_file",
+                                "arguments": json.dumps({
+                                    "action": "write",
+                                    "path": str(t_script),
+                                    "content": "print('NOW_GOOD')\n",
+                                }),
+                            },
+                        }]
+                    }
+                }]
+            }
+        else:
+            yield {"choices": [{"delta": {"content": "Updated and verified."}}]}
+
+    monkeypatch.chdir(tmp_path)
+    async for _ in orch.generate_stream(
+        {
+            "messages": [{"role": "user", "content": f"Update {t_script} so python3 {t_script.name} prints NOW_GOOD."}],
+            "acceptance_criteria": "command_output:echo STILL_BAD:NOW_GOOD",
+        },
+        stream_provider=stream_cmd_verify,
+        tool_executor=wf_exec,
+    ):
+        pass
+    assert any("[Outcome Verification Failed]:" in c for c in seen_tool_contents)

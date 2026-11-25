@@ -1420,6 +1420,40 @@ class ObservationFramingEngine:
         so = cls.frame_structured("unknown", str(observation))
         return so.to_compact_dict(max_chars=max_chars) if as_dict else so.to_compact_planner_context(max_chars=max_chars)
 
+    @staticmethod
+    def _summarize_multiline_error(text: str, max_chars: int = 320) -> str:
+        """Collapse multiline error traces into a high-signal single-line headline."""
+        raw = str(text or "").strip()
+        if "\n" not in raw:
+            return raw
+        raw_lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        useful = [ln for ln in raw_lines if not set(ln) <= set("=-_~* ")]
+        priority_markers = (
+            "FAILED ",
+            "ERROR",
+            "AssertionError",
+            "SyntaxError",
+            "IndentationError",
+            "NameError",
+            "TypeError",
+            "ValueError",
+            "ImportError",
+            "ModuleNotFoundError",
+            "ZeroDivisionError",
+            "Failed:",
+            "E   ",
+            " failed,",
+        )
+        hits = [ln for ln in useful if any(m in ln for m in priority_markers)]
+        chosen: List[str] = []
+        for ln in (hits[-4:] if hits else useful[-3:]):
+            if ln not in chosen:
+                chosen.append(ln)
+        joined = " | ".join(chosen) if chosen else raw_lines[0]
+        if len(joined) > max_chars:
+            return joined[: max_chars - 3].rstrip() + "..."
+        return joined
+
     @classmethod
     def frame_observation(
         cls,
@@ -1644,8 +1678,12 @@ class ObservationFramingEngine:
                     error = ""
                 else:
                     status = "ERROR"
-                    output = ""
-                    error = body or f"Command exited with code {exit_code}"
+                    if "\n" in body:
+                        output = body
+                        error = cls._summarize_multiline_error(body) or f"Command exited with code {exit_code}"
+                    else:
+                        output = ""
+                        error = body or f"Command exited with code {exit_code}"
             elif raw_str.startswith(("Error executing command:", "Tool execution failed:", "Error:")):
                 status = "ERROR"
                 exit_code = 1
@@ -1876,9 +1914,12 @@ class ObservationFramingEngine:
                     lines.append("- Required Correction: Emit a fresh tool call with corrected parameters to satisfy the acceptance criteria.")
 
         else:
+            if error and "\n" in error and not output:
+                output = error
+            error_reason = cls._summarize_multiline_error(error) if error else ""
             lines.append("")
             lines.append(f"[Error Diagnostic: {error_type or 'TOOL_EXECUTION_FAILED'}]")
-            lines.append(f"- Failure Reason: {error or 'Execution failed'}")
+            lines.append(f"- Failure Reason: {error_reason or 'Execution failed'}")
             lines.append(f"- Recovery Hint: {remedy_hint}")
             lines.append(f"- Allowed Actions: {json.dumps(allowed_actions) if allowed_actions else '[]'}")
 
@@ -1893,7 +1934,7 @@ class ObservationFramingEngine:
                 lines.append(cls._bound_stream_text(output.strip()))
 
             lines.append("")
-            lines.append(f"[Tool Error]: {error or 'Command failed'}. Recovery Hint: {remedy_hint}")
+            lines.append(f"[Tool Error]: {error_reason or 'Command failed'}. Recovery Hint: {remedy_hint}")
 
         return "\n".join(lines)
 
@@ -2169,13 +2210,21 @@ class ObservationFramingEngine:
             except Exception:
                 parsed["allowed_actions"] = [a.strip() for a in actions_str.split(",") if a.strip()]
 
-        # 5. Error stderr parsing
+        # 5. Error stderr & trace parsing
         err_stderr_match = re.search(
             r"\[Error Output \(stderr\)\]:\n([\s\S]*?)(?=\n\n\[|$)",
             stripped,
         )
         if err_stderr_match:
             parsed["stderr"] = err_stderr_match.group(1).strip()
+
+        if not parsed.get("output"):
+            out_trace_match = re.search(
+                r"\[Output Trace\]:\n([\s\S]*?)(?=\n\n\[|$)",
+                stripped,
+            )
+            if out_trace_match:
+                parsed["output"] = out_trace_match.group(1).strip()
 
         # 6. Fallback Tool Error marker parsing
         tool_err_match = re.search(r"\[Tool Error\]:\s*([^\n]+)", stripped)

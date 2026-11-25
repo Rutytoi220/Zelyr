@@ -206,26 +206,80 @@ class ManageWorkspaceFileTool(BaseTool):
                 return True
         return False
 
-    def _build_tree(self, current: Path, root: Path, patterns: List[str], depth: int, max_depth: int) -> List[Dict[str, Any]]:
+    @staticmethod
+    def _attach_file_preview(payload: Dict[str, Any], content: str, key: str) -> None:
+        """Attach line_count and a bounded file content preview for small edits."""
+        lines = content.splitlines()
+        payload["line_count"] = len(lines)
+        if len(lines) <= 60 and len(content) <= 2400:
+            payload[key] = content
+
+    def _build_tree(
+        self,
+        current: Path,
+        root: Path,
+        patterns: List[str],
+        depth: int,
+        max_depth: int,
+        budget: Optional[List[int]] = None,
+    ) -> List[Dict[str, Any]]:
         if depth > max_depth or not current.is_dir():
+            return []
+        if budget is not None and budget[0] <= 0:
             return []
         items = []
         try:
             entries = sorted(current.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower()))
             for entry in entries:
+                if budget is not None and budget[0] <= 0:
+                    break
                 if self._is_ignored(entry, root, patterns):
                     continue
+                if budget is not None:
+                    budget[0] -= 1
                 item_info: Dict[str, Any] = {
                     "name": entry.name,
                     "path": str(entry.relative_to(root)),
                     "type": "directory" if entry.is_dir() else "file",
                 }
-                if entry.is_dir() and depth < max_depth:
-                    item_info["children"] = self._build_tree(entry, root, patterns, depth + 1, max_depth)
+                if entry.is_dir() and depth < max_depth and (budget is None or budget[0] > 0):
+                    item_info["children"] = self._build_tree(
+                        entry, root, patterns, depth + 1, max_depth, budget=budget
+                    )
                 items.append(item_info)
         except PermissionError:
             pass
         return items
+
+    def _list_directory_tree(
+        self,
+        target_path: Path,
+        path_str: str,
+        cwd_dir: Optional[Path],
+        *,
+        from_read: bool = False,
+        max_entries: int = 120,
+    ) -> ToolResult:
+        """List directory tree with root-path safeguard and bounded entry count."""
+        if path_str == "/" and cwd_dir is None and Path.cwd().resolve() != Path("/"):
+            return ToolResult(
+                False,
+                error="Path '/' targets the Linux root filesystem, not the workspace. Pass '.' to inspect the current workspace directory.",
+            )
+        patterns = self._load_gitignore_patterns(target_path)
+        budget = [max_entries]
+        tree_items = self._build_tree(target_path, target_path, patterns, depth=1, max_depth=3, budget=budget)
+        truncated = budget[0] <= 0
+        payload: Dict[str, Any] = {
+            "root": str(target_path),
+            "depth": 3,
+            "entries": tree_items,
+            "count": len(tree_items),
+            "truncated": truncated,
+        }
+        if from_read:
+            payload["note"] = "Path is a directory; returned directory listing (use action='read' on a file path to read file contents)."
+        return ToolResult(True, output=payload)
 
     async def execute(self, params: Optional[Dict[str, Any]] = None, **kwargs) -> ToolResult:
         global _last_modified_file
@@ -255,18 +309,7 @@ class ManageWorkspaceFileTool(BaseTool):
             if not target_path.exists():
                 return ToolResult(False, error=f"File not found: {target_path}")
             if target_path.is_dir():
-                patterns = self._load_gitignore_patterns(target_path)
-                tree_items = self._build_tree(target_path, target_path, patterns, depth=1, max_depth=3)
-                return ToolResult(
-                    True,
-                    output={
-                        "root": str(target_path),
-                        "depth": 3,
-                        "entries": tree_items,
-                        "count": len(tree_items),
-                        "note": "Path is a directory; returned directory listing (use action='read' on a file path to read file contents).",
-                    },
-                )
+                return self._list_directory_tree(target_path, path_str, cwd_dir, from_read=True)
             if not target_path.is_file():
                 return ToolResult(False, error=f"Path is not a regular file: {target_path}")
 
@@ -312,15 +355,14 @@ class ManageWorkspaceFileTool(BaseTool):
                 target_path.parent.mkdir(parents=True, exist_ok=True)
                 target_path.write_text(content, encoding="utf-8")
                 _last_modified_file = target_path
-                return ToolResult(
-                    True,
-                    output={
-                        "path": str(target_path),
-                        "bytes_written": len(content.encode("utf-8")),
-                        "backup": backup_path,
-                        "message": f"Successfully wrote {len(content)} characters to {target_path.name}.",
-                    },
-                )
+                out_payload: Dict[str, Any] = {
+                    "path": str(target_path),
+                    "bytes_written": len(content.encode("utf-8")),
+                    "backup": backup_path,
+                    "message": f"Successfully wrote {len(content)} characters to {target_path.name}.",
+                }
+                self._attach_file_preview(out_payload, content, "written_content")
+                return ToolResult(True, output=out_payload)
             except Exception as e:
                 return ToolResult(False, error=f"Failed to write file {target_path}: {e}")
 
@@ -363,15 +405,14 @@ class ManageWorkspaceFileTool(BaseTool):
                 target_path.write_text(new_content, encoding="utf-8")
                 _last_modified_file = target_path
 
-                return ToolResult(
-                    True,
-                    output={
-                        "path": str(target_path),
-                        "backup": backup_path,
-                        "occurrences_replaced": 1,
-                        "message": f"Successfully patched {target_path.name}.",
-                    },
-                )
+                out_payload: Dict[str, Any] = {
+                    "path": str(target_path),
+                    "backup": backup_path,
+                    "occurrences_replaced": 1,
+                    "message": f"Successfully patched {target_path.name}.",
+                }
+                self._attach_file_preview(out_payload, new_content, "patched_content")
+                return ToolResult(True, output=out_payload)
             except Exception as e:
                 return ToolResult(False, error=f"Failed to patch file {target_path}: {e}")
 
@@ -451,19 +492,7 @@ class ManageWorkspaceFileTool(BaseTool):
                 return ToolResult(False, error=f"Directory does not exist: {target_path}")
             if not target_path.is_dir():
                 return ToolResult(False, error=f"Path is not a directory: {target_path}")
-
-            patterns = self._load_gitignore_patterns(target_path)
-            tree_items = self._build_tree(target_path, target_path, patterns, depth=1, max_depth=3)
-
-            return ToolResult(
-                True,
-                output={
-                    "root": str(target_path),
-                    "depth": 3,
-                    "entries": tree_items,
-                    "count": len(tree_items),
-                },
-            )
+            return self._list_directory_tree(target_path, path_str, cwd_dir, from_read=False)
 
         else:
             return ToolResult(

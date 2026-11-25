@@ -1607,6 +1607,10 @@ class NativeOrchestrator:
                     all_records = [eff_ledger._records[cid] for cid in eff_ledger._order]
                     has_ver_fail = any(getattr(r, "verification_failed", False) for r in all_records)
                     has_unresolved = eff_ledger.has_unresolved_failures()
+                    if has_unresolved and not acceptance_spec:
+                        from zelyr.engine.execution_ledger import is_read_only_diagnostic_failures_only
+                        if is_read_only_diagnostic_failures_only(user_prompt, eff_ledger, final_text):
+                            has_unresolved = False
                     has_verified = bool(eff_ledger.verified_actions() or eff_ledger.get_verified_targets())
                     total_acts = eff_ledger.total_actions()
                     interruption_reason: Optional[str] = None
@@ -2743,6 +2747,52 @@ class NativeOrchestrator:
             clean_text = re.sub(r"<think>.*?</think>", "", full_text, flags=re.DOTALL)
             clean_text = re.sub(r"<think>.*$", "", clean_text, flags=re.DOTALL).strip()
 
+            # Mid-task token-limit exhaustion during <think>: retry once concisely rather than discarding prior steps
+            if (
+                stream_finish_reason in ("length", "max_tokens")
+                and not clean_text
+                and actual_step_count > 0
+                and not is_retry
+                and depth < eff_max_depth - 1
+                and not getattr(self, "_cancelled", False)
+                and not payload.get("cancelled", False)
+            ):
+                buffered_chunks.clear()
+                collected_assistant_text.clear()
+                for msg in payload.get("messages", []):
+                    if isinstance(msg, dict) and msg.get("role") == "assistant" and isinstance(msg.get("content"), str) and "<think>" in msg["content"]:
+                        msg["content"] = re.sub(r"<think>.*?(?:</think>|$)", "", msg["content"], flags=re.DOTALL).strip()
+                payload.setdefault("messages", []).append({
+                    "role": "user",
+                    "content": (
+                        "[SYSTEM NOTICE: Token Limit Reached During Reasoning] Your previous reasoning "
+                        "exhausted the generation limit before emitting a tool call or visible answer. "
+                        "Keep internal thinking brief (1-2 sentences) and immediately invoke the single next "
+                        "tool call or provide your grounded final response."
+                    ),
+                })
+                payload.setdefault("options", {})["temperature"] = 0.1
+                payload["temperature"] = 0.1
+                async for retry_chunk in self.generate_stream(
+                    payload,
+                    depth=depth + 1,
+                    is_retry=True,
+                    stream_provider=eff_stream_provider,
+                    tool_schemas=eff_tool_schemas,
+                    tool_executor=eff_tool_executor,
+                    db_path=eff_db_path,
+                    max_depth=eff_max_depth,
+                    turn_tool_history=curr_tool_history,
+                    actual_step_count=actual_step_count,
+                    ledger=eff_ledger,
+                    enable_cycle_detection=eff_cycle_detection,
+                    replanning_attempts=replanning_attempts,
+                    max_replanning_attempts=eff_max_replanning,
+                    task_local_scope=eff_task_local_scope,
+                ):
+                    yield retry_chunk
+                return
+
             # Generation exhaustion check: if model reached length limit without emitting any tools or usable text
             if stream_finish_reason in ("length", "max_tokens") and not clean_text:
                 buffered_chunks.clear()
@@ -2766,7 +2816,7 @@ class NativeOrchestrator:
                 not clean_text
                 and ("<think>" in full_text or "</think>" in full_text)
                 and not is_retry
-                and depth < eff_max_depth - 1
+                and (depth < eff_max_depth - 1 or (depth < eff_max_depth and actual_step_count > 0))
                 and not getattr(self, "_cancelled", False)
                 and not payload.get("cancelled", False)
             ):
@@ -2783,6 +2833,7 @@ class NativeOrchestrator:
                 })
                 payload.setdefault("options", {})["temperature"] = 0.1
                 payload["temperature"] = 0.1
+                synthesis_only = depth + 1 >= eff_max_depth
                 async for retry_chunk in self.generate_stream(
                     payload,
                     depth=depth + 1,
@@ -2791,9 +2842,10 @@ class NativeOrchestrator:
                     tool_schemas=eff_tool_schemas,
                     tool_executor=eff_tool_executor,
                     db_path=eff_db_path,
-                    max_depth=eff_max_depth,
+                    max_depth=(depth + 2) if synthesis_only else eff_max_depth,
                     turn_tool_history=curr_tool_history,
                     actual_step_count=actual_step_count,
+                    disable_tools=bool(disable_tools or synthesis_only),
                     ledger=eff_ledger,
                     enable_cycle_detection=eff_cycle_detection,
                     replanning_attempts=replanning_attempts,
@@ -4353,19 +4405,25 @@ class NativeOrchestrator:
 
                     if (
                         not matching_pairs
-                        and func_name in ("execute_command", "bash", "sh")
                         and not _is_inspection_action(func_name, func_args)
                     ):
-                        cmd_str = str(func_args.get("command", "") or func_args.get("cmd", ""))
-                        matching_pairs = [
-                            (c, r) for c, r in c_results
-                            if (
-                                str(c.get("check", "")).lower() in ("command_output", "command", "cmd")
-                                or (c.get("target") and Path(str(c["target"])).name and Path(str(c["target"])).name in cmd_str)
-                            )
-                        ]
-                        if matching_pairs and not tool_target and matching_pairs[0][0].get("target"):
-                            tool_target = str(matching_pairs[0][0]["target"])
+                        if func_name in ("execute_command", "bash", "sh"):
+                            cmd_str = str(func_args.get("command", "") or func_args.get("cmd", ""))
+                            matching_pairs = [
+                                (c, r) for c, r in c_results
+                                if (
+                                    str(c.get("check", "")).lower() in ("command_output", "command", "cmd")
+                                    or (c.get("target") and Path(str(c["target"])).name and Path(str(c["target"])).name in cmd_str)
+                                )
+                            ]
+                            if matching_pairs and not tool_target and matching_pairs[0][0].get("target"):
+                                tool_target = str(matching_pairs[0][0]["target"])
+                        elif tool_target:
+                            # Attach unmatched command_output checks (e.g. pytest -q) immediately on mutating file edits.
+                            matching_pairs = [
+                                (c, r) for c, r in c_results
+                                if str(c.get("check", "")).lower() in ("command_output", "command", "cmd")
+                            ]
 
                     is_pure_inspection = (
                         _is_inspection_action(func_name, func_args)

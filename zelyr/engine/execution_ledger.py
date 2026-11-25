@@ -2837,6 +2837,43 @@ def detect_false_success(text: str, has_unresolved: bool) -> bool:
     return False
 
 
+def is_read_only_diagnostic_failures_only(
+    prompt: str,
+    ledger: Optional[Any],
+    final_answer: str = "",
+) -> bool:
+    """Return True when all unresolved failures are expected read-only test/inspection diagnostics."""
+    if ledger is None or not hasattr(ledger, "unresolved_failures"):
+        return False
+    unresolved_recs = list(ledger.unresolved_failures())
+    if not unresolved_recs:
+        return False
+    global_prohib = extract_global_mutation_prohibition(prompt)
+    if not (global_prohib.get("no_file_modifications") and global_prohib.get("is_test_diagnostic")):
+        return False
+    cleaned_answer = re.sub(r"<think>.*?</think>", "", str(final_answer or ""), flags=re.DOTALL)
+    cleaned_answer = re.sub(r"<think>.*$", "", cleaned_answer, flags=re.DOTALL).strip()
+    if not cleaned_answer or detect_false_success(cleaned_answer, has_unresolved=True):
+        return False
+
+    succ_read_names = set()
+    for sr in (ledger.successful_actions() if hasattr(ledger, "successful_actions") else []):
+        if _is_inspection_action(sr.tool_name, sr.arguments):
+            t_s = _extract_action_target(sr.tool_name, sr.arguments)
+            if t_s:
+                succ_read_names.add(Path(t_s).name)
+
+    for rec in unresolved_recs:
+        if is_diagnostic_test_command(rec.tool_name, rec.arguments):
+            continue
+        if _is_inspection_action(rec.tool_name, rec.arguments):
+            t_f = _extract_action_target(rec.tool_name, rec.arguments)
+            if t_f and Path(t_f).name in succ_read_names:
+                continue
+        return False
+    return True
+
+
 def has_imperative_action_intent(prompt: str) -> bool:
     """Check if user prompt explicitly requests machine host actuation."""
     lower = prompt.lower()

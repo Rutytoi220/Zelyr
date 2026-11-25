@@ -1351,12 +1351,19 @@ def verify_command_output(
                 target=command_str,
                 observed=observed,
             )
+        combined = "\n".join(part.strip() for part in (out, err) if part and part.strip()).strip()
+        snippet = " | ".join(line.strip() for line in combined.splitlines() if line.strip())
+        if len(snippet) > 360:
+            snippet = snippet[-357:]
+        err_msg = f"Expected pattern '{expected_pattern}' not found in command output (exit {proc.returncode})"
+        if snippet:
+            err_msg = f"{err_msg} | output: {snippet}"
         return VerificationResult(
             success=False,
             check="command_output",
             target=command_str,
             observed=observed,
-            error=f"Expected pattern '{expected_pattern}' not found in command output (exit {proc.returncode})",
+            error=err_msg,
         )
     except Exception as exc:
         return VerificationResult(
