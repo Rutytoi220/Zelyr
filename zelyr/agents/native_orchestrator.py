@@ -316,7 +316,7 @@ class NativeOrchestrator:
         self,
         messages: list[dict],
         max_context_tokens: Optional[int] = None,
-        reserve_tokens: int = 1000,
+        reserve_tokens: Optional[int] = 1000,
         model_name: Optional[str] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
         config: Optional[Any] = None,
@@ -1984,16 +1984,6 @@ class NativeOrchestrator:
             elif system_prompt_content not in payload["messages"][0].get("content", ""):
                 payload["messages"][0]["content"] += f"\n\n{system_prompt_content}"
 
-        # Apply adaptive context window budgeting and historical tool compaction
-        eff_model = payload.get("model") or config.ollama_model
-        payload["messages"] = self.prune_messages(
-            payload.get("messages", []),
-            max_context_tokens=self.max_context_tokens,
-            reserve_tokens=1000,
-            model_name=eff_model,
-            tools=payload.get("tools") or eff_tool_schemas,
-            config=config,
-        )
         user_query_for_intent = ""
         for msg in reversed(payload.get("messages", [])):
             if msg.get("role") == "user":
@@ -2249,6 +2239,22 @@ class NativeOrchestrator:
             payload["tools"] = CompactSchemaGenerator.compact_schemas(payload["tools"])
 
         payload["model"] = payload.get("model") or config.ollama_model
+
+        # Apply adaptive context window budgeting using final scoped/compacted schemas and safe reserve
+        if 4096 <= eff_ctx <= 8192:
+            eff_reserve: Optional[int] = max(1638, int(eff_ctx * 0.25))
+        elif eff_ctx < 4096:
+            eff_reserve = max(100, int(eff_ctx * 0.25))
+        else:
+            eff_reserve = None
+        payload["messages"] = self.prune_messages(
+            payload.get("messages", []),
+            max_context_tokens=eff_ctx,
+            reserve_tokens=eff_reserve,
+            model_name=payload["model"],
+            tools=payload.get("tools") if payload.get("tools") is not None else eff_tool_schemas,
+            config=config,
+        )
 
         # Scrub images from payload to prevent context-window collapse
         for msg in payload.get("messages", []):
@@ -3541,6 +3547,17 @@ class NativeOrchestrator:
                             (curr_tool_history and curr_tool_history[-1][0] == fingerprint and curr_tool_history[-1][1] == "success")
                             or (hasattr(eff_ledger, "has_identical_successful_action") and eff_ledger.has_identical_successful_action(func_name, canonical_args))
                         )
+                    is_file_mutation_action = (
+                        func_name == "manage_workspace_file"
+                        and str(func_args.get("action", "")).lower() in ("write", "patch", "rollback")
+                    )
+                    has_prior_failed_verification = (
+                        is_file_mutation_action
+                        and not is_test_or_verify_cmd
+                        and not is_read_tool
+                        and hasattr(eff_ledger, "has_identical_failed_verification_action")
+                        and eff_ledger.has_identical_failed_verification_action(func_name, canonical_args)
+                    )
 
                     mutated_targets = self._get_mutation_targets(
                         func_name, func_args, eff_ledger.get_verified_targets()
@@ -3638,17 +3655,35 @@ class NativeOrchestrator:
                             f"Action '{func_name}' with identical parameters has already succeeded. "
                             "Do not repeat completed actions; provide the final response or proceed to the next distinct step."
                         )
+                    elif has_prior_failed_verification and not is_explicit_repeat and not is_read_tool:
+                        rejection_reason = "redundant_action"
+                        rejection_detail = (
+                            f"Action '{func_name}' with identical parameters already ran and failed verification. "
+                            "Inspect the failing test/verification details using 'manage_workspace_file' and make a distinct fix instead of reverting to failed parameters."
+                        )
                     elif cycle_history and cycle_history[-1][0] == fingerprint and cycle_history[-1][1] == "error":
                         # Identical Retry After Error: immediate preceding had same fingerprint and ended in error
                         rejection_reason = "cycle_detected"
-                        rejection_detail = "Identical tool call retry after immediate failure is blocked. Alter parameters or explain the limitation."
+                        if is_test_or_verify_cmd:
+                            rejection_detail = (
+                                "Identical tool call retry after immediate failure is blocked. "
+                                "Do not repeat the failing test command unchanged; inspect source/test files with 'manage_workspace_file' and fix the code before re-testing."
+                            )
+                        else:
+                            rejection_detail = "Identical tool call retry after immediate failure is blocked. Alter parameters or explain the limitation."
                     elif (
                         sum(1 for prior_fp, _ in cycle_history if prior_fp == fingerprint) >= 2
                         or sum(1 for prior_fp, _ in curr_tool_history if prior_fp == fingerprint) >= 8
                     ):
                         # Identical Call Ceiling: attempted for the 3rd time without intervening state change
                         rejection_reason = "cycle_detected"
-                        rejection_detail = "Identical tool call ceiling reached (attempted 3 or more times). Alter parameters or explain the limitation."
+                        if is_test_or_verify_cmd:
+                            rejection_detail = (
+                                "Identical tool call ceiling reached (attempted 3 or more times). "
+                                "Do not repeat unchanged test runs; inspect or edit the code with 'manage_workspace_file' before testing again."
+                            )
+                        else:
+                            rejection_detail = "Identical tool call ceiling reached (attempted 3 or more times). Alter parameters or explain the limitation."
                     elif len(cycle_history) >= 3:
                         # Alternating Failure Loop: A -> B -> A -> B where both A and B returned error
                         A_prev = cycle_history[-1][0]

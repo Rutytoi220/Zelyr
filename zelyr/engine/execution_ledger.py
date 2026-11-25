@@ -2386,6 +2386,33 @@ class TurnExecutionLedger:
                     return True
         return False
 
+    def has_identical_failed_verification_action(
+        self, tool_name: str, arguments: Any
+    ) -> bool:
+        """Check if identical mutating action failed verification with no later unrelated state change or verification."""
+        target_canon = _canonicalize_args(arguments)
+        failed_match = False
+        match_targets: List[str] = []
+        for cid in self._order:
+            rec = self._records[cid]
+            is_same_call = rec.tool_name == tool_name and _canonicalize_args(rec.arguments) == target_canon
+            if is_same_call:
+                if getattr(rec, "verification_failed", False):
+                    failed_match = True
+                    match_targets = _collect_later_resolution_targets(rec, False)
+                elif rec.state == ActionState.VERIFIED or (rec.state == ActionState.SUCCESS and rec.verified):
+                    failed_match = False
+            elif failed_match and rec.state in (ActionState.SUCCESS, ActionState.VERIFIED):
+                is_inspect = _is_inspection_action(rec.tool_name, rec.arguments)
+                if not is_inspect and not is_diagnostic_test_command(rec.tool_name, rec.arguments):
+                    later_targets = _collect_later_resolution_targets(rec, False)
+                    if not match_targets or not later_targets or any(
+                        not any(targets_match(mt, lt) for mt in match_targets)
+                        for lt in later_targets
+                    ):
+                        failed_match = False
+        return failed_match
+
     def unresolved_failures(self) -> List[ActionRecord]:
         """Actions that failed, were cancelled, partially completed, or failed outcome verification and were not subsequently resolved."""
         unresolved: List[ActionRecord] = []
@@ -2405,6 +2432,7 @@ class TurnExecutionLedger:
                 or "prohibited_by_user" in str(rec.error)
                 or "already satisfies the verified acceptance criteria" in str(rec.error)
                 or "identical parameters has already succeeded" in str(rec.error)
+                or "identical parameters already ran and failed verification" in str(rec.error)
                 or "Pending call discarded" in str(rec.error)
                 or "unconfirmed_by_model" in str(rec.error)
                 or "superseded_by_model" in str(rec.error)

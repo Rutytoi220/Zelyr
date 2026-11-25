@@ -119,7 +119,7 @@ class ManageWorkspaceFileTool(BaseTool):
             ToolParameter(
                 name="path",
                 type="string",
-                description="Target file or directory path relative to current workspace root (or absolute).",
+                description="Required target file or dir path for read/write/patch.",
                 required=False,
                 default="",
             ),
@@ -367,6 +367,13 @@ class ManageWorkspaceFileTool(BaseTool):
                 return ToolResult(False, error=f"Failed to write file {target_path}: {e}")
 
         elif action == "patch":
+            if not path_str:
+                return ToolResult(False, error="Missing required parameter 'path' for patch action.")
+            if target_path.is_dir():
+                return ToolResult(
+                    False,
+                    error=f"Missing required parameter 'path': expected a file path for patch action, got directory {target_path}.",
+                )
             if not target_path.is_file():
                 return ToolResult(False, error=f"File does not exist to patch: {target_path}")
 

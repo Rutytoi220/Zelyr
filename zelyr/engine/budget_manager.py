@@ -547,64 +547,65 @@ class ContextBudgetEngine:
 
         # Check if text is framed tool observation
         if text.startswith("[TOOL OBSERVATION:"):
-            # 1. Check for [Output]: section (preserve Verification / Error Diagnostic sections)
-            out_section = re.search(
-                r"(\[Output\]:\n)([\s\S]*?)(\n\n\[(?:Informational Diagnostic Stream|Machine State Verified|Outcome Verification Failed|Error Diagnostic|Error Output|Output Trace|Tool Error)|$)",
-                text,
+            modified_observation = False
+
+            def _excerpt_section(section_pattern: str, current_text: str) -> Tuple[str, bool]:
+                match = re.search(section_pattern, current_text)
+                if not match:
+                    return current_text, False
+                body = match.group(2)
+                if len(body) > 1000 or estimate_tokens(body) > token_limit:
+                    head = body[:keep_head_chars]
+                    tail = body[-keep_tail_chars:] if keep_tail_chars > 0 else ""
+                    omitted = len(body) - len(head) - len(tail)
+                    if omitted > 0:
+                        compacted_body = (
+                            f"{head}\n\n[... output truncated: {omitted} chars omitted ...]\n"
+                            f"... [OUTPUT TRUNCATED FOR CONTEXT BUDGET] ...\n\n{tail}"
+                        )
+                        return current_text[: match.start(2)] + compacted_body + current_text[match.end(2) :], True
+                return current_text, False
+
+            # 1. Check for [Output]: section (strip bulky write/patch echoes before optional head/tail slice)
+            out_pattern = (
+                r"(\[Output\]:\n)([\s\S]*?)"
+                r"(\n\n\[(?:Informational Diagnostic Stream|Machine State Verified|Outcome Verification Failed|"
+                r"Error Diagnostic|Error Output|Output Trace|Tool Error)|$)"
             )
+            out_section = re.search(out_pattern, text)
             if out_section:
                 body = out_section.group(2)
-                start_idx = out_section.start(2)
-                end_idx = out_section.end(2)
-                if len(body) > 1000 or estimate_tokens(body) > token_limit:
-                    head = body[:keep_head_chars]
-                    tail = body[-keep_tail_chars:] if keep_tail_chars > 0 else ""
-                    omitted = len(body) - len(head) - len(tail)
-                    if omitted > 0:
-                        compacted_body = (
-                            f"{head}\n\n[... output truncated: {omitted} chars omitted ...]\n"
-                            f"... [OUTPUT TRUNCATED FOR CONTEXT BUDGET] ...\n\n{tail}"
-                        )
-                        return text[:start_idx] + compacted_body + text[end_idx:]
+                if body.lstrip().startswith("{"):
+                    try:
+                        parsed_out = json.loads(body)
+                        if isinstance(parsed_out, dict) and any(
+                            k in parsed_out for k in ("written_content", "patched_content", "backup")
+                        ):
+                            had_echo = any(k in parsed_out for k in ("written_content", "patched_content"))
+                            parsed_out.pop("written_content", None)
+                            parsed_out.pop("patched_content", None)
+                            parsed_out.pop("backup", None)
+                            if had_echo:
+                                parsed_out["content_omitted"] = True
+                            stripped_json = json.dumps(parsed_out, ensure_ascii=False)
+                            text = text[: out_section.start(2)] + stripped_json + text[out_section.end(2) :]
+                            modified_observation = True
+                    except Exception:
+                        pass
+                text, sec1_compacted = _excerpt_section(out_pattern, text)
+                modified_observation = modified_observation or sec1_compacted
 
-            # 2. Check for [Output Trace]: section
-            trace_section = re.search(
-                r"(\[Output Trace\]:\n)([\s\S]*?)(\n\n\[(?:Tool Error)|$)",
-                text,
-            )
-            if trace_section:
-                body = trace_section.group(2)
-                start_idx = trace_section.start(2)
-                end_idx = trace_section.end(2)
-                if len(body) > 1000 or estimate_tokens(body) > token_limit:
-                    head = body[:keep_head_chars]
-                    tail = body[-keep_tail_chars:] if keep_tail_chars > 0 else ""
-                    omitted = len(body) - len(head) - len(tail)
-                    if omitted > 0:
-                        compacted_body = (
-                            f"{head}\n\n[... output truncated: {omitted} chars omitted ...]\n"
-                            f"... [OUTPUT TRUNCATED FOR CONTEXT BUDGET] ...\n\n{tail}"
-                        )
-                        return text[:start_idx] + compacted_body + text[end_idx:]
-
-            # 3. Check oversized [Error Output (stderr)] or [Informational Diagnostic Stream] while keeping headers intact
+            # 2 & 3. Check oversized [Output Trace], [Error Output (stderr)], or [Informational Diagnostic Stream]
             for sec_pat in (
+                r"(\[Output Trace\]:\n)([\s\S]*?)(\n\n\[(?:Tool Error)|$)",
                 r"(\[Error Output \(stderr\)\]:\n)([\s\S]*?)(\n\n\[(?:Output Trace|Tool Error)|$)",
                 r"(\[Informational Diagnostic Stream \(stderr\)\]:\n)([\s\S]*?)(\n\(Note:|\n\n\[|$)",
             ):
-                sec_match = re.search(sec_pat, text)
-                if sec_match:
-                    body = sec_match.group(2)
-                    if len(body) > 1000 or estimate_tokens(body) > token_limit:
-                        head = body[:keep_head_chars]
-                        tail = body[-keep_tail_chars:] if keep_tail_chars > 0 else ""
-                        omitted = len(body) - len(head) - len(tail)
-                        if omitted > 0:
-                            compacted_body = (
-                                f"{head}\n\n[... output truncated: {omitted} chars omitted ...]\n"
-                                f"... [OUTPUT TRUNCATED FOR CONTEXT BUDGET] ...\n\n{tail}"
-                            )
-                            return text[: sec_match.start(2)] + compacted_body + text[sec_match.end(2) :]
+                text, sec_compacted = _excerpt_section(sec_pat, text)
+                modified_observation = modified_observation or sec_compacted
+
+            if modified_observation:
+                return text
 
         # Compact structured planner observation blocks while preserving error, uncertainty & refs
         if text.startswith("[OBSERVATION "):
@@ -830,9 +831,9 @@ class ContextBudgetEngine:
                         )
                     ]
                     if err_lines:
-                        failure_evidence.append(f"{fn}: {' / '.join(err_lines[:3])[:160]}")
+                        failure_evidence.append(f"{fn}: {' / '.join(err_lines[:3])[:260]}")
                     else:
-                        failure_evidence.append(f"{fn}: {content_str[:120]}")
+                        failure_evidence.append(f"{fn}: {content_str[:160]}")
 
         parts: List[str] = []
         if user_queries:
@@ -847,6 +848,74 @@ class ContextBudgetEngine:
 
         summary = " | ".join(parts) if parts else "Prior conversational context compacted."
         return _truncate_to_tokens(summary, max_summary_tokens)
+
+    _SUMMARY_PREFIX = "[Previous conversation summary:"
+
+    @classmethod
+    def _merge_conversation_summaries(
+        cls,
+        prior_summary_msgs: List[Dict[str, Any]],
+        new_summary: str,
+        max_summary_tokens: int = 250,
+    ) -> str:
+        """Consolidate prior Stage 2 summaries with newly evicted summary clauses without stacking duplicates."""
+        all_bodies: List[str] = []
+        for pm in prior_summary_msgs:
+            raw_c = str(pm.get("content", "")).strip()
+            if raw_c.startswith(cls._SUMMARY_PREFIX):
+                body = raw_c[len(cls._SUMMARY_PREFIX) :].strip()
+                if body.endswith("]"):
+                    body = body[:-1].strip()
+                if body:
+                    all_bodies.append(body)
+        if new_summary:
+            all_bodies.append(new_summary.strip())
+
+        user_asked: List[str] = []
+        tools_exec: List[str] = []
+        failures: List[str] = []
+        outcomes: List[str] = []
+        other_clauses: List[str] = []
+
+        for body in all_bodies:
+            for clause in [c.strip() for c in body.split(" | ") if c.strip()]:
+                if clause.startswith("User asked:"):
+                    val = clause[len("User asked:") :].strip()
+                    if val and val not in user_asked:
+                        user_asked.append(val)
+                elif clause.startswith("Tools executed:"):
+                    for t in clause[len("Tools executed:") :].split(","):
+                        ts = t.strip()
+                        if ts and ts not in tools_exec:
+                            tools_exec.append(ts)
+                elif clause.startswith("Preserved failures/verification errors:"):
+                    for f_item in clause[len("Preserved failures/verification errors:") :].split(";"):
+                        fs = f_item.strip()
+                        if fs and fs not in failures:
+                            failures.append(fs)
+                elif clause.startswith("Key outcomes:"):
+                    for o_item in clause[len("Key outcomes:") :].split(";"):
+                        os_ = o_item.strip()
+                        if os_ and os_ not in outcomes:
+                            outcomes.append(os_)
+                elif clause not in other_clauses:
+                    other_clauses.append(clause)
+
+        merged_parts: List[str] = []
+        if user_asked:
+            merged_parts.append(f"User asked: {'; '.join(user_asked[:4])}")
+        if tools_exec:
+            merged_parts.append(f"Tools executed: {', '.join(tools_exec[:8])}")
+        if failures:
+            merged_parts.append(f"Preserved failures/verification errors: {'; '.join(failures[-4:])}")
+        if outcomes:
+            merged_parts.append(f"Key outcomes: {'; '.join(outcomes[-2:])}")
+        for oc in other_clauses:
+            if oc not in merged_parts:
+                merged_parts.append(oc)
+
+        merged = " | ".join(merged_parts) if merged_parts else new_summary or "Prior conversational context compacted."
+        return _truncate_to_tokens(merged, max_summary_tokens)
 
     def stage2_prune_turns(
         self,
@@ -869,92 +938,64 @@ class ContextBudgetEngine:
         if total_tokens <= target_budget:
             return messages, 0
 
-        # Separate leading system messages from conversation messages
+        # Separate leading system messages into core directives and prior consolidated summaries
         sys_idx = 0
         while sys_idx < len(messages) and messages[sys_idx].get("role") == "system":
             sys_idx += 1
 
-        system_messages = messages[:sys_idx]
+        leading_sys = messages[:sys_idx]
+        core_system_messages = [
+            m for m in leading_sys
+            if not str(m.get("content", "")).lstrip().startswith(self._SUMMARY_PREFIX)
+        ]
+        prior_summary_messages = [
+            m for m in leading_sys
+            if str(m.get("content", "")).lstrip().startswith(self._SUMMARY_PREFIX)
+        ]
         conv_messages = messages[sys_idx:]
 
         if not conv_messages:
-            return system_messages, 0
+            return core_system_messages + prior_summary_messages[-1:], 0
 
         user_indices = [i for i, m in enumerate(conv_messages) if m.get("role") == "user"]
 
         if not user_indices:
             if len(conv_messages) == 1:
-                return system_messages + conv_messages, 0
+                return core_system_messages + prior_summary_messages[-1:] + conv_messages, 0
             root_user_msg = conv_messages[0]
             active_turn_msgs = [conv_messages[-1]]
-            middle_msgs = conv_messages[1:-1]
+            middle_blocks = self._group_into_atomic_turns(conv_messages[1:-1])
         elif len(user_indices) == 1:
             first_idx = user_indices[0]
             root_user_msg = conv_messages[first_idx]
             subsequent_msgs = conv_messages[first_idx + 1:]
 
             if not subsequent_msgs:
-                return system_messages + [root_user_msg], 0
+                return core_system_messages + prior_summary_messages[-1:] + [root_user_msg], 0
 
             react_blocks = self._group_into_atomic_turns(subsequent_msgs)
-            active_block = react_blocks[-1]
+            active_turn_msgs = react_blocks[-1]
             middle_blocks = react_blocks[:-1]
-
-            if not middle_blocks:
-                return system_messages + [root_user_msg] + active_block, 0
-
-            sys_tokens = sum(count_message_tokens(m) for m in system_messages)
-            root_tokens = count_message_tokens(root_user_msg)
-            active_tokens = sum(count_message_tokens(m) for m in active_block)
-            summary_reserve = 150
-            avail_for_middle = target_budget - sys_tokens - root_tokens - active_tokens - summary_reserve
-
-            kept_middle_blocks: List[List[Dict[str, Any]]] = []
-            evicted_middle_blocks: List[List[Dict[str, Any]]] = []
-            accum_tokens = 0
-
-            for b in reversed(middle_blocks):
-                b_tokens = sum(count_message_tokens(m) for m in b)
-                if accum_tokens + b_tokens <= avail_for_middle:
-                    kept_middle_blocks.insert(0, b)
-                    accum_tokens += b_tokens
-                else:
-                    evicted_middle_blocks.insert(0, b)
-
-            evicted_msgs = [m for b in evicted_middle_blocks for m in b]
-            pruned_conv = [root_user_msg]
-            for b in kept_middle_blocks:
-                pruned_conv.extend(b)
-            pruned_conv.extend(active_block)
-
-            if evicted_msgs:
-                summary_text = self.summarize_turns(evicted_msgs, max_summary_tokens=250)
-                summary_msg = {
-                    "role": "system",
-                    "content": f"[Previous conversation summary: {summary_text}]",
-                }
-                assembled = system_messages + [summary_msg] + pruned_conv
-                return self._sanitize_wire_invariants(assembled), len(evicted_msgs)
-
-            return self._sanitize_wire_invariants(system_messages + pruned_conv), 0
         else:
             first_user_idx = user_indices[0]
             last_user_idx = user_indices[-1]
-
             root_user_msg = conv_messages[first_user_idx]
             active_turn_msgs = conv_messages[last_user_idx:]
-            middle_msgs = conv_messages[first_user_idx + 1 : last_user_idx]
+            middle_blocks = self._group_into_atomic_turns(conv_messages[first_user_idx + 1 : last_user_idx])
 
-        middle_blocks = self._group_into_atomic_turns(middle_msgs)
+        if not middle_blocks:
+            return self._sanitize_wire_invariants(
+                core_system_messages + prior_summary_messages[-1:] + [root_user_msg] + active_turn_msgs
+            ), 0
 
-        sys_tokens = sum(count_message_tokens(m) for m in system_messages)
+        sys_tokens = sum(count_message_tokens(m) for m in core_system_messages)
         root_tokens = count_message_tokens(root_user_msg)
         active_tokens = sum(count_message_tokens(m) for m in active_turn_msgs)
-        summary_reserve = 150
+        summary_reserve = 250 if prior_summary_messages else 150
         avail_for_middle = target_budget - sys_tokens - root_tokens - active_tokens - summary_reserve
 
-        kept_middle_blocks = []
-        evicted_middle_blocks = []
+        kept_middle_blocks: List[List[Dict[str, Any]]] = []
+        evicted_middle_blocks: List[List[Dict[str, Any]]] = []
         accum_tokens = 0
 
         for b in reversed(middle_blocks):
@@ -966,7 +1007,6 @@ class ContextBudgetEngine:
                 evicted_middle_blocks.insert(0, b)
 
         evicted_msgs = [m for b in evicted_middle_blocks for m in b]
-
         pruned_conv = [root_user_msg]
         for b in kept_middle_blocks:
             pruned_conv.extend(b)
@@ -974,14 +1014,25 @@ class ContextBudgetEngine:
 
         if evicted_msgs:
             summary_text = self.summarize_turns(evicted_msgs, max_summary_tokens=250)
+            if prior_summary_messages:
+                summary_text = self._merge_conversation_summaries(
+                    prior_summary_messages, summary_text, max_summary_tokens=250
+                )
             summary_msg = {
                 "role": "system",
-                "content": f"[Previous conversation summary: {summary_text}]",
+                "content": f"{self._SUMMARY_PREFIX} {summary_text}]",
             }
-            assembled = system_messages + [summary_msg] + pruned_conv
+            assembled = core_system_messages + [summary_msg] + pruned_conv
             return self._sanitize_wire_invariants(assembled), len(evicted_msgs)
 
-        return self._sanitize_wire_invariants(system_messages + pruned_conv), 0
+        if len(prior_summary_messages) > 1:
+            consolidated_text = self._merge_conversation_summaries(
+                prior_summary_messages, "", max_summary_tokens=250
+            )
+            prior_anchor = [{"role": "system", "content": f"{self._SUMMARY_PREFIX} {consolidated_text}]"}]
+        else:
+            prior_anchor = prior_summary_messages
+        return self._sanitize_wire_invariants(core_system_messages + prior_anchor + pruned_conv), 0
 
     def apply_context_budget(
         self,

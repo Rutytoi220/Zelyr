@@ -1421,38 +1421,14 @@ class ObservationFramingEngine:
         return so.to_compact_dict(max_chars=max_chars) if as_dict else so.to_compact_planner_context(max_chars=max_chars)
 
     @staticmethod
-    def _summarize_multiline_error(text: str, max_chars: int = 320) -> str:
-        """Collapse multiline error traces into a high-signal single-line headline."""
+    def _summarize_multiline_error(text: str, max_chars: int = 640) -> str:
+        """Collapse multiline error traces while preserving both earliest and latest failures."""
         raw = str(text or "").strip()
         if "\n" not in raw:
             return raw
-        raw_lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-        useful = [ln for ln in raw_lines if not set(ln) <= set("=-_~* ")]
-        priority_markers = (
-            "FAILED ",
-            "ERROR",
-            "AssertionError",
-            "SyntaxError",
-            "IndentationError",
-            "NameError",
-            "TypeError",
-            "ValueError",
-            "ImportError",
-            "ModuleNotFoundError",
-            "ZeroDivisionError",
-            "Failed:",
-            "E   ",
-            " failed,",
-        )
-        hits = [ln for ln in useful if any(m in ln for m in priority_markers)]
-        chosen: List[str] = []
-        for ln in (hits[-4:] if hits else useful[-3:]):
-            if ln not in chosen:
-                chosen.append(ln)
-        joined = " | ".join(chosen) if chosen else raw_lines[0]
-        if len(joined) > max_chars:
-            return joined[: max_chars - 3].rstrip() + "..."
-        return joined
+        from zelyr.engine.verifier import _extract_command_failure_snippet
+
+        return _extract_command_failure_snippet(raw, max_chars=max_chars)
 
     @classmethod
     def frame_observation(
@@ -1763,7 +1739,7 @@ class ObservationFramingEngine:
         stderr, _, _ = _sanitize_untrusted_text(stderr, is_external=is_ext, escape_anchors=True, max_chars=0)
         error, _, _ = _sanitize_untrusted_text(error, is_external=is_ext, escape_anchors=True, max_chars=4096)
         remedy_hint, _, _ = _sanitize_untrusted_text(remedy_hint, is_external=is_ext, escape_anchors=True, max_chars=1024)
-        verification_detail, _, _ = _sanitize_untrusted_text(verification_detail, is_external=is_ext, escape_anchors=True, max_chars=512)
+        verification_detail, _, _ = _sanitize_untrusted_text(verification_detail, is_external=is_ext, escape_anchors=True, max_chars=960)
 
         # Summary generation
         if not summary:
@@ -1839,7 +1815,7 @@ class ObservationFramingEngine:
             if parsed is not None:
                 for ver_key in ("target", "check", "failed_criterion", "verifier_reason"):
                     if parsed.get(ver_key):
-                        cleaned_vk, _, _ = _sanitize_untrusted_text(str(parsed[ver_key]), is_external=is_ext, escape_anchors=True, max_chars=512)
+                        cleaned_vk, _, _ = _sanitize_untrusted_text(str(parsed[ver_key]), is_external=is_ext, escape_anchors=True, max_chars=960)
                         data_payload[ver_key] = cleaned_vk
             data_payload["output"] = cls._bound_stream_text(output) if output else output
 
@@ -1856,7 +1832,7 @@ class ObservationFramingEngine:
             f"- Execution Status: {structured_obs.execution_status}",
         ]
         if structured_obs.remaining_uncertainty:
-            unc_line = " ".join(str(structured_obs.remaining_uncertainty).splitlines())[:240]
+            unc_line = " ".join(str(structured_obs.remaining_uncertainty).splitlines())[:480]
             lines.append(f"- Uncertainty: {unc_line}")
         if ext_source_meta is not None:
             lines.append(

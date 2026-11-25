@@ -1117,6 +1117,93 @@ def _read_stream_bounded(
             pass
 
 
+def _extract_command_failure_snippet(combined: str, max_chars: int = 900) -> str:
+    """Extract a high-signal failure excerpt preserving both top and summary test failures."""
+    raw = str(combined or "").strip()
+    if not raw:
+        return ""
+    lines = [
+        ln.strip()
+        for ln in raw.splitlines()
+        if ln.strip() and not set(ln.strip()) <= set("=-_~* ")
+    ]
+    if not lines:
+        return raw[:max_chars]
+
+    markers = (
+        "FAILED",
+        "ERROR",
+        "AssertionError",
+        "ValueError",
+        "TypeError",
+        "NameError",
+        "SyntaxError",
+        "IndentationError",
+        "ImportError",
+        "ModuleNotFoundError",
+        "KeyError",
+        "AttributeError",
+        "ZeroDivisionError",
+        "Traceback",
+        "E   ",
+        "Failed:",
+        " failed",
+    )
+    hits: List[str] = []
+    for ln in lines:
+        # Exclude pytest source echo lines ("> assert ...") so failure headers/assertions take priority
+        if not ln.startswith("> ") and any(m in ln for m in markers) and ln not in hits:
+            hits.append(ln)
+
+    chosen = list(hits) if hits else list(lines)
+    if hits and lines[-1] not in chosen and (
+        "failed" in lines[-1] or "passed" in lines[-1] or "error" in lines[-1].lower()
+    ):
+        chosen.append(lines[-1])
+
+    joined = " | ".join(chosen)
+    if len(joined) <= max_chars:
+        return joined
+
+    sep = " | ... | "
+    head_parts: List[str] = []
+    tail_parts: List[str] = []
+    head_len = 0
+    tail_len = 0
+    left = 0
+    right = len(chosen) - 1
+
+    while left <= right:
+        progressed = False
+        h_item = chosen[left]
+        h_add = len(h_item) + (3 if head_parts else 0)
+        bridge_after_h = len(sep) if (right > left and tail_parts) else (3 if tail_parts else (len(sep) if right > left else 0))
+        if head_len + tail_len + h_add + bridge_after_h <= max_chars:
+            head_parts.append(h_item)
+            head_len += h_add
+            left += 1
+            progressed = True
+
+        if left <= right:
+            t_item = chosen[right]
+            t_add = len(t_item) + (3 if tail_parts else 0)
+            bridge_after_t = len(sep) if right > left else (3 if head_parts else 0)
+            if head_len + tail_len + t_add + bridge_after_t <= max_chars:
+                tail_parts.insert(0, t_item)
+                tail_len += t_add
+                right -= 1
+                progressed = True
+
+        if not progressed:
+            break
+
+    if not head_parts and not tail_parts:
+        return chosen[0][: max(1, max_chars - 3)].rstrip() + "..."
+    if left <= right and head_parts and tail_parts:
+        return (" | ".join(head_parts) + sep + " | ".join(tail_parts))[:max_chars]
+    return " | ".join(head_parts + tail_parts)[:max_chars]
+
+
 def verify_command_output(
     command: str,
     expected_pattern: str,
@@ -1352,9 +1439,7 @@ def verify_command_output(
                 observed=observed,
             )
         combined = "\n".join(part.strip() for part in (out, err) if part and part.strip()).strip()
-        snippet = " | ".join(line.strip() for line in combined.splitlines() if line.strip())
-        if len(snippet) > 360:
-            snippet = snippet[-357:]
+        snippet = _extract_command_failure_snippet(combined, max_chars=900)
         err_msg = f"Expected pattern '{expected_pattern}' not found in command output (exit {proc.returncode})"
         if snippet:
             err_msg = f"{err_msg} | output: {snippet}"
