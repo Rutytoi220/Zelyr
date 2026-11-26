@@ -33,6 +33,7 @@ class FixtureWindow(QWidget):
     """High-contrast disposable PySide6 desktop application for live Zelyr testing."""
 
     reset_requested = Signal()
+    activate_requested = Signal()
 
     def __init__(self, title: str = "Zelyr Desktop Test Fixture", distraction: bool = False) -> None:
         super().__init__()
@@ -45,6 +46,8 @@ class FixtureWindow(QWidget):
         self._double_clicks = 0
         self._right_clicks = 0
         self._key_presses = 0
+        self._focus_in_count = 0
+        self._focus_out_count = 0
         self._event_log: List[Dict[str, Any]] = []
         self._distraction = distraction
 
@@ -55,6 +58,7 @@ class FixtureWindow(QWidget):
 
         self.installEventFilter(self)
         self.reset_requested.connect(self._reset_ui_slot)
+        self.activate_requested.connect(self._activate_ui_slot)
 
     def _init_distraction_ui(self) -> None:
         self.setFixedSize(360, 180)
@@ -220,6 +224,11 @@ class FixtureWindow(QWidget):
         self._refresh_status_label()
         self._record_event("apply", text)
 
+    def _activate_ui_slot(self) -> None:
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
     def _reset_ui_slot(self) -> None:
         with self._lock:
             self._counter = 0
@@ -229,6 +238,8 @@ class FixtureWindow(QWidget):
             self._double_clicks = 0
             self._right_clicks = 0
             self._key_presses = 0
+            self._focus_in_count = 0
+            self._focus_out_count = 0
             self._event_log.clear()
         if not self._distraction:
             self.input_field.clear()
@@ -237,7 +248,15 @@ class FixtureWindow(QWidget):
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         etype = event.type()
-        if etype == QEvent.Type.MouseButtonPress:
+        if watched is self and etype == QEvent.Type.WindowActivate:
+            with self._lock:
+                self._focus_in_count += 1
+            self._record_event("window_activate", self.windowTitle())
+        elif watched is self and etype == QEvent.Type.WindowDeactivate:
+            with self._lock:
+                self._focus_out_count += 1
+            self._record_event("window_deactivate", self.windowTitle())
+        elif etype == QEvent.Type.MouseButtonPress:
             with self._lock:
                 self._mouse_clicks += 1
                 if hasattr(event, "button") and event.button() == Qt.MouseButton.RightButton:
@@ -277,6 +296,8 @@ class FixtureWindow(QWidget):
                 "double_clicks": self._double_clicks,
                 "right_clicks": self._right_clicks,
                 "key_presses": self._key_presses,
+                "focus_in_count": self._focus_in_count,
+                "focus_out_count": self._focus_out_count,
                 "event_log": list(self._event_log),
             }
         if not self._distraction:
@@ -320,6 +341,10 @@ def _make_handler(window: FixtureWindow, app: QApplication):
         def do_POST(self) -> None:  # noqa: N802
             if self.path == "/reset":
                 window.reset_requested.emit()
+                time.sleep(0.05)
+                self._send_json(200, {"ok": True, "state": window.snapshot_state()})
+            elif self.path == "/activate":
+                window.activate_requested.emit()
                 time.sleep(0.05)
                 self._send_json(200, {"ok": True, "state": window.snapshot_state()})
             elif self.path == "/quit":

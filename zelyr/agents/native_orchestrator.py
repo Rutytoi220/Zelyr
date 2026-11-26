@@ -1293,7 +1293,10 @@ class NativeOrchestrator:
                         "role": "user",
                         "content": (
                             "[Transient desktop screenshot attached for the immediately preceding "
-                            "capture_screen/observe tool observation. Read UI labels, state, and coordinates from it.]"
+                            "capture_screen/observe tool observation. Carefully read the ACTUAL rendered UI "
+                            "text, values, and coordinates from this image. Never assume an earlier click or "
+                            "type succeeded unless the resulting state is clearly visible here; if anything is "
+                            "missing or reset, emit corrective tool calls now rather than concluding.]"
                         ),
                         "images": [pending_vision_b64],
                     }
@@ -2471,6 +2474,8 @@ class NativeOrchestrator:
             eff_ledger.record_orchestration_step()
         _llm_t0 = time.monotonic()
         pending_vis_for_turn = payload.pop("_pending_vision_b64", None)
+        if pending_vis_for_turn and eff_ledger is not None:
+            eff_ledger._cached_desktop_vision_b64 = pending_vis_for_turn
         stream_payload = payload
         if pending_vis_for_turn:
             stream_payload = dict(payload)
@@ -3432,6 +3437,8 @@ class NativeOrchestrator:
                     return
 
         if not pending_tool_calls and buffered_chunks:
+            if eff_ledger is not None:
+                eff_ledger._cached_desktop_vision_b64 = None
             for b in buffered_chunks:
                 yield b
             buffered_chunks.clear()
@@ -3818,6 +3825,27 @@ class NativeOrchestrator:
                             eff_ledger,
                         )
                     )
+                    last_exec_rec = next(
+                        (
+                            eff_ledger._records[cid]
+                            for cid in reversed(eff_ledger._order)
+                            if cid != tool_call_id
+                            and cid in eff_ledger._records
+                            and eff_ledger._records[cid].state not in (ActionState.PROPOSED, ActionState.REJECTED)
+                        ),
+                        None,
+                    )
+                    last_exec_desktop_focus_lost = bool(
+                        func_lower in ("desktop_control", "desktop_automation", "interact_with_ui")
+                        and not is_read_tool
+                        and last_exec_rec is not None
+                        and (last_exec_rec.tool_name or "").lower() in ("desktop_control", "desktop_automation", "interact_with_ui")
+                        and last_exec_rec.state == ActionState.FAILED
+                        and (
+                            "focus_lost" in str(last_exec_rec.error or "").lower()
+                            or "is not focused" in str(last_exec_rec.error or "").lower()
+                        )
+                    )
 
                     if target_already_verified and not is_explicit_repeat and not is_authorized_sequential and not is_read_tool:
                         has_unresolved_on_target = any(
@@ -3888,6 +3916,12 @@ class NativeOrchestrator:
                         rejection_detail = (
                             f"Action '{func_name}' with identical parameters already ran and failed verification. "
                             "Inspect the failing test/verification details using 'manage_workspace_file' and make a distinct fix instead of reverting to failed parameters."
+                        )
+                    elif last_exec_desktop_focus_lost:
+                        rejection_reason = "cycle_detected"
+                        rejection_detail = (
+                            "Focus was lost (FOCUS_LOST) on the preceding desktop_control action and focus recovery has not run yet. "
+                            "Do NOT retry clicks or typing with adjusted coordinates; call manage_desktop_window(action='focus', target=...) first."
                         )
                     elif cycle_history and cycle_history[-1][0] == fingerprint and cycle_history[-1][1] == "error":
                         # Identical Retry After Error: immediate preceding had same fingerprint and ended in error
@@ -4404,6 +4438,7 @@ class NativeOrchestrator:
                 was_timed_out = False
                 was_cancelled = False
                 raw_tool_payload: Any = None
+                pending_vision_b64_extracted: Optional[str] = None
                 ext_src_for_frame: Optional[Dict[str, Any]] = None
                 _tool_t0 = time.monotonic()
                 _tool_duration_ms: Optional[float] = None
@@ -4539,6 +4574,8 @@ class NativeOrchestrator:
                             raw_tool_payload = tool_result
                     if pending_vision_b64_extracted:
                         payload["_pending_vision_b64"] = pending_vision_b64_extracted
+                        if eff_ledger is not None:
+                            eff_ledger._cached_desktop_vision_b64 = pending_vision_b64_extracted
                     res_str = tool_result
                 except asyncio.CancelledError:
                     was_cancelled = True
@@ -4939,6 +4976,22 @@ class NativeOrchestrator:
                     duration_ms=_tool_duration_ms,
                     verification_duration_ms=_ver_duration_ms,
                 )
+                cached_vis = getattr(eff_ledger, "_cached_desktop_vision_b64", None) if eff_ledger is not None else None
+                if not pending_vision_b64_extracted and cached_vis:
+                    fn_low = (func_name or "").strip().lower()
+                    act_low = str((func_args or {}).get("action") or "").strip().lower()
+                    preserve_for_recovery = (
+                        (fn_low in ("desktop_control", "desktop_automation", "interact_with_ui") and is_failed)
+                        or (
+                            fn_low == "manage_desktop_window"
+                            and not is_failed
+                            and act_low in ("focus", "list", "get_active", "monitors", "geometry", "inspect")
+                        )
+                    )
+                    if preserve_for_recovery:
+                        payload["_pending_vision_b64"] = cached_vis
+                    else:
+                        eff_ledger._cached_desktop_vision_b64 = None
                 if active_tg_step is not None and bound_tg_nodes:
                     for gn in bound_tg_nodes:
                         try:

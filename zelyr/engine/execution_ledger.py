@@ -1125,6 +1125,10 @@ def _is_action_resolved_by_later(failed: ActionRecord, later: ActionRecord) -> b
         # Same target: operations must be compatible (e.g. write resolves write, append resolves append,
         # write/patch/edit/update on the same file resolve each other,
         # or any non-inspection corrective mutation/verification resolves a verification_failed state)
+        # A window-management action (e.g. refocusing a window) prepares focus state
+        # but never substitutes for executing a failed desktop_control input actuation.
+        if (failed.tool_name or "").lower() in ("desktop_control", "desktop_automation") and op_later == "manage_desktop_window":
+            return False
         if op_failed == op_later:
             return True
         edit_write_ops = ("write", "overwrite", "patch", "edit", "update", "replace", "create")
@@ -1217,6 +1221,7 @@ class TurnExecutionLedger:
         self._model_request_count: int = 0
         self._model_request_duration_ms: float = 0.0
         self._orchestration_step_count: int = 0
+        self._cached_desktop_vision_b64: Optional[str] = None
 
     @_synchronized
     def record_model_request(self, duration_ms: float) -> None:
@@ -3148,6 +3153,73 @@ class RootOutcomeResolution:
     exit_code: int = 0
 
 
+def _assess_desktop_verification_state(ledger: Optional[Any]) -> Dict[str, Any]:
+    """Inspect chronological desktop mutations vs visual/outcome observations in ledger."""
+    state: Dict[str, Any] = {
+        "last_desktop_mut_idx": -1,
+        "last_desktop_mut_rec": None,
+        "last_desktop_obs_idx": -1,
+        "last_click_idx": -1,
+        "last_type_idx": -1,
+        "has_verified_desktop_mut": False,
+        "has_only_pre_mutation_or_window_verified": False,
+        "trailing_unobserved_mutation": False,
+    }
+    if ledger is None:
+        return state
+
+    if hasattr(ledger, "_order") and hasattr(ledger, "_records"):
+        records = [ledger._records[cid] for cid in ledger._order if cid in ledger._records]
+    elif hasattr(ledger, "records") and callable(ledger.records):
+        records = list(ledger.records())
+    else:
+        return state
+    desktop_mut_tools = {"desktop_control", "desktop_automation", "interact_with_ui"}
+    desktop_obs_tools = {"capture_screen", "screen_capture", "capture_som_screen", "verify_outcome"}
+    verified_indices: List[Tuple[int, ActionRecord]] = []
+
+    for idx, rec in enumerate(records):
+        if rec.state not in (ActionState.SUCCESS, ActionState.VERIFIED) or getattr(rec, "verification_failed", False):
+            continue
+        t_low = (rec.tool_name or "").strip().lower()
+        args = rec.arguments if isinstance(rec.arguments, dict) else {}
+
+        if rec.state == ActionState.VERIFIED:
+            verified_indices.append((idx, rec))
+
+        if t_low in desktop_mut_tools and not _is_inspection_action(rec.tool_name, args):
+            state["last_desktop_mut_idx"] = idx
+            state["last_desktop_mut_rec"] = rec
+            act_low = str(args.get("action") or "").strip().lower()
+            if "click" in act_low:
+                state["last_click_idx"] = idx
+            if act_low in ("keyboard_type", "type", "type_text"):
+                state["last_type_idx"] = idx
+            if rec.state == ActionState.VERIFIED:
+                state["has_verified_desktop_mut"] = True
+        elif t_low in desktop_obs_tools or (
+            t_low in ("desktop_control", "desktop_automation")
+            and str(args.get("action") or "").strip().lower() in ("observe", "screenshot")
+        ):
+            state["last_desktop_obs_idx"] = idx
+
+    last_mut_idx = state["last_desktop_mut_idx"]
+    last_obs_idx = state["last_desktop_obs_idx"]
+    trailing_unobserved = (
+        last_mut_idx >= 0
+        and last_mut_idx > last_obs_idx
+        and not state["has_verified_desktop_mut"]
+    )
+    state["trailing_unobserved_mutation"] = trailing_unobserved
+    if trailing_unobserved and verified_indices:
+        state["has_only_pre_mutation_or_window_verified"] = all(
+            ((r.tool_name or "").strip().lower() == "manage_desktop_window" or v_idx < last_mut_idx)
+            and (r.tool_name or "").strip().lower() != "verify_outcome"
+            for v_idx, r in verified_indices
+        )
+    return state
+
+
 def resolve_root_execution_outcome(
     *,
     prompt: str,
@@ -3182,6 +3254,7 @@ def resolve_root_execution_outcome(
         if (ledger is not None and hasattr(ledger, "get_verified_targets"))
         else []
     )
+    desktop_ver_state = _assess_desktop_verification_state(ledger)
     has_verified = bool(
         (ledger is not None and hasattr(ledger, "verified_actions") and ledger.verified_actions())
         or verified_targets
@@ -3190,6 +3263,14 @@ def resolve_root_execution_outcome(
     has_ver_fail_unresolved = any(getattr(r, "verification_failed", False) for r in unresolved_recs)
 
     eff_v_results: List[Tuple[str, str, Any]] = list(v_results) if v_results is not None else []
+    if (
+        has_verified
+        and not eff_v_results
+        and not verified_targets
+        and desktop_ver_state["trailing_unobserved_mutation"]
+        and desktop_ver_state["has_only_pre_mutation_or_window_verified"]
+    ):
+        has_verified = False
     eff_invalid_spec = invalid_verify_spec_error
     if v_results is None and acceptance_spec is not None and not eff_invalid_spec:
         if isinstance(acceptance_spec, str) and not acceptance_spec.strip():
@@ -3485,7 +3566,10 @@ def resolve_root_execution_outcome(
     if total_acts > 0:
         ver_st = (
             VerificationStatus.CLAIMED_UNVERIFIED
-            if (acceptance_spec and detect_false_success(final_text, has_unresolved=False))
+            if (
+                (acceptance_spec and detect_false_success(final_text, has_unresolved=False))
+                or (desktop_ver_state["trailing_unobserved_mutation"] and detect_false_success(final_text, has_unresolved=True))
+            )
             else VerificationStatus.NOT_VERIFIED
         )
         return RootOutcomeResolution(
@@ -4104,6 +4188,39 @@ def find_unfulfilled_task_requirements(
                 rep_desc = f"Repetition incomplete: {total_succ}/{t_count} executions performed"
                 if rep_desc not in unfulfilled_outcomes:
                     unfulfilled_outcomes.append(rep_desc)
+
+    # 4b. Check trailing unobserved desktop GUI mutations when visual verification was established or requested
+    desktop_ver_state = _assess_desktop_verification_state(ledger)
+    if desktop_ver_state["trailing_unobserved_mutation"]:
+        prompt_low = (user_prompt or "").lower()
+        has_visual_verify_request = bool(
+            re.search(r"\b(?:capture|screenshot|screen\s*shot|verify|confirm|inspect|check)\b", prompt_low)
+            and re.search(r"\b(?:window|screen|ui|desktop|button|input|field|counter|applied|fixture)\b", prompt_low)
+        )
+        prior_obs_taken = desktop_ver_state["last_desktop_obs_idx"] >= 0
+        type_before_reclick = (
+            desktop_ver_state["last_click_idx"] >= 0
+            and desktop_ver_state["last_type_idx"] >= 0
+            and desktop_ver_state["last_click_idx"] > desktop_ver_state["last_type_idx"]
+            and bool(re.search(r"\b(?:type|enter|input)\b", prompt_low))
+        )
+        if prior_obs_taken or has_visual_verify_request or type_before_reclick:
+            last_mut_rec = desktop_ver_state["last_desktop_mut_rec"]
+            mut_act = ""
+            if last_mut_rec is not None and isinstance(last_mut_rec.arguments, dict):
+                mut_act = str(last_mut_rec.arguments.get("action") or "").strip()
+            mut_desc = (
+                f"{last_mut_rec.tool_name}:{mut_act}"
+                if (last_mut_rec is not None and mut_act)
+                else (last_mut_rec.tool_name if last_mut_rec is not None else "desktop_control")
+            )
+            dt_desc = (
+                f"Trailing desktop GUI action ('{mut_desc}') executed after the last 'capture_screen' "
+                "observation; complete any remaining requested UI input/actions and call 'capture_screen' "
+                "to visually observe and verify the current UI state before concluding."
+            )
+            if dt_desc not in unfulfilled_outcomes:
+                unfulfilled_outcomes.append(dt_desc)
 
     # 5. Check unresolved failures
     if ledger.has_unresolved_failures():

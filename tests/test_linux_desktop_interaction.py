@@ -312,6 +312,8 @@ async def test_focus_loss_blocks_input_then_recovers_after_refocus(monkeypatch):
 
     ctrl = WaylandInputController(auto_check=False, bounds_provider=lambda: SAMPLE_MONITORS)
     ctrl.mouse_click = MagicMock()
+    ctrl.keyboard_type = MagicMock()
+    ctrl.keyboard_press = MagicMock()
     tool = DesktopAutomationTool(wayland_controller=ctrl, ipc_client=mock_ipc)
 
     res_lost = await tool.execute(
@@ -323,7 +325,17 @@ async def test_focus_loss_blocks_input_then_recovers_after_refocus(monkeypatch):
     )
     assert res_lost.success is False
     assert res_lost.error_type == "FOCUS_LOST"
+    assert "FOCUS_LOST" in (res_lost.error or "")
     ctrl.mouse_click.assert_not_called()
+
+    # Keyboard mutations must also fail closed with zero input while focus validation fails
+    res_type_lost = await tool.execute(action="keyboard_type", text="abc", expected_window="Zelyr Fixture")
+    assert res_type_lost.success is False and res_type_lost.error_type == "FOCUS_LOST"
+    ctrl.keyboard_type.assert_not_called()
+
+    res_key_lost = await tool.execute(action="keyboard_press", key="enter", expected_window="Zelyr Fixture")
+    assert res_key_lost.success is False and res_key_lost.error_type == "FOCUS_LOST"
+    ctrl.keyboard_press.assert_not_called()
 
     cl = ErrorClassifier.classify("desktop_control", output=json.dumps(res_lost.output))
     assert cl.error_type == "FOCUS_LOST"
@@ -859,3 +871,596 @@ def test_failed_capture_screen_resolved_by_later_valid_capture_while_preserving_
     ledger.record_dispatched("cap_ok2")
     ledger.record_observation("cap_ok2", status="success", output="ok", exit_code=None)
     assert len(ledger.unresolved_failures()) == 1
+
+
+@pytest.mark.asyncio
+async def test_focus_loss_end_to_end_recovery_and_failed_recovery_remains_failure(monkeypatch):
+    """End-to-end orchestrator + ledger check: recovered FOCUS_LOST passes while unrecovered FOCUS_LOST fails."""
+    from zelyr.engine.execution_ledger import ExecutionStatus, TurnExecutionLedger, resolve_root_execution_outcome
+
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-1")
+    monkeypatch.setenv("HYPRLAND_INSTANCE_SIGNATURE", "sig")
+
+    active_state = {"title": "Zelyr Fixture", "class": "python3", "address": "0x111", "at": [100, 1100], "size": [640, 420]}
+    mock_ipc = AsyncMock(spec=HyprlandIPCClient)
+    mock_ipc.can_connect.return_value = True
+    mock_ipc.get_monitors.return_value = SAMPLE_MONITORS
+    mock_ipc.get_active_window.side_effect = lambda: dict(active_state)
+    mock_ipc.get_cursor_pos.return_value = (400, 1400)
+
+    ctrl = WaylandInputController(auto_check=False, bounds_provider=lambda: SAMPLE_MONITORS)
+    ctrl.mouse_click = MagicMock()
+    dc_tool = DesktopAutomationTool(wayland_controller=ctrl, ipc_client=mock_ipc)
+
+    async def _run_case(*, recover_focus: bool, retry_after_focus: bool):
+        active_state["title"] = "Zelyr Fixture"
+        active_state["address"] = "0x111"
+        ctrl.mouse_click.reset_mock()
+        turn = 0
+        final_chunks = []
+
+        async def provider(_payload):
+            nonlocal turn
+            turn += 1
+            if turn == 1:
+                call = ("c_obs", "capture_screen", '{"target": "window", "window": "Zelyr Fixture"}')
+            elif turn == 2:
+                # Focus shifted to auxiliary distraction window before first click executes
+                active_state["title"] = "Zelyr Distraction Window"
+                active_state["address"] = "0x222"
+                call = ("c_clk1", "desktop_control", '{"action": "mouse_click", "x": 400, "y": 1400, "expected_window": "Zelyr Fixture"}')
+            elif turn == 3:
+                call = ("c_foc", "manage_desktop_window", '{"action": "focus", "target": "Zelyr Fixture"}')
+            elif turn == 4 and retry_after_focus:
+                call = ("c_clk2", "desktop_control", '{"action": "mouse_click", "x": 400, "y": 1400, "expected_window": "Zelyr Fixture"}')
+            else:
+                yield {"choices": [{"delta": {"content": "Finished run."}}]}
+                return
+            yield {
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": call[0],
+                            "type": "function",
+                            "function": {"name": call[1], "arguments": call[2]},
+                        }]
+                    }
+                }]
+            }
+
+        async def executor(name: str, args: dict):
+            if name == "capture_screen":
+                return {"success": True, "status": "success", "target": "window", "message": "Captured Zelyr Fixture."}
+            if name == "manage_desktop_window":
+                if recover_focus:
+                    active_state["title"] = "Zelyr Fixture"
+                    active_state["address"] = "0x111"
+                    return {"status": "success", "action": "focus", "target": "Zelyr Fixture", "verified": True}
+                return {"status": "error", "error_type": "WINDOW_NOT_FOUND", "error": "Target window not found"}
+            res = await dc_tool.execute(args)
+            return res.to_dict(tool=name, arguments=args)
+
+        ledger = TurnExecutionLedger()
+        orch = NativeOrchestrator(stream_provider=provider, tool_executor=executor, enable_cycle_detection=True)
+        schemas = [
+            s for s in get_tool_schemas(0)
+            if (s.get("function") or {}).get("name") in ("capture_screen", "desktop_control", "manage_desktop_window", "execute_command")
+        ]
+        async for ch in orch.generate_stream(
+            {"messages": [{"role": "user", "content": "Click Increment Counter cleanly."}], "tools": schemas},
+            ledger=ledger,
+        ):
+            final_chunks.append(ch)
+        outcome = resolve_root_execution_outcome(
+            prompt="Click Increment Counter cleanly.",
+            ledger=ledger,
+            final_text="Finished run.",
+        )
+        return ledger, outcome
+
+    # Case 1: Genuine FOCUS_LOST -> refocus -> successful retry
+    ledger_ok, outcome_ok = await _run_case(recover_focus=True, retry_after_focus=True)
+    assert ctrl.mouse_click.call_count == 1
+    assert any("FOCUS_LOST" in str(r.error or "") for r in ledger_ok.failed_actions())
+    assert ledger_ok.unresolved_failures() == []
+    assert outcome_ok.exit_code == 0
+    assert outcome_ok.execution_status in (ExecutionStatus.COMPLETED, ExecutionStatus.COMPLETED_UNVERIFIED)
+
+    # Case 2: Refocus happens, but retry is NOT performed -> remains failure!
+    ledger_noretry, outcome_noretry = await _run_case(recover_focus=True, retry_after_focus=False)
+    assert ctrl.mouse_click.call_count == 0
+    assert len(ledger_noretry.unresolved_failures()) == 1
+    assert outcome_noretry.exit_code == 2
+    assert outcome_noretry.execution_status == ExecutionStatus.FAILED
+
+    # Case 3: Refocus fails -> retry also fails -> remains failure!
+    ledger_badrefocus, outcome_badrefocus = await _run_case(recover_focus=False, retry_after_focus=True)
+    assert ctrl.mouse_click.call_count == 0
+    assert len(ledger_badrefocus.unresolved_failures()) >= 1
+    assert outcome_badrefocus.exit_code == 2
+    assert outcome_badrefocus.execution_status == ExecutionStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_cancelled_error_releases_and_destroys_active_uinput_fds(monkeypatch):
+    """CancelledError mid-actuation releases held keys/buttons, calls UI_DEV_DESTROY, and closes fds."""
+    from zelyr.tools.input_controller import _UI_DEV_DESTROY, _UInputBackend
+
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-1")
+    uinput = _UInputBackend(settle_s=0.0)
+    uinput._pointer_fd = 101
+    uinput._keyboard_fd = 102
+    uinput._active_buttons = {272}
+    uinput._active_keys = {29}
+
+    writes = []
+    ioctls = []
+    closed_fds = []
+
+    monkeypatch.setattr("os.write", lambda fd, data: (writes.append((fd, len(data))), len(data))[1])
+    monkeypatch.setattr("fcntl.ioctl", lambda fd, req, *_a: ioctls.append((fd, req)) or 0)
+    monkeypatch.setattr("os.close", lambda fd: closed_fds.append(fd))
+
+    ctrl = WaylandInputController(auto_check=False, bounds_provider=lambda: SAMPLE_MONITORS)
+    ctrl._uinput = uinput
+    tool = DesktopAutomationTool(wayland_controller=ctrl)
+
+    with patch.object(tool, "_action_mouse_click", side_effect=asyncio.CancelledError):
+        with pytest.raises(asyncio.CancelledError):
+            await tool.execute(action="mouse_click", button="left")
+
+    assert uinput._closed is True
+    assert uinput._active_buttons == set()
+    assert uinput._active_keys == set()
+    assert (101, _UI_DEV_DESTROY) in ioctls
+    assert (102, _UI_DEV_DESTROY) in ioctls
+    assert set(closed_fds) == {101, 102}
+    assert any(fd == 101 for fd, _ in writes)
+    assert any(fd == 102 for fd, _ in writes)
+
+
+def test_focus_recovery_validator_tri_state_and_fixture_cleanup(monkeypatch):
+    """Validator enforces PASS/FAIL/UNVERIFIED semantics and fixtures clean up after success and failure."""
+    import importlib.util
+
+    bench_path = Path(__file__).resolve().parents[1] / "scripts" / "linux_desktop_benchmark.py"
+    spec = importlib.util.spec_from_file_location("linux_desktop_benchmark", bench_path)
+    assert spec is not None and spec.loader is not None
+    bench = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bench)
+
+    base_steal = {
+        "stolen": True,
+        "active_before": {"address": "0x111", "title": "Zelyr Desktop Test Fixture"},
+        "active_after": {"address": "0x222", "title": "Zelyr Distraction Window"},
+        "fix_state_at_steal": {"counter": 0, "mouse_clicks": 0, "key_presses": 0, "applied_text": ""},
+        "fix_state_after_steal": {"is_active_window": False},
+        "dist_state_at_steal": {"is_active_window": True},
+    }
+    good_records = [
+        {"call_id": "c1", "tool_name": "capture_screen", "state": "success", "arguments": {"target": "window", "window": "Zelyr Desktop Test Fixture"}, "error": None},
+        {"call_id": "c2", "tool_name": "desktop_control", "state": "failed", "arguments": {"action": "mouse_click", "expected_window": "Zelyr Desktop Test Fixture"}, "error": "FOCUS_LOST: not focused"},
+        {"call_id": "c3", "tool_name": "manage_desktop_window", "state": "success", "arguments": {"action": "focus", "target": "Zelyr Desktop Test Fixture"}, "error": None},
+        {"call_id": "c4", "tool_name": "desktop_control", "state": "success", "arguments": {"action": "mouse_click", "expected_window": "Zelyr Desktop Test Fixture"}, "error": None},
+    ]
+    good_run = {
+        "returncode": 0,
+        "cli_json": {
+            "execution_ledger": {
+                "has_unresolved_failures": False,
+                "unresolved_failures": [],
+                "failed_actions": [good_records[1]],
+                "successful_actions": [good_records[0], good_records[2], good_records[3]],
+                "records": good_records,
+            }
+        },
+        "ledger": {
+            "status": "completed_unverified",
+            "verification_status": "not_verified",
+            "error": None,
+            "calls": [{"event_type": "tool_execution_result", "tool_name": "desktop_control", "status": "failed", "error": "FOCUS_LOST: not focused"}],
+        },
+    }
+    good_after = {"counter": 1, "applied_text": "focus-recovery-ok", "input_text": "focus-recovery-ok", "key_presses": 18, "is_active_window": True, "focus_out_count": 1}
+    dist_clean = {"mouse_clicks": 0, "key_presses": 0}
+
+    ev_pass = bench.evaluate_focus_recovery_run(
+        good_run,
+        before_state={"counter": 0},
+        after_state=good_after,
+        dist_after_state=dist_clean,
+        steal_telemetry=base_steal,
+    )
+    assert ev_pass["verdict"] == "PASS"
+
+    # Proactive focus bypass (no FOCUS_LOST encountered) MUST NOT count as PASS -> UNVERIFIED
+    proactive_records = [
+        good_records[0],
+        good_records[2],  # focused before mutating click!
+        good_records[3],
+    ]
+    proactive_run = {
+        "returncode": 0,
+        "cli_json": {
+            "execution_ledger": {
+                "has_unresolved_failures": False,
+                "unresolved_failures": [],
+                "failed_actions": [],
+                "successful_actions": proactive_records,
+                "records": proactive_records,
+            }
+        },
+        "ledger": {"status": "completed", "verification_status": "verified", "error": None, "calls": [{"event_type": "tool_execution_result", "tool_name": "desktop_control", "status": "succeeded"}]},
+    }
+    ev_proactive = bench.evaluate_focus_recovery_run(
+        proactive_run,
+        before_state={"counter": 0},
+        after_state=good_after,
+        dist_after_state=dist_clean,
+        steal_telemetry=base_steal,
+    )
+    assert ev_proactive["verdict"] == "UNVERIFIED"
+    assert ev_proactive["passed"] is False
+
+    # Distraction click leakage during failure -> FAIL
+    ev_leak = bench.evaluate_focus_recovery_run(
+        good_run,
+        before_state={"counter": 0},
+        after_state=good_after,
+        dist_after_state={"mouse_clicks": 1, "key_presses": 0},
+        steal_telemetry=base_steal,
+    )
+    assert ev_leak["verdict"] == "FAIL"
+
+    # Verify _cleanup_fixture_processes tears down processes even when wait times out
+    quit_calls = []
+    monkeypatch.setattr(bench, "_http_json", lambda url, **_kw: quit_calls.append(url) or {"ok": True})
+    fake_p1 = MagicMock()
+    fake_p1.wait.side_effect = [subprocess.TimeoutExpired("x", 3.0), 0]
+    fake_p2 = MagicMock()
+    fake_p2.wait.return_value = 0
+    bench._cleanup_fixture_processes((fake_p1, 9001), (fake_p2, 9002))
+    assert len(quit_calls) == 2
+    fake_p1.terminate.assert_called_once()
+    fake_p1.kill.assert_called_once()
+    fake_p2.terminate.assert_called_once()
+
+    # Verify run_focus_recovery_benchmark cleans up fixtures and restores workspace after mid-run failure
+    dispatched = []
+    cleaned_procs = []
+    monkeypatch.setattr(bench, "_hyprctl_json", lambda cmd, *_a: [{"name": "DP-1", "x": 0, "y": 0, "width": 1920, "height": 1080, "scale": 1.0, "focused": True, "activeWorkspace": {"id": 11}}] if cmd == "monitors" else ({"id": 11} if cmd == "activeworkspace" else ({"address": "0x999"} if cmd == "activewindow" else [])))
+    monkeypatch.setattr(bench, "_hyprctl_dispatch", lambda c, a="": dispatched.append((c, a)))
+    monkeypatch.setattr(bench, "_wait_for_http", lambda *_a, **_kw: {"ok": True})
+    monkeypatch.setattr(bench, "_wait_for_window", lambda title, **_kw: {"address": "0x111" if "Test Fixture" in title else "0x222"})
+    monkeypatch.setattr(bench, "_place_floating_window", lambda *_a, **_kw: None)
+    monkeypatch.setattr(bench, "_focus_and_verify_window", lambda *_a, **_kw: {"active_window": {"address": "0x111", "title": "Zelyr Desktop Test Fixture"}, "verified": True})
+
+    fake_procs = []
+
+    def _fake_popen(*_a, **_kw):
+        pr = MagicMock(pid=1000 + len(fake_procs))
+        fake_procs.append(pr)
+        return pr
+
+    monkeypatch.setattr(bench.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(bench, "_cleanup_fixture_processes", lambda *items: cleaned_procs.extend([p for p, _ in items if p is not None]))
+    monkeypatch.setattr(bench, "_run_zelyr_cli", MagicMock(side_effect=RuntimeError("boom mid-run")))
+
+    with pytest.raises(RuntimeError, match="boom mid-run"):
+        bench.run_focus_recovery_benchmark(runs=1)
+
+    assert len(cleaned_procs) == 2
+    assert ("workspace", "11") in dispatched
+    assert ("focuswindow", "address:0x999") in dispatched
+
+
+@pytest.mark.asyncio
+async def test_focus_recovery_preserves_vision_across_failure_and_refocus_without_history_bloat():
+    """Transient vision survives FOCUS_LOST -> manage_desktop_window(focus) -> retry, then clears on success."""
+    from zelyr.tools.core import ToolResult
+
+    orch = NativeOrchestrator()
+    orch.max_steps = 8
+    ledger = TurnExecutionLedger()
+    seen_images_per_turn = []
+    call_idx = 0
+
+    async def mock_stream(payload: dict):
+        nonlocal call_idx
+        call_idx += 1
+        seen_images_per_turn.append(payload.get("_pending_vision_b64"))
+        if call_idx == 1:
+            yield {
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "c_obs",
+                            "type": "function",
+                            "function": {
+                                "name": "capture_screen",
+                                "arguments": json.dumps({"target": "window", "window": "TestWin"}),
+                            },
+                        }]
+                    }
+                }]
+            }
+        elif call_idx == 2:
+            yield {
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "c_fail",
+                            "type": "function",
+                            "function": {
+                                "name": "desktop_control",
+                                "arguments": json.dumps({"action": "mouse_click", "x": 100, "y": 200, "expected_window": "TestWin"}),
+                            },
+                        }]
+                    }
+                }]
+            }
+        elif call_idx == 3:
+            yield {
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "c_focus",
+                            "type": "function",
+                            "function": {
+                                "name": "manage_desktop_window",
+                                "arguments": json.dumps({"action": "focus", "target": "TestWin", "verify": True}),
+                            },
+                        }]
+                    }
+                }]
+            }
+        elif call_idx == 4:
+            yield {
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "c_retry",
+                            "type": "function",
+                            "function": {
+                                "name": "desktop_control",
+                                "arguments": json.dumps({"action": "mouse_click", "x": 100, "y": 200, "expected_window": "TestWin"}),
+                            },
+                        }]
+                    }
+                }]
+            }
+        elif call_idx == 5:
+            yield {
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "c_post_obs",
+                            "type": "function",
+                            "function": {
+                                "name": "capture_screen",
+                                "arguments": json.dumps({"target": "window", "window": "TestWin"}),
+                            },
+                        }]
+                    }
+                }]
+            }
+        else:
+            yield {"choices": [{"delta": {"content": "Completed and verified."}}]}
+
+    async def mock_executor(name: str, args: dict):
+        if name == "capture_screen":
+            return ToolResult(
+                True,
+                output={"status": "success"},
+                metadata={"_vision_b64": "FRAME_BASE64_1" if call_idx == 1 else "FRAME_BASE64_2"},
+            )
+        if name == "desktop_control":
+            if call_idx == 2:
+                return ToolResult(
+                    False,
+                    error="FOCUS_LOST: Target window 'TestWin' is not focused",
+                    output={"success": False, "error_type": "FOCUS_LOST", "error": "FOCUS_LOST: Target window 'TestWin' is not focused"},
+                )
+            return ToolResult(True, output={"status": "success", "action": args.get("action")})
+        if name == "manage_desktop_window":
+            return ToolResult(True, output={"status": "success", "verified": True, "action": "focus"})
+        raise AssertionError(f"Unexpected tool {name}")
+
+    payload = {
+        "model": "qwen3.6:35b-a3b",
+        "_force_vision_image": True,
+        "messages": [{"role": "user", "content": "Capture TestWin, click button, and capture TestWin again to verify."}],
+    }
+    schemas = [
+        {"type": "function", "function": {"name": "capture_screen", "parameters": {"type": "object"}}},
+        {"type": "function", "function": {"name": "desktop_control", "parameters": {"type": "object"}}},
+        {"type": "function", "function": {"name": "manage_desktop_window", "parameters": {"type": "object"}}},
+    ]
+
+    with patch.object(orch, "_model_supports_vision", return_value=True):
+        chunks = [
+            c
+            async for c in orch.generate_stream(
+                payload,
+                stream_provider=mock_stream,
+                tool_schemas=schemas,
+                tool_executor=mock_executor,
+                ledger=ledger,
+            )
+        ]
+
+    assert chunks
+    assert "_pending_vision_b64" not in payload
+    assert all("images" not in m for m in payload["messages"] if isinstance(m, dict))
+    assert seen_images_per_turn == [
+        None,              # before initial capture
+        "FRAME_BASE64_1",  # initial click attempt (receives FOCUS_LOST)
+        "FRAME_BASE64_1",  # manage_desktop_window(focus) keeps frame
+        "FRAME_BASE64_1",  # retry click still sees frame
+        None,              # cleared immediately after mutating click succeeded
+        "FRAME_BASE64_2",  # fresh frame from post-mutation capture
+    ]
+
+
+@pytest.mark.asyncio
+async def test_desktop_trailing_unobserved_mutation_gating_and_outcome_resolution():
+    """Trailing desktop_control click after capture_screen triggers replanning and cannot claim VERIFIED."""
+    from PIL import Image
+    from zelyr.engine.execution_ledger import (
+        ExecutionStatus,
+        TurnExecutionLedger,
+        VerificationStatus,
+        find_unfulfilled_task_requirements,
+        resolve_root_execution_outcome,
+    )
+    from zelyr.tools.core import ToolResult
+    from zelyr.tools.screen_perception import _overlay_coordinate_grid
+
+    # Grid helper handles narrow windows symmetrically without raising
+    sample_img = Image.new("RGB", (640, 420), (15, 23, 42))
+    gridded = _overlay_coordinate_grid(sample_img, {"x": 640, "y": 1410, "width": 640, "height": 420})
+    assert gridded.size == (640, 420)
+
+    # Ledger unit invariant: Turn 2 focus verify=True cannot mark later trailing click as VERIFIED
+    l_stale = TurnExecutionLedger()
+    l_stale.record_proposed("c0", "capture_screen", {"target": "window", "window": "TestWin"})
+    l_stale.record_dispatched("c0")
+    l_stale.record_observation("c0", status="success", output="ok")
+    l_stale.record_proposed("c1", "manage_desktop_window", {"action": "focus", "target": "TestWin", "verify": True})
+    l_stale.record_dispatched("c1")
+    l_stale.record_observation("c1", status="success", output="ok", verified=True)
+    l_stale.record_proposed("c2", "desktop_control", {"action": "mouse_click", "x": 960, "y": 1670})
+    l_stale.record_dispatched("c2")
+    l_stale.record_observation("c2", status="success", output="clicked")
+
+    _, unfulfilled = find_unfulfilled_task_requirements(
+        "Capture TestWin, click field, type 'abc', and capture window again to verify.",
+        l_stale,
+    )
+    assert any("Trailing desktop GUI action" in msg for msg in unfulfilled)
+
+    outcome_unobs = resolve_root_execution_outcome(
+        ledger=l_stale,
+        final_text="All interactions completed successfully.",
+        prompt="Capture TestWin and verify.",
+    )
+    assert outcome_unobs.verification_status == VerificationStatus.CLAIMED_UNVERIFIED
+    assert outcome_unobs.execution_status == ExecutionStatus.COMPLETED_UNVERIFIED
+
+    # End-to-end orchestrator Stage 4 replanning catches premature completion after trailing click
+    orch = NativeOrchestrator()
+    orch.max_steps = 8
+    ledger_e2e = TurnExecutionLedger()
+    turn_no = 0
+
+    async def mock_stream_e2e(payload: dict):
+        nonlocal turn_no
+        turn_no += 1
+        if turn_no == 1:
+            yield {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "t1", "type": "function", "function": {"name": "capture_screen", "arguments": json.dumps({"target": "window", "window": "TestWin"})}}]}}]}
+        elif turn_no == 2:
+            yield {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "t2", "type": "function", "function": {"name": "desktop_control", "arguments": json.dumps({"action": "mouse_click", "x": 960, "y": 1670})}}]}}]}
+        elif turn_no == 3:
+            # Model tries to claim completion right after trailing click!
+            yield {"choices": [{"delta": {"content": "I have completed all interactions."}}]}
+        elif turn_no == 4:
+            # After Stage 4 directive, model types and then re-captures
+            yield {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "t4", "type": "function", "function": {"name": "desktop_control", "arguments": json.dumps({"action": "keyboard_type", "text": "abc", "press_enter": True})}}]}}]}
+        elif turn_no == 5:
+            yield {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "t5", "type": "function", "function": {"name": "capture_screen", "arguments": json.dumps({"target": "window", "window": "TestWin"})}}]}}]}
+        else:
+            yield {"choices": [{"delta": {"content": "Typed abc and verified via final capture_screen."}}]}
+
+    async def mock_exec_e2e(name: str, args: dict):
+        return ToolResult(True, output={"status": "success", "action": args.get("action")})
+
+    payload_e2e = {
+        "model": "qwen3.6:35b-a3b",
+        "messages": [{"role": "user", "content": "Capture TestWin, click input field, type 'abc', then capture window again to verify."}],
+    }
+    schemas_e2e = [
+        {"type": "function", "function": {"name": "capture_screen", "parameters": {"type": "object"}}},
+        {"type": "function", "function": {"name": "desktop_control", "parameters": {"type": "object"}}},
+    ]
+    out_chunks = [
+        c
+        async for c in orch.generate_stream(
+            payload_e2e,
+            stream_provider=mock_stream_e2e,
+            tool_schemas=schemas_e2e,
+            tool_executor=mock_exec_e2e,
+            ledger=ledger_e2e,
+        )
+    ]
+    final_txt = "".join(
+        c.get("choices", [{}])[0].get("delta", {}).get("content", "")
+        for c in out_chunks
+    )
+    assert "Typed abc and verified" in final_txt
+    assert [
+        ledger_e2e._records[cid].tool_name
+        for cid in ledger_e2e._order
+        if cid in ledger_e2e._records
+    ] == ["capture_screen", "desktop_control", "desktop_control", "capture_screen"]
+    _, unfulfilled_after = find_unfulfilled_task_requirements(
+        payload_e2e["messages"][1]["content"] if len(payload_e2e["messages"]) > 1 else "",
+        ledger_e2e,
+    )
+    assert unfulfilled_after == []
+
+
+@pytest.mark.asyncio
+async def test_consecutive_desktop_control_mutation_after_focus_lost_requires_refocus():
+    """Retrying desktop_control with jittered coordinates right after FOCUS_LOST is blocked until manage_desktop_window refocuses."""
+    from zelyr.tools.core import ToolResult
+
+    orch = NativeOrchestrator()
+    orch.max_steps = 8
+    orch.enable_cycle_detection = True
+    ledger = TurnExecutionLedger()
+    executed = []
+    turn_no = 0
+
+    async def mock_stream(payload: dict):
+        nonlocal turn_no
+        turn_no += 1
+        if turn_no == 1:
+            yield {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1", "type": "function", "function": {"name": "desktop_control", "arguments": json.dumps({"action": "mouse_click", "x": 960, "y": 1650, "expected_window": "Fix"})}}]}}]}
+        elif turn_no == 2:
+            # Tweaked coords without refocusing first -> must be blocked pre-dispatch!
+            yield {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c2", "type": "function", "function": {"name": "desktop_control", "arguments": json.dumps({"action": "mouse_click", "x": 962, "y": 1680, "expected_window": "Fix"})}}]}}]}
+        elif turn_no == 3:
+            yield {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c3", "type": "function", "function": {"name": "manage_desktop_window", "arguments": json.dumps({"action": "focus", "target": "Fix", "verify": True})}}]}}]}
+        elif turn_no == 4:
+            yield {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c4", "type": "function", "function": {"name": "desktop_control", "arguments": json.dumps({"action": "mouse_click", "x": 960, "y": 1660, "expected_window": "Fix"})}}]}}]}
+        else:
+            yield {"choices": [{"delta": {"content": "Refocused and retried cleanly."}}]}
+
+    async def mock_exec(name: str, args: dict):
+        executed.append((name, args.get("action"), args.get("x"), args.get("y")))
+        if name == "desktop_control" and len(executed) == 1:
+            return ToolResult(False, error="FOCUS_LOST: Target window 'Fix' is not focused", output={"success": False, "error_type": "FOCUS_LOST"})
+        return ToolResult(True, output={"status": "success", "verified": True if name == "manage_desktop_window" else False})
+
+    schemas = [
+        {"type": "function", "function": {"name": "desktop_control", "parameters": {"type": "object"}}},
+        {"type": "function", "function": {"name": "manage_desktop_window", "parameters": {"type": "object"}}},
+        {"type": "function", "function": {"name": "capture_screen", "parameters": {"type": "object"}}},
+    ]
+    payload = {"model": "qwen3.6:35b-a3b", "messages": [{"role": "user", "content": "Click button in Fix."}]}
+    async for _ in orch.generate_stream(payload, stream_provider=mock_stream, tool_schemas=schemas, tool_executor=mock_exec, ledger=ledger):
+        pass
+
+    assert executed == [
+        ("desktop_control", "mouse_click", 960, 1650),
+        ("manage_desktop_window", "focus", None, None),
+        ("desktop_control", "mouse_click", 960, 1660),
+    ]
+    assert ledger._records["c2"].rejection_reason == "cycle_detected"
+    assert "manage_desktop_window" in str(ledger._records["c2"].error)

@@ -293,7 +293,7 @@ class DesktopAutomationTool(BaseTool):
             return self._structured_error(
                 error_type="FOCUS_LOST",
                 error=(
-                    f"Target window '{exp}' is not focused (currently active: "
+                    f"FOCUS_LOST: Target window '{exp}' is not focused (currently active: "
                     f"title={active.get('title')!r}, class={active.get('class')!r}, address={active.get('address')!r})."
                 ),
                 remedy_hint=(
@@ -617,7 +617,10 @@ class DesktopAutomationTool(BaseTool):
                 "y": y,
                 "cursor_pos": cursor_pos,
                 "active_window": active_win,
-                "message": f"Clicked {button} button {clicks} time(s){coords_msg}.",
+                "message": (
+                    f"Clicked {button} button {clicks} time(s){coords_msg}. "
+                    "Call capture_screen to observe updated UI state or confirm coordinates before clicking another control."
+                ),
             },
         )
 

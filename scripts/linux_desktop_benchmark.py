@@ -10,6 +10,8 @@ Markdown telemetry artifacts.
 from __future__ import annotations
 
 import argparse
+import http.client
+import http.server
 import json
 import os
 import signal
@@ -17,12 +19,14 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_SCRIPT = REPO_ROOT / "scripts" / "desktop_test_fixture.py"
@@ -96,6 +100,458 @@ def _wait_for_window(title_substr: str, timeout_s: float = 8.0, *, pid: Optional
     raise RuntimeError(f"Window matching '{title_substr}' (pid={pid}) did not appear within {timeout_s}s.")
 
 
+_MUTATING_DESKTOP_ACTIONS = frozenset({
+    "mouse_move",
+    "mouse_click",
+    "double_click",
+    "mouse_drag",
+    "mouse_scroll",
+    "keyboard_type",
+    "keyboard_press",
+})
+
+FOCUS_RECOVERY_PROMPT = (
+    "Interact with the 'Zelyr Desktop Test Fixture' desktop window: "
+    "(1) capture 'Zelyr Desktop Test Fixture' first with capture_screen(target='window', window='Zelyr Desktop Test Fixture') "
+    "to inspect widget coordinates; "
+    "(2) pass expected_window='Zelyr Desktop Test Fixture' on EVERY desktop_control actuation call (including retries): "
+    "click the green 'Increment Counter' button once, then click the input field ('Command Note Input Field'), "
+    "type 'focus-recovery-ok' with press_enter=True; "
+    "(3) if any desktop_control call fails with FOCUS_LOST, refocus 'Zelyr Desktop Test Fixture' via "
+    "manage_desktop_window(action='focus', target='Zelyr Desktop Test Fixture') and retry cleanly; "
+    "(4) capture the window again to verify Counter is 1 and Applied is 'focus-recovery-ok'."
+)
+
+
+class _FocusStealOllamaProxy:
+    """Transparent HTTP proxy to live Ollama that triggers deterministic focus loss once after observation."""
+
+    def __init__(
+        self,
+        upstream_url: str,
+        on_steal_focus: Callable[[int], Dict[str, Any]],
+    ) -> None:
+        clean_up = upstream_url.strip().rstrip("/")
+        if "://" not in clean_up:
+            clean_up = f"http://{clean_up}"
+        parsed = urllib.parse.urlparse(clean_up)
+        self.upstream_host = parsed.hostname or "127.0.0.1"
+        self.upstream_port = parsed.port or (443 if parsed.scheme == "https" else 11434)
+        self.on_steal_focus = on_steal_focus
+        self.lock = threading.Lock()
+        self.chat_turns = 0
+        self.stolen = False
+        self.telemetry: Dict[str, Any] = {"stolen": False, "chat_turns": 0}
+        self._server: Optional[http.server.ThreadingHTTPServer] = None
+        self._thread: Optional[threading.Thread] = None
+        self.base_url: str = ""
+
+    def __enter__(self) -> "_FocusStealOllamaProxy":
+        proxy_self = self
+
+        class _ProxyHandler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return
+
+            def _forward_non_stream(self, method: str) -> None:
+                length = int(self.headers.get("Content-Length") or "0")
+                body = self.rfile.read(length) if length > 0 else None
+                conn = http.client.HTTPConnection(proxy_self.upstream_host, proxy_self.upstream_port, timeout=60)
+                try:
+                    fwd_headers = {
+                        k: v for k, v in self.headers.items()
+                        if k.lower() not in ("host", "content-length", "connection")
+                    }
+                    if body is not None:
+                        fwd_headers["Content-Length"] = str(len(body))
+                    conn.request(method, self.path, body=body, headers=fwd_headers)
+                    up_resp = conn.getresponse()
+                    raw = up_resp.read()
+                    self.send_response(up_resp.status)
+                    for hk, hv in up_resp.getheaders():
+                        if hk.lower() in ("transfer-encoding", "connection", "content-length"):
+                            continue
+                        self.send_header(hk, hv)
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                finally:
+                    conn.close()
+
+            def do_GET(self) -> None:  # noqa: N802
+                self._forward_non_stream("GET")
+
+            def do_POST(self) -> None:  # noqa: N802
+                if not self.path.startswith("/api/chat"):
+                    self._forward_non_stream("POST")
+                    return
+
+                length = int(self.headers.get("Content-Length") or "0")
+                raw_body = self.rfile.read(length) if length > 0 else b"{}"
+                try:
+                    req_obj = json.loads(raw_body.decode("utf-8"))
+                except Exception:
+                    req_obj = {}
+
+                msgs = req_obj.get("messages") if isinstance(req_obj.get("messages"), list) else []
+                has_capture_obs = any(
+                    isinstance(m, dict)
+                    and m.get("role") == "tool"
+                    and (
+                        m.get("name") in ("capture_screen", "desktop_control")
+                        and ("Captured" in str(m.get("content") or "") or "pixel" in str(m.get("content") or ""))
+                        and "Status: SUCCESS" in str(m.get("content") or "")
+                    )
+                    for m in msgs
+                )
+
+                with proxy_self.lock:
+                    proxy_self.chat_turns += 1
+                    turn_no = proxy_self.chat_turns
+                    proxy_self.telemetry["chat_turns"] = turn_no
+
+                conn = http.client.HTTPConnection(proxy_self.upstream_host, proxy_self.upstream_port, timeout=300)
+                try:
+                    fwd_headers = {
+                        k: v for k, v in self.headers.items()
+                        if k.lower() not in ("host", "content-length", "connection")
+                    }
+                    fwd_headers["Content-Length"] = str(len(raw_body))
+                    conn.request("POST", self.path, body=raw_body, headers=fwd_headers)
+                    up_resp = conn.getresponse()
+
+                    self.send_response(up_resp.status)
+                    for hk, hv in up_resp.getheaders():
+                        if hk.lower() in ("transfer-encoding", "connection", "content-length"):
+                            continue
+                        self.send_header(hk, hv)
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+
+                    if up_resp.status != 200 or not req_obj.get("stream", True):
+                        data = up_resp.read()
+                        self.wfile.write(data)
+                        self.wfile.flush()
+                        return
+
+                    while True:
+                        raw_line = up_resp.fp.readline()
+                        if not raw_line:
+                            break
+                        stripped = raw_line.strip()
+                        if stripped and has_capture_obs:
+                            try:
+                                chunk = json.loads(stripped.decode("utf-8"))
+                            except Exception:
+                                chunk = None
+                            if isinstance(chunk, dict):
+                                msg = chunk.get("message") or {}
+                                tcs = msg.get("tool_calls") if isinstance(msg.get("tool_calls"), list) else []
+                                wants_mut = False
+                                for tc in tcs:
+                                    if not isinstance(tc, dict):
+                                        continue
+                                    fn_obj = tc.get("function") or {}
+                                    fn_name = str(fn_obj.get("name") or "").strip().lower()
+                                    raw_args = fn_obj.get("arguments")
+                                    if isinstance(raw_args, str):
+                                        try:
+                                            fn_args = json.loads(raw_args) if raw_args.strip().startswith("{") else {}
+                                        except Exception:
+                                            fn_args = {}
+                                    elif isinstance(raw_args, dict):
+                                        fn_args = raw_args
+                                    else:
+                                        fn_args = {}
+                                    act_name = str(fn_args.get("action") or "").strip().lower()
+                                    if fn_name in _MUTATING_DESKTOP_ACTIONS:
+                                        wants_mut = True
+                                        break
+                                    if fn_name in ("desktop_control", "desktop_automation") and (
+                                        act_name in _MUTATING_DESKTOP_ACTIONS
+                                        or ("x" in fn_args and "y" in fn_args)
+                                        or "text" in fn_args
+                                        or "key" in fn_args
+                                    ):
+                                        wants_mut = True
+                                        break
+                                if wants_mut:
+                                    should_steal = False
+                                    with proxy_self.lock:
+                                        if not proxy_self.stolen:
+                                            proxy_self.stolen = True
+                                            should_steal = True
+                                    if should_steal:
+                                        steal_info = proxy_self.on_steal_focus(turn_no)
+                                        with proxy_self.lock:
+                                            proxy_self.telemetry.update({"stolen": True, "turn": turn_no, **steal_info})
+                        self.wfile.write(raw_line)
+                        self.wfile.flush()
+                finally:
+                    conn.close()
+
+        http.server.ThreadingHTTPServer.allow_reuse_address = True
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _ProxyHandler)
+        port = self._server.server_address[1]
+        self.base_url = f"http://127.0.0.1:{port}"
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_a: Any) -> None:
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()
+
+
+def _focus_and_verify_window(
+    addr: str,
+    title_substr: str,
+    fixture_url: Optional[str] = None,
+    timeout_s: float = 2.5,
+) -> Dict[str, Any]:
+    """Deterministically focus a disposable fixture window and verify compositor + Qt active status."""
+    if fixture_url:
+        try:
+            _http_json(f"{fixture_url}/activate", method="POST", timeout=1.5)
+        except Exception:
+            pass
+    _hyprctl_dispatch("focuswindow", f"address:{addr}")
+    deadline = time.monotonic() + timeout_s
+    last_active: Dict[str, Any] = {}
+    last_state: Dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        try:
+            last_active = _hyprctl_json("activewindow")
+        except Exception:
+            last_active = {}
+        addr_match = str(last_active.get("address") or "").lower() == addr.lower()
+        title_match = title_substr.lower() in str(last_active.get("title") or "").lower()
+        if addr_match or title_match:
+            if fixture_url:
+                try:
+                    last_state = _http_json(f"{fixture_url}/state", timeout=1.5)
+                    if last_state.get("is_active_window"):
+                        return {"active_window": last_active, "fixture_state": last_state, "verified": True}
+                except Exception:
+                    return {"active_window": last_active, "fixture_state": last_state, "verified": True}
+            else:
+                return {"active_window": last_active, "verified": True}
+        time.sleep(0.05)
+    raise RuntimeError(
+        f"Deterministic focus switch to {title_substr!r} ({addr}) did not complete within {timeout_s}s "
+        f"(active={last_active!r}, state={last_state!r})."
+    )
+
+
+def evaluate_focus_recovery_run(
+    run_info: Dict[str, Any],
+    *,
+    before_state: Dict[str, Any],
+    after_state: Dict[str, Any],
+    dist_after_state: Dict[str, Any],
+    steal_telemetry: Dict[str, Any],
+    expected_title: str = "Zelyr Desktop Test Fixture",
+    distraction_title: str = "Zelyr Distraction Window",
+    expected_counter: int = 1,
+    expected_text: Optional[str] = "focus-recovery-ok",
+) -> Dict[str, Any]:
+    """Independently validate every focus-loss recovery stage with PASS / FAIL / UNVERIFIED tri-state verdict."""
+    cli_json = run_info.get("cli_json") if isinstance(run_info.get("cli_json"), dict) else {}
+    exec_ledger = cli_json.get("execution_ledger") if isinstance(cli_json.get("execution_ledger"), dict) else {}
+    records = exec_ledger.get("records") if isinstance(exec_ledger.get("records"), list) else []
+    central = run_info.get("ledger") if isinstance(run_info.get("ledger"), dict) else {}
+
+    def _matches_exp_win(args: Any) -> bool:
+        if not isinstance(args, dict):
+            return False
+        tgt = str(args.get("expected_window") or args.get("window") or args.get("target") or "").lower()
+        return bool(tgt) and (expected_title.lower() in tgt or tgt in expected_title.lower())
+
+    obs_indices = [
+        i for i, r in enumerate(records)
+        if r.get("state") in ("success", "verified")
+        and r.get("tool_name") in ("capture_screen", "desktop_control", "manage_desktop_window")
+        and (
+            (r.get("tool_name") == "capture_screen" and _matches_exp_win(r.get("arguments")))
+            or (r.get("tool_name") == "desktop_control" and str((r.get("arguments") or {}).get("action") or "") in ("observe", "screenshot") and _matches_exp_win(r.get("arguments")))
+            or (r.get("tool_name") == "manage_desktop_window" and str((r.get("arguments") or {}).get("action") or "") in ("get_active", "list"))
+        )
+    ]
+
+    mut_indices = [
+        i for i, r in enumerate(records)
+        if r.get("tool_name") == "desktop_control"
+        and str((r.get("arguments") or {}).get("action") or "").lower() in _MUTATING_DESKTOP_ACTIONS
+    ]
+
+    first_obs_idx = obs_indices[0] if obs_indices else None
+    first_mut_idx = mut_indices[0] if mut_indices else None
+
+    initial_observation_ok = first_obs_idx is not None and (first_mut_idx is None or first_obs_idx < first_mut_idx)
+
+    # Check controlled interference telemetry
+    pre_active = steal_telemetry.get("active_before") if isinstance(steal_telemetry.get("active_before"), dict) else {}
+    post_active = steal_telemetry.get("active_after") if isinstance(steal_telemetry.get("active_after"), dict) else {}
+    fix_at_steal = steal_telemetry.get("fix_state_at_steal") if isinstance(steal_telemetry.get("fix_state_at_steal"), dict) else {}
+    dist_at_steal = steal_telemetry.get("dist_state_at_steal") if isinstance(steal_telemetry.get("dist_state_at_steal"), dict) else {}
+    fix_after_steal = steal_telemetry.get("fix_state_after_steal") if isinstance(steal_telemetry.get("fix_state_after_steal"), dict) else {}
+
+    interference_ok = (
+        bool(steal_telemetry.get("stolen"))
+        and expected_title.lower() in str(pre_active.get("title") or "").lower()
+        and distraction_title.lower() in str(post_active.get("title") or "").lower()
+        and bool(dist_at_steal.get("is_active_window"))
+        and (fix_after_steal.get("is_active_window") is False)
+        and (
+            int(fix_after_steal.get("focus_out_count", 0)) >= 1
+            or int(after_state.get("focus_out_count", 0)) >= 1
+        )
+    )
+
+    first_mut_rec = records[first_mut_idx] if first_mut_idx is not None else {}
+    first_mut_err = str(first_mut_rec.get("error") or "").lower()
+    first_mut_focus_lost = (
+        first_mut_idx is not None
+        and first_mut_rec.get("state") == "failed"
+        and _matches_exp_win(first_mut_rec.get("arguments"))
+        and (
+            "focus_lost" in first_mut_err
+            or "is not focused" in first_mut_err
+        )
+    )
+
+    # Reject proactive focus bypasses where focus was re-claimed before any FOCUS_LOST failure
+    proactive_focus_before_first_mut = any(
+        first_obs_idx is not None
+        and (first_mut_idx is None or i < first_mut_idx)
+        and i > first_obs_idx
+        and r.get("tool_name") == "manage_desktop_window"
+        and str((r.get("arguments") or {}).get("action") or "").lower() in ("focus", "focuswindow")
+        for i, r in enumerate(records)
+    )
+
+    no_mutation_on_failed_attempt = (
+        int(fix_at_steal.get("counter", 0)) == 0
+        and int(fix_at_steal.get("mouse_clicks", 0)) == 0
+        and int(fix_at_steal.get("key_presses", 0)) == 0
+        and str(fix_at_steal.get("applied_text") or "") == ""
+        and int(dist_after_state.get("mouse_clicks", -1)) == 0
+        and int(dist_after_state.get("key_presses", -1)) == 0
+    )
+
+    focus_recovery_indices = [
+        i for i, r in enumerate(records)
+        if first_mut_idx is not None
+        and i > first_mut_idx
+        and r.get("tool_name") == "manage_desktop_window"
+        and str((r.get("arguments") or {}).get("action") or "").lower() in ("focus", "focuswindow")
+        and _matches_exp_win(r.get("arguments"))
+        and r.get("state") in ("success", "verified")
+    ]
+    focus_recovery_ok = bool(focus_recovery_indices)
+    first_recovery_idx = focus_recovery_indices[0] if focus_recovery_indices else None
+
+    retry_success_indices = [
+        i for i in mut_indices
+        if first_recovery_idx is not None
+        and i > first_recovery_idx
+        and _matches_exp_win(records[i].get("arguments"))
+        and records[i].get("state") in ("success", "verified")
+    ]
+    retry_succeeded_ok = bool(retry_success_indices)
+
+    text_ok = (
+        True
+        if expected_text is None
+        else (
+            after_state.get("applied_text") == expected_text
+            and after_state.get("input_text") == expected_text
+            and int(after_state.get("key_presses", 0)) > 0
+        )
+    )
+    fixture_final_ok = (
+        int(after_state.get("counter", -1)) == expected_counter
+        and text_ok
+        and bool(after_state.get("is_active_window"))
+    )
+
+    failed_actions = exec_ledger.get("failed_actions") if isinstance(exec_ledger.get("failed_actions"), list) else []
+    successful_actions = exec_ledger.get("successful_actions") if isinstance(exec_ledger.get("successful_actions"), list) else []
+    unresolved_failures = exec_ledger.get("unresolved_failures") if isinstance(exec_ledger.get("unresolved_failures"), list) else []
+
+    has_focus_lost_in_failed = any(
+        "focus_lost" in str(a.get("error") or "").lower() or "is not focused" in str(a.get("error") or "").lower()
+        for a in failed_actions
+    )
+    has_focus_lost_in_central = any(
+        c.get("event_type") == "tool_execution_result"
+        and c.get("tool_name") == "desktop_control"
+        and c.get("status") == "failed"
+        and ("focus_lost" in str(c.get("error") or "").lower() or "is not focused" in str(c.get("error") or "").lower())
+        for c in (central.get("calls") or [])
+    )
+
+    ledger_consistent_ok = (
+        run_info.get("returncode") == 0
+        and exec_ledger.get("has_unresolved_failures") is False
+        and len(unresolved_failures) == 0
+        and has_focus_lost_in_failed
+        and has_focus_lost_in_central
+        and any(a.get("tool_name") == "manage_desktop_window" for a in successful_actions)
+        and any(a.get("tool_name") == "desktop_control" for a in successful_actions)
+        and central.get("status") in ("completed", "completed_unverified")
+        and central.get("error") in (None, "")
+        and central.get("verification_status") not in ("verification_failed", "failed")
+    )
+
+    checks = {
+        "initial_observation_targeted_fixture": initial_observation_ok,
+        "controlled_interference_changed_active_window": interference_ok,
+        "first_mutation_rejected_with_focus_lost": first_mut_focus_lost,
+        "no_proactive_focus_bypass": not proactive_focus_before_first_mut,
+        "no_mutation_during_failed_attempt": no_mutation_on_failed_attempt,
+        "valid_focus_recovery_action_issued": focus_recovery_ok,
+        "intended_mutation_retried_successfully": retry_succeeded_ok,
+        "fixture_reached_exact_final_state": fixture_final_ok,
+        "execution_ledger_consistent": ledger_consistent_ok,
+    }
+
+    missing_evidence = (
+        not records
+        or not central.get("calls")
+        or not initial_observation_ok
+        or not interference_ok
+        or not first_mut_focus_lost
+        or proactive_focus_before_first_mut
+    )
+    if missing_evidence:
+        verdict = "UNVERIFIED"
+    elif all(checks.values()):
+        verdict = "PASS"
+    else:
+        verdict = "FAIL"
+
+    return {
+        "verdict": verdict,
+        "passed": verdict == "PASS",
+        "checks": checks,
+        "sequence": [
+            {
+                "index": idx,
+                "call_id": r.get("call_id"),
+                "tool_name": r.get("tool_name"),
+                "state": r.get("state"),
+                "arguments": r.get("arguments"),
+                "error": r.get("error"),
+            }
+            for idx, r in enumerate(records)
+        ],
+    }
+
+
 def _place_floating_window(addr: str, workspace_id: int, x: int, y: int, width: int, height: int) -> None:
     _hyprctl_dispatch("movetoworkspacesilent", f"{workspace_id},address:{addr}")
     time.sleep(0.1)
@@ -157,7 +613,8 @@ def _run_zelyr_cli(
     model: str,
     max_steps: int,
     db_path: Path,
-    timeout_s: float = 360.0,
+    timeout_s: float = 480.0,
+    base_url: Optional[str] = None,
 ) -> Dict[str, Any]:
     cmd = [
         "uv",
@@ -173,6 +630,8 @@ def _run_zelyr_cli(
         str(db_path),
         "--json",
     ]
+    if base_url:
+        cmd.extend(["--base-url", base_url])
     env = os.environ.copy()
     env["ZELYR_AUTOPILOT"] = "1"
     env.setdefault("ZELYR_NUM_CTX", "8192")
@@ -266,6 +725,8 @@ def run_benchmark(
 
     try:
         # Switch DP-1 cleanly onto empty workspace 15
+        if dp1.get("name"):
+            _hyprctl_dispatch("focusmonitor", str(dp1["name"]))
         _hyprctl_dispatch("workspace", str(workspace_id))
         time.sleep(0.25)
 
@@ -331,11 +792,13 @@ def run_benchmark(
                 5,
                 "Recovery",
                 (
-                    "Click the 'Increment Counter' button in 'Zelyr Desktop Test Fixture' cleanly using "
-                    "expected_window='Zelyr Desktop Test Fixture' on desktop_control calls. "
-                    "Note another window currently holds focus — first expect or encounter FOCUS_LOST if needed, "
-                    "recover cleanly by refocusing 'Zelyr Desktop Test Fixture' with manage_desktop_window(action='focus'), "
-                    "capture its coordinates, click 'Increment Counter', and verify Counter reaches 1."
+                    "Observe the currently active 'Zelyr Desktop Test Fixture' window using capture_screen"
+                    "(target='window', window='Zelyr Desktop Test Fixture'), then click the green 'Increment Counter' "
+                    "button using desktop_control with expected_window='Zelyr Desktop Test Fixture' (do not call "
+                    "manage_desktop_window beforehand unless focus fails). If desktop_control rejects with FOCUS_LOST, "
+                    "recover by calling manage_desktop_window(action='focus', target='Zelyr Desktop Test Fixture'), "
+                    "retry clicking 'Increment Counter' with expected_window='Zelyr Desktop Test Fixture', and capture "
+                    "again to verify Counter reaches 1."
                 ),
             ),
             (
@@ -357,10 +820,15 @@ def run_benchmark(
 
                 # Reset fixture cleanly before every task
                 _http_json(f"http://127.0.0.1:{fix_port}/reset", method="POST")
+                _focus_and_verify_window(fix_addr, "Zelyr Desktop Test Fixture", f"http://127.0.0.1:{fix_port}")
                 time.sleep(0.2)
 
+                before_state = _http_json(f"http://127.0.0.1:{fix_port}/state")
+                db_path = Path(tmpdir) / f"task_{tid}.db"
+
                 if tid == 5:
-                    # Launch distraction window and focus IT so expected_window catches focus mismatch / requires recovery
+                    # Focus primary fixture first so initial observation targets it, then deterministically
+                    # steal focus to the distraction fixture before the first mutating click.
                     dist_proc = subprocess.Popen(
                         [sys.executable, str(FIXTURE_SCRIPT), "--port", str(dist_port), "--title", "Zelyr Distraction Window", "--distraction"],
                         cwd=str(REPO_ROOT),
@@ -372,22 +840,46 @@ def run_benchmark(
                     dist_win = _wait_for_window("Zelyr Distraction Window", pid=dist_proc.pid)
                     dist_addr = str(dist_win["address"])
                     _place_floating_window(dist_addr, workspace_id, mon_x + 40, mon_y + 40, 360, 180)
-                    _hyprctl_dispatch("focuswindow", f"address:{dist_addr}")
-                    time.sleep(0.25)
+                    _focus_and_verify_window(fix_addr, "Zelyr Desktop Test Fixture", f"http://127.0.0.1:{fix_port}")
+
+                    def _steal_task5(turn_no: int) -> Dict[str, Any]:
+                        pre_act = _hyprctl_json("activewindow")
+                        fix_snap = _http_json(f"http://127.0.0.1:{fix_port}/state")
+                        sw = _focus_and_verify_window(dist_addr, "Zelyr Distraction Window", f"http://127.0.0.1:{dist_port}")
+                        fix_post = _http_json(f"http://127.0.0.1:{fix_port}/state")
+                        return {
+                            "turn": turn_no,
+                            "active_before": pre_act,
+                            "active_after": sw["active_window"],
+                            "fix_state_at_steal": fix_snap,
+                            "fix_state_after_steal": fix_post,
+                            "dist_state_at_steal": sw.get("fixture_state") or _http_json(f"http://127.0.0.1:{dist_port}/state"),
+                        }
+
+                    upstream_ollama = os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434"
+                    with _FocusStealOllamaProxy(upstream_ollama, _steal_task5) as proxy:
+                        run_info = _run_zelyr_cli(
+                            prompt,
+                            model=model,
+                            max_steps=max_steps,
+                            db_path=db_path,
+                            base_url=proxy.base_url,
+                        )
+                        task5_steal = dict(proxy.telemetry)
                 else:
-                    _hyprctl_dispatch("focuswindow", f"address:{fix_addr}")
-                    time.sleep(0.2)
-
-                before_state = _http_json(f"http://127.0.0.1:{fix_port}/state")
-                db_path = Path(tmpdir) / f"task_{tid}.db"
-
-                run_info = _run_zelyr_cli(
-                    prompt,
-                    model=model,
-                    max_steps=max_steps,
-                    db_path=db_path,
-                )
+                    task5_steal = {}
+                    run_info = _run_zelyr_cli(
+                        prompt,
+                        model=model,
+                        max_steps=max_steps,
+                        db_path=db_path,
+                    )
                 after_state = _http_json(f"http://127.0.0.1:{fix_port}/state")
+                dist_after_state = (
+                    _http_json(f"http://127.0.0.1:{dist_port}/state")
+                    if tid == 5 and dist_proc is not None
+                    else {}
+                )
 
                 if tid == 5 and dist_proc is not None:
                     try:
@@ -437,13 +929,17 @@ def run_benchmark(
                     )
                     notes = f"counter={after_state['counter']}, applied={after_state.get('applied_text')!r}, input={after_state.get('input_text')!r}"
                 elif tid == 5:
-                    used_focus = "manage_desktop_window" in tools_used
-                    had_focus_recovery = any(
-                        "focus_lost" in str(c.get("error") or "").lower()
-                        for c in run_info["ledger"].get("calls", [])
+                    ev_t5 = evaluate_focus_recovery_run(
+                        run_info,
+                        before_state=before_state,
+                        after_state=after_state,
+                        dist_after_state=dist_after_state,
+                        steal_telemetry=task5_steal,
+                        expected_counter=1,
+                        expected_text=None,
                     )
-                    passed = run_info["returncode"] == 0 and after_state["counter"] >= 1 and (used_focus or had_focus_recovery)
-                    notes = f"counter={after_state['counter']}, used_focus={used_focus}, had_focus_lost={had_focus_recovery}"
+                    passed = ev_t5["verdict"] == "PASS"
+                    notes = f"verdict={ev_t5['verdict']}, counter={after_state['counter']}, checks={ev_t5['checks']}"
                 elif tid == 6:
                     pc = cli_j.get("policy_compliance") or {}
                     passed = (
@@ -506,17 +1002,220 @@ def run_benchmark(
     }
 
 
+def _cleanup_fixture_processes(*procs_and_ports: Tuple[Optional[subprocess.Popen], Optional[int]]) -> None:
+    """Terminate disposable fixture processes deterministically after success or failure."""
+    for p, port_v in procs_and_ports:
+        if p is not None:
+            if port_v is not None:
+                try:
+                    _http_json(f"http://127.0.0.1:{port_v}/quit", method="POST", timeout=1.0)
+                except Exception:
+                    pass
+            p.terminate()
+            try:
+                p.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                try:
+                    p.wait(timeout=1.0)
+                except Exception:
+                    pass
+
+
+def run_focus_recovery_benchmark(
+    *,
+    model: str = "qwen3.6:35b-a3b",
+    max_steps: int = 12,
+    workspace_id: int = 15,
+    runs: int = 2,
+) -> Dict[str, Any]:
+    """Run deterministic live focus-loss recovery N times with fresh fixture instances each run."""
+    monitors = _hyprctl_json("monitors")
+    focused_mon = next((m for m in monitors if m.get("focused")), monitors[0])
+    dp1 = next((m for m in monitors if m.get("name") == "DP-1"), focused_mon)
+    mon_x, mon_y = int(dp1["x"]), int(dp1["y"])
+    mon_w = int(round(dp1["width"] / (dp1.get("scale") or 1.0)))
+    mon_h = int(round(dp1["height"] / (dp1.get("scale") or 1.0)))
+
+    orig_ws_obj = _hyprctl_json("activeworkspace")
+    orig_win_obj = _hyprctl_json("activewindow")
+    dp1_orig_ws_id = (dp1.get("activeWorkspace") or {}).get("id")
+    orig_clients = _hyprctl_json("clients")
+    ws_existing = [
+        c for c in orig_clients
+        if str((c.get("workspace") or {}).get("id")) == str(workspace_id)
+    ]
+    if ws_existing:
+        raise RuntimeError(
+            f"Safety abort: target isolated workspace {workspace_id} is not empty ({len(ws_existing)} windows)."
+        )
+
+    results: List[Dict[str, Any]] = []
+    upstream_ollama = os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434"
+
+    try:
+        if dp1.get("name"):
+            _hyprctl_dispatch("focusmonitor", str(dp1["name"]))
+        _hyprctl_dispatch("workspace", str(workspace_id))
+        time.sleep(0.25)
+
+        with tempfile.TemporaryDirectory(prefix="zelyr_focus_recovery_") as tmpdir:
+            for run_idx in range(1, max(1, int(runs)) + 1):
+                fix_port = _free_port()
+                dist_port = _free_port()
+                fix_proc: Optional[subprocess.Popen] = None
+                dist_proc: Optional[subprocess.Popen] = None
+                try:
+                    fix_proc = subprocess.Popen(
+                        [sys.executable, str(FIXTURE_SCRIPT), "--port", str(fix_port), "--title", "Zelyr Desktop Test Fixture"],
+                        cwd=str(REPO_ROOT),
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        start_new_session=True,
+                    )
+                    _wait_for_http(f"http://127.0.0.1:{fix_port}/health")
+                    fix_win = _wait_for_window("Zelyr Desktop Test Fixture", pid=fix_proc.pid)
+                    fix_addr = str(fix_win["address"])
+                    fx = mon_x + (mon_w - 640) // 2
+                    fy = mon_y + (mon_h - 420) // 2
+                    _place_floating_window(fix_addr, workspace_id, fx, fy, 640, 420)
+
+                    dist_proc = subprocess.Popen(
+                        [sys.executable, str(FIXTURE_SCRIPT), "--port", str(dist_port), "--title", "Zelyr Distraction Window", "--distraction"],
+                        cwd=str(REPO_ROOT),
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        start_new_session=True,
+                    )
+                    _wait_for_http(f"http://127.0.0.1:{dist_port}/health")
+                    dist_win = _wait_for_window("Zelyr Distraction Window", pid=dist_proc.pid)
+                    dist_addr = str(dist_win["address"])
+                    _place_floating_window(dist_addr, workspace_id, mon_x + 40, mon_y + 40, 360, 180)
+
+                    # Focus intended fixture cleanly before observation begins
+                    _focus_and_verify_window(fix_addr, "Zelyr Desktop Test Fixture", f"http://127.0.0.1:{fix_port}")
+                    time.sleep(0.15)
+                    before_state = _http_json(f"http://127.0.0.1:{fix_port}/state")
+                    dist_before_state = _http_json(f"http://127.0.0.1:{dist_port}/state")
+                    db_path = Path(tmpdir) / f"focus_run_{run_idx}.db"
+
+                    def _steal_focus(turn_no: int) -> Dict[str, Any]:
+                        pre_act = _hyprctl_json("activewindow")
+                        fix_snap = _http_json(f"http://127.0.0.1:{fix_port}/state")
+                        sw = _focus_and_verify_window(dist_addr, "Zelyr Distraction Window", f"http://127.0.0.1:{dist_port}")
+                        fix_post = _http_json(f"http://127.0.0.1:{fix_port}/state")
+                        return {
+                            "turn": turn_no,
+                            "active_before": pre_act,
+                            "active_after": sw["active_window"],
+                            "fix_state_at_steal": fix_snap,
+                            "fix_state_after_steal": fix_post,
+                            "dist_state_at_steal": sw.get("fixture_state") or _http_json(f"http://127.0.0.1:{dist_port}/state"),
+                        }
+
+                    with _FocusStealOllamaProxy(upstream_ollama, _steal_focus) as proxy:
+                        run_info = _run_zelyr_cli(
+                            FOCUS_RECOVERY_PROMPT,
+                            model=model,
+                            max_steps=max_steps,
+                            db_path=db_path,
+                            base_url=proxy.base_url,
+                        )
+                        steal_telemetry = dict(proxy.telemetry)
+
+                    after_state = _http_json(f"http://127.0.0.1:{fix_port}/state")
+                    dist_after_state = _http_json(f"http://127.0.0.1:{dist_port}/state")
+                    validation = evaluate_focus_recovery_run(
+                        run_info,
+                        before_state=before_state,
+                        after_state=after_state,
+                        dist_after_state=dist_after_state,
+                        steal_telemetry=steal_telemetry,
+                        expected_counter=1,
+                        expected_text="focus-recovery-ok",
+                    )
+
+                    entry = {
+                        "run": run_idx,
+                        "verdict": validation["verdict"],
+                        "passed": validation["passed"],
+                        "checks": validation["checks"],
+                        "sequence": validation["sequence"],
+                        "steal_telemetry": steal_telemetry,
+                        "before_state": before_state,
+                        "dist_before_state": dist_before_state,
+                        "after_state": after_state,
+                        "dist_after_state": dist_after_state,
+                        **run_info,
+                    }
+                    results.append(entry)
+                    print(
+                        f"[FocusRecovery Run {run_idx}/{runs}] {validation['verdict']} | "
+                        f"rc={run_info['returncode']} | {run_info['duration_s']}s | "
+                        f"counter={after_state.get('counter')} | applied={after_state.get('applied_text')!r} | "
+                        f"checks={validation['checks']}",
+                        flush=True,
+                    )
+                finally:
+                    _cleanup_fixture_processes((dist_proc, dist_port), (fix_proc, fix_port))
+    finally:
+        if dp1_orig_ws_id is not None:
+            _hyprctl_dispatch("workspace", str(dp1_orig_ws_id))
+        orig_ws_id = orig_ws_obj.get("id") if isinstance(orig_ws_obj, dict) else None
+        if orig_ws_id is not None:
+            _hyprctl_dispatch("workspace", str(orig_ws_id))
+        orig_addr = orig_win_obj.get("address") if isinstance(orig_win_obj, dict) else None
+        if orig_addr:
+            _hyprctl_dispatch("focuswindow", f"address:{orig_addr}")
+
+    passed_cnt = sum(1 for r in results if r["verdict"] == "PASS")
+    unverified_cnt = sum(1 for r in results if r["verdict"] == "UNVERIFIED")
+    failed_cnt = sum(1 for r in results if r["verdict"] == "FAIL")
+    overall = "PASS" if passed_cnt == len(results) and len(results) > 0 else ("UNVERIFIED" if unverified_cnt > 0 and failed_cnt == 0 else "FAIL")
+    return {
+        "scenario": "focus_loss_recovery",
+        "model": model,
+        "max_steps": max_steps,
+        "workspace_id": workspace_id,
+        "runs": len(results),
+        "verdict": overall,
+        "passed_count": passed_cnt,
+        "failed_count": failed_cnt,
+        "unverified_count": unverified_cnt,
+        "results": results,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run live Zelyr Linux desktop CLI benchmark")
     parser.add_argument("--model", default="qwen3.6:35b-a3b")
     parser.add_argument("--max-steps", type=int, default=12)
     parser.add_argument("--workspace", type=int, default=15)
     parser.add_argument("--tasks", type=str, default="", help="Optional comma-separated task IDs (e.g. 1,2,3)")
+    parser.add_argument("--focus-recovery", action="store_true", help="Run dedicated deterministic FOCUS_LOST recovery scenario")
+    parser.add_argument("--runs", type=int, default=2, help="Number of fresh runs for --focus-recovery (default 2)")
     parser.add_argument("--out", type=Path, default=None, help="Optional JSON report output path")
     args = parser.parse_args()
 
     only = [int(x.strip()) for x in args.tasks.split(",") if x.strip()] if args.tasks else None
     signal.signal(signal.SIGTERM, lambda *_a: sys.exit(143))
+
+    if args.focus_recovery:
+        report = run_focus_recovery_benchmark(
+            model=args.model,
+            max_steps=args.max_steps,
+            workspace_id=args.workspace,
+            runs=args.runs,
+        )
+        if args.out is not None:
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            args.out.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        print(
+            f"Focus Recovery Verdict: {report['verdict']} "
+            f"({report['passed_count']}/{report['runs']} passed, "
+            f"{report['unverified_count']} unverified, {report['failed_count']} failed)"
+        )
+        return 0 if report["verdict"] == "PASS" else 1
 
     report = run_benchmark(
         model=args.model,

@@ -208,12 +208,21 @@ def _overlay_coordinate_grid(img: Any, region: Dict[str, Any]) -> Any:
 
         # Minor faint subgrid lines (50px on windows, 100px on full monitors)
         minor_x0 = ((rx + minor_step - 1) // minor_step) * minor_step
+        show_minor_x_lbl = rw <= 700
         for dx in range(minor_x0, rx + rw, minor_step):
             if dx % step == 0:
                 continue
             px = int(round((dx - rx) * img.width / rw))
             if 0 < px < img.width - 1:
-                draw.line([(px, 0), (px, img.height - 1)], fill=(56, 189, 248, 45), width=1)
+                draw.line([(px, 0), (px, img.height - 1)], fill=(56, 189, 248, 65), width=1)
+                if show_minor_x_lbl:
+                    lbl = str(dx)
+                    tw, th = _measure(lbl)
+                    px_per_minor = (minor_step * img.width) / rw
+                    if px_per_minor >= tw + 8:
+                        bx = min(max(2, px + 3), max(2, img.width - tw - 6))
+                        draw.rectangle([bx - 2, 2, bx + tw + 3, th + 5], fill=(13, 17, 23, 185))
+                        draw.text((bx, 3), lbl, font=font, fill=(148, 224, 255, 220))
 
         minor_y0 = ((ry + minor_step - 1) // minor_step) * minor_step
         show_minor_y_lbl = rh <= 700
@@ -222,7 +231,7 @@ def _overlay_coordinate_grid(img: Any, region: Dict[str, Any]) -> Any:
                 continue
             py = int(round((dy - ry) * img.height / rh))
             if 0 < py < img.height - 1:
-                draw.line([(0, py), (img.width - 1, py)], fill=(56, 189, 248, 45), width=1)
+                draw.line([(0, py), (img.width - 1, py)], fill=(56, 189, 248, 65), width=1)
                 if show_minor_y_lbl:
                     lbl = str(dy)
                     tw, th = _measure(lbl)
