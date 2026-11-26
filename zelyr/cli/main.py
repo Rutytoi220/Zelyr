@@ -405,6 +405,47 @@ async def _execute_headless_run(
         )
     tier = orch.route_tier(clean_prompt)
     dynamic_tools = filter_tool_schemas_by_tier(get_tool_schemas(0), tier)
+    try:
+        from zelyr.core.vision_engine.singleton import is_spotless_arms_available
+
+        has_desktop_ctrl = any(
+            (t.get("function") or {}).get("name") == "desktop_control"
+            for t in dynamic_tools
+            if isinstance(t, dict)
+        )
+        if has_desktop_ctrl and not is_spotless_arms_available():
+            dynamic_tools = [
+                t for t in dynamic_tools
+                if (t.get("function") or {}).get("name") != "interact_with_ui"
+            ]
+        # On Tier 3 native desktop tasks (num_ctx=8192), strip unrelated browser/web/routine
+        # schemas unless referenced in the prompt so compact tools stay ~1.4k tokens instead of 3.4k.
+        if tier == "tier3_vision" and has_desktop_ctrl:
+            p_low = clean_prompt.lower()
+            optional_by_kw = {
+                "interact_with_browser": ("browser", "http://", "https://", "tab", "dom", "webpage", "web page", "website"),
+                "web_search": ("search", "web", "lookup", "google", "online", "internet"),
+                "fetch_web_page": ("fetch", "url", "http://", "https://", "web", "page"),
+                "manage_routine": ("routine", "cron", "schedule", "recurring", "timer"),
+                "remember_fact": ("remember", "memory", "recall", "fact", "preference"),
+                "manage_media_playback": ("media", "music", "audio", "volume", "player", "playback", "pause", "spotify"),
+                "query_system_journal": ("journal", "journalctl", "systemd", "syslog", "service log"),
+                "inspect_network": ("network", "ip", "dns", "gateway", "tailscale", "vpn", "ping", "port"),
+                "delegate_subtask": ("delegate", "subtask", "subagent"),
+                "send_desktop_notification": ("notify", "notification", "alert", "toast"),
+                "manage_system_process": ("process", "pid", "kill", "pkill", "ps "),
+            }
+            drop_tools = {
+                name
+                for name, kws in optional_by_kw.items()
+                if not any(k in p_low for k in kws)
+            }
+            dynamic_tools = [
+                t for t in dynamic_tools
+                if ((t.get("function") or {}).get("name") or t.get("name")) not in drop_tools
+            ]
+    except Exception:
+        pass
 
     payload: Dict[str, Any] = {
         "model": active_model,

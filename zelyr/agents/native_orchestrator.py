@@ -384,6 +384,29 @@ class NativeOrchestrator:
         "window_manager",
     }
 
+    SCREENSHOT_TOOL_ALIASES = {
+        "screenshot",
+        "screen_capture",
+        "take_screenshot",
+        "capture_screenshot",
+        "observe_screen",
+        "observe_desktop",
+    }
+
+    DESKTOP_CONTROL_ALIASES = {
+        "mouse_move",
+        "move_mouse",
+        "mouse_click",
+        "click_mouse",
+        "double_click",
+        "mouse_drag",
+        "mouse_scroll",
+        "keyboard_type",
+        "type_text",
+        "keyboard_press",
+        "press_key",
+    }
+
     BROWSER_TOOL_ALIASES = {
         "browser",
         "cdp",
@@ -419,6 +442,8 @@ class NativeOrchestrator:
         **{alias: "manage_workspace_file" for alias in FILE_TOOL_ALIASES},
         **{alias: "verify_outcome" for alias in VERIFY_TOOL_ALIASES},
         **{alias: "manage_desktop_window" for alias in DESKTOP_TOOL_ALIASES},
+        **{alias: "capture_screen" for alias in SCREENSHOT_TOOL_ALIASES},
+        **{alias: "desktop_control" for alias in DESKTOP_CONTROL_ALIASES},
         **{alias: "interact_with_browser" for alias in BROWSER_TOOL_ALIASES},
         **{alias: "manage_memory" for alias in MEMORY_TOOL_ALIASES},
         **{alias: "craft_tool" for alias in CRAFT_TOOL_ALIASES},
@@ -558,6 +583,75 @@ class NativeOrchestrator:
                             break
             elif "action" not in args:
                 args.setdefault("action", "get_active")
+
+        elif clean_name == "desktop_control":
+            alias_action_map = {
+                "mouse_move": "mouse_move",
+                "move_mouse": "mouse_move",
+                "mouse_click": "mouse_click",
+                "click_mouse": "mouse_click",
+                "double_click": "double_click",
+                "mouse_drag": "mouse_drag",
+                "mouse_scroll": "mouse_scroll",
+                "keyboard_type": "keyboard_type",
+                "type_text": "keyboard_type",
+                "keyboard_press": "keyboard_press",
+                "press_key": "keyboard_press",
+            }
+            if not str(args.get("action") or "").strip():
+                if raw_orig in alias_action_map:
+                    args["action"] = alias_action_map[raw_orig]
+                elif "text" in args:
+                    args["action"] = "keyboard_type"
+                elif "key" in args or "keys" in args or "hotkey" in args:
+                    args["action"] = "keyboard_press"
+                elif "end_x" in args or "end_y" in args:
+                    args["action"] = "mouse_drag"
+                elif "x" in args and "y" in args and "button" in args:
+                    args["action"] = "mouse_click"
+                elif "x" in args and "y" in args:
+                    args["action"] = "mouse_move"
+            if "key" not in args:
+                for alt_key in ("keys", "hotkey", "key_name", "shortcut"):
+                    if alt_key in args:
+                        args["key"] = args.pop(alt_key)
+                        break
+            if "expected_window" not in args and "window" in args and args.get("action") != "inspect_windows":
+                args["expected_window"] = args.get("window")
+            if args.get("action") in ("screenshot", "observe") and "target" in args:
+                tgt_val = str(args.pop("target") or "").strip()
+                if tgt_val and "window" not in args and tgt_val.lower() not in (
+                    "window",
+                    "active_window",
+                    "active_monitor",
+                    "monitor",
+                    "region",
+                    "full",
+                    "screen",
+                    "desktop",
+                ):
+                    args["window"] = tgt_val
+
+        elif clean_name == "capture_screen":
+            valid_capture_targets = {"active_monitor", "active_window", "window", "monitor", "region", "full"}
+            t_raw = str(args.get("target") or "").strip()
+            if not t_raw:
+                if args.get("window"):
+                    args["target"] = "window"
+                elif args.get("monitor"):
+                    args["target"] = "monitor"
+                elif args.get("region"):
+                    args["target"] = "region"
+                else:
+                    args["target"] = "active_monitor"
+            elif t_raw.lower() in valid_capture_targets:
+                args["target"] = t_raw.lower()
+            elif t_raw.lower() in ("desktop", "screen", "all", "entire_screen", "full_screen"):
+                args["target"] = "full"
+            else:
+                if not str(args.get("window") or "").strip():
+                    args["window"] = t_raw
+                args["target"] = "window"
 
         elif clean_name == "interact_with_browser":
             act = args.get("action")
@@ -1141,6 +1235,8 @@ class NativeOrchestrator:
         # silently ignores options.num_ctx and falls back to 4096) and requires assistant
         # tool_calls.function.arguments to be native JSON dicts rather than JSON strings.
         wire_payload = dict(payload)
+        pending_vision_b64 = wire_payload.pop("_pending_vision_b64", None)
+        force_vision_image = bool(wire_payload.pop("_force_vision_image", False))
         wire_payload["stream"] = True
         wire_payload.setdefault("keep_alive", eff_keep_alive)
         if "temperature" in wire_payload and wire_payload["temperature"] is not None:
@@ -1186,6 +1282,24 @@ class NativeOrchestrator:
             else 300.0
         )
         timeout_config = httpx.Timeout(connect=10.0, read=read_timeout, write=20.0, pool=20.0)
+        vision_attached = False
+        if isinstance(pending_vision_b64, str) and pending_vision_b64 and isinstance(wire_payload.get("messages"), list):
+            supports_vision = force_vision_image or await self._model_supports_vision(
+                str(wire_payload.get("model") or ""), base_url
+            )
+            if supports_vision:
+                wire_payload["messages"] = list(wire_payload["messages"]) + [
+                    {
+                        "role": "user",
+                        "content": (
+                            "[Transient desktop screenshot attached for the immediately preceding "
+                            "capture_screen/observe tool observation. Read UI labels, state, and coordinates from it.]"
+                        ),
+                        "images": [pending_vision_b64],
+                    }
+                ]
+                vision_attached = True
+
         async with httpx.AsyncClient(timeout=timeout_config) as client:
             async with client.stream(
                 "POST",
@@ -1194,7 +1308,31 @@ class NativeOrchestrator:
             ) as resp:
                 if resp.status_code != 200:
                     await resp.aread()
-                    yield {"_api_error": f"HTTP {resp.status_code}: {resp.text}"}
+                    err_text_resp = resp.text
+                    if vision_attached and resp.status_code == 400 and any(
+                        tok in err_text_resp.lower() for tok in ("vision", "image", "multimodal", "unsupported")
+                    ):
+                        cache_key = (str(base_url).rstrip("/"), str(wire_payload.get("model") or ""))
+                        self._vision_support_cache[cache_key] = False
+                        retry_payload = dict(wire_payload)
+                        retry_payload["messages"] = list(wire_payload["messages"][:-1])
+                        async with client.stream(
+                            "POST",
+                            f"{base_url}/api/chat",
+                            json=retry_payload,
+                        ) as retry_resp:
+                            if retry_resp.status_code != 200:
+                                await retry_resp.aread()
+                                yield {"_api_error": f"HTTP {retry_resp.status_code}: {retry_resp.text}"}
+                                return
+                            async for line in retry_resp.aiter_lines():
+                                is_done, events = self._parse_stream_line_to_events(line)
+                                for evt in events:
+                                    yield evt
+                                if is_done:
+                                    break
+                        return
+                    yield {"_api_error": f"HTTP {resp.status_code}: {err_text_resp}"}
                     return
 
                 async for line in resp.aiter_lines():
@@ -1203,6 +1341,36 @@ class NativeOrchestrator:
                         yield evt
                     if is_done:
                         break
+
+    _vision_support_cache: Dict[tuple, bool] = {}
+
+    async def _model_supports_vision(self, model: str, base_url: str) -> bool:
+        """Query and cache whether the target Ollama model advertises vision capability."""
+        clean_model = (model or "").strip()
+        clean_url = (base_url or "").rstrip("/")
+        if not clean_model or not clean_url:
+            return False
+        cache_key = (clean_url, clean_model)
+        if cache_key in self._vision_support_cache:
+            return self._vision_support_cache[cache_key]
+        try:
+            async with httpx.AsyncClient(timeout=1.5) as client:
+                resp = await client.post(f"{clean_url}/api/show", json={"name": clean_model})
+            if resp.status_code == 200:
+                data = resp.json()
+                caps = data.get("capabilities")
+                if isinstance(caps, list):
+                    supported = any(str(c).lower() == "vision" for c in caps)
+                    self._vision_support_cache[cache_key] = supported
+                    return supported
+                details = data.get("details") if isinstance(data.get("details"), dict) else {}
+                families = [str(f).lower() for f in (details.get("families") or [])]
+                supported = any("clip" in f or "vision" in f or "mllama" in f or "vl" in f for f in families)
+                self._vision_support_cache[cache_key] = supported
+                return supported
+        except Exception:
+            pass
+        return False
 
     @staticmethod
     def _normalize_done_reason(chunk: Dict[str, Any]) -> Dict[str, Any]:
@@ -2225,8 +2393,16 @@ class NativeOrchestrator:
                 if last_failed_for_tools.tool_name:
                     effective_allowed.add(last_failed_for_tools.tool_name)
 
+            desktop_recovery_tools = {"desktop_control", "capture_screen", "manage_desktop_window"}
+            desktop_failure_seen = any(
+                (getattr(f, "tool_name", "") or "").lower()
+                in {"interact_with_ui", "desktop_control", "capture_screen", "screen_capture", "manage_desktop_window"}
+                for f in unresolved_exec_failures
+            )
             foundational_tools = {"execute_command", "manage_workspace_file"}
             permitted_recovery_tools = effective_allowed | foundational_tools
+            if desktop_failure_seen:
+                permitted_recovery_tools |= desktop_recovery_tools
             scoped_tools = [
                 t for t in payload["tools"]
                 if (t.get("function", {}).get("name") or t.get("name")) in permitted_recovery_tools
@@ -2294,8 +2470,13 @@ class NativeOrchestrator:
         if hasattr(eff_ledger, "record_orchestration_step"):
             eff_ledger.record_orchestration_step()
         _llm_t0 = time.monotonic()
+        pending_vis_for_turn = payload.pop("_pending_vision_b64", None)
+        stream_payload = payload
+        if pending_vis_for_turn:
+            stream_payload = dict(payload)
+            stream_payload["_pending_vision_b64"] = pending_vis_for_turn
         try:
-            async for data in self._stream_model_events(payload, base_url, stream_provider=eff_stream_provider):
+            async for data in self._stream_model_events(stream_payload, base_url, stream_provider=eff_stream_provider):
                 if "_api_error" in data:
                     if hasattr(eff_ledger, "_root_meta") and isinstance(eff_ledger._root_meta, dict):
                         eff_ledger._root_meta["provider_error"] = str(data["_api_error"])
@@ -2742,7 +2923,7 @@ class NativeOrchestrator:
             # Mid-task token-limit exhaustion during <think>: retry once concisely rather than discarding prior steps
             if (
                 stream_finish_reason in ("length", "max_tokens")
-                and not clean_text
+                and len(clean_text) < 120
                 and actual_step_count > 0
                 and not is_retry
                 and depth < eff_max_depth - 1
@@ -3496,15 +3677,6 @@ class NativeOrchestrator:
                     )
                     is_explicit_repeat = self._is_explicit_repeat_requested(all_user_prompts)
 
-                    # Check if action is an idempotent read/inspection check (allowed to poll up to ceiling)
-                    func_lower = func_name.lower()
-                    is_read_tool = (
-                        func_lower.startswith(("read_", "get_", "list_", "check_", "inspect_", "verify_", "stat_"))
-                        or func_lower in ("get_page_snapshot", "list_tabs", "read_file", "view_file", "list_dir", "list_tree", "read_state", "verify_outcome")
-                        or (func_lower == "manage_workspace_file" and str(func_args.get("action", "")).lower() in ("read", "view", "list", "list_tree", "stat", "exists", "inspect", "check"))
-                    )
-
-                    # Check if action mutates any already-verified resource
                     from zelyr.engine.execution_ledger import (
                         _is_inspection_action,
                         canonicalize_target,
@@ -3517,6 +3689,41 @@ class NativeOrchestrator:
                     )
                     from zelyr.engine.verifier import OutcomeVerifier
 
+                    # Check if action is an idempotent read/inspection check (allowed to re-observe after mutations)
+                    func_lower = func_name.lower()
+                    is_read_tool = (
+                        func_lower.startswith(("read_", "get_", "list_", "check_", "inspect_", "verify_", "stat_"))
+                        or func_lower in (
+                            "get_page_snapshot",
+                            "list_tabs",
+                            "read_file",
+                            "view_file",
+                            "list_dir",
+                            "list_tree",
+                            "read_state",
+                            "verify_outcome",
+                            "capture_screen",
+                            "screen_capture",
+                        )
+                        or (
+                            func_lower in ("desktop_control", "desktop_automation", "manage_desktop_window")
+                            and _is_inspection_action(func_name, func_args)
+                        )
+                    )
+                    # Stateful compositor focus/workspace switching may legitimately need to run again
+                    # after focus drifts or an intervening desktop failure (e.g. FOCUS_LOST), though
+                    # consecutive back-to-back duplicates with no intervening call remain redundant.
+                    is_state_recovery_action = (
+                        func_lower == "manage_desktop_window"
+                        and isinstance(func_args, dict)
+                        and str(func_args.get("action") or "").strip().lower() in ("focus", "workspace", "focus_window")
+                        and (
+                            not curr_tool_history
+                            or not (curr_tool_history[-1][0] == fingerprint and curr_tool_history[-1][1] == "success")
+                        )
+                    )
+
+                    # Check if action mutates any already-verified resource
                     is_test_or_verify_cmd = is_diagnostic_test_command(func_name, func_args) or func_lower in (
                         "verify_outcome",
                         "verify_state",
@@ -3524,7 +3731,7 @@ class NativeOrchestrator:
                     )
                     cycle_history = curr_tool_history
                     last_mut_idx = -1
-                    if is_test_or_verify_cmd and curr_tool_history:
+                    if (is_test_or_verify_cmd or is_read_tool) and curr_tool_history:
                         for idx_h, (h_fp, h_st) in enumerate(curr_tool_history):
                             if h_st != "success":
                                 continue
@@ -3649,7 +3856,28 @@ class NativeOrchestrator:
                             f"Action '{func_name}' was already completed and verified prior to interruption; "
                             "skip repeating this verified operation."
                         )
-                    elif has_prior_success and not is_explicit_repeat and not is_read_tool:
+                    elif (
+                        func_lower == "interact_with_ui"
+                        and isinstance(payload.get("tools") or auth_schemas, list)
+                        and bool(payload.get("tools") or auth_schemas)
+                        and "interact_with_ui" not in {
+                            (s.get("function", {}).get("name") or s.get("name"))
+                            for s in (payload.get("tools") or auth_schemas)
+                            if isinstance(s, dict)
+                        }
+                        and "desktop_control" in {
+                            (s.get("function", {}).get("name") or s.get("name"))
+                            for s in (payload.get("tools") or auth_schemas)
+                            if isinstance(s, dict)
+                        }
+                    ):
+                        rejection_reason = "tool_unavailable"
+                        rejection_detail = (
+                            "Tool 'interact_with_ui' is not enabled in this runtime (Spotless Arms unavailable). "
+                            "Use 'capture_screen' to inspect coordinates and 'desktop_control' "
+                            "(mouse_click, double_click, mouse_move, keyboard_type, keyboard_press) instead."
+                        )
+                    elif has_prior_success and not is_explicit_repeat and not is_read_tool and not is_state_recovery_action:
                         rejection_reason = "redundant_action"
                         rejection_detail = (
                             f"Action '{func_name}' with identical parameters has already succeeded. "
@@ -3860,6 +4088,11 @@ class NativeOrchestrator:
                             )
 
                     if rejection_reason is None:
+                        from zelyr.engine.execution_ledger import (
+                            _DESKTOP_MUTATION_SHELL_RE,
+                            _is_inspection_action,
+                            extract_desktop_interaction_prohibition,
+                        )
                         global_prohib = extract_global_mutation_prohibition(_user_text)
                         if global_prohib["no_file_modifications"] or global_prohib["no_mutating_commands"]:
                             allow_tests = bool(
@@ -3876,6 +4109,35 @@ class NativeOrchestrator:
                                 rejection_detail = (
                                     f"The user explicitly prohibited modifying files or running mutating commands ({mut_reason}). "
                                     f"The call to '{func_name}' is blocked; use read-only inspection only and do not retry mutations."
+                                )
+                        elif extract_desktop_interaction_prohibition(_user_text):
+                            t_low_prohib = (func_name or "").lower().strip()
+                            is_desktop_mut = (
+                                not _is_inspection_action(t_low_prohib, func_args)
+                                and (
+                                    t_low_prohib in (
+                                        "desktop_control",
+                                        "desktop_automation",
+                                        "interact_with_ui",
+                                        "gui_actuate",
+                                        "click_tag",
+                                        "type_text",
+                                        "press_key",
+                                        "move_mouse",
+                                        "click_mouse",
+                                        "manage_desktop_window",
+                                    )
+                                    or (
+                                        t_low_prohib in ("execute_command", "bash", "sh")
+                                        and bool(_DESKTOP_MUTATION_SHELL_RE.search(str(func_args.get("command") or func_args.get("cmd") or "")))
+                                    )
+                                )
+                            )
+                            if is_desktop_mut:
+                                rejection_reason = "prohibited_by_user"
+                                rejection_detail = (
+                                    f"The user explicitly prohibited interacting with or modifying the desktop UI/window. "
+                                    f"The call to '{func_name}' is blocked; use read-only observation only and do not retry interaction."
                                 )
 
                 # Centralized Unified Execution Policy gate right before dispatch
@@ -4198,9 +4460,14 @@ class NativeOrchestrator:
                             )
 
                     extra_telemetry: Dict[str, Any] = {}
+                    pending_vision_b64_extracted: Optional[str] = None
                     raw_res_meta = getattr(tool_result, "metadata", None)
                     if isinstance(raw_res_meta, dict):
-                        extra_telemetry.update(raw_res_meta)
+                        for mk, mv in raw_res_meta.items():
+                            if mk == "_vision_b64" and isinstance(mv, str) and mv:
+                                pending_vision_b64_extracted = mv
+                            else:
+                                extra_telemetry[mk] = mv
                     bag = getattr(call_ctx, "telemetry_bag", None)
                     if isinstance(bag, dict) and bag:
                         extra_telemetry.update(bag)
@@ -4220,15 +4487,58 @@ class NativeOrchestrator:
                             extra=extra_telemetry,
                         )
 
+                    def _pop_vision_b64_recursive(node: Any) -> Optional[str]:
+                        if isinstance(node, dict):
+                            direct = node.pop("_vision_b64", None)
+                            if isinstance(direct, str) and direct:
+                                return direct
+                            for key in ("output", "result", "data", "metadata"):
+                                if key in node:
+                                    nested = _pop_vision_b64_recursive(node[key])
+                                    if nested:
+                                        return nested
+                        return None
+
                     if hasattr(tool_result, "to_dict"):
                         tool_dict = tool_result.to_dict(tool=func_name, arguments=func_args)
+                        v_b64 = _pop_vision_b64_recursive(tool_dict)
+                        if v_b64:
+                            pending_vision_b64_extracted = v_b64
                         raw_tool_payload = tool_dict
                         tool_result = json.dumps(tool_dict, indent=2)
                     elif not isinstance(tool_result, str):
+                        if isinstance(tool_result, dict) and "_vision_b64" in str(tool_result)[:4096]:
+                            import copy as _copy_vis
+
+                            tool_result = _copy_vis.deepcopy(tool_result)
+                            v_b64 = _pop_vision_b64_recursive(tool_result)
+                            if v_b64:
+                                pending_vision_b64_extracted = v_b64
+                        elif isinstance(tool_result, dict) and "_vision_b64" in tool_result:
+                            tool_result = dict(tool_result)
+                            v_b64 = tool_result.pop("_vision_b64", None)
+                            if isinstance(v_b64, str) and v_b64:
+                                pending_vision_b64_extracted = v_b64
                         raw_tool_payload = tool_result
                         tool_result = json.dumps(tool_result, indent=2)
                     else:
-                        raw_tool_payload = tool_result
+                        stripped_str = tool_result.strip()
+                        if "_vision_b64" in stripped_str and stripped_str.startswith("{") and stripped_str.endswith("}"):
+                            try:
+                                parsed_tr = json.loads(stripped_str)
+                                v_b64 = _pop_vision_b64_recursive(parsed_tr)
+                                if v_b64:
+                                    pending_vision_b64_extracted = v_b64
+                                    tool_result = json.dumps(parsed_tr, indent=2)
+                                    raw_tool_payload = parsed_tr
+                                else:
+                                    raw_tool_payload = tool_result
+                            except json.JSONDecodeError:
+                                raw_tool_payload = tool_result
+                        else:
+                            raw_tool_payload = tool_result
+                    if pending_vision_b64_extracted:
+                        payload["_pending_vision_b64"] = pending_vision_b64_extracted
                     res_str = tool_result
                 except asyncio.CancelledError:
                     was_cancelled = True
@@ -4780,12 +5090,19 @@ class NativeOrchestrator:
             if any(k in task_lower for k in ("file", "rollback", "undo", "patch")):
                 return "manage_workspace_file"
             return "manage_desktop_window"
+        if tier == "tier3_vision":
+            try:
+                from zelyr.core.vision_engine.singleton import is_spotless_arms_available
+                if not is_spotless_arms_available():
+                    return "desktop_control"
+            except Exception:
+                return "desktop_control"
         tier_map = {
             "tier1_ipc": "manage_desktop_window",
             "tier2_browser": "interact_with_browser",
             "tier3_vision": "interact_with_ui",
         }
-        return tier_map.get(tier, "interact_with_ui")
+        return tier_map.get(tier, "desktop_control")
 
     @staticmethod
     def _normalize_graph_proposal(item: Any, execution_id: str, fallback_order: int = 0) -> Dict[str, Any]:

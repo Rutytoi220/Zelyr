@@ -753,6 +753,38 @@ def extract_global_mutation_prohibition(prompt: str) -> Dict[str, bool]:
     }
 
 
+_DESKTOP_INTERACT_PROHIBIT_RE = re.compile(
+    r"\b(?:do\s+not|don'?t|never|must\s+not|should\s+not|shall\s+not|cannot|can'?t|may\s+not|avoid|refrain\s+from|without)\b"
+    r"[^.;\n]{0,120}\b(?:click(?:ing)?|double[\s\-]?click(?:ing)?|right[\s\-]?click(?:ing)?|type|typing|press(?:ing)?\s+keys?|"
+    r"send(?:ing)?\s+(?:input|keys?|clicks?)|move\s+(?:the\s+)?mouse|drag(?:ging)?|scroll(?:ing)?|"
+    r"interact(?:ing)?\s+with|modify(?:ing)?|alter(?:ing)?|change|changing|trigger(?:ing)?|mutate|mutating)\b"
+    r"[^.;\n]{0,80}\b(?:fixture|window|ui|desktop|screen|button|textbox|text\s+field|input\s+field|controls?)\b|"
+    r"\b(?:leave|keep)\s+(?:the\s+)?(?:fixture|desktop\s+window|window|ui)\s+"
+    r"(?:untouched|alone|unchanged|intact|unmodified|as[\s\-]is)\b",
+    flags=re.IGNORECASE,
+)
+
+_DESKTOP_MUTATION_SHELL_RE = re.compile(
+    r"\b(?:wtype|ydotool|xdotool|dotool)\b|\bhyprctl\s+dispatch\b",
+    flags=re.IGNORECASE,
+)
+
+
+def extract_desktop_interaction_prohibition(prompt: str) -> bool:
+    """Return True when the prompt explicitly forbids clicking, typing, or mutating desktop UI/windows."""
+    cleaned = _strip_fenced_and_quoted(prompt)
+    if not cleaned:
+        return False
+    if re.search(
+        r"\b(?:do\s+not|don'?t|never|must\s+not|without|avoid)\s+(?:click|type|press\s+keys?|interact|modify|change|trigger)\b"
+        r"[^.;\n]{0,80}\b(?:read[\s\-]?only|inspect|without\s+(?:clicking|typing|modifying))\b",
+        cleaned,
+        flags=re.IGNORECASE,
+    ):
+        return True
+    return bool(_DESKTOP_INTERACT_PROHIBIT_RE.search(cleaned))
+
+
 def is_diagnostic_test_command(tool_name: str, arguments: Dict[str, Any]) -> bool:
     """Return True if tool call runs a non-mutating test/lint command (e.g. pytest, unittest, ruff check)."""
     if (tool_name or "").lower() not in ("execute_command", "bash", "sh"):
@@ -787,8 +819,8 @@ def is_mutating_tool_call(
     if t_lower in ("execute_command", "bash", "sh"):
         cmd = str(args.get("command") or args.get("cmd") or "").strip()
         if not cmd:
-            return False, ""
-        if any(pat.search(cmd) for pat in _MUTATING_SHELL_OP_PATTERNS):
+            return False
+        if any(pat.search(cmd) for pat in _MUTATING_SHELL_OP_PATTERNS) or _DESKTOP_MUTATION_SHELL_RE.search(cmd):
             return True, f"shell command performs write/mutation: {cmd[:80]}"
         if _is_inspection_action(t_lower, args):
             return False, ""
@@ -840,22 +872,53 @@ def _is_inspection_action(tool_name: str, arguments: Dict[str, Any]) -> bool:
     if t_lower == "manage_workspace_file":
         act = str(arguments.get("action", "read")).lower()
         return act in ("read", "view", "list", "list_tree", "stat", "exists", "inspect", "check")
-    if t_lower in ("read_file", "view_file", "list_dir", "list_tree", "get_state", "inspect_state"):
+    if t_lower in (
+        "read_file",
+        "view_file",
+        "list_dir",
+        "list_tree",
+        "get_state",
+        "inspect_state",
+        "capture_screen",
+        "screen_capture",
+        "capture_som_screen",
+        "gui_inspect",
+    ):
         return True
+    if t_lower in ("desktop_control", "desktop_automation"):
+        act = str(arguments.get("action") or "get_screen_size").strip().lower()
+        return act in (
+            "get_screen_size",
+            "observe",
+            "screenshot",
+            "inspect_windows",
+            "get_active_window",
+            "get_cursor_position",
+        )
+    if t_lower == "manage_desktop_window":
+        act = str(arguments.get("action") or "list").strip().lower()
+        return act in ("list", "get_active", "monitors", "geometry", "inspect")
     if t_lower.startswith(("read_", "get_", "list_", "check_", "inspect_", "stat_")):
         return True
     if t_lower in ("execute_command", "bash", "sh"):
         cmd = str(arguments.get("command", "") or arguments.get("cmd", "")).strip()
         cmd_parts = cmd.split()
         first_word = cmd_parts[0].lower() if cmd_parts else ""
+        if _DESKTOP_MUTATION_SHELL_RE.search(cmd):
+            return False
         if first_word in (
             "ls", "cat", "head", "tail", "grep", "find", "pwd", "whoami", "uname", "stat", "file",
-            "wc", "du", "df", "ps", "id", "env", "printenv", "which", "type", "readlink", "realpath",
+            "wc", "du", "df", "ps", "pgrep", "id", "env", "printenv", "which", "type", "readlink", "realpath",
             "md5sum", "sha256sum", "diff", "test", "[",
             "uptime", "ss", "netstat", "free", "hostname", "date", "lsof", "lsblk", "who", "w",
         ):
             if not any(op in cmd for op in (">", ">>", "| tee", "|tee")):
                 return True
+        if first_word == "hyprctl" and len(cmd_parts) >= 2:
+            h_sub = cmd_parts[1].lower()
+            if h_sub in ("monitors", "clients", "activewindow", "activeworkspace", "workspaces", "cursorpos", "version"):
+                if not any(op in cmd for op in (">", ">>", "| tee", "|tee")):
+                    return True
         if first_word == "git" and len(cmd_parts) >= 2:
             git_sub = cmd_parts[1].lower()
             if git_sub in ("status", "diff", "log", "show", "branch", "rev-parse", "describe", "tag", "check-ignore", "version", "--version"):
@@ -895,6 +958,36 @@ def _extract_action_target(tool_name: str, arguments: Dict[str, Any]) -> Optiona
             val = arguments.get(k)
             if val and isinstance(val, str) and val.strip():
                 return canonicalize_target(val.strip())
+        return None
+
+    if t_lower in (
+        "capture_screen",
+        "screen_capture",
+        "desktop_control",
+        "desktop_automation",
+        "manage_desktop_window",
+    ):
+        for k in ("window", "expected_window"):
+            val = arguments.get(k)
+            if val and isinstance(val, str) and val.strip():
+                return val.strip()
+        raw_tgt = arguments.get("target")
+        if raw_tgt and isinstance(raw_tgt, str) and raw_tgt.strip():
+            raw_clean = raw_tgt.strip()
+            if t_lower in ("capture_screen", "screen_capture") and raw_clean.lower() in (
+                "active_monitor",
+                "active_window",
+                "window",
+                "monitor",
+                "region",
+                "full",
+            ):
+                return None
+            return raw_clean
+        for k in ("monitor", "name", "id"):
+            val = arguments.get(k)
+            if val and isinstance(val, str) and val.strip():
+                return val.strip()
         return None
 
     for k in ("target", "path", "file", "url", "id", "name"):
@@ -963,6 +1056,20 @@ def _is_action_resolved_by_later(failed: ActionRecord, later: ActionRecord) -> b
 
     target_failed = _extract_action_target(failed.tool_name, failed.arguments)
     target_later = _extract_action_target(later.tool_name, later.arguments)
+
+    # 1b. A later successful read-only observation with valid args resolves an earlier
+    # failed observation attempt on the same tool & matching/superset target.
+    if (
+        failed_is_inspect
+        and later_is_inspect
+        and failed.tool_name
+        and failed.tool_name == later.tool_name
+        and failed.tool_name.lower() in ("capture_screen", "screen_capture", "manage_desktop_window")
+    ):
+        if target_failed is None or target_later is None:
+            return True
+        if targets_match(canonicalize_target(target_failed), canonicalize_target(target_later)):
+            return True
 
     op_failed = _extract_action_operation(failed.tool_name, failed.arguments)
     op_later = _extract_action_operation(later.tool_name, later.arguments)
@@ -2910,10 +3017,12 @@ def compute_policy_compliance(
     clean_prompt = str(prompt or "")
     prohibited_targets = extract_prohibited_targets(clean_prompt, ledger=ledger)
     global_prohib = extract_global_mutation_prohibition(clean_prompt)
+    desktop_prohib = extract_desktop_interaction_prohibition(clean_prompt)
     has_prohibitions = bool(
         prohibited_targets
         or global_prohib.get("no_file_modifications")
         or global_prohib.get("no_mutating_commands")
+        or desktop_prohib
     )
     if not has_prohibitions:
         return {
@@ -2963,6 +3072,27 @@ def compute_policy_compliance(
                 allow_read_only_tests=allow_tests,
             )
             if is_mut:
+                violations += 1
+                continue
+
+        if desktop_prohib and not _is_inspection_action(rec.tool_name, args):
+            t_low = (rec.tool_name or "").lower().strip()
+            is_desktop_mut = t_low in (
+                "desktop_control",
+                "desktop_automation",
+                "interact_with_ui",
+                "gui_actuate",
+                "click_tag",
+                "type_text",
+                "press_key",
+                "move_mouse",
+                "click_mouse",
+                "manage_desktop_window",
+            ) or (
+                t_low in ("execute_command", "bash", "sh")
+                and bool(_DESKTOP_MUTATION_SHELL_RE.search(str(args.get("command") or args.get("cmd") or "")))
+            )
+            if is_desktop_mut:
                 violations += 1
                 continue
 

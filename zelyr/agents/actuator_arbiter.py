@@ -57,9 +57,26 @@ TIER_3_EXPLICIT_PATTERNS = [
     r"\b(grounding|vision engine|screenshot|look at screen|on my display|on screen|visual grounding)\b",
 ]
 
+# Desktop GUI automation / observation indicators (capture_screen, desktop_control, pointer/keyboard actions)
+DESKTOP_GUI_PATTERNS = [
+    r"\b(capture_screen|screen_capture|screenshot|screen capture|take a screenshot)\b",
+    r"\b(desktop_control|move_mouse|mouse_move|mouse_click|double[- ]click|right[- ]click|left[- ]click|middle[- ]click|mouse_drag|drag and drop|mouse_scroll|mouse cursor|pointer)\b",
+    r"\b(keyboard_type|type_text|keyboard_press|press_key|hotkey|key combo|press enter|press return|press tab)\b",
+    r"\b(visible state|window layout|ui controls?|what appears in the .* window)\b",
+    r"\b(?:focus|inspect|observe|click|type|press|drag|scroll)\b[^.\n]{0,60}\b(?:fixture|button|textbox|text box|text field|input field|checkbox|dropdown|dialog|popup|label|gui)\b",
+]
+
+# Pure OS / compositor window IPC patterns (do not require GUI pointer/keyboard/screenshot tools)
+_PURE_WINDOW_IPC_PATTERNS = [
+    r"\b(switch to|move to|send to)\s+(workspace|desktop)\b",
+    r"\b(close|minimize|maximize|tile|float)\s+(the\s+)?window\b",
+    r"\b(focus|activate)\s+(the\s+)?(terminal|editor|browser|kitty|alacritty|vesktop|window)\s*$",
+    r"\b(list windows|active window|fullscreen|toggle floating|hyprctl|hyprland)\b",
+]
+
 # Tier 1 Desktop/OS indicators
 TIER_1_PATTERNS = [
-    r"\b(window|windows|workspace|workspaces|fullscreen|floating|tile|tiling)\b",
+    r"\b(workspace|workspaces|fullscreen|floating|tile|tiling)\b",
     r"\b(focus|switch to|move to|close)\s+(window|workspace)\b",
     r"\b(active window|list windows|hyprctl|hyprland)\b",
     r"\b(process|processes|pid|kill\s+process|kill\s+pid|journal|journalctl|systemd|clipboard|wl-copy|wl-paste)\b",
@@ -131,7 +148,7 @@ class ActuatorArbiter:
     TIER_TOOLS = {
         "tier1_ipc": ["manage_desktop_window", "manage_system_process", "execute_command"],
         "tier2_browser": ["interact_with_browser", "web_search", "fetch_web_page"],
-        "tier3_vision": ["interact_with_ui"],
+        "tier3_vision": ["desktop_control", "capture_screen", "interact_with_ui"],
     }
 
     @classmethod
@@ -164,21 +181,25 @@ class ActuatorArbiter:
         browser_active = is_browser_window(active_window)
         has_functioning_dom_bridge = browser_active and bridge_connected
 
-        # 1. Desktop / OS action check:
-        # If user explicitly requests OS, shell, file, process, media, notification, or workspace operations,
-        # prioritize Tier 1 (unless it explicitly targets browser tabs/DOM).
+        # 1. Evaluate tier indicators cleanly before committing to Tier 1 vs Tier 3
         is_tier1 = any(re.search(p, task_lower) for p in TIER_1_PATTERNS)
         is_tier2_explicit = any(re.search(p, task_lower) for p in TIER_2_PATTERNS)
+        is_tier3_explicit = any(re.search(p, task_lower) for p in TIER_3_EXPLICIT_PATTERNS)
+        is_desktop_gui = any(re.search(p, task_lower) for p in DESKTOP_GUI_PATTERNS)
+        is_ui_interaction = any(re.search(p, task_lower) for p in UI_INTERACTION_PATTERNS)
+        is_pure_window_ipc = any(re.search(p, task_lower) for p in _PURE_WINDOW_IPC_PATTERNS)
 
-        if is_tier1 and not is_tier2_explicit:
+        has_desktop_gui_intent = is_tier3_explicit or is_desktop_gui or (
+            is_ui_interaction and not is_tier2_explicit and not is_tier1
+        )
+
+        # Prioritized Tier 1 OS/shell/repo/workspace operations (unless browser or desktop GUI input/observation requested)
+        if is_tier1 and not is_tier2_explicit and (is_pure_window_ipc or not (is_tier3_explicit or is_desktop_gui)):
             return "tier1_ipc"
 
-        # 2. Explicit visual/screen grounding request:
-        # Tier 3 (interact_with_ui) must ONLY be exposed if:
-        #   a) The user explicitly requests visual/screen grounding (look at screen, on display, canvas, etc.)
-        #   b) The active window is NOT a browser tab with a functioning DOM bridge.
-        is_tier3_explicit = any(re.search(p, task_lower) for p in TIER_3_EXPLICIT_PATTERNS)
-        if is_tier3_explicit:
+        # 2. Explicit visual/screen/desktop GUI request:
+        # Must route to browser when browser + DOM bridge is active (negative gating).
+        if has_desktop_gui_intent:
             if has_functioning_dom_bridge:
                 # Browser tab with functioning DOM bridge: strictly route to Tier 2, never Tier 3
                 return "tier2_browser"
@@ -188,10 +209,9 @@ class ActuatorArbiter:
         if is_tier2_explicit:
             return "tier2_browser"
 
-        # 4. Context-aware interaction:
+        # 4. Context-aware browser interaction:
         # If browser window is active AND extension bridge is connected:
         # All UI interaction tasks (click button, submit form, type text...) route to Tier 2
-        is_ui_interaction = any(re.search(p, task_lower) for p in UI_INTERACTION_PATTERNS)
         if has_functioning_dom_bridge:
             if is_ui_interaction or browser_active:
                 return "tier2_browser"
@@ -202,7 +222,7 @@ class ActuatorArbiter:
             return "tier1_ipc"
 
         # 6. Fallback when no active window or generic task:
-        # Without explicit visual grounding or active browser, route to Tier 1 (local-first host IPC/CLI)
+        # Without explicit desktop GUI/visual grounding or active browser, route to Tier 1
         return "tier1_ipc"
 
 

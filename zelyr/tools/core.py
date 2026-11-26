@@ -68,24 +68,22 @@ class ToolResult:
 class ToolParameter:
     """Parameter definition for a tool."""
 
-    def __init__(self, name: str, type: str, description: str, required: bool=True, default: Any=None):
-        """Auto-generated docstring.
-
-Args:
-    name: Argument.
-    type: Argument.
-    description: Argument.
-    required: Argument.
-    default: Argument.
-
-Returns:
-    Return value.
-"""
+    def __init__(
+        self,
+        name: str,
+        type: str,
+        description: str,
+        required: bool = True,
+        default: Any = None,
+        enum: Optional[List[Any]] = None,
+    ):
+        """Initialize a tool parameter definition with optional enum constraints."""
         self.name = name
         self.type = type
         self.description = description
         self.required = required
         self.default = default
+        self.enum = list(enum) if enum is not None else None
 
 class ToolCapability:
     """Formal capability metadata for dynamic tier routing and schema pruning."""
@@ -188,7 +186,10 @@ Returns:
             properties = {}
             required = []
             for p in self.parameters:
-                properties[p.name] = {'type': p.type, 'description': p.description}
+                prop_def: Dict[str, Any] = {'type': p.type, 'description': p.description}
+                if getattr(p, 'enum', None):
+                    prop_def['enum'] = list(p.enum)
+                properties[p.name] = prop_def
                 if p.required:
                     required.append(p.name)
             return {

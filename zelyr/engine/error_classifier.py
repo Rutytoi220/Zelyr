@@ -18,6 +18,7 @@ _NON_RECOVERABLE_ERROR_TYPES = frozenset(
         "AUTHORIZATION_DENIED",
         "CANCELLED",
         "TOOL_UNAVAILABLE",
+        "BACKEND_UNAVAILABLE",
         "DESKTOP_UNAVAILABLE",
         "BROWSER_UNAVAILABLE",
     }
@@ -162,18 +163,97 @@ def classify_tool_error(
             allowed_actions=[],
         )
 
-    # 5. Desktop window manager unavailable
+    # 5. Desktop session / window manager unavailable
     if (
         structured_type == "DESKTOP_UNAVAILABLE"
         or "desktop_unavailable" in combined
         or "hyprland session not detected" in combined
+        or "no active wayland/x11 desktop session" in combined
+        or "wayland_display and display are unset" in combined
         or ("hyprland" in combined and any(k in combined for k in ("not detected", "not running", "not found", "unavailable", "unreachable")))
     ):
         return ErrorClassification(
             error_type="DESKTOP_UNAVAILABLE",
-            summary="Desktop window manager (Hyprland) is unavailable",
-            remedy_hint="Desktop window manager (Hyprland) is not running or socket is unreachable. Use standard shell utilities or verify XDG_RUNTIME_DIR.",
+            summary="Desktop display session or compositor is unavailable",
+            remedy_hint="Desktop session or compositor is unavailable or unreachable. Verify WAYLAND_DISPLAY / DISPLAY / XDG_RUNTIME_DIR or fall back to non-GUI inspection.",
             allowed_actions=["execute_command"],
+        )
+
+    # 5b. Desktop/screenshot/input backend missing
+    if (
+        structured_type == "BACKEND_UNAVAILABLE"
+        or "backend_unavailable" in combined
+    ):
+        return ErrorClassification(
+            error_type="BACKEND_UNAVAILABLE",
+            summary="Required desktop input or screenshot backend is unavailable",
+            remedy_hint="Required desktop backend (grim/uinput/ydotool/wtype) is unavailable. Check system capabilities before retrying or report the missing backend.",
+            allowed_actions=["execute_command"],
+        )
+
+    # 5c. Desktop focus lost before or during UI interaction
+    if (
+        structured_type == "FOCUS_LOST"
+        or "focus_lost" in combined
+        or "expected window lost focus" in combined
+        or "target window is not focused" in combined
+    ):
+        return ErrorClassification(
+            error_type="FOCUS_LOST",
+            summary="Target desktop window lost focus before interaction",
+            remedy_hint="Target desktop window lost focus. Call manage_desktop_window with action='focus' on the target window and re-verify before retrying desktop_control.",
+            allowed_actions=["manage_desktop_window", "capture_screen", "desktop_control"],
+        )
+
+    # 5d. Invalid desktop coordinates
+    if (
+        structured_type == "INVALID_COORDINATES"
+        or "invalid_coordinates" in combined
+        or "coordinates out of monitor bounds" in combined
+    ):
+        return ErrorClassification(
+            error_type="INVALID_COORDINATES",
+            summary="Desktop pointer coordinates are invalid or out of monitor bounds",
+            remedy_hint="Coordinates are invalid or outside monitor bounds. Call desktop_control(action='get_screen_size') or capture_screen to inspect monitor and window bounds before retrying.",
+            allowed_actions=["capture_screen", "desktop_control", "manage_desktop_window"],
+        )
+
+    # 5e. Invalid desktop input key or parameters
+    if (
+        structured_type == "INVALID_INPUT"
+        or "invalid_input" in combined
+        or "unsupported or invalid key" in combined
+    ):
+        return ErrorClassification(
+            error_type="INVALID_INPUT",
+            summary="Invalid keyboard key, modifier combo, or mouse button specified",
+            remedy_hint="Check supported key names (e.g. 'enter', 'tab', 'ctrl+c', 'alt+tab') and retry desktop_control.",
+            allowed_actions=["desktop_control"],
+        )
+
+    # 5f. Screenshot capture or image decoding failed
+    if (
+        structured_type == "SCREENSHOT_FAILED"
+        or "screenshot_failed" in combined
+    ):
+        return ErrorClassification(
+            error_type="SCREENSHOT_FAILED",
+            summary="Desktop screenshot capture failed or timed out",
+            remedy_hint="Screenshot capture failed. Check display/monitor state via manage_desktop_window or inspect desktop environment.",
+            allowed_actions=["manage_desktop_window", "capture_screen", "execute_command"],
+        )
+
+    # 5g. Desktop input dispatch failed or timed out
+    if (
+        structured_type in ("INPUT_FAILED", "INPUT_TIMEOUT")
+        or "input_failed" in combined
+        or "input_timeout" in combined
+    ):
+        return ErrorClassification(
+            error_type=structured_type if structured_type in ("INPUT_FAILED", "INPUT_TIMEOUT") else "INPUT_FAILED",
+            summary="Desktop input dispatch failed or timed out",
+            remedy_hint="Verify target window focus and input backend state via manage_desktop_window or capture_screen before retrying.",
+            allowed_actions=["manage_desktop_window", "capture_screen", "desktop_control"],
         )
 
     # 6. Window not found

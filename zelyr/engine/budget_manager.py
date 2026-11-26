@@ -776,8 +776,41 @@ class ContextBudgetEngine:
 
         user_queries: List[str] = []
         tool_actions: List[str] = []
+        recent_steps: List[str] = []
         assistant_notes: List[str] = []
         failure_evidence: List[str] = []
+
+        def _format_step_descriptor(fn_name: str, raw_args: Any) -> str:
+            args_dict: Dict[str, Any] = {}
+            if isinstance(raw_args, dict):
+                args_dict = raw_args
+            elif isinstance(raw_args, str) and raw_args.strip().startswith("{"):
+                try:
+                    parsed_a = json.loads(raw_args)
+                    if isinstance(parsed_a, dict):
+                        args_dict = parsed_a
+                except Exception:
+                    pass
+            if not args_dict:
+                return fn_name
+            bits: List[str] = []
+            if args_dict.get("action"):
+                bits.append(str(args_dict["action"]))
+            if args_dict.get("x") is not None and args_dict.get("y") is not None:
+                bits.append(f"({args_dict['x']},{args_dict['y']})")
+            for key_k in ("text", "key", "path", "target", "window"):
+                v = args_dict.get(key_k)
+                if v not in (None, "") and (key_k != "target" or not args_dict.get("window")):
+                    sv = str(v)
+                    if len(sv) > 24:
+                        sv = sv[:21] + "..."
+                    bits.append(f"{key_k}={sv}")
+            if args_dict.get("command"):
+                cmd_s = str(args_dict["command"]).strip()
+                if len(cmd_s) > 28:
+                    cmd_s = cmd_s[:25] + "..."
+                bits.append(cmd_s)
+            return f"{fn_name}({' '.join(bits[:4])})" if bits else fn_name
 
         for msg in turns:
             role = msg.get("role", "")
@@ -793,9 +826,11 @@ class ContextBudgetEngine:
                     user_queries.append(snip)
             elif role == "assistant":
                 for tc in msg.get("tool_calls") or []:
-                    fn = tc.get("function", {}).get("name") or tc.get("name")
+                    fn_obj = tc.get("function", {}) if isinstance(tc, dict) else {}
+                    fn = fn_obj.get("name") or (tc.get("name") if isinstance(tc, dict) else None)
                     if fn:
                         tool_actions.append(fn)
+                        recent_steps.append(_format_step_descriptor(str(fn), fn_obj.get("arguments")))
                 if content_str and len(content_str) > 15:
                     clean_c = re.sub(r"<think>.*?</think>", "", content_str, flags=re.DOTALL).strip()
                     if clean_c:
@@ -841,6 +876,8 @@ class ContextBudgetEngine:
         if tool_actions:
             deduped = list(dict.fromkeys(tool_actions))
             parts.append(f"Tools executed: {', '.join(deduped[:6])}")
+        if recent_steps:
+            parts.append(f"Recent steps: {' -> '.join(recent_steps[-6:])}")
         if failure_evidence:
             parts.append(f"Preserved failures/verification errors: {'; '.join(failure_evidence[-3:])}")
         if assistant_notes:
@@ -873,6 +910,7 @@ class ContextBudgetEngine:
 
         user_asked: List[str] = []
         tools_exec: List[str] = []
+        recent_steps_merged: List[str] = []
         failures: List[str] = []
         outcomes: List[str] = []
         other_clauses: List[str] = []
@@ -888,6 +926,11 @@ class ContextBudgetEngine:
                         ts = t.strip()
                         if ts and ts not in tools_exec:
                             tools_exec.append(ts)
+                elif clause.startswith("Recent steps:"):
+                    for st_item in clause[len("Recent steps:") :].split(" -> "):
+                        ss = st_item.strip()
+                        if ss:
+                            recent_steps_merged.append(ss)
                 elif clause.startswith("Preserved failures/verification errors:"):
                     for f_item in clause[len("Preserved failures/verification errors:") :].split(";"):
                         fs = f_item.strip()
@@ -906,6 +949,8 @@ class ContextBudgetEngine:
             merged_parts.append(f"User asked: {'; '.join(user_asked[:4])}")
         if tools_exec:
             merged_parts.append(f"Tools executed: {', '.join(tools_exec[:8])}")
+        if recent_steps_merged:
+            merged_parts.append(f"Recent steps: {' -> '.join(recent_steps_merged[-6:])}")
         if failures:
             merged_parts.append(f"Preserved failures/verification errors: {'; '.join(failures[-4:])}")
         if outcomes:

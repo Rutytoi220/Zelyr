@@ -1468,14 +1468,24 @@ class ObservationFramingEngine:
         raw_str = ""
 
         if isinstance(result, dict):
-            parsed = result
-            raw_str = json.dumps(result, default=str)
+            parsed = {
+                k: ({"omitted": True, "reason": "large_payload"} if str(k).lower() in _BULKY_OBSERVATION_KEYS else v)
+                for k, v in result.items()
+            }
+            raw_str = json.dumps(parsed, default=str)
         elif isinstance(result, str):
             raw_str = result.strip()
             try:
                 data = json.loads(raw_str)
                 if isinstance(data, dict):
-                    parsed = data
+                    if any(str(k).lower() in _BULKY_OBSERVATION_KEYS for k in data):
+                        parsed = {
+                            k: ({"omitted": True, "reason": "large_payload"} if str(k).lower() in _BULKY_OBSERVATION_KEYS else v)
+                            for k, v in data.items()
+                        }
+                        raw_str = json.dumps(parsed, default=str)
+                    else:
+                        parsed = data
             except Exception:
                 pass
         else:

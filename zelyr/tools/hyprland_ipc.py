@@ -265,7 +265,8 @@ class ManageDesktopWindowTool(BaseTool):
             ToolParameter(
                 name="action",
                 type="string",
-                description="The window management action to perform: 'list', 'get_active', 'focus', 'workspace', 'move_to_workspace', 'toggle_floating', 'fullscreen', 'close'.",
+                description="Hyprland window/workspace management action.",
+                enum=["list", "get_active", "focus", "workspace", "move_to_workspace", "toggle_floating", "fullscreen", "close"],
                 required=True,
             ),
             ToolParameter(

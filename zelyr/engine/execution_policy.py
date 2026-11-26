@@ -111,6 +111,7 @@ _READ_ONLY_TOOL_IDS: Set[str] = {
     "read_document_content",
     "gui_inspect",
     "capture_screen",
+    "screen_capture",
     "capture_som_screen",
     "blackboard_read",
     "semantic_memory_search",
@@ -1403,7 +1404,20 @@ class RiskClassifier:
         if tid in _PRIVILEGED_TOOL_IDS or (
             required_ring == 0 and tid not in _READ_ONLY_TOOL_IDS and tid != "manage_workspace_file"
         ):
-            # Read-only inspection action inside gui_inspect stays READ_ONLY; mutating GUI/shell stay PRIVILEGED.
+            # Read-only inspection actions inside desktop tools stay READ_ONLY; mutating GUI/shell stay PRIVILEGED.
+            if tid in ("desktop_control", "desktop_automation") and action in {
+                "get_screen_size",
+                "observe",
+                "screenshot",
+                "inspect_windows",
+                "get_active_window",
+                "get_cursor_position",
+            }:
+                rules.append(f"risk:desktop_read_only:{action}")
+                return RiskLevel.READ_ONLY, rules
+            if tid == "manage_desktop_window" and action in {"list", "get_active", "monitors", "geometry", "inspect"}:
+                rules.append(f"risk:window_read_only:{action}")
+                return RiskLevel.READ_ONLY, rules
             if tid == "desktop_automation" and action == "open_url":
                 url = str(normalized_arguments.get("url") or "").strip().lower()
                 if url.startswith(("https://", "http://")):

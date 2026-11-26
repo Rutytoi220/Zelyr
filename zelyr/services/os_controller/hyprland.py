@@ -1,11 +1,22 @@
-import subprocess
 import logging
+from typing import Optional
 from zelyr.services.os_controller.base import BaseOSController
 
 logger = logging.getLogger(__name__)
 
+
 class HyprlandController(BaseOSController):
-    """OS Controller for Wayland + Hyprland."""
+    """OS Controller for Wayland + Hyprland backed by WaylandInputController."""
+
+    def __init__(self) -> None:
+        self._ctrl: Optional[object] = None
+
+    def _get_ctrl(self):
+        if self._ctrl is None:
+            from zelyr.tools.input_controller import WaylandInputController
+
+            self._ctrl = WaylandInputController(auto_check=False)
+        return self._ctrl
 
     @property
     def can_click(self) -> bool:
@@ -23,35 +34,35 @@ class HyprlandController(BaseOSController):
     def can_manage_windows(self) -> bool:
         return True
 
-    def click(self, x: int, y: int, button: str = "left", clicks: int = 1) -> None:
+    def move_mouse(self, x: int, y: int) -> None:
+        """Move pointer to desktop coordinates (x, y)."""
         try:
-            subprocess.run(["hyprctl", "dispatch", "movecursor", f"{x} {y}"], check=True)
-            btn_code = "3" if button == "right" else "1"
-            for _ in range(clicks):
-                subprocess.run(["hyprctl", "dispatch", "click", btn_code], check=True)
-        except FileNotFoundError as e:
-            logger.error("Hyprland click failed: hyprctl not found")
-            raise RuntimeError("Hyprland click failed: hyprctl not found")
-        except subprocess.CalledProcessError as e:
+            self._get_ctrl().mouse_move(x, y)
+        except Exception as e:
+            logger.error("Hyprland move_mouse failed: %s", e)
+            raise RuntimeError(f"Hyprland move_mouse failed: {e}") from e
+
+    def click(self, x: int, y: int, button: str = "left", clicks: int = 1) -> None:
+        """Move cursor to (x, y) and click using Wayland/uinput input controller."""
+        try:
+            ctrl = self._get_ctrl()
+            ctrl.mouse_click(button=button, clicks=clicks, x=x, y=y)
+        except Exception as e:
             logger.error("Hyprland click failed: %s", e)
-            raise RuntimeError(f"Hyprland click failed: {e}")
+            raise RuntimeError(f"Hyprland click failed: {e}") from e
 
     def type_text(self, text: str) -> None:
+        """Type text via Wayland/uinput input controller."""
         try:
-            subprocess.run(["wtype", text], check=True)
-        except FileNotFoundError as e:
-            logger.error("wtype text failed: wtype not found")
-            raise RuntimeError("wtype text failed: wtype not found")
-        except subprocess.CalledProcessError as e:
-            logger.error("wtype text failed: %s", e)
-            raise RuntimeError(f"wtype text failed: {e}")
+            self._get_ctrl().keyboard_type(text)
+        except Exception as e:
+            logger.error("Hyprland type_text failed: %s", e)
+            raise RuntimeError(f"Hyprland type_text failed: {e}") from e
 
     def press_key(self, key: str) -> None:
+        """Press key or modifier combo via Wayland/uinput input controller."""
         try:
-            subprocess.run(["wtype", "-k", key], check=True)
-        except FileNotFoundError as e:
-            logger.error("wtype key press failed: wtype not found")
-            raise RuntimeError("wtype key press failed: wtype not found")
-        except subprocess.CalledProcessError as e:
-            logger.error("wtype key press failed: %s", e)
-            raise RuntimeError(f"wtype key press failed: {e}")
+            self._get_ctrl().keyboard_press(key)
+        except Exception as e:
+            logger.error("Hyprland press_key failed: %s", e)
+            raise RuntimeError(f"Hyprland press_key failed: {e}") from e

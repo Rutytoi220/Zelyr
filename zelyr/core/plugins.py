@@ -668,6 +668,68 @@ def load_plugins() -> None:
             ),
         ),
         (
+            TOOLS_DIR / "capture_screen.py",
+            (
+                "import json\n"
+                "from zelyr.tools.screen_perception import CaptureScreenTool\n\n"
+                "_tool = CaptureScreenTool()\n\n"
+                "TOOL_SCHEMA = {\n"
+                '    "type": "function",\n'
+                '    "function": {\n'
+                '        "name": "capture_screen",\n'
+                '        "description": _tool.description,\n'
+                '        "parameters": _tool.schema,\n'
+                '    }\n'
+                "}\n"
+                'TUI_HINT = "📸 Observing desktop screen..."\n'
+                "REQUIRED_RING = 1\n"
+                "TIER = 3\n"
+                "IS_CORE = False\n"
+                "REQUIRES_WINDOW = True\n\n"
+                "async def execute(target: str = 'active_monitor', window: str = '', monitor: str = '', region: str = '', include_image: bool = True, **kwargs) -> str:\n"
+                '    params = {"target": target, "include_image": include_image, **kwargs}\n'
+                "    if window:\n"
+                '        params["window"] = window\n'
+                "    if monitor:\n"
+                '        params["monitor"] = monitor\n'
+                "    if region:\n"
+                '        params["region"] = region\n'
+                "    res = await _tool.execute(params)\n"
+                "    payload = res.to_dict(tool=_tool.name, arguments=params)\n"
+                '    if isinstance(res.metadata, dict) and res.metadata.get("_vision_b64"):\n'
+                '        payload["_vision_b64"] = res.metadata["_vision_b64"]\n'
+                "    return json.dumps(payload)\n"
+            ),
+        ),
+        (
+            TOOLS_DIR / "desktop_control.py",
+            (
+                "import json\n"
+                "from zelyr.tools.desktop_control import DesktopAutomationTool\n\n"
+                "_tool = DesktopAutomationTool()\n\n"
+                "TOOL_SCHEMA = {\n"
+                '    "type": "function",\n'
+                '    "function": {\n'
+                '        "name": "desktop_control",\n'
+                '        "description": _tool.description,\n'
+                '        "parameters": _tool.schema,\n'
+                '    }\n'
+                "}\n"
+                'TUI_HINT = "🖱️ Interacting with desktop UI..."\n'
+                "REQUIRED_RING = 0\n"
+                "TIER = 3\n"
+                "IS_CORE = False\n"
+                "REQUIRES_WINDOW = True\n\n"
+                "async def execute(action: str = 'get_screen_size', **kwargs) -> str:\n"
+                '    params = {"action": action, **kwargs}\n'
+                "    res = await _tool.execute(params)\n"
+                '    payload = res.to_dict(tool="desktop_control", arguments=params)\n'
+                '    if isinstance(res.metadata, dict) and res.metadata.get("_vision_b64"):\n'
+                '        payload["_vision_b64"] = res.metadata["_vision_b64"]\n'
+                "    return json.dumps(payload)\n"
+            ),
+        ),
+        (
             TOOLS_DIR / "vision.py",
             (
                 "import json\n"
@@ -842,13 +904,13 @@ def _extract_capability(mod: Any, name: str):
             requires_window=(name == "interact_with_browser"),
             token_cost=250,
         )
-    if name in ("interact_with_ui", "vision", "capture_som_screen", "som_click", "som_type", "som_key"):
+    if name in ("interact_with_ui", "vision", "capture_som_screen", "som_click", "som_type", "som_key", "capture_screen", "desktop_control"):
         return ToolCapability(
             tier=3,
             is_core=False,
             requires_bridge=False,
             requires_window=True,
-            token_cost=600,
+            token_cost=350 if name in ("capture_screen", "desktop_control") else 600,
         )
     return ToolCapability(
         tier=None,
@@ -969,7 +1031,7 @@ TIER_2_TOOLS = DynamicCapabilitySet(
 
 TIER_3_TOOLS = DynamicCapabilitySet(
     lambda n, c: getattr(c, "tier", None) == 3,
-    {"interact_with_ui"},
+    {"interact_with_ui", "capture_screen", "desktop_control"},
 )
 
 
@@ -1002,7 +1064,10 @@ def filter_tool_schemas_by_tier(schemas: List[Dict[str, Any]], tier: str, is_bro
         result = list(schemas)
 
     if is_browser:
-        result = [s for s in result if (s.get("function", {}).get("name") or s.get("name")) != "interact_with_ui"]
+        result = [
+            s for s in result
+            if (s.get("function", {}).get("name") or s.get("name")) not in ("interact_with_ui", "desktop_control")
+        ]
 
     return result
 
@@ -1041,6 +1106,8 @@ PROVISIONED_TOOLS = {
     "inspect_network",
     "interact_with_browser",
     "interact_with_ui",
+    "capture_screen",
+    "desktop_control",
     "vision",
     "capture_som_screen",
     "click_tag",
@@ -1058,6 +1125,8 @@ PROVISIONED_TOOLS = {
 
 TIER_TIMEOUTS: Dict[str, float] = {
     "interact_with_ui": 35.0,
+    "capture_screen": 12.0,
+    "desktop_control": 15.0,
     "vision": 35.0,
     "capture_som_screen": 35.0,
     "click_tag": 35.0,
