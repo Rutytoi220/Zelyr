@@ -71,8 +71,7 @@ class DesktopAutomationTool(BaseTool):
             tool_id="desktop_control",
             name="desktop_control",
             description=(
-                "Click/double-click/drag/scroll mouse, type text, press keys, or inspect desktop windows. "
-                "Supports 'expected_window' focus guard and validated desktop (x, y) coordinates."
+                "Mouse/keyboard desktop input and observe; pass expected_window on inputs to guard focus."
             ),
             tier=3,
             is_core=False,
@@ -166,13 +165,13 @@ class DesktopAutomationTool(BaseTool):
         self.add_parameter(ToolParameter(
             name="press_enter",
             type="boolean",
-            description="For keyboard_type, also press Enter after typing (default false).",
+            description="Press Enter after typing (default false).",
             required=False,
         ))
         self.add_parameter(ToolParameter(
             name="expected_window",
             type="string",
-            description="Optional target window title/class/address that MUST be focused before sending input.",
+            description="Required window title that must stay focused on input.",
             required=False,
         ))
         self.add_parameter(ToolParameter(

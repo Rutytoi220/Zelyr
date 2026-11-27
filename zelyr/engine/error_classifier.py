@@ -294,14 +294,16 @@ def classify_tool_error(
     if (
         structured_type == "ELEMENT_NOT_FOUND"
         or "element_not_found" in combined
+        or "element not found" in combined
         or "target element id was not found" in combined
         or ("element id" in combined and "not found" in combined)
         or ("element not found for id" in combined)
+        or ("element not found for selector" in combined)
     ):
         return ErrorClassification(
             error_type="ELEMENT_NOT_FOUND",
             summary="Target element not found on page",
-            remedy_hint="Target element ID was not found on the active page. Call get_page_snapshot to refresh element IDs.",
+            remedy_hint="Target element ID or selector was not found on the active page. Call interact_with_browser(action='get_page_snapshot') to refresh element IDs.",
             allowed_actions=["interact_with_browser"],
         )
 
@@ -338,6 +340,16 @@ def classify_tool_error(
         or "timed out" in combined
         or "timeout" in combined
     ):
+        if tname in ("interact_with_browser", "browser_cdp", "browser_navigate", "fetch_web_page"):
+            return ErrorClassification(
+                error_type="TIMEOUT",
+                summary="Browser action timed out",
+                remedy_hint=(
+                    "Browser action timed out. Refresh page state with interact_with_browser(action='get_page_snapshot'), "
+                    "reload the tab, or retry the browser action."
+                ),
+                allowed_actions=["interact_with_browser", "execute_command"],
+            )
         return ErrorClassification(
             error_type="TIMEOUT",
             summary="Command execution timed out",

@@ -1035,14 +1035,19 @@ TIER_3_TOOLS = DynamicCapabilitySet(
 )
 
 
-def filter_tool_schemas_by_tier(schemas: List[Dict[str, Any]], tier: str, is_browser: bool = False) -> List[Dict[str, Any]]:
+def filter_tool_schemas_by_tier(
+    schemas: List[Dict[str, Any]],
+    tier: str,
+    is_browser: bool = False,
+    include_tiers: Optional[Any] = None,
+) -> List[Dict[str, Any]]:
     """Filter dynamic tool schemas based on the detected automation tier.
 
     - Always includes core system tools: execute_command, manage_desktop_window.
-    - If Tier 1: includes Core + Tier 1 tools.
-    - If Tier 2: includes Core + Tier 2 tools.
+    - If Tier 1: includes Core + Tier 1 tools (plus any explicit include_tiers).
+    - If Tier 2: includes Core + Tier 2 tools (plus any explicit include_tiers).
     - If Tier 3 / Ambiguous / General: includes the full registry.
-    - If is_browser is True, interact_with_ui is strictly purged from exposed schemas.
+    - If is_browser is True, interact_with_ui and desktop_control are purged from exposed schemas.
     """
     tier_lower = (tier or "").lower().strip()
     if tier_lower in ("tier1", "tier1_ipc", "1"):
@@ -1053,11 +1058,18 @@ def filter_tool_schemas_by_tier(schemas: List[Dict[str, Any]], tier: str, is_bro
         target_tier = None
 
     if target_tier is not None:
+        allowed_tiers = {target_tier}
+        if include_tiers is not None:
+            for extra_t in include_tiers:
+                try:
+                    allowed_tiers.add(int(extra_t))
+                except (TypeError, ValueError):
+                    pass
         filtered = []
         for s in schemas:
             name = s.get("function", {}).get("name") or s.get("name")
             cap = get_tool_capability(name)
-            if cap.is_core or cap.tier == 0 or cap.tier == target_tier:
+            if cap.is_core or cap.tier == 0 or cap.tier in allowed_tiers:
                 filtered.append(s)
         result = filtered if filtered else list(schemas)
     else:

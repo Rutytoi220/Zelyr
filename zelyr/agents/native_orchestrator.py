@@ -616,6 +616,19 @@ class NativeOrchestrator:
                     if alt_key in args:
                         args["key"] = args.pop(alt_key)
                         break
+            if "coordinate" in args and "x" not in args and "y" not in args:
+                coord_val = args.pop("coordinate")
+                if isinstance(coord_val, str) and coord_val.strip().startswith("["):
+                    try:
+                        coord_val = json.loads(coord_val)
+                    except Exception:
+                        coord_val = None
+                if isinstance(coord_val, (list, tuple)) and len(coord_val) == 2:
+                    try:
+                        args["x"] = int(round(float(coord_val[0])))
+                        args["y"] = int(round(float(coord_val[1])))
+                    except (TypeError, ValueError):
+                        pass
             if "expected_window" not in args and "window" in args and args.get("action") != "inspect_windows":
                 args["expected_window"] = args.get("window")
             if args.get("action") in ("screenshot", "observe") and "target" in args:
@@ -2081,13 +2094,15 @@ class NativeOrchestrator:
         if depth == 0:
             if eff_stream_provider is None:
                 # Eagerly ensure WebExtension bridge server is running on 127.0.0.1:41144
-                try:
-                    from zelyr.tools.browser_extension import get_bridge
-                    bridge = get_bridge()
-                    if bridge.server is None:
-                        asyncio.create_task(bridge.start_server())
-                except Exception:
-                    pass
+                # unless running under an isolated Native Messaging socket.
+                if not (os.environ.get("ZELYR_BROWSER_NATIVE_SOCKET") or "").strip():
+                    try:
+                        from zelyr.tools.browser_extension import get_bridge
+                        bridge = get_bridge()
+                        if bridge.server is None:
+                            asyncio.create_task(bridge.start_server())
+                    except Exception:
+                        pass
 
                 active_win_header = await self.get_active_window_context()
                 if active_win_header:
@@ -2183,6 +2198,10 @@ class NativeOrchestrator:
         except Exception:
             pass
 
+        from zelyr.core.plugins import filter_tool_schemas_by_tier
+        from zelyr.agents.actuator_arbiter import ActuatorArbiter, is_browser_window
+        browser_active = is_browser_window(active_window)
+
         tier = self.route_tier(
             user_query_for_intent,
             active_window=active_window,
@@ -2190,8 +2209,11 @@ class NativeOrchestrator:
         )
         if is_recovery_turn and allowed_recovery_actions:
             tier2_actions = {"get_page_snapshot", "scroll_page", "click_element", "fill_element", "list_tabs", "open_tab", "switch_tab", "navigate_url"}
+            tier3_actions = {"desktop_control", "capture_screen"}
             if any(a in tier2_actions for a in allowed_recovery_actions):
                 tier = "tier2_browser"
+            elif any(a in tier3_actions for a in allowed_recovery_actions) and not browser_active:
+                tier = "tier3_vision"
 
         # Enforce adequate context size in Ollama and determine schema compaction mode
         options = payload.setdefault("options", {})
@@ -2220,9 +2242,11 @@ class NativeOrchestrator:
             or budget_pressure_ratio >= 0.5
         )
 
-        from zelyr.core.plugins import filter_tool_schemas_by_tier
-        from zelyr.agents.actuator_arbiter import is_browser_window
-        browser_active = is_browser_window(active_window)
+        has_cross_surface = ActuatorArbiter.has_cross_surface_browser_and_desktop_intent(
+            user_query_for_intent
+        )
+        if depth == 0 and not hasattr(eff_ledger, "_base_payload_tools") and payload.get("tools"):
+            eff_ledger._base_payload_tools = list(payload["tools"])
 
         from zelyr.tool_registry import authorize_and_validate_tool_call
 
@@ -2298,7 +2322,11 @@ class NativeOrchestrator:
                 else:
                     active_tools = []
             else:
-                active_tools = payload.get("tools") or get_tool_schemas(0)
+                active_tools = list(
+                    getattr(eff_ledger, "_base_payload_tools", None)
+                    or payload.get("tools")
+                    or get_tool_schemas(0)
+                )
 
             # Keep authorized, live external tools eligible across automation tiers while preserving native tier gating
             external_names: set[str] = set()
@@ -2320,7 +2348,12 @@ class NativeOrchestrator:
                 s for s in active_tools
                 if (s.get("function", {}).get("name") or s.get("name") or "") in external_names
             ]
-            payload["tools"] = filter_tool_schemas_by_tier(native_tools_only, tier, is_browser=browser_active)
+            payload["tools"] = filter_tool_schemas_by_tier(
+                native_tools_only,
+                tier,
+                is_browser=browser_active,
+                include_tiers=({2, 3} if has_cross_surface else None),
+            )
             payload["tools"].extend(external_tools_only)
 
             # Strict negative gating: purge Tier 3 interact_with_ui whenever a browser window is active
@@ -3713,20 +3746,49 @@ class NativeOrchestrator:
                             "screen_capture",
                         )
                         or (
-                            func_lower in ("desktop_control", "desktop_automation", "manage_desktop_window")
+                            func_lower in ("desktop_control", "desktop_automation", "manage_desktop_window", "interact_with_browser", "browser_cdp")
                             and _is_inspection_action(func_name, func_args)
                         )
                     )
                     # Stateful compositor focus/workspace switching may legitimately need to run again
                     # after focus drifts or an intervening desktop failure (e.g. FOCUS_LOST), though
                     # consecutive back-to-back duplicates with no intervening call remain redundant.
-                    is_state_recovery_action = (
-                        func_lower == "manage_desktop_window"
+                    is_browser_after_nav = False
+                    if (
+                        func_lower in ("interact_with_browser", "browser_cdp")
                         and isinstance(func_args, dict)
-                        and str(func_args.get("action") or "").strip().lower() in ("focus", "workspace", "focus_window")
-                        and (
-                            not curr_tool_history
-                            or not (curr_tool_history[-1][0] == fingerprint and curr_tool_history[-1][1] == "success")
+                        and str(func_args.get("action") or "").strip().lower() in ("click_element", "fill_element", "press_key", "click", "type")
+                        and curr_tool_history
+                    ):
+                        last_same_idx = -1
+                        for idx_h, (h_fp, h_st) in enumerate(curr_tool_history):
+                            if h_fp == fingerprint and h_st == "success":
+                                last_same_idx = idx_h
+                        if last_same_idx >= 0:
+                            for h_fp, h_st in curr_tool_history[last_same_idx + 1 :]:
+                                if h_st != "success" or not isinstance(h_fp, tuple):
+                                    continue
+                                h_name, h_canon = h_fp
+                                if str(h_name or "").lower() in ("interact_with_browser", "browser_cdp"):
+                                    try:
+                                        h_args = json.loads(h_canon) if isinstance(h_canon, str) and h_canon.startswith("{") else {}
+                                    except Exception:
+                                        h_args = {}
+                                    if str(h_args.get("action") or "").strip().lower() in (
+                                        "navigate_url", "open_tab", "switch_tab", "reload_tab", "get_page_snapshot", "scroll_page"
+                                    ):
+                                        is_browser_after_nav = True
+                                        break
+                    is_state_recovery_action = (
+                        is_browser_after_nav
+                        or (
+                            func_lower == "manage_desktop_window"
+                            and isinstance(func_args, dict)
+                            and str(func_args.get("action") or "").strip().lower() in ("focus", "workspace", "focus_window")
+                            and (
+                                not curr_tool_history
+                                or not (curr_tool_history[-1][0] == fingerprint and curr_tool_history[-1][1] == "success")
+                            )
                         )
                     )
 
@@ -3751,6 +3813,67 @@ class NativeOrchestrator:
                                 last_mut_idx = idx_h
                         if last_mut_idx >= 0:
                             cycle_history = curr_tool_history[last_mut_idx + 1 :]
+                    elif (
+                        func_lower in ("interact_with_browser", "browser_cdp")
+                        and isinstance(func_args, dict)
+                        and str(func_args.get("action") or "").strip().lower() in ("click_element", "fill_element", "press_key", "click", "type")
+                        and curr_tool_history
+                    ):
+                        # Reset browser element retry window after a successful DOM refresh or navigation
+                        last_refresh_idx = -1
+                        for idx_h, (h_fp, h_st) in enumerate(curr_tool_history):
+                            if h_st != "success" or not isinstance(h_fp, tuple):
+                                continue
+                            h_name, h_canon = h_fp
+                            if str(h_name or "").lower() in ("interact_with_browser", "browser_cdp"):
+                                try:
+                                    h_args = json.loads(h_canon) if isinstance(h_canon, str) and h_canon.startswith("{") else {}
+                                except Exception:
+                                    h_args = {}
+                                if str(h_args.get("action") or "").strip().lower() in (
+                                    "get_page_snapshot", "navigate_url", "open_tab", "reload_tab", "switch_tab"
+                                ):
+                                    last_refresh_idx = idx_h
+                        if last_refresh_idx >= 0:
+                            cycle_history = curr_tool_history[last_refresh_idx + 1 :]
+                    elif (
+                        func_lower in ("desktop_control", "desktop_automation")
+                        and not is_read_tool
+                        and curr_tool_history
+                    ):
+                        # Reset desktop retry ceiling after explicit window focus/workspace recovery
+                        last_focus_idx = -1
+                        for idx_h, (h_fp, h_st) in enumerate(curr_tool_history):
+                            if h_st != "success" or not isinstance(h_fp, tuple):
+                                continue
+                            h_name, h_canon = h_fp
+                            h_low = str(h_name or "").lower()
+                            try:
+                                h_args = json.loads(h_canon) if isinstance(h_canon, str) and h_canon.startswith("{") else {}
+                            except Exception:
+                                h_args = {}
+                            h_act = str(h_args.get("action") or "").strip().lower()
+                            if (
+                                (h_low == "manage_desktop_window" and h_act in ("focus", "focus_window", "focuswindow", "workspace"))
+                                or (h_low in ("desktop_control", "desktop_automation") and h_act == "focus_window")
+                            ):
+                                last_focus_idx = idx_h
+                        if last_focus_idx >= 0:
+                            cycle_history = curr_tool_history[last_focus_idx + 1 :]
+                    elif (
+                        func_lower == "manage_desktop_window"
+                        and isinstance(func_args, dict)
+                        and str(func_args.get("action") or "").strip().lower() in ("focus", "focus_window", "focuswindow", "workspace")
+                        and curr_tool_history
+                    ):
+                        # Reset focus-call retry window whenever a newer desktop_control failure (e.g. FOCUS_LOST) occurred
+                        last_dc_fail_idx = -1
+                        for idx_h, (h_fp, h_st) in enumerate(curr_tool_history):
+                            if h_st == "error" and isinstance(h_fp, tuple):
+                                if str(h_fp[0] or "").lower() in ("desktop_control", "desktop_automation"):
+                                    last_dc_fail_idx = idx_h
+                        if last_dc_fail_idx >= 0:
+                            cycle_history = curr_tool_history[last_dc_fail_idx + 1 :]
 
                     if is_test_or_verify_cmd and last_mut_idx >= 0:
                         has_prior_success = any(

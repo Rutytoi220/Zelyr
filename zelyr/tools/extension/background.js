@@ -998,7 +998,15 @@ async function handleCommand(msg) {
         const results = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
           func: (sel) => {
-            const el = document.querySelector(sel);
+            let el = null;
+            try {
+              el = document.querySelector(sel);
+            } catch (err) {
+              return {
+                success: false,
+                error: `Invalid CSS selector '${sel}': ${err && err.message ? err.message : String(err)}. Use standard CSS selectors or call get_page_snapshot then click_element(element_id=...).`,
+              };
+            }
             if (!el) {
               return { success: false, error: `Element not found for selector: '${sel}'` };
             }
@@ -1016,7 +1024,7 @@ async function handleCommand(msg) {
           args: [selector],
         });
 
-        const execResult = results && results[0] ? results[0].result : { success: false, error: "Script execution produced no result" };
+        const execResult = (results && results[0] && results[0].result != null) ? results[0].result : { success: false, error: "Script execution produced no result" };
         sendReply({ ...execResult, id, action: "click", selector });
         break;
       }
@@ -1038,7 +1046,15 @@ async function handleCommand(msg) {
         const results = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
           func: (sel, val) => {
-            const el = document.querySelector(sel);
+            let el = null;
+            try {
+              el = document.querySelector(sel);
+            } catch (err) {
+              return {
+                success: false,
+                error: `Invalid CSS selector '${sel}': ${err && err.message ? err.message : String(err)}. Use standard CSS selectors or call get_page_snapshot then fill_element(element_id=...).`,
+              };
+            }
             if (!el) {
               return { success: false, error: `Element not found for selector: '${sel}'` };
             }
@@ -1061,7 +1077,7 @@ async function handleCommand(msg) {
           args: [selector, text],
         });
 
-        const execResult = results && results[0] ? results[0].result : { success: false, error: "Script execution produced no result" };
+        const execResult = (results && results[0] && results[0].result != null) ? results[0].result : { success: false, error: "Script execution produced no result" };
         sendReply({ ...execResult, id, action: "type", selector });
         break;
       }
@@ -1680,22 +1696,31 @@ async function handleCommand(msg) {
               }, 400);
             } catch (_) {}
 
+            const clickedId = elemId != null ? elemId : (el.getAttribute("data-zelyr-id") ? Number(el.getAttribute("data-zelyr-id")) : null);
+            const clickedTag = el.tagName;
+            const clickedText = (el.innerText || el.textContent || "").trim().slice(0, 100);
+            const anchorEl = typeof el.closest === "function" ? el.closest("a[href]") : null;
+            const hrefAttr = anchorEl ? (anchorEl.getAttribute("href") || "").trim() : "";
+            const isCrossDocNav = Boolean(hrefAttr && !hrefAttr.startsWith("#") && !hrefAttr.toLowerCase().startsWith("javascript:"));
+
             el.click();
 
-            // Await DOM settlement before completing
-            await waitForSettled();
+            // Skip post-click async settlement on cross-document navigation links so page unload does not void the result
+            if (!isCrossDocNav) {
+              await waitForSettled();
+            }
 
             return {
               success: true,
-              clicked_id: elemId != null ? elemId : (el.getAttribute("data-zelyr-id") ? Number(el.getAttribute("data-zelyr-id")) : null),
-              tag: el.tagName,
-              text: (el.innerText || el.textContent || "").trim().slice(0, 100),
+              clicked_id: clickedId,
+              tag: clickedTag,
+              text: clickedText,
             };
           },
           args: [selector, elementId],
         });
 
-        const execResult = results && results[0] ? results[0].result : { success: false, error: "Click script execution produced no result" };
+        const execResult = (results && results[0] && results[0].result != null) ? results[0].result : { success: false, error: "Click script execution produced no result" };
         sendReply({ ...execResult, id, action: "click_element" });
         break;
       }
@@ -2144,7 +2169,7 @@ async function handleCommand(msg) {
           args: [selector, text, submit, elementId],
         });
 
-        const execResult = results && results[0] ? results[0].result : { success: false, error: "Fill script execution produced no result" };
+        const execResult = (results && results[0] && results[0].result != null) ? results[0].result : { success: false, error: "Fill script execution produced no result" };
         sendReply({ ...execResult, id, action: "fill_element" });
         break;
       }

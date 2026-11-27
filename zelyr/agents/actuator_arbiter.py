@@ -151,6 +151,29 @@ class ActuatorArbiter:
         "tier3_vision": ["desktop_control", "capture_screen", "interact_with_ui"],
     }
 
+    CROSS_SURFACE_DESKTOP_PATTERNS = [
+        *DESKTOP_GUI_PATTERNS,
+        *TIER_3_EXPLICIT_PATTERNS,
+        r"\b(desktop\s+(?:app|application|window|fixture|ui|gui)|pyside\d?|gtk|qt)\b",
+        r"\b(desktop)\b[^.\n]{0,80}\b(window|button|field|input|confirm|submit|label|status|screen)\b",
+    ]
+
+    @classmethod
+    def has_cross_surface_browser_and_desktop_intent(cls, task: str) -> bool:
+        """Return True when task explicitly spans both browser automation and desktop GUI surfaces."""
+        task_clean = re.sub(r"\[Active Window:[^\]]*\]\s*", "", task or "")
+        task_lower = task_clean.lower().strip()
+        if not task_lower:
+            return False
+        has_browser = (
+            any(re.search(p, task_lower) for p in TIER_2_PATTERNS)
+            or ("http://" in task_lower)
+            or ("https://" in task_lower)
+        )
+        if not has_browser:
+            return False
+        return any(re.search(p, task_lower) for p in cls.CROSS_SURFACE_DESKTOP_PATTERNS)
+
     @classmethod
     def arbitrate(
         cls,

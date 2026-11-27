@@ -747,14 +747,14 @@ class CaptureScreenTool(BaseTool):
             ToolParameter(
                 name="target",
                 type="string",
-                description="Capture scope: 'active_monitor' (default), 'active_window', 'window', 'monitor', 'region', or 'full'.",
+                description="Scope: 'window' (recommended), 'active_monitor', or 'full'.",
                 required=False,
                 default="active_monitor",
             ),
             ToolParameter(
                 name="window",
                 type="string",
-                description="Optional window title, class, or address to capture when target='window'.",
+                description="Window title/class to zoom into with target='window'.",
                 required=False,
             ),
             ToolParameter(
@@ -772,7 +772,7 @@ class CaptureScreenTool(BaseTool):
             ToolParameter(
                 name="include_image",
                 type="boolean",
-                description="Keep True (default) to attach the screenshot image so visible text, buttons, and coordinates can be read/verified.",
+                description="Keep True (default) to attach screenshot for visual inspection.",
                 required=False,
                 default=True,
             ),
@@ -812,10 +812,10 @@ TOOL_SCHEMA = {
             "properties": {
                 "target": {
                     "type": "string",
-                    "description": "Capture scope: 'active_monitor', 'active_window', 'window', 'monitor', 'region', or 'full'.",
+                    "description": "Scope: 'window' (recommended), 'active_monitor', or 'full'.",
                     "default": "active_monitor",
                 },
-                "window": {"type": "string", "description": "Window title/class/address when target='window'."},
+                "window": {"type": "string", "description": "Window title/class to zoom into with target='window'."},
                 "monitor": {"type": "string", "description": "Monitor connector name when target='monitor'."},
                 "region": {"type": "string", "description": "Region 'x,y wxh' when target='region'."},
                 "include_image": {"type": "boolean", "description": "Attach bounded visual image (default true).", "default": True},

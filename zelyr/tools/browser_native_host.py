@@ -558,7 +558,7 @@ class NativeBrowserClient:
                     error="Native browser host closed connection without reply.",
                 )
             resp = json.loads(raw_line.decode("utf-8"))
-            ok = bool(resp.get("success", resp.get("status") != "error"))
+            ok = bool(resp.get("success", resp.get("status") != "error" and not resp.get("error")))
             return NativeBrowserResult(
                 success=ok,
                 output=resp,

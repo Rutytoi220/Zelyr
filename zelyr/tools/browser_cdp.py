@@ -10,6 +10,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -366,6 +367,33 @@ class InteractWithBrowserTool(BaseTool):
 
         # Tier 2 WebExtension Bridge / Native Messaging is primary for browser automation.
         if not force_cdp:
+            ext_params = {k: v for k, v in params.items() if k not in ("action", "_force_cdp")}
+            explicit_native_socket = bool(os.environ.get("ZELYR_BROWSER_NATIVE_SOCKET", "").strip())
+
+            # When isolated Native Messaging socket is explicitly configured, use it exclusively
+            # before touching the global WebSocket bridge (127.0.0.1:41144) so external browser
+            # sessions never hijack isolated runs.
+            if explicit_native_socket:
+                try:
+                    from zelyr.tools.browser_native_host import NativeBrowserClient
+                    native_client = NativeBrowserClient()
+                    if native_client.is_socket_present() and await native_client.is_available():
+                        native_res = await native_client.send_command(action, **ext_params)
+                        return self._format_extension_result(action, params, native_res)
+                except Exception:
+                    pass
+                base_err = (
+                    f"No browser extension connected for action '{action}' "
+                    f"(isolated Native Messaging socket '{os.environ.get('ZELYR_BROWSER_NATIVE_SOCKET')}' unavailable)."
+                )
+                return ToolResult(
+                    False,
+                    error=base_err,
+                    remedy_hint="Ensure the isolated browser Native Messaging host is connected.",
+                    allowed_actions=["interact_with_browser", "execute_command"],
+                    output={"status": "error", "error_type": "BROWSER_UNAVAILABLE", "error": base_err},
+                )
+
             try:
                 from zelyr.tools.browser_extension import get_bridge
                 bridge = get_bridge()
@@ -375,7 +403,6 @@ class InteractWithBrowserTool(BaseTool):
                     except Exception:
                         pass
 
-                ext_params = {k: v for k, v in params.items() if k not in ("action", "_force_cdp")}
                 if bridge.is_connected():
                     ext_res = await bridge.send_command(action, **ext_params)
                     return self._format_extension_result(action, params, ext_res)

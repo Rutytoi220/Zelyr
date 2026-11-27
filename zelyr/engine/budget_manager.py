@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -186,12 +187,19 @@ class ContextBudgetLimitError(ValueError):
 
 
 def _truncate_to_tokens(text: str, max_tokens: int) -> str:
-    """Truncate text to fit within max_tokens worth of words."""
+    """Truncate text to fit within max_tokens under both word and character heuristics."""
+    if max_tokens <= 0:
+        return ""
     if estimate_tokens(text) <= max_tokens:
         return text
     words = text.split()
-    keep = max(1, int(max_tokens / _TOKENS_PER_WORD))
-    return " ".join(words[:keep]) + "..."
+    keep_words = max(1, int(max_tokens / _TOKENS_PER_WORD))
+    clipped = " ".join(words[:keep_words])
+    max_chars = max(12, (max_tokens * 4) - 3)
+    if len(clipped) > max_chars:
+        cut = clipped[:max_chars].rsplit(" ", 1)[0].strip()
+        clipped = cut if cut else clipped[:max_chars]
+    return clipped.rstrip(".,;:") + "..."
 
 
 def is_tool_result_message(msg: Dict[str, Any]) -> bool:
@@ -769,6 +777,75 @@ class ContextBudgetEngine:
 
         return compacted, stripped_count
 
+    def stage1_75_compact_observation_headers(
+        self,
+        messages: List[Dict[str, Any]],
+        recent_turns_to_preserve: int = 2,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Stage 1.75: Strip repetitive [TOOL OBSERVATION] framing metadata from older tool messages.
+
+        Preserves the `[TOOL OBSERVATION: ...]` title, status, verification status, and `[Output]` /
+        `[Output Trace]` / error sections while removing repeated per-turn boilerplate lines.
+        """
+        if not messages:
+            return messages, 0
+
+        tool_indices = [i for i, m in enumerate(messages) if is_tool_result_message(m)]
+        protected = set(tool_indices[-max(1, recent_turns_to_preserve):]) if tool_indices else set()
+        drop_prefixes = (
+            "- Summary:",
+            "- Evidence Level:",
+            "- Execution Status:",
+            "- Uncertainty:",
+            "- Remaining Uncertainty:",
+            "- Ledger Ref:",
+            "- Action Authority:",
+            "- Suggested Next",
+            "- Exit Code: N/A",
+            "- Verified: N/A",
+        )
+        out: List[Dict[str, Any]] = []
+        compacted_count = 0
+        for idx, msg in enumerate(messages):
+            content = msg.get("content", "")
+            if (
+                idx not in protected
+                and is_tool_result_message(msg)
+                and isinstance(content, str)
+                and content.startswith("[TOOL OBSERVATION:")
+            ):
+                kept = [
+                    ln for ln in content.splitlines()
+                    if not ln.lstrip().startswith(drop_prefixes)
+                ]
+                new_content = re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+                if content.startswith("[TOOL OBSERVATION: capture_screen]"):
+                    out_m = re.search(r"(\[Output\]:\s*\n)(\{[\s\S]*\})(\n\n\[|$)", new_content)
+                    if out_m:
+                        try:
+                            cap_obj = json.loads(out_m.group(2))
+                            if isinstance(cap_obj, dict):
+                                compact_cap = {
+                                    k: cap_obj[k]
+                                    for k in ("success", "target", "captured_region", "active_window", "cursor_pos", "changed_since_last", "message")
+                                    if k in cap_obj
+                                }
+                                new_content = (
+                                    new_content[: out_m.start(2)]
+                                    + json.dumps(compact_cap, ensure_ascii=False)
+                                    + new_content[out_m.end(2) :]
+                                )
+                        except Exception:
+                            pass
+                if len(new_content) < len(content):
+                    nm = dict(msg)
+                    nm["content"] = new_content
+                    out.append(nm)
+                    compacted_count += 1
+                    continue
+            out.append(msg)
+        return out, compacted_count
+
     def summarize_turns(self, turns: List[Dict[str, Any]], max_summary_tokens: int = 300) -> str:
         """Extract key intents, tool actions, and outcomes from evicted turns."""
         if not turns:
@@ -776,9 +853,63 @@ class ContextBudgetEngine:
 
         user_queries: List[str] = []
         tool_actions: List[str] = []
+        completed_milestones: List[str] = []
         recent_steps: List[str] = []
         assistant_notes: List[str] = []
         failure_evidence: List[str] = []
+        verified_facts: List[str] = []
+        skip_fact_call_ids: set[str] = set()
+
+        def _add_milestone(label: str) -> None:
+            clean_m = re.sub(r"\s+", " ", label).strip()
+            if clean_m and clean_m not in completed_milestones:
+                completed_milestones.append(clean_m)
+
+        def _is_trivial_status_json(raw_s: str) -> bool:
+            s = raw_s.strip()
+            if not s.startswith("{"):
+                return False
+            try:
+                obj = json.loads(s)
+            except Exception:
+                return False
+            if not isinstance(obj, dict):
+                return False
+            domain_keys = {"record_id", "confirmation_token", "service", "owner", "region", "score", "snapshot", "records", "error", "data", "result"}
+            if any(k in obj for k in domain_keys):
+                return False
+            if "status" in obj and obj["status"] not in (None, "ok", "success", "true", "done", "completed"):
+                return False
+            transport_keys = {"id", "success", "ok", "status", "action", "tab_id", "url", "title", "clicked", "filled"}
+            return set(obj.keys()).issubset(transport_keys)
+
+        def _extract_verified_fact(fn_name: str, text_body: str) -> Optional[str]:
+            """Extract compact structured JSON or command output facts from evicted tool results."""
+            if not text_body:
+                return None
+            candidate = ""
+            for sec_pat in (
+                r"\[Output Trace\]:\s*\n([\s\S]*?)(?:\n\n\[|$)",
+                r"\[Output\]:\s*\n([\s\S]*?)(?:\n\n\[|$)",
+            ):
+                sec_m = re.search(sec_pat, text_body)
+                if sec_m and sec_m.group(1).strip():
+                    sec_body = sec_m.group(1).strip()
+                    if not _is_trivial_status_json(sec_body):
+                        candidate = sec_body
+                        break
+            if not candidate:
+                for json_m in re.finditer(r"(\{[^{}]{8,360}\})", text_body):
+                    j_str = json_m.group(1).strip()
+                    if not _is_trivial_status_json(j_str):
+                        candidate = j_str
+                        break
+            if not candidate:
+                return None
+            compact = re.sub(r"\s+", " ", candidate).strip()
+            if len(compact) > 220:
+                compact = compact[:217] + "..."
+            return f"{fn_name}: {compact}"
 
         def _format_step_descriptor(fn_name: str, raw_args: Any) -> str:
             args_dict: Dict[str, Any] = {}
@@ -791,26 +922,34 @@ class ContextBudgetEngine:
                         args_dict = parsed_a
                 except Exception:
                     pass
+            short_fn = {
+                "interact_with_browser": "browser",
+                "execute_command": "cmd",
+                "capture_screen": "screen",
+                "desktop_control": "desktop",
+                "manage_desktop_window": "win",
+            }.get(fn_name, fn_name)
             if not args_dict:
-                return fn_name
+                return short_fn
             bits: List[str] = []
             if args_dict.get("action"):
                 bits.append(str(args_dict["action"]))
             if args_dict.get("x") is not None and args_dict.get("y") is not None:
                 bits.append(f"({args_dict['x']},{args_dict['y']})")
-            for key_k in ("text", "key", "path", "target", "window"):
+            for key_k in ("url", "element_id", "text", "key", "path", "target", "window"):
                 v = args_dict.get(key_k)
                 if v not in (None, "") and (key_k != "target" or not args_dict.get("window")):
                     sv = str(v)
-                    if len(sv) > 24:
-                        sv = sv[:21] + "..."
+                    limit_len = 56 if key_k == "url" else 24
+                    if len(sv) > limit_len:
+                        sv = sv[: limit_len - 3] + "..."
                     bits.append(f"{key_k}={sv}")
             if args_dict.get("command"):
                 cmd_s = str(args_dict["command"]).strip()
-                if len(cmd_s) > 28:
-                    cmd_s = cmd_s[:25] + "..."
+                if len(cmd_s) > 72:
+                    cmd_s = cmd_s[:69] + "..."
                 bits.append(cmd_s)
-            return f"{fn_name}({' '.join(bits[:4])})" if bits else fn_name
+            return f"{short_fn}({' '.join(bits[:4])})" if bits else short_fn
 
         for msg in turns:
             role = msg.get("role", "")
@@ -830,7 +969,39 @@ class ContextBudgetEngine:
                     fn = fn_obj.get("name") or (tc.get("name") if isinstance(tc, dict) else None)
                     if fn:
                         tool_actions.append(fn)
-                        recent_steps.append(_format_step_descriptor(str(fn), fn_obj.get("arguments")))
+                        raw_tc_args = fn_obj.get("arguments")
+                        step_desc = _format_step_descriptor(str(fn), raw_tc_args)
+                        recent_steps.append(step_desc)
+                        if isinstance(raw_tc_args, str) and raw_tc_args.strip().startswith("{"):
+                            try:
+                                raw_tc_args = json.loads(raw_tc_args)
+                            except Exception:
+                                pass
+                        if str(fn) == "manage_workspace_file" and isinstance(raw_tc_args, dict):
+                            act_w = str(raw_tc_args.get("action") or "").lower()
+                            if act_w in ("write", "patch"):
+                                w_path = Path(str(raw_tc_args.get("path") or "file")).name
+                                _add_milestone(f"wrote:{w_path}")
+                                if act_w == "write" and raw_tc_args.get("content"):
+                                    w_cont = re.sub(r"\s+", " ", str(raw_tc_args["content"])).strip()
+                                    if w_cont.startswith("{") and len(w_cont) <= 260:
+                                        verified_facts.append(f"wrote {w_path}={w_cont}")
+                        elif str(fn) in ("interact_with_browser", "execute_command", "capture_screen", "desktop_control"):
+                            if str(fn) == "interact_with_browser" and isinstance(raw_tc_args, dict):
+                                act_b = str(raw_tc_args.get("action") or "").lower()
+                                if act_b in ("get_page_snapshot", "list_tabs", "get_active_tab"):
+                                    tc_id = tc.get("id") if isinstance(tc, dict) else None
+                                    if tc_id:
+                                        skip_fact_call_ids.add(str(tc_id))
+                                else:
+                                    _add_milestone(step_desc)
+                            else:
+                                _add_milestone(step_desc)
+                            if str(fn) == "execute_command" and isinstance(raw_tc_args, dict):
+                                cmd_raw = str(raw_tc_args.get("command") or raw_tc_args.get("cmd") or "")
+                                redir_m = re.search(r">{1,2}\s*([\w\./\-]+)", cmd_raw)
+                                if redir_m:
+                                    _add_milestone(f"wrote:{Path(redir_m.group(1)).name}")
                 if content_str and len(content_str) > 15:
                     clean_c = re.sub(r"<think>.*?</think>", "", content_str, flags=re.DOTALL).strip()
                     if clean_c:
@@ -869,17 +1040,30 @@ class ContextBudgetEngine:
                         failure_evidence.append(f"{fn}: {' / '.join(err_lines[:3])[:260]}")
                     else:
                         failure_evidence.append(f"{fn}: {content_str[:160]}")
+                elif fn in ("execute_command", "interact_with_browser", "manage_workspace_file", "fetch_web_page"):
+                    t_cid = str(msg.get("tool_call_id") or "")
+                    if t_cid and t_cid in skip_fact_call_ids:
+                        continue
+                    if fn == "interact_with_browser" and "\"snapshot\"" in content_str:
+                        continue
+                    fact = _extract_verified_fact(str(fn), content_str)
+                    if fact and fact not in verified_facts:
+                        verified_facts.append(fact)
 
         parts: List[str] = []
+        if completed_milestones:
+            parts.append(f"Completed earlier (do not repeat): {', '.join(completed_milestones[:12])}")
+        if verified_facts:
+            parts.append(f"Key verified data: {'; '.join(verified_facts[-2:])}")
+        if failure_evidence:
+            parts.append(f"Preserved failures/verification errors: {'; '.join(failure_evidence[-3:])}")
+        if recent_steps:
+            parts.append(f"Recent steps: {' -> '.join(recent_steps[-6:])}")
         if user_queries:
-            parts.append(f"User asked: {'; '.join(user_queries[:4])}")
+            parts.append(f"User asked: {'; '.join(user_queries[:3])}")
         if tool_actions:
             deduped = list(dict.fromkeys(tool_actions))
             parts.append(f"Tools executed: {', '.join(deduped[:6])}")
-        if recent_steps:
-            parts.append(f"Recent steps: {' -> '.join(recent_steps[-6:])}")
-        if failure_evidence:
-            parts.append(f"Preserved failures/verification errors: {'; '.join(failure_evidence[-3:])}")
         if assistant_notes:
             parts.append(f"Key outcomes: {'; '.join(assistant_notes[-2:])}")
 
@@ -910,14 +1094,26 @@ class ContextBudgetEngine:
 
         user_asked: List[str] = []
         tools_exec: List[str] = []
+        completed_earlier: List[str] = []
         recent_steps_merged: List[str] = []
         failures: List[str] = []
+        verified_data: List[str] = []
         outcomes: List[str] = []
         other_clauses: List[str] = []
 
         for body in all_bodies:
             for clause in [c.strip() for c in body.split(" | ") if c.strip()]:
-                if clause.startswith("User asked:"):
+                if clause.startswith("Completed earlier (do not repeat):"):
+                    for c_item in clause[len("Completed earlier (do not repeat):") :].split(","):
+                        cs = c_item.strip()
+                        if cs and cs not in completed_earlier:
+                            completed_earlier.append(cs)
+                elif clause.startswith("Key verified data:"):
+                    for d_item in clause[len("Key verified data:") :].split(";"):
+                        ds = d_item.strip()
+                        if ds and ds not in verified_data:
+                            verified_data.append(ds)
+                elif clause.startswith("User asked:"):
                     val = clause[len("User asked:") :].strip()
                     if val and val not in user_asked:
                         user_asked.append(val)
@@ -945,14 +1141,18 @@ class ContextBudgetEngine:
                     other_clauses.append(clause)
 
         merged_parts: List[str] = []
-        if user_asked:
-            merged_parts.append(f"User asked: {'; '.join(user_asked[:4])}")
-        if tools_exec:
-            merged_parts.append(f"Tools executed: {', '.join(tools_exec[:8])}")
-        if recent_steps_merged:
-            merged_parts.append(f"Recent steps: {' -> '.join(recent_steps_merged[-6:])}")
+        if completed_earlier:
+            merged_parts.append(f"Completed earlier (do not repeat): {', '.join(completed_earlier[:14])}")
+        if verified_data:
+            merged_parts.append(f"Key verified data: {'; '.join(verified_data[-3:])}")
         if failures:
             merged_parts.append(f"Preserved failures/verification errors: {'; '.join(failures[-4:])}")
+        if recent_steps_merged:
+            merged_parts.append(f"Recent steps: {' -> '.join(recent_steps_merged[-6:])}")
+        if user_asked:
+            merged_parts.append(f"User asked: {'; '.join(user_asked[:3])}")
+        if tools_exec:
+            merged_parts.append(f"Tools executed: {', '.join(tools_exec[:8])}")
         if outcomes:
             merged_parts.append(f"Key outcomes: {'; '.join(outcomes[-2:])}")
         for oc in other_clauses:
@@ -1025,8 +1225,21 @@ class ContextBudgetEngine:
             first_user_idx = user_indices[0]
             last_user_idx = user_indices[-1]
             root_user_msg = conv_messages[first_user_idx]
-            active_turn_msgs = conv_messages[last_user_idx:]
-            middle_blocks = self._group_into_atomic_turns(conv_messages[first_user_idx + 1 : last_user_idx])
+            tail_after_last_user = conv_messages[last_user_idx + 1 :]
+            if tail_after_last_user:
+                tail_blocks = self._group_into_atomic_turns(tail_after_last_user)
+                if len(tail_blocks) > 1:
+                    active_turn_msgs = [conv_messages[last_user_idx]] + tail_blocks[-1]
+                    middle_blocks = (
+                        self._group_into_atomic_turns(conv_messages[first_user_idx + 1 : last_user_idx])
+                        + tail_blocks[:-1]
+                    )
+                else:
+                    active_turn_msgs = conv_messages[last_user_idx:]
+                    middle_blocks = self._group_into_atomic_turns(conv_messages[first_user_idx + 1 : last_user_idx])
+            else:
+                active_turn_msgs = conv_messages[last_user_idx:]
+                middle_blocks = self._group_into_atomic_turns(conv_messages[first_user_idx + 1 : last_user_idx])
 
         if not middle_blocks:
             return self._sanitize_wire_invariants(
@@ -1036,7 +1249,7 @@ class ContextBudgetEngine:
         sys_tokens = sum(count_message_tokens(m) for m in core_system_messages)
         root_tokens = count_message_tokens(root_user_msg)
         active_tokens = sum(count_message_tokens(m) for m in active_turn_msgs)
-        summary_reserve = 250 if prior_summary_messages else 150
+        summary_reserve = 265
         avail_for_middle = target_budget - sys_tokens - root_tokens - active_tokens - summary_reserve
 
         kept_middle_blocks: List[List[Dict[str, Any]]] = []
@@ -1058,10 +1271,10 @@ class ContextBudgetEngine:
         pruned_conv.extend(active_turn_msgs)
 
         if evicted_msgs:
-            summary_text = self.summarize_turns(evicted_msgs, max_summary_tokens=250)
+            summary_text = self.summarize_turns(evicted_msgs, max_summary_tokens=245)
             if prior_summary_messages:
                 summary_text = self._merge_conversation_summaries(
-                    prior_summary_messages, summary_text, max_summary_tokens=250
+                    prior_summary_messages, summary_text, max_summary_tokens=245
                 )
             summary_msg = {
                 "role": "system",
@@ -1072,7 +1285,7 @@ class ContextBudgetEngine:
 
         if len(prior_summary_messages) > 1:
             consolidated_text = self._merge_conversation_summaries(
-                prior_summary_messages, "", max_summary_tokens=250
+                prior_summary_messages, "", max_summary_tokens=245
             )
             prior_anchor = [{"role": "system", "content": f"{self._SUMMARY_PREFIX} {consolidated_text}]"}]
         else:
@@ -1154,9 +1367,27 @@ class ContextBudgetEngine:
             )
             return stage1_5_msgs
 
+        # 1.75. Stage 1.75 — Strip repetitive historical [TOOL OBSERVATION] framing metadata & old capture_screen arrays
+        stage1_75_msgs, compacted_obs_headers = self.stage1_75_compact_observation_headers(
+            stage1_5_msgs,
+            recent_turns_to_preserve=self.recent_turns_to_preserve,
+        )
+        post_s1_75_tokens = estimate_messages_tokens(stage1_75_msgs)
+        if post_s1_75_tokens <= target_budget:
+            logger.debug(
+                "Context budget: Stage 1.75 sufficient. initial=%d, final=%d, compacted_tools=%d, compacted_thinks=%d, compacted_obs=%d, pruned_turns=0, max=%d",
+                initial_tokens,
+                post_s1_75_tokens,
+                compacted_tools,
+                compacted_thinks,
+                compacted_obs_headers,
+                effective_max,
+            )
+            return stage1_75_msgs
+
         # 2. Stage 2 — Sliding-Window Turn Pruning with Semantic Summarization
         final_msgs, pruned_turns = self.stage2_prune_turns(
-            stage1_5_msgs,
+            stage1_75_msgs,
             target_budget=target_budget,
         )
         final_tokens = estimate_messages_tokens(final_msgs)

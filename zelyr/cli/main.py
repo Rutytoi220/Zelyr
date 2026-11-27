@@ -403,8 +403,27 @@ async def _execute_headless_run(
             central_ledger=cli_ledger,
             max_steps=eff_max_steps,
         )
+    from zelyr.agents.actuator_arbiter import ActuatorArbiter
+
+    all_schemas = get_tool_schemas(0)
+    has_cross_surface = ActuatorArbiter.has_cross_surface_browser_and_desktop_intent(clean_prompt)
     tier = orch.route_tier(clean_prompt)
-    dynamic_tools = filter_tool_schemas_by_tier(get_tool_schemas(0), tier)
+    dynamic_tools = filter_tool_schemas_by_tier(
+        all_schemas,
+        tier,
+        include_tiers=({2, 3} if has_cross_surface else None),
+    )
+    if has_cross_surface:
+        present_names = {
+            (t.get("function") or {}).get("name") or t.get("name")
+            for t in dynamic_tools
+            if isinstance(t, dict)
+        }
+        if "manage_workspace_file" not in present_names:
+            for cand in all_schemas:
+                if ((cand.get("function") or {}).get("name") or cand.get("name")) == "manage_workspace_file":
+                    dynamic_tools.append(cand)
+                    break
     try:
         from zelyr.core.vision_engine.singleton import is_spotless_arms_available
 
@@ -418,9 +437,9 @@ async def _execute_headless_run(
                 t for t in dynamic_tools
                 if (t.get("function") or {}).get("name") != "interact_with_ui"
             ]
-        # On Tier 3 native desktop tasks (num_ctx=8192), strip unrelated browser/web/routine
-        # schemas unless referenced in the prompt so compact tools stay ~1.4k tokens instead of 3.4k.
-        if tier == "tier3_vision" and has_desktop_ctrl:
+        # On Tier 3 / cross-surface desktop tasks (num_ctx=8192), strip unrelated browser/web/routine
+        # schemas unless referenced in the prompt so compact tools stay tight.
+        if (tier == "tier3_vision" or has_cross_surface) and has_desktop_ctrl:
             p_low = clean_prompt.lower()
             optional_by_kw = {
                 "interact_with_browser": ("browser", "http://", "https://", "tab", "dom", "webpage", "web page", "website"),
@@ -438,7 +457,7 @@ async def _execute_headless_run(
             drop_tools = {
                 name
                 for name, kws in optional_by_kw.items()
-                if not any(k in p_low for k in kws)
+                if not any(re.search(rf"(?<!\w){re.escape(k.strip())}(?!\w)", p_low) for k in kws)
             }
             dynamic_tools = [
                 t for t in dynamic_tools

@@ -842,8 +842,12 @@ def extract_file_targets_from_text(text: str) -> List[str]:
     if not text:
         return []
 
+    # Strip HTTP/WS/FTP URLs so URL route segments (e.g. /api/records/REC-204)
+    # are never misclassified as local filesystem paths.
+    scrubbed = re.sub(r"\b(?:https?|wss?|ftp)://[^\s\)\]\'\"<>]+", " ", text, flags=re.IGNORECASE)
+
     # 1. Match absolute paths
-    raw_abs = re.findall(r"(?:/(?:[\w\.\-]+))+", text)
+    raw_abs = re.findall(r"(?:/(?:[\w\.\-]+))+", scrubbed)
     cleaned_abs = set()
     for p in raw_abs:
         p_clean = re.sub(r"[.,:;!?]+$", "", p).strip()
@@ -851,7 +855,7 @@ def extract_file_targets_from_text(text: str) -> List[str]:
             cleaned_abs.add(canonicalize_target(p_clean))
 
     # 2. Remove absolute paths from text before matching standalone relative paths
-    text_no_abs = re.sub(r"(?:/(?:[\w\.\-]+))+", " ", text)
+    text_no_abs = re.sub(r"(?:/(?:[\w\.\-]+))+", " ", scrubbed)
     rel_candidates = re.findall(
         r"\b[\w\-]+\.(?:txt|py|sh|json|md|yaml|yml|log|csv|toml|html|css|js|rs|go|cpp|c|h)\b",
         text_no_abs,
@@ -898,6 +902,19 @@ def _is_inspection_action(tool_name: str, arguments: Dict[str, Any]) -> bool:
     if t_lower == "manage_desktop_window":
         act = str(arguments.get("action") or "list").strip().lower()
         return act in ("list", "get_active", "monitors", "geometry", "inspect")
+    if t_lower in ("interact_with_browser", "browser_cdp"):
+        act = str(arguments.get("action") or "get_page_snapshot").strip().lower()
+        return act in (
+            "get_page_snapshot",
+            "extract_page_content",
+            "list_tabs",
+            "get_active_tab",
+            "get_dom",
+            "scroll_page",
+            "get_cookies",
+        )
+    if t_lower in ("get_page_snapshot", "fetch_web_page", "web_search"):
+        return True
     if t_lower.startswith(("read_", "get_", "list_", "check_", "inspect_", "stat_")):
         return True
     if t_lower in ("execute_command", "bash", "sh"):
@@ -914,6 +931,50 @@ def _is_inspection_action(tool_name: str, arguments: Dict[str, Any]) -> bool:
         ):
             if not any(op in cmd for op in (">", ">>", "| tee", "|tee")):
                 return True
+        if first_word == "curl":
+            has_shell_mut = any(op in cmd for op in (">", ">>", "| tee", "|tee", ";", "&&", "||", "`", "$("))
+            if not has_shell_mut:
+                mut_curl = False
+                skip_next_method = False
+                for tok in cmd_parts[1:]:
+                    if skip_next_method:
+                        skip_next_method = False
+                        if tok.upper() not in ("GET", "HEAD"):
+                            mut_curl = True
+                            break
+                        continue
+                    if tok in ("-X", "--request"):
+                        skip_next_method = True
+                        continue
+                    if tok.startswith("-X") and tok[2:].upper() not in ("GET", "HEAD"):
+                        mut_curl = True
+                        break
+                    if tok.startswith("--request=") and tok.split("=", 1)[1].upper() not in ("GET", "HEAD"):
+                        mut_curl = True
+                        break
+                    if (
+                        tok in ("-d", "-F", "-T", "-o", "-O")
+                        or tok.startswith(("-d", "-F", "-T", "-o"))
+                        or tok.startswith(("--data", "--form", "--upload-file", "--json", "--output", "--remote-name"))
+                    ):
+                        mut_curl = True
+                        break
+                if not mut_curl:
+                    return True
+        if first_word == "wget":
+            has_shell_mut = any(op in cmd for op in (">", ">>", "| tee", "|tee", ";", "&&", "||", "`", "$("))
+            if not has_shell_mut:
+                stdout_wget = any(tok in ("-O-", "-qO-") for tok in cmd_parts[1:]) or any(
+                    i + 1 < len(cmd_parts) and cmd_parts[i] in ("-O", "--output-document") and cmd_parts[i + 1] == "-"
+                    for i in range(1, len(cmd_parts))
+                )
+                mut_wget = any(
+                    tok.startswith(("--post-data", "--post-file", "--body-data", "--body-file"))
+                    or (tok.startswith("--method=") and tok.split("=", 1)[1].upper() not in ("GET", "HEAD"))
+                    for tok in cmd_parts[1:]
+                )
+                if stdout_wget and not mut_wget:
+                    return True
         if first_word == "hyprctl" and len(cmd_parts) >= 2:
             h_sub = cmd_parts[1].lower()
             if h_sub in ("monitors", "clients", "activewindow", "activeworkspace", "workspaces", "cursorpos", "version"):
@@ -990,6 +1051,14 @@ def _extract_action_target(tool_name: str, arguments: Dict[str, Any]) -> Optiona
                 return val.strip()
         return None
 
+    if t_lower in ("interact_with_browser", "browser_cdp"):
+        act = str(arguments.get("action") or "").strip().lower()
+        if act in ("navigate_url", "open_tab", "fetch_web_page"):
+            raw_url = arguments.get("url")
+            if raw_url and isinstance(raw_url, str) and raw_url.strip():
+                return raw_url.strip().rstrip("/")
+        return None
+
     for k in ("target", "path", "file", "url", "id", "name"):
         val = arguments.get(k)
         if val and isinstance(val, str) and val.strip():
@@ -1002,6 +1071,8 @@ def _extract_action_operation(tool_name: str, arguments: Dict[str, Any]) -> str:
     t_lower = (tool_name or "").lower()
     if t_lower == "manage_workspace_file":
         return str(arguments.get("action", "write")).lower()
+    if t_lower in ("interact_with_browser", "browser_cdp"):
+        return f"browser:{str(arguments.get('action', '')).strip().lower()}"
     if t_lower == "verify_outcome":
         return f"verify:{str(arguments.get('check', '')).lower()}"
     if t_lower in ("execute_command", "bash", "sh"):
@@ -1029,6 +1100,29 @@ def _normalize_target_list(targets: Any) -> List[str]:
     return out
 
 
+def _extract_http_read_url(tool_name: str, arguments: Any) -> Optional[str]:
+    """Extract normalized HTTP/HTTPS URL targeted by an HTTP fetch/browser/curl action."""
+    if not isinstance(arguments, dict):
+        return None
+    t_lower = (tool_name or "").lower()
+    if t_lower == "fetch_web_page":
+        raw = arguments.get("url")
+        return str(raw).strip().rstrip("/") if isinstance(raw, str) and raw.strip() else None
+    if t_lower in ("interact_with_browser", "browser_cdp"):
+        act = str(arguments.get("action") or "").strip().lower()
+        if act in ("navigate_url", "open_tab", "get_page_snapshot", "extract_page_content", "get_dom"):
+            raw = arguments.get("url")
+            return str(raw).strip().rstrip("/") if isinstance(raw, str) and raw.strip() else None
+        return None
+    if t_lower in ("execute_command", "bash", "sh"):
+        cmd = str(arguments.get("command") or arguments.get("cmd") or "").strip()
+        if cmd.split()[:1] in (["curl"], ["wget"]):
+            m = re.search(r"\bhttps?://[^\s\'\"<>`]+", cmd, flags=re.IGNORECASE)
+            if m:
+                return m.group(0).rstrip(".,;:!?\"'").rstrip("/")
+    return None
+
+
 def _collect_later_resolution_targets(later: ActionRecord, later_is_inspect: bool) -> List[str]:
     """Collect canonical targets resolved or verified by a later successful action."""
     targets: List[str] = []
@@ -1050,6 +1144,20 @@ def _is_action_resolved_by_later(failed: ActionRecord, later: ActionRecord) -> b
     failed_is_inspect = _is_inspection_action(failed.tool_name, failed.arguments)
     later_is_inspect = _is_inspection_action(later.tool_name, later.arguments)
 
+    # Cross-surface recovery: a failed browser switch_tab lookup for a desktop window
+    # resolves when Zelyr transitions to the matching OS desktop window surface.
+    if (
+        (failed.tool_name or "").lower() in ("interact_with_browser", "browser_cdp")
+        and isinstance(failed.arguments, dict)
+        and str(failed.arguments.get("action") or "").strip().lower() == "switch_tab"
+        and "no open tab" in str(failed.error or "").lower()
+        and (later.tool_name or "").lower() in ("capture_screen", "screen_capture", "manage_desktop_window", "desktop_control")
+    ):
+        q = str(failed.arguments.get("query") or failed.arguments.get("url") or "").strip().lower()
+        t_later = _extract_action_target(later.tool_name, later.arguments)
+        if not q or not t_later or q in t_later.lower() or t_later.lower() in q:
+            return True
+
     # 1. An inspection must never resolve a mutation or execution failure
     if not failed_is_inspect and later_is_inspect:
         return False
@@ -1058,18 +1166,22 @@ def _is_action_resolved_by_later(failed: ActionRecord, later: ActionRecord) -> b
     target_later = _extract_action_target(later.tool_name, later.arguments)
 
     # 1b. A later successful read-only observation with valid args resolves an earlier
-    # failed observation attempt on the same tool & matching/superset target.
-    if (
-        failed_is_inspect
-        and later_is_inspect
-        and failed.tool_name
-        and failed.tool_name == later.tool_name
-        and failed.tool_name.lower() in ("capture_screen", "screen_capture", "manage_desktop_window")
-    ):
-        if target_failed is None or target_later is None:
+    # failed observation attempt on the same tool & matching/superset target,
+    # or an equivalent read-only HTTP inspection (e.g. curl GET resolving SSRF-blocked fetch_web_page).
+    if failed_is_inspect and later_is_inspect:
+        url_failed = _extract_http_read_url(failed.tool_name, failed.arguments)
+        url_later = _extract_http_read_url(later.tool_name, later.arguments)
+        if url_failed and url_later and url_failed == url_later:
             return True
-        if targets_match(canonicalize_target(target_failed), canonicalize_target(target_later)):
-            return True
+        if (
+            failed.tool_name
+            and failed.tool_name == later.tool_name
+            and failed.tool_name.lower() in ("capture_screen", "screen_capture", "manage_desktop_window")
+        ):
+            if target_failed is None or target_later is None:
+                return True
+            if targets_match(canonicalize_target(target_failed), canonicalize_target(target_later)):
+                return True
 
     op_failed = _extract_action_operation(failed.tool_name, failed.arguments)
     op_later = _extract_action_operation(later.tool_name, later.arguments)
@@ -1119,6 +1231,16 @@ def _is_action_resolved_by_later(failed: ActionRecord, later: ActionRecord) -> b
 
     # 3. If failed action had a specific target:
     if target_failed is not None:
+        if (
+            (failed.tool_name or "").lower() in ("interact_with_browser", "browser_cdp")
+            and (later.tool_name or "").lower() in ("interact_with_browser", "browser_cdp")
+        ):
+            nav_ops = ("browser:navigate_url", "browser:open_tab", "browser:reload_tab")
+            if op_failed in nav_ops and op_later in nav_ops:
+                if op_later == "browser:reload_tab" or not target_later:
+                    return True
+                if target_later == target_failed or targets_match(target_failed, target_later):
+                    return True
         if not later_targets or not any(targets_match(target_failed, lt) for lt in later_targets):
             # Different targets never resolve each other
             return False

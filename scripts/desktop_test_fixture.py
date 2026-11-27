@@ -35,13 +35,21 @@ class FixtureWindow(QWidget):
     reset_requested = Signal()
     activate_requested = Signal()
 
-    def __init__(self, title: str = "Zelyr Desktop Test Fixture", distraction: bool = False) -> None:
+    def __init__(
+        self,
+        title: str = "Zelyr Desktop Test Fixture",
+        distraction: bool = False,
+        cross_surface: bool = False,
+        initial_status: str = "IDLE",
+    ) -> None:
         super().__init__()
         self.setWindowTitle(title)
         self._lock = threading.Lock()
         self._counter = 0
         self._applied_text = ""
-        self._status_text = "IDLE"
+        self._cross_surface = cross_surface
+        self._initial_status = initial_status
+        self._status_text = initial_status
         self._mouse_clicks = 0
         self._double_clicks = 0
         self._right_clicks = 0
@@ -95,13 +103,13 @@ class FixtureWindow(QWidget):
                 color: #ffffff;
             }
             QLineEdit#inputField {
-                background-color: #0d1117;
-                border: 2px solid #58a6ff;
+                background-color: #0b1623;
+                border: 3px solid #58a6ff;
                 border-radius: 6px;
-                padding: 10px 14px;
-                font-size: 16px;
+                padding: 12px 16px;
+                font-size: 17px;
                 color: #ffffff;
-                min-height: 30px;
+                min-height: 40px;
             }
             QLineEdit#inputField:focus {
                 border: 3px solid #79c0ff;
@@ -148,7 +156,12 @@ class FixtureWindow(QWidget):
         layout.setContentsMargins(24, 20, 24, 20)
         layout.setSpacing(14)
 
-        self.header_label = QLabel("Zelyr Desktop Test Fixture")
+        header_title = (
+            "Zelyr Cross-Surface Confirmation"
+            if self._cross_surface
+            else "Zelyr Desktop Test Fixture"
+        )
+        self.header_label = QLabel(header_title)
         self.header_label.setObjectName("headerLabel")
         self.header_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.header_label)
@@ -159,39 +172,54 @@ class FixtureWindow(QWidget):
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
 
-        input_hint = QLabel("Command Note Input Field:")
+        hint_text = (
+            "Confirmation Payload Input Field:"
+            if self._cross_surface
+            else "Command Note Input Field:"
+        )
+        input_hint = QLabel(hint_text)
         input_hint.setStyleSheet("font-size: 14px; color: #c9d1d9; font-weight: bold;")
         layout.addWidget(input_hint)
 
         self.input_field = QLineEdit()
         self.input_field.setObjectName("inputField")
-        self.input_field.setPlaceholderText("Click here and type text...")
+        self.input_field.setPlaceholderText(
+            "Enter confirmation string and click Confirm..."
+            if self._cross_surface
+            else "Click here and type text..."
+        )
         self.input_field.returnPressed.connect(self._on_apply)
         self.input_field.installEventFilter(self)
         layout.addWidget(self.input_field)
-
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(16)
 
         self.increment_btn = QPushButton("Increment Counter")
         self.increment_btn.setObjectName("incrementBtn")
         self.increment_btn.clicked.connect(self._on_increment)
         self.increment_btn.installEventFilter(self)
-        btn_row.addWidget(self.increment_btn, stretch=1)
 
-        self.apply_btn = QPushButton("Apply Text")
+        apply_label = "Confirm" if self._cross_surface else "Apply Text"
+        self.apply_btn = QPushButton(apply_label)
         self.apply_btn.setObjectName("applyBtn")
         self.apply_btn.clicked.connect(self._on_apply)
         self.apply_btn.installEventFilter(self)
-        btn_row.addWidget(self.apply_btn, stretch=1)
-
-        layout.addLayout(btn_row)
 
         self.reset_btn = QPushButton("Reset State")
         self.reset_btn.setObjectName("resetBtn")
         self.reset_btn.clicked.connect(self._reset_ui_slot)
         self.reset_btn.installEventFilter(self)
-        layout.addWidget(self.reset_btn)
+
+        if self._cross_surface:
+            # Dedicated single full-width Confirm button for crisp cross-surface targeting
+            self.increment_btn.hide()
+            self.reset_btn.hide()
+            layout.addWidget(self.apply_btn)
+        else:
+            btn_row = QHBoxLayout()
+            btn_row.setSpacing(16)
+            btn_row.addWidget(self.increment_btn, stretch=1)
+            btn_row.addWidget(self.apply_btn, stretch=1)
+            layout.addLayout(btn_row)
+            layout.addWidget(self.reset_btn)
 
         self._refresh_status_label()
 
@@ -220,7 +248,7 @@ class FixtureWindow(QWidget):
         text = self.input_field.text()
         with self._lock:
             self._applied_text = text
-            self._status_text = f"APPLIED:{text}"
+            self._status_text = f"CONFIRMED:{text}" if self._cross_surface else f"APPLIED:{text}"
         self._refresh_status_label()
         self._record_event("apply", text)
 
@@ -233,7 +261,7 @@ class FixtureWindow(QWidget):
         with self._lock:
             self._counter = 0
             self._applied_text = ""
-            self._status_text = "IDLE"
+            self._status_text = self._initial_status
             self._mouse_clicks = 0
             self._double_clicks = 0
             self._right_clicks = 0
@@ -361,13 +389,21 @@ def main() -> int:
     parser.add_argument("--port", type=int, required=True, help="Localhost HTTP port for state inspection")
     parser.add_argument("--title", type=str, default="Zelyr Desktop Test Fixture", help="Window title")
     parser.add_argument("--distraction", action="store_true", help="Launch auxiliary focus-steal distraction window")
+    parser.add_argument("--cross-surface", action="store_true", help="Enable Cross-Surface confirmation mode")
+    parser.add_argument("--initial-status", type=str, default=None, help="Initial status label text")
     args = parser.parse_args()
 
     app = QApplication(sys.argv)
     signal.signal(signal.SIGTERM, lambda *_a: app.quit())
     signal.signal(signal.SIGINT, lambda *_a: app.quit())
 
-    win = FixtureWindow(title=args.title, distraction=args.distraction)
+    init_status = args.initial_status or ("AWAITING_CONFIRMATION" if args.cross_surface else "IDLE")
+    win = FixtureWindow(
+        title=args.title,
+        distraction=args.distraction,
+        cross_surface=args.cross_surface,
+        initial_status=init_status,
+    )
     win.show()
 
     server = http.server.ThreadingHTTPServer(("127.0.0.1", args.port), _make_handler(win, app))
