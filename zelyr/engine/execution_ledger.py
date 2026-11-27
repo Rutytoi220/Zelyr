@@ -476,6 +476,19 @@ def targets_match(
     return False
 
 
+def criterion_canonical_target_raw(criterion: Dict[str, Any]) -> str:
+    """Return raw criterion target preserving desktop ::selector scoping when present."""
+    c_target = str((criterion or {}).get("target") or "").strip()
+    if not c_target:
+        return ""
+    c_check = str((criterion or {}).get("check") or "").strip().lower()
+    ctx = (criterion or {}).get("context") if isinstance((criterion or {}).get("context"), dict) else {}
+    sel = str(ctx.get("selector") or "").strip()
+    if c_check in KNOWN_DESKTOP_CHECKS and sel and "::" not in c_target:
+        return f"{c_target}::{sel}"
+    return c_target
+
+
 def criterion_applies_to_target(
     criterion: Dict[str, Any],
     candidate_target: str,
@@ -488,8 +501,16 @@ def criterion_applies_to_target(
     c_check = str(criterion.get("check") or "").strip()
     if not c_target:
         return False
+    eff_target = criterion_canonical_target_raw(criterion)
+    if targets_match(candidate_target, eff_target, all_known_canons, check_type=c_check):
+        return True
     if targets_match(candidate_target, c_target, all_known_canons, check_type=c_check):
         return True
+    if "::" not in str(candidate_target) and "::" in eff_target:
+        cand_canon = canonicalize_target(candidate_target, check_type=c_check)
+        crit_canon = canonicalize_target(eff_target, check_type=c_check)
+        if cand_canon.split("::", 1)[0] == crit_canon.split("::", 1)[0]:
+            return True
     if c_check.lower() in ("command_output", "command", "cmd"):
         for ft in extract_file_targets_from_text(c_target):
             if targets_match(candidate_target, ft, all_known_canons):
@@ -1014,9 +1035,19 @@ def _extract_action_target(tool_name: str, arguments: Dict[str, Any]) -> Optiona
         return None
 
     if t_lower == "verify_outcome":
-        val = arguments.get("target")
+        val = arguments.get("target") or arguments.get("window")
         if val and isinstance(val, str) and val.strip():
-            return canonicalize_target(val.strip(), check_type=arguments.get("check"))
+            base_val = val.strip()
+            sel_val = arguments.get("selector")
+            chk_low = str(arguments.get("check") or "").strip().lower()
+            if (
+                chk_low in KNOWN_DESKTOP_CHECKS
+                and isinstance(sel_val, str)
+                and sel_val.strip()
+                and "::" not in base_val
+            ):
+                base_val = f"{base_val}::{sel_val.strip()}"
+            return canonicalize_target(base_val, check_type=arguments.get("check"))
         return None
 
     if t_lower in ("execute_command", "bash", "sh"):
@@ -1569,10 +1600,32 @@ class TurnExecutionLedger:
                 metadata={"target": target, "check_type": check_type},
             )
 
+    @staticmethod
+    def _surface_target_matches_window(canon_target: str, rec_args: Any, window_target: str) -> bool:
+        """Return True if a verified desktop record targets the mutated window or checks active focus."""
+        win_l = window_target.strip().lower()
+        if not win_l:
+            return True
+        if ":desktop_active_window:" in canon_target:
+            return True
+        if isinstance(rec_args, dict):
+            chk_l = str(rec_args.get("check") or "").strip().lower()
+            if chk_l == "desktop_active_window":
+                return True
+            rec_win = str(rec_args.get("window") or rec_args.get("target") or "").split("::", 1)[0].strip().lower()
+            if rec_win and (win_l in rec_win or rec_win in win_l):
+                return True
+        body = canon_target.removeprefix("desktop:")
+        if ":" in body:
+            body = body.split(":", 1)[1]
+        tgt_win = body.split("::", 1)[0].strip().lower()
+        return bool(tgt_win and (win_l in tgt_win or tgt_win in win_l))
+
     def invalidate_surface_verifications(
         self,
         surface: str,
         exclude_targets: Optional[Set[str]] = None,
+        window_target: Optional[str] = None,
     ) -> None:
         """Invalidate prior verifications belonging to a surface (e.g. 'browser', 'desktop') after later mutation."""
         surf = str(surface or "").strip().lower()
@@ -1580,10 +1633,15 @@ class TurnExecutionLedger:
             return
         prefix = f"{surf}:"
         excluded = set(exclude_targets or ())
-        to_remove = [
-            vt for vt in list(self._verified_targets)
-            if vt.startswith(prefix) and vt not in excluded
-        ]
+        scoped_win = str(window_target or "").strip() if surf == "desktop" else ""
+
+        to_remove: List[str] = []
+        for vt in list(self._verified_targets):
+            if not vt.startswith(prefix) or vt in excluded:
+                continue
+            if scoped_win and not self._surface_target_matches_window(vt, None, scoped_win):
+                continue
+            to_remove.append(vt)
         for vt in to_remove:
             self._verified_targets.discard(vt)
 
@@ -1610,6 +1668,8 @@ class TurnExecutionLedger:
                     is_match = True
                 elif surf == "desktop" and chk_low.startswith("desktop_"):
                     is_match = True
+            if is_match and scoped_win:
+                is_match = self._surface_target_matches_window(rec_target, rec.arguments, scoped_win)
             if is_match and rec_target not in excluded:
                 invalidated_any = True
                 self._records[cid] = ActionRecord(
@@ -1633,7 +1693,7 @@ class TurnExecutionLedger:
             self._emit_central_event(
                 LedgerEventType.VERIFICATION_RECORDED,
                 status="verification_invalidated",
-                metadata={"surface": surf, "invalidated_targets": to_remove},
+                metadata={"surface": surf, "window_target": scoped_win or None, "invalidated_targets": to_remove},
             )
 
     def is_target_verified(self, target: str, check_type: Optional[str] = None) -> bool:
@@ -4083,15 +4143,24 @@ def parse_acceptance_criteria(criteria: Any) -> List[Dict[str, Any]]:
 
     for item in items:
         if isinstance(item, dict):
-            raw_target = (
-                item.get("target")
-                or item.get("selector")
-                or item.get("url")
-                or item.get("window")
-                or ""
-            )
+            chk_str = str(item.get("check", "")).strip()
+            if chk_str.lower() in KNOWN_DESKTOP_CHECKS:
+                raw_target = (
+                    item.get("target")
+                    or item.get("window")
+                    or item.get("selector")
+                    or ""
+                )
+            else:
+                raw_target = (
+                    item.get("target")
+                    or item.get("selector")
+                    or item.get("url")
+                    or item.get("window")
+                    or ""
+                )
             entry: Dict[str, Any] = {
-                "check": str(item.get("check", "")).strip(),
+                "check": chk_str,
                 "target": str(raw_target).strip(),
                 "expected": item.get("expected"),
             }
@@ -4099,6 +4168,8 @@ def parse_acceptance_criteria(criteria: Any) -> List[Dict[str, Any]]:
             if isinstance(item.get("context"), dict):
                 ctx.update(item["context"])
             for extra_key in (
+                "window",
+                "pid",
                 "selector",
                 "url",
                 "expected_url",
@@ -4482,7 +4553,7 @@ def _evaluate_unfulfilled_task_requirements(
                 if pre_verified is not None and idx in pre_verified
                 else OutcomeVerifier.verify_criterion(c)
             )
-            norm_t = canonicalize_target(target, check_type=check_name) if target else ""
+            norm_t = canonicalize_target(criterion_canonical_target_raw(c) or target, check_type=check_name) if target else ""
             if norm_t:
                 target_results.setdefault(norm_t, []).append((c, vr))
             if check_name.lower() in ("command_output", "command", "cmd") and target:
@@ -4505,7 +4576,7 @@ def _evaluate_unfulfilled_task_requirements(
         for norm_t, results in target_results.items():
             all_passed = all(vr.success for _, vr in results)
             first_c, _ = results[0]
-            raw_target = first_c["target"]
+            raw_target = criterion_canonical_target_raw(first_c) or first_c["target"]
             check_name = first_c["check"]
             if all_passed:
                 if raw_target and hasattr(ledger, "record_target_verified"):

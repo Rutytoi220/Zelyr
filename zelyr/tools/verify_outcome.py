@@ -28,7 +28,7 @@ TOOL_SCHEMA: Dict[str, Any] = {
         "description": (
             "Deterministically verify an expected system, filesystem, browser, or desktop state outcome "
             "(files, contents, checksums, JSON, processes, listening ports, command outputs, "
-            "read-only Chromium DOM/URL checks, read-only Hyprland compositor window checks)."
+            "read-only Chromium DOM/URL checks, read-only Hyprland compositor & AT-SPI2 widget checks)."
         ),
         "parameters": {
             "type": "object",
@@ -40,11 +40,19 @@ TOOL_SCHEMA: Dict[str, Any] = {
                 },
                 "target": {
                     "type": "string",
-                    "description": "Target of the check: file path, process pattern, port, command, CSS selector/URL, or window identifier.",
+                    "description": "Target of the check: file path, process pattern, port, command, CSS selector/URL, or window identifier (or 'window::selector').",
                 },
                 "expected": {
                     "type": "string",
-                    "description": "Expected value or pattern (required for file_contains, file_checksum, command_output).",
+                    "description": "Expected value, text, state, or pattern.",
+                },
+                "window": {
+                    "type": "string",
+                    "description": "Optional explicit target desktop window title/class/address for accessibility checks.",
+                },
+                "selector": {
+                    "type": "string",
+                    "description": "Optional CSS selector (browser) or AT-SPI2 widget selector (#id, role=..., name=...) for desktop accessibility checks.",
                 },
                 "cwd": {
                     "type": "string",
@@ -91,7 +99,21 @@ class VerifyOutcomeTool(BaseTool):
             ToolParameter(
                 name="expected",
                 type="string",
-                description="Expected content, checksum, or pattern.",
+                description="Expected content, checksum, state, or pattern.",
+                required=False,
+                default=None,
+            ),
+            ToolParameter(
+                name="window",
+                type="string",
+                description="Optional target desktop window title/class/address for accessibility checks.",
+                required=False,
+                default=None,
+            ),
+            ToolParameter(
+                name="selector",
+                type="string",
+                description="Optional widget/DOM selector (#id, role=..., name=...).",
                 required=False,
                 default=None,
             ),

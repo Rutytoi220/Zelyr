@@ -95,8 +95,8 @@ SCENARIO_SPECS: Dict[str, Dict[str, Any]] = {
 DEFAULT_SCENARIOS: List[str] = ["browser_fs", "normal", "browser_failure", "desktop_focus_loss"]
 
 INTERNAL_VERIFIER_UNSUPPORTED_LIMITATIONS: List[str] = [
-    "OutcomeVerifier natively verifies filesystem artifacts, read-only Chromium DOM/URL state via Native Messaging, and read-only Hyprland compositor window existence/title/focus metadata.",
-    "Direct REST HTTP API endpoints and PySide6 desktop widget internal text/state (requires an available AT-SPI/pyatspi accessibility bridge) remain outside OutcomeVerifier's semantic scope and are verified independently by external_validation.",
+    "OutcomeVerifier natively verifies filesystem artifacts, read-only Chromium DOM/URL state via Native Messaging, read-only Hyprland compositor window metadata, and read-only Linux AT-SPI2 widget text/state.",
+    "Direct REST HTTP API endpoints remain outside OutcomeVerifier's direct scope and are verified independently by external_validation alongside independent PySide6/WebApp oracles.",
 ]
 
 INITIAL_RECORDS: Dict[str, Dict[str, Any]] = {
@@ -696,11 +696,28 @@ def build_cross_surface_verify_spec(
     ]
     use_desktop = bool(ws_info.get("requires_desktop", True)) if requires_desktop is None else bool(requires_desktop)
     if use_desktop:
-        criteria.append({
-            "surface": "desktop_compositor",
-            "check": "desktop_window_exists",
-            "target": desktop_title,
-        })
+        target_rec = str(ws_info.get("target_record_id") or "REC-204")
+        criteria.extend([
+            {
+                "surface": "desktop_compositor",
+                "check": "desktop_window_exists",
+                "target": desktop_title,
+            },
+            {
+                "surface": "desktop_accessibility",
+                "check": "desktop_visible_text",
+                "window": desktop_title,
+                "selector": "#statusLabel",
+                "expected": f"CONFIRMED:{target_rec}",
+            },
+            {
+                "surface": "desktop_accessibility",
+                "check": "desktop_widget_state",
+                "window": desktop_title,
+                "selector": "#applyBtn",
+                "expected": "enabled",
+            },
+        ])
     return json.dumps(criteria)
 
 
@@ -1038,17 +1055,19 @@ def evaluate_cross_surface_run(
                 verified_surfaces.append("browser")
             elif cname in ("desktop_window_exists", "desktop_window_title", "desktop_active_window") and "desktop_compositor" not in verified_surfaces:
                 verified_surfaces.append("desktop_compositor")
-            elif cname.startswith("desktop_") and "desktop_semantic" not in verified_surfaces:
-                verified_surfaces.append("desktop_semantic")
+            elif cname.startswith("desktop_") and "desktop_accessibility" not in verified_surfaces:
+                verified_surfaces.append("desktop_accessibility")
 
     unsupported_surfaces: List[str] = []
     if "browser" not in verified_surfaces:
         unsupported_surfaces.append("web_dom")
     unsupported_surfaces.append("http_api")
     if eff_requires_desktop:
-        if "desktop_compositor" in verified_surfaces:
+        if "desktop_accessibility" in verified_surfaces:
+            pass
+        elif "desktop_compositor" in verified_surfaces:
             unsupported_surfaces.append("desktop_widget_semantic_text")
-        elif "desktop_semantic" not in verified_surfaces:
+        else:
             unsupported_surfaces.append("desktop_gui")
 
     if not internal_requested:

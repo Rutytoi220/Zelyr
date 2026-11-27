@@ -151,7 +151,7 @@ DESKTOP_COMPOSITOR_CHECKS: Set[str] = {
     "desktop_active_window",
 }
 
-DESKTOP_SEMANTIC_UNSUPPORTED_CHECKS: Set[str] = {
+DESKTOP_ACCESSIBILITY_CHECKS: Set[str] = {
     "desktop_visible_text",
     "desktop_widget_state",
     "desktop_text",
@@ -159,8 +159,11 @@ DESKTOP_SEMANTIC_UNSUPPORTED_CHECKS: Set[str] = {
     "desktop_ui_state",
 }
 
+# Backward-compatible alias preserved for external callers
+DESKTOP_SEMANTIC_UNSUPPORTED_CHECKS: Set[str] = DESKTOP_ACCESSIBILITY_CHECKS
+
 DESKTOP_VERIFICATION_CHECKS: Set[str] = (
-    DESKTOP_COMPOSITOR_CHECKS | DESKTOP_SEMANTIC_UNSUPPORTED_CHECKS
+    DESKTOP_COMPOSITOR_CHECKS | DESKTOP_ACCESSIBILITY_CHECKS
 )
 
 FILESYSTEM_AND_HOST_CHECKS: Set[str] = {
@@ -1747,29 +1750,60 @@ def _normalize_http_url(url_str: str) -> Optional[Tuple[str, str, str, str, str]
     return (p.scheme.lower(), p.netloc.lower(), path, p.query, p.fragment)
 
 
-def _parse_browser_state_expectation(expected: Any) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """Validate and parse expected element state into canonical dict assertions."""
+_DESKTOP_STATE_BOOL_MAP: Dict[str, Tuple[str, bool]] = {
+    "disabled": ("disabled", True),
+    "enabled": ("disabled", False),
+    "checked": ("checked", True),
+    "unchecked": ("checked", False),
+    "selected": ("selected", True),
+    "unselected": ("selected", False),
+    "visible": ("visible", True),
+    "hidden": ("visible", False),
+    "showing": ("showing", True),
+    "focused": ("focused", True),
+    "unfocused": ("focused", False),
+    "editable": ("editable", True),
+    "readonly": ("read_only", True),
+    "read_only": ("read_only", True),
+    "expanded": ("expanded", True),
+    "collapsed": ("expanded", False),
+    "active": ("active", True),
+    "inactive": ("active", False),
+    "indeterminate": ("indeterminate", True),
+}
+
+
+def _normalize_state_expectation(
+    expected: Any,
+    *,
+    check_name: str,
+    bool_map: Dict[str, Tuple[str, bool]],
+    allowed_bool_keys: Set[str],
+    string_keys: Tuple[str, ...] = (),
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Shared parser/validator for browser and desktop element/widget state expectations."""
     if expected is None:
-        return None, "Incomplete verification specification: 'browser_element_state' requires an expected state."
+        return None, f"Incomplete verification specification: '{check_name}' requires an expected state."
     if isinstance(expected, dict):
         raw_map = expected
     else:
         raw_s = str(expected).strip()
         if not raw_s:
-            return None, "Incomplete verification specification: 'browser_element_state' requires a non-empty expected state."
+            return None, f"Incomplete verification specification: '{check_name}' requires a non-empty expected state."
         if raw_s.startswith("{"):
             try:
                 decoded = json.loads(raw_s)
             except Exception as exc:
-                return None, f"Invalid JSON state specification for 'browser_element_state': {exc}"
+                return None, f"Invalid JSON state specification for '{check_name}': {exc}"
             if not isinstance(decoded, dict) or not decoded:
-                return None, "JSON state specification for 'browser_element_state' must be a non-empty object."
+                return None, f"JSON state specification for '{check_name}' must be a non-empty object."
             raw_map = decoded
         elif "=" in raw_s:
             k, v = [p.strip() for p in raw_s.split("=", 1)]
             k_low = k.lower()
-            if k_low in ("selected_option", "option"):
-                return {"selected_option": v}, None
+            if k_low in string_keys or (k_low == "option" and "selected_option" in string_keys):
+                canon_k = "selected_option" if k_low == "option" else k_low
+                return {canon_k: v}, None
             if v.lower() in ("true", "1", "yes"):
                 raw_map = {k_low: True}
             elif v.lower() in ("false", "0", "no"):
@@ -1778,27 +1812,51 @@ def _parse_browser_state_expectation(expected: Any) -> Tuple[Optional[Dict[str, 
                 return None, f"Unsupported boolean state value '{v}' for key '{k}'."
         else:
             tok_low = raw_s.lower()
-            if tok_low in _BROWSER_STATE_BOOL_MAP:
-                field_name, field_bool = _BROWSER_STATE_BOOL_MAP[tok_low]
+            if tok_low in bool_map:
+                field_name, field_bool = bool_map[tok_low]
                 return {field_name: field_bool}, None
             return None, (
-                f"Unsupported expected state '{raw_s}' for 'browser_element_state'. "
-                "Supported states: enabled, disabled, checked, unchecked, selected, unselected, "
-                "visible, hidden, focused, unfocused, selected_option=<val>."
+                f"Unsupported expected state '{raw_s}' for '{check_name}'. "
+                f"Supported states: {', '.join(sorted(bool_map.keys()))}."
             )
 
     parsed: Dict[str, Any] = {}
     for k, v in raw_map.items():
         k_low = str(k).strip().lower()
-        if k_low in ("disabled", "checked", "selected", "visible", "focused"):
+        if k_low in allowed_bool_keys:
             if not isinstance(v, bool):
                 return None, f"State key '{k_low}' expects a boolean value."
             parsed[k_low] = v
-        elif k_low == "selected_option":
+        elif k_low in string_keys:
             parsed[k_low] = str(v)
         else:
-            return None, f"Unsupported state attribute '{k}' in 'browser_element_state'."
-    return (parsed, None) if parsed else (None, "Empty state specification for 'browser_element_state'.")
+            return None, f"Unsupported state attribute '{k}' in '{check_name}'."
+    return (parsed, None) if parsed else (None, f"Empty state specification for '{check_name}'.")
+
+
+def _parse_browser_state_expectation(expected: Any) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Validate and parse expected browser element state into canonical dict assertions."""
+    return _normalize_state_expectation(
+        expected,
+        check_name="browser_element_state",
+        bool_map=_BROWSER_STATE_BOOL_MAP,
+        allowed_bool_keys={"disabled", "checked", "selected", "visible", "focused"},
+        string_keys=("selected_option",),
+    )
+
+
+def _parse_desktop_state_expectation(expected: Any, check_name: str = "desktop_widget_state") -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Validate and parse expected desktop widget state into canonical dict assertions."""
+    return _normalize_state_expectation(
+        expected,
+        check_name=check_name,
+        bool_map=_DESKTOP_STATE_BOOL_MAP,
+        allowed_bool_keys={
+            "enabled", "disabled", "checked", "selected", "visible", "showing",
+            "focused", "editable", "read_only", "expanded", "active", "indeterminate",
+        },
+        string_keys=(),
+    )
 
 
 def _extract_browser_context_args(
@@ -2420,20 +2478,22 @@ async def verify_browser_outcome_async(
     )
 
 
-async def verify_desktop_outcome_async(
-    check: str,
-    target: str,
-    expected: Optional[Any] = None,
-    **kwargs: Any,
-) -> VerificationResult:
-    """Verify read-only Linux desktop compositor window state (no synthetic input or screenshot guessing)."""
-    from zelyr.engine.hyprland_ipc import HyprlandIPCClient, HyprlandUnavailableError
+def _validate_desktop_params(
+    norm_check: str,
+    target_val: str,
+    expected: Optional[Any],
+    kwargs: Dict[str, Any],
+) -> Union[Tuple[None, VerificationResult], Tuple[Dict[str, Any], None]]:
+    """Pure parameter/selector/target validation for desktop verification checks."""
+    from zelyr.engine.desktop_accessibility import (
+        MAX_RETURNED_TEXT_LEN,
+        parse_desktop_selector,
+        split_window_and_widget_target,
+    )
 
-    norm_check = (check or "").strip().lower()
-    target_val = "" if target is None else str(target).strip()
     ctx = kwargs.get("context") if isinstance(kwargs.get("context"), dict) else {}
-    match_mode = str(kwargs.get("match") or ctx.get("match") or "").strip().lower()
-    criterion_obj = {"check": norm_check, "target": target_val, "expected": expected}
+    ev_src = "hyprland_ipc" if norm_check in DESKTOP_COMPOSITOR_CHECKS else "desktop_accessibility"
+    criterion_obj: Dict[str, Any] = {"check": norm_check, "target": target_val, "expected": expected}
 
     def _invalid(msg: str) -> VerificationResult:
         return VerificationResult(
@@ -2443,97 +2503,383 @@ async def verify_desktop_outcome_async(
             observed={"invalid_spec": True},
             error=msg,
             result=VERDICT_FAIL,
-            evidence_source="hyprland_ipc" if norm_check in DESKTOP_COMPOSITOR_CHECKS else "desktop_accessibility",
+            evidence_source=ev_src,
             expected=expected,
             evidence_collected=False,
             criterion=criterion_obj,
         )
 
     if "\x00" in target_val or (isinstance(expected, str) and "\x00" in expected):
-        return _invalid("Invalid desktop verification specification: null byte is not permitted.")
+        return None, _invalid("Invalid desktop verification specification: null byte is not permitted.")
 
-    if not target_val:
-        return _invalid(f"Incomplete verification specification: '{norm_check}' requires a non-empty target window identifier.")
-
-    if norm_check in DESKTOP_SEMANTIC_UNSUPPORTED_CHECKS:
-        if expected is None or str(expected).strip() == "":
-            return _invalid(f"Incomplete verification specification: '{norm_check}' requires an expected text/state.")
-        # Honest boundary: never synthesize semantic proof from Hyprland focus, input injection, or pixels.
-        reader = kwargs.get("desktop_accessibility_reader")
-        if callable(reader):
-            try:
-                acc_res = reader(target=target_val, expected=str(expected), check=norm_check)
-                if asyncio.iscoroutine(acc_res):
-                    acc_res = await acc_res
-                if isinstance(acc_res, VerificationResult):
-                    return acc_res
-            except Exception as acc_exc:
-                return VerificationResult(
-                    success=False,
-                    check=norm_check,
-                    target=target_val,
-                    observed={"unverified": True, "evidence_collected": False},
-                    error=f"Desktop accessibility query failed: {acc_exc}",
-                    result=VERDICT_UNVERIFIED,
-                    evidence_source="desktop_accessibility",
-                    expected=expected,
-                    evidence_collected=False,
-                    criterion=criterion_obj,
+    if norm_check in DESKTOP_COMPOSITOR_CHECKS:
+        if not target_val:
+            return None, _invalid(
+                f"Incomplete verification specification: '{norm_check}' requires a non-empty target window identifier."
+            )
+        if norm_check in ("desktop_window_exists", "desktop_active_window"):
+            if expected is not None and str(expected).strip() != "":
+                return None, _invalid(
+                    f"Incompatible specification: '{norm_check}' does not accept expected text (use 'desktop_window_title' for title checks)."
                 )
+        elif expected is None or str(expected).strip() == "":
+            return None, _invalid("Incomplete verification specification: 'desktop_window_title' requires an expected title.")
+        return {
+            "norm_check": norm_check,
+            "window_target": target_val,
+            "selector": None,
+            "parsed_state": None,
+            "eff_expected": expected,
+            "criterion_obj": criterion_obj,
+            "match_mode": str(kwargs.get("match") or ctx.get("match") or "").strip().lower(),
+        }, None
+
+    if norm_check not in DESKTOP_ACCESSIBILITY_CHECKS:
+        return None, _invalid(f"Unknown desktop verification check '{norm_check}'.")
+
+    explicit_window = kwargs.get("window") or ctx.get("window")
+    explicit_selector = kwargs.get("selector") or ctx.get("selector")
+    window_target, raw_selector = split_window_and_widget_target(
+        target_val,
+        explicit_window=str(explicit_window) if explicit_window is not None else None,
+        explicit_selector=str(explicit_selector) if explicit_selector is not None else None,
+    )
+    if not window_target or window_target == "*" or len(window_target) > 256:
+        return None, _invalid(
+            f"Invalid desktop target window '{window_target}' for '{norm_check}': must be a specific non-empty window identifier."
+        )
+    if len(window_target) < 2 and not window_target.lower().startswith(("0x", "address:")):
+        return None, _invalid(f"Ambiguous window target '{window_target}' is too short for deterministic identification.")
+
+    sel_obj, sel_err = parse_desktop_selector(raw_selector)
+    if sel_err or sel_obj is None:
+        return None, _invalid(sel_err or f"Invalid widget selector for '{norm_check}'.")
+
+    criterion_obj = {
+        "check": norm_check,
+        "target": target_val,
+        "window": window_target,
+        "selector": sel_obj.raw,
+        "expected": expected,
+    }
+
+    parsed_state: Optional[Dict[str, Any]] = None
+    eff_expected: Any = expected
+    if norm_check in ("desktop_widget_state", "desktop_ui_state"):
+        parsed_state, st_err = _parse_desktop_state_expectation(expected, check_name=norm_check)
+        if st_err:
+            return None, _invalid(st_err)
+        eff_expected = parsed_state
+    else:
+        if expected is None or str(expected).strip() == "":
+            return None, _invalid(f"Incomplete verification specification: '{norm_check}' requires expected visible text.")
+        exp_str = str(expected)
+        if len(exp_str) > MAX_RETURNED_TEXT_LEN:
+            return None, _invalid(f"Expected text exceeds {MAX_RETURNED_TEXT_LEN} char limit.")
+        eff_expected = exp_str
+
+    criterion_obj["expected"] = eff_expected
+    return {
+        "norm_check": norm_check,
+        "window_target": window_target,
+        "selector": sel_obj,
+        "parsed_state": parsed_state,
+        "eff_expected": eff_expected,
+        "criterion_obj": criterion_obj,
+        "match_mode": str(kwargs.get("match") or ctx.get("match") or "").strip().lower(),
+    }, None
+
+
+async def _verify_desktop_accessibility_async(
+    validated: Dict[str, Any],
+    target_val: str,
+    kwargs: Dict[str, Any],
+) -> VerificationResult:
+    """Execute narrowly scoped read-only desktop semantic verification via AT-SPI2."""
+    from zelyr.engine.desktop_accessibility import (
+        DEFAULT_DBUS_TIMEOUT,
+        is_widget_checkable,
+        query_desktop_widget_via_accessibility,
+    )
+
+    norm_check = validated["norm_check"]
+    window_target = validated["window_target"]
+    sel_obj = validated["selector"]
+    parsed_state = validated["parsed_state"]
+    eff_expected = validated["eff_expected"]
+    criterion_obj = validated["criterion_obj"]
+    match_mode = validated["match_mode"]
+
+    legacy_reader = kwargs.get("desktop_accessibility_reader")
+    if callable(legacy_reader):
         try:
-            import pyatspi  # type: ignore  # noqa: F401
-        except Exception:
+            acc_res = legacy_reader(
+                target=target_val,
+                window=window_target,
+                selector=sel_obj.raw,
+                expected=eff_expected,
+                check=norm_check,
+            )
+            if asyncio.iscoroutine(acc_res):
+                acc_res = await acc_res
+            if isinstance(acc_res, VerificationResult):
+                return acc_res
+        except Exception as acc_exc:
             return VerificationResult(
                 success=False,
                 check=norm_check,
                 target=target_val,
-                observed={
-                    "unsupported": True,
-                    "evidence_collected": False,
-                    "focus_ipc_not_semantic": True,
-                    "reason": (
-                        "AT-SPI accessibility backend (pyatspi) is not available in this runtime; "
-                        "compositor IPC verifies window existence/title/focus metadata only."
-                    ),
-                },
-                error=(
-                    f"Unsupported verification criterion '{norm_check}': semantic desktop UI widget text/state "
-                    "cannot be verified natively without an available accessibility bridge (pyatspi)."
-                ),
-                result=VERDICT_UNSUPPORTED,
+                observed={"unverified": True, "evidence_collected": False},
+                error=f"Desktop accessibility query failed: {acc_exc}",
+                result=VERDICT_UNVERIFIED,
                 evidence_source="desktop_accessibility",
-                expected=expected,
+                expected=eff_expected,
                 evidence_collected=False,
                 criterion=criterion_obj,
             )
 
+    try:
+        timeout = float(kwargs.get("timeout", DEFAULT_DBUS_TIMEOUT))
+    except (TypeError, ValueError):
+        timeout = DEFAULT_DBUS_TIMEOUT
+
+    qres = await query_desktop_widget_via_accessibility(
+        window_target=window_target,
+        selector=sel_obj,
+        backend=kwargs.get("desktop_accessibility_backend"),
+        hyprland_client=kwargs.get("hyprland_client"),
+        hyprland_socket_path=kwargs.get("hyprland_socket_path"),
+        timeout=timeout,
+    )
+
+    if qres.unsupported:
         return VerificationResult(
             success=False,
             check=norm_check,
             target=target_val,
             observed={
                 "unsupported": True,
+                "accessibility_backend": qres.backend,
                 "evidence_collected": False,
-                "reason": "Scoped semantic widget inspection via AT-SPI requires an explicit target widget bridge.",
+                "focus_ipc_not_semantic": True,
+                "reason": qres.error or "AT-SPI2 accessibility backend unavailable.",
             },
-            error=f"Unsupported verification criterion '{norm_check}': deterministic scoped AT-SPI widget verification is not enabled.",
+            error=qres.error or f"Unsupported verification criterion '{norm_check}': AT-SPI2 backend unavailable.",
             result=VERDICT_UNSUPPORTED,
             evidence_source="desktop_accessibility",
-            expected=expected,
+            expected=eff_expected,
             evidence_collected=False,
             criterion=criterion_obj,
         )
 
-    if norm_check in ("desktop_window_exists", "desktop_active_window"):
-        if expected is not None and str(expected).strip() != "":
-            return _invalid(
-                f"Incompatible specification: '{norm_check}' does not accept expected text (use 'desktop_window_title' for title checks)."
+    if qres.ambiguous or qres.inaccessible:
+        return VerificationResult(
+            success=False,
+            check=norm_check,
+            target=target_val,
+            observed={
+                "unverified": True,
+                "accessibility_backend": qres.backend,
+                "evidence_collected": False,
+                "window_found": qres.window_found,
+                "window_accessible": qres.window_accessible,
+                "widget_found": qres.widget_found,
+                "widget_accessible": qres.widget_accessible,
+                "window_title": qres.window_title,
+                "window_pid": qres.window_pid,
+                "ambiguous": qres.ambiguous,
+                "inaccessible": qres.inaccessible,
+                "truncated": qres.truncated,
+                "inspected_descendants": qres.inspected_descendants,
+            },
+            error=qres.error or "Target desktop widget could not be unambiguously inspected.",
+            result=VERDICT_UNVERIFIED,
+            evidence_source="desktop_accessibility",
+            expected=eff_expected,
+            evidence_collected=False,
+            criterion=criterion_obj,
+        )
+
+    if not qres.window_found:
+        return VerificationResult(
+            success=False,
+            check=norm_check,
+            target=target_val,
+            observed={
+                "window_found": False,
+                "accessibility_backend": qres.backend,
+                "window_target": window_target,
+                "selector": sel_obj.raw,
+            },
+            error=qres.error or f"Target desktop window '{window_target}' was not found.",
+            result=VERDICT_FAIL,
+            evidence_source="desktop_accessibility",
+            expected=eff_expected,
+            evidence_collected=True,
+            criterion=criterion_obj,
+        )
+
+    if not qres.widget_found or qres.widget is None:
+        return VerificationResult(
+            success=False,
+            check=norm_check,
+            target=target_val,
+            observed={
+                "window_found": True,
+                "window_accessible": True,
+                "widget_found": False,
+                "widget_accessible": qres.widget_accessible,
+                "accessibility_backend": qres.backend,
+                "window_title": qres.window_title,
+                "window_pid": qres.window_pid,
+                "selector": sel_obj.raw,
+                "inspected_descendants": qres.inspected_descendants,
+            },
+            error=qres.error or f"Widget matching '{sel_obj.raw}' was not found inside '{qres.window_title}'.",
+            result=VERDICT_FAIL,
+            evidence_source="desktop_accessibility",
+            expected=eff_expected,
+            evidence_collected=True,
+            criterion=criterion_obj,
+        )
+
+    w = qres.widget
+    if w.sensitive_redacted:
+        return VerificationResult(
+            success=False,
+            check=norm_check,
+            target=target_val,
+            observed={
+                "safety_blocked": True,
+                "accessibility_backend": qres.backend,
+                "window_title": w.window_title,
+                "window_pid": w.window_pid,
+                "selector": sel_obj.raw,
+                "role": w.role,
+            },
+            error=f"Refused to verify or expose sensitive/password desktop widget matching '{sel_obj.raw}'.",
+            result=VERDICT_FAIL,
+            evidence_source="desktop_accessibility",
+            expected=eff_expected,
+            evidence_collected=False,
+            criterion=criterion_obj,
+        )
+
+    base_widget_obs = {
+        "accessibility_backend": qres.backend,
+        "window_found": True,
+        "window_accessible": True,
+        "widget_found": True,
+        "widget_accessible": True,
+        "window_title": w.window_title,
+        "window_pid": w.window_pid,
+        "selector": sel_obj.raw,
+        "inspected_descendants": qres.inspected_descendants,
+        "widget": {
+            "role": w.role,
+            "accessible_id": w.accessible_id,
+            "name": w.name,
+            "visible": bool(w.states.get("visible") and w.states.get("showing")),
+        },
+    }
+
+    if norm_check in ("desktop_widget_state", "desktop_ui_state"):
+        assert parsed_state is not None
+        mismatches: List[str] = []
+        reported_states = {
+            k: bool(w.states.get(k))
+            for k in (
+                "enabled", "disabled", "checked", "selected", "focused",
+                "visible", "showing", "editable", "read_only", "expanded",
+                "active", "indeterminate",
             )
-    elif norm_check == "desktop_window_title":
-        if expected is None or str(expected).strip() == "":
-            return _invalid("Incomplete verification specification: 'desktop_window_title' requires an expected title.")
-    else:
-        return _invalid(f"Unknown desktop verification check '{check}'.")
+        }
+        base_widget_obs["widget"]["states"] = reported_states
+
+        for attr_name, exp_bool in parsed_state.items():
+            if attr_name == "checked" and not is_widget_checkable(w):
+                mismatches.append(f"widget role '{w.role}' is not checkable")
+                continue
+            if attr_name == "visible":
+                actual = bool(w.states.get("visible") and w.states.get("showing"))
+            else:
+                actual = bool(w.states.get(attr_name))
+            if actual != bool(exp_bool):
+                mismatches.append(f"{attr_name}={exp_bool} (observed {actual})")
+
+        passed = not mismatches
+        return VerificationResult(
+            success=passed,
+            check=norm_check,
+            target=target_val,
+            observed=base_widget_obs,
+            error=None if passed else f"Desktop widget '{sel_obj.raw}' state mismatch: {'; '.join(mismatches)}.",
+            result=VERDICT_PASS if passed else VERDICT_FAIL,
+            evidence_source="desktop_accessibility",
+            expected=parsed_state,
+            evidence_collected=True,
+            criterion=criterion_obj,
+        )
+
+    # desktop_visible_text / desktop_text / desktop_status
+    is_visible = bool(w.states.get("visible") and w.states.get("showing"))
+    obs_text = w.visible_text
+    base_widget_obs["widget"]["visible_text"] = obs_text
+    if not is_visible:
+        return VerificationResult(
+            success=False,
+            check=norm_check,
+            target=target_val,
+            observed=base_widget_obs,
+            error=f"Desktop widget '{sel_obj.raw}' inside '{w.window_title}' is hidden/not showing.",
+            result=VERDICT_FAIL,
+            evidence_source="desktop_accessibility",
+            expected=eff_expected,
+            evidence_collected=True,
+            criterion=criterion_obj,
+        )
+
+    exp_s = str(eff_expected)
+    passed = (obs_text == exp_s) if match_mode == "exact" else (exp_s in obs_text)
+    return VerificationResult(
+        success=passed,
+        check=norm_check,
+        target=target_val,
+        observed=base_widget_obs,
+        error=(
+            None
+            if passed
+            else f"Expected widget '{sel_obj.raw}' text containing '{exp_s}', observed '{obs_text}'."
+        ),
+        result=VERDICT_PASS if passed else VERDICT_FAIL,
+        evidence_source="desktop_accessibility",
+        expected=exp_s,
+        evidence_collected=True,
+        criterion=criterion_obj,
+    )
+
+
+async def verify_desktop_outcome_async(
+    check: str,
+    target: str,
+    expected: Optional[Any] = None,
+    **kwargs: Any,
+) -> VerificationResult:
+    """Verify read-only Linux desktop compositor or AT-SPI2 accessibility UI state."""
+    from zelyr.engine.hyprland_ipc import HyprlandIPCClient, HyprlandUnavailableError
+
+    norm_check = (check or "").strip().lower()
+    target_val = "" if target is None else str(target).strip()
+    validated, invalid_res = _validate_desktop_params(norm_check, target_val, expected, kwargs)
+    if invalid_res is not None:
+        return invalid_res
+    assert validated is not None
+
+    if norm_check in DESKTOP_ACCESSIBILITY_CHECKS:
+        return await _verify_desktop_accessibility_async(validated, target_val, kwargs)
+
+    match_mode = validated["match_mode"]
+    criterion_obj = validated["criterion_obj"]
 
     hypr = kwargs.get("hyprland_client")
     if hypr is None:
@@ -2989,33 +3335,11 @@ def validate_criterion_spec(
         return invalid_res
 
     if norm_check in DESKTOP_VERIFICATION_CHECKS:
-        if not target_val:
-            return VerificationResult(
-                success=False,
-                check=norm_check,
-                target="",
-                observed={"invalid_spec": True},
-                error=f"Incomplete verification specification: '{norm_check}' requires a non-empty target window identifier.",
-            )
-        if norm_check in ("desktop_window_exists", "desktop_active_window"):
-            if expected is not None and str(expected).strip() != "":
-                return VerificationResult(
-                    success=False,
-                    check=norm_check,
-                    target=target_val,
-                    observed={"invalid_spec": True},
-                    error=f"Incompatible specification: '{norm_check}' does not accept expected text.",
-                )
-        else:
-            if expected is None or str(expected).strip() == "":
-                return VerificationResult(
-                    success=False,
-                    check=norm_check,
-                    target=target_val,
-                    observed={"invalid_spec": True},
-                    error=f"Incomplete verification specification: '{norm_check}' requires expected text/state.",
-                )
-        return None
+        merged_kw = dict(kwargs)
+        if isinstance(criterion.get("context"), dict):
+            merged_kw.setdefault("context", criterion["context"])
+        _, invalid_res = _validate_desktop_params(norm_check, target_val, expected, merged_kw)
+        return invalid_res
 
     if norm_check in ("file_exists", "exists"):
         if not target_val:
@@ -3175,8 +3499,8 @@ def summarize_verification_scope(
             surfaces.append("browser")
         elif chk in DESKTOP_COMPOSITOR_CHECKS and "desktop_compositor" not in surfaces:
             surfaces.append("desktop_compositor")
-        elif chk in DESKTOP_SEMANTIC_UNSUPPORTED_CHECKS and "desktop_semantic" not in surfaces:
-            surfaces.append("desktop_semantic")
+        elif chk in DESKTOP_ACCESSIBILITY_CHECKS and "desktop_accessibility" not in surfaces:
+            surfaces.append("desktop_accessibility")
         elif chk in ("file_exists", "exists", "file_contains", "contains", "file_checksum", "checksum", "sha256", "file_json", "json"):
             if "filesystem" not in surfaces:
                 surfaces.append("filesystem")

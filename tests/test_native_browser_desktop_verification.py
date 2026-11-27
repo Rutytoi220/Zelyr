@@ -394,10 +394,21 @@ async def test_desktop_compositor_checks_are_read_only_privacy_scoped_and_honest
 
 @pytest.mark.asyncio
 async def test_desktop_semantic_widget_check_returns_unsupported_and_focus_cannot_promote_root() -> None:
+    class _UnavailableA11yBackend:
+        backend_name = "atspi2_dbus_jeepney"
+
+        def is_available(self):
+            return False, "AT-SPI2 session bus unavailable in test double"
+
+        def query_widget(self, **_kwargs):
+            raise AssertionError("query_widget must not run when backend is unavailable")
+
     sem_res = await OutcomeVerifier.verify_async(
         "desktop_visible_text",
         "Zelyr Cross-Surface Confirmation",
+        selector="#statusLabel",
         expected="CONFIRMED:REC-204",
+        desktop_accessibility_backend=_UnavailableA11yBackend(),
     )
     assert sem_res.success is False
     assert sem_res.result == VERDICT_UNSUPPORTED
@@ -432,6 +443,7 @@ async def test_invalid_verify_specs_rejected_before_task_execution(tmp_path: Pat
         "browser_visible_text:#status-badge",
         "browser_visible_text:document.cookie:abc",
         "desktop_window_title:MyWindow",
+        "desktop_visible_text:MyWindow:CONFIRMED",
     ]
     for spec in invalid_specs:
         stream_calls = 0
@@ -457,12 +469,24 @@ async def test_invalid_verify_specs_rejected_before_task_execution(tmp_path: Pat
 
 
 @pytest.mark.asyncio
-async def test_unsupported_criterion_blocks_root_verified_status(tmp_path: Path, capsys) -> None:
+async def test_unsupported_criterion_blocks_root_verified_status(tmp_path: Path, capsys, monkeypatch) -> None:
+    from zelyr.engine.desktop_accessibility import AtspiDbusAccessibilityBackend
+
+    monkeypatch.setattr(
+        AtspiDbusAccessibilityBackend,
+        "is_available",
+        lambda _self: (False, "AT-SPI2 disabled in offline test"),
+    )
     out_file = tmp_path / "ok.txt"
     out_file.write_text("READY\n", encoding="utf-8")
     spec = json.dumps([
         {"check": "file_contains", "target": str(out_file), "expected": "READY"},
-        {"check": "desktop_visible_text", "target": "Zelyr Cross-Surface Confirmation", "expected": "CONFIRMED"},
+        {
+            "check": "desktop_visible_text",
+            "window": "Zelyr Cross-Surface Confirmation",
+            "selector": "#statusLabel",
+            "expected": "CONFIRMED",
+        },
     ])
 
     async def mock_stream(_payload):

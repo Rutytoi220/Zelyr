@@ -10,11 +10,16 @@ from __future__ import annotations
 import argparse
 import http.server
 import json
+import os
 import signal
 import sys
 import threading
 import time
 from typing import Any, Dict, List
+
+# Enable Qt Linux AT-SPI2 bridge inside the isolated test fixture without modifying host config.
+os.environ.setdefault("QT_ACCESSIBILITY", "1")
+os.environ.setdefault("QT_LINUX_ACCESSIBILITY_ALWAYS_ON", "1")
 
 from PySide6.QtCore import QEvent, QObject, Qt, Signal
 from PySide6.QtGui import QFont
@@ -163,11 +168,13 @@ class FixtureWindow(QWidget):
         )
         self.header_label = QLabel(header_title)
         self.header_label.setObjectName("headerLabel")
+        self.header_label.setAccessibleDescription("Fixture window header")
         self.header_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.header_label)
 
         self.status_label = QLabel()
         self.status_label.setObjectName("statusLabel")
+        self.status_label.setAccessibleDescription("Live fixture status indicator")
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
@@ -178,11 +185,16 @@ class FixtureWindow(QWidget):
             else "Command Note Input Field:"
         )
         input_hint = QLabel(hint_text)
+        input_hint.setObjectName("inputHintLabel")
         input_hint.setStyleSheet("font-size: 14px; color: #c9d1d9; font-weight: bold;")
         layout.addWidget(input_hint)
 
         self.input_field = QLineEdit()
         self.input_field.setObjectName("inputField")
+        self.input_field.setAccessibleName(
+            "Confirmation Payload Input" if self._cross_surface else "Command Note Input"
+        )
+        self.input_field.setAccessibleDescription("Text input field for desktop verification payload")
         self.input_field.setPlaceholderText(
             "Enter confirmation string and click Confirm..."
             if self._cross_surface
@@ -194,17 +206,20 @@ class FixtureWindow(QWidget):
 
         self.increment_btn = QPushButton("Increment Counter")
         self.increment_btn.setObjectName("incrementBtn")
+        self.increment_btn.setAccessibleName("Increment Counter")
         self.increment_btn.clicked.connect(self._on_increment)
         self.increment_btn.installEventFilter(self)
 
         apply_label = "Confirm" if self._cross_surface else "Apply Text"
         self.apply_btn = QPushButton(apply_label)
         self.apply_btn.setObjectName("applyBtn")
+        self.apply_btn.setAccessibleName(apply_label)
         self.apply_btn.clicked.connect(self._on_apply)
         self.apply_btn.installEventFilter(self)
 
         self.reset_btn = QPushButton("Reset State")
         self.reset_btn.setObjectName("resetBtn")
+        self.reset_btn.setAccessibleName("Reset State")
         self.reset_btn.clicked.connect(self._reset_ui_slot)
         self.reset_btn.installEventFilter(self)
 

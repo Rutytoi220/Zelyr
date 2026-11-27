@@ -822,6 +822,22 @@ class NativeOrchestrator:
         """Extract target resource identifier (e.g. file path) from tool arguments."""
         if not isinstance(func_args, dict):
             return None
+        fn_low = (func_name or "").lower()
+        if fn_low == "verify_outcome":
+            val = func_args.get("target") or func_args.get("window")
+            if val and isinstance(val, str) and val.strip():
+                base_val = val.strip()
+                sel_val = func_args.get("selector")
+                chk_low = str(func_args.get("check") or "").strip().lower()
+                if (
+                    chk_low.startswith("desktop_")
+                    and isinstance(sel_val, str)
+                    and sel_val.strip()
+                    and "::" not in base_val
+                ):
+                    return f"{base_val}::{sel_val.strip()}"
+                return base_val
+            return None
         for k in ("path", "filepath", "file", "target", "filename", "dst", "destination"):
             val = func_args.get(k)
             if val and isinstance(val, str) and val.strip():
@@ -4868,6 +4884,7 @@ class NativeOrchestrator:
                         _is_inspection_action,
                         canonicalize_target,
                         criterion_applies_to_target,
+                        criterion_canonical_target_raw,
                         extract_file_targets_from_text,
                         has_remaining_explicit_steps,
                         parse_acceptance_criteria,
@@ -4877,13 +4894,14 @@ class NativeOrchestrator:
                     _ver_t0 = time.monotonic()
                     try:
                         parsed_c = parse_acceptance_criteria(acceptance_spec)
-                        all_c_targets = [c.get("target", "") for c in parsed_c if c.get("target")]
+                        all_c_targets = [criterion_canonical_target_raw(c) or c.get("target", "") for c in parsed_c if c.get("target")]
                         c_results = []
                         by_target: Dict[str, List[Any]] = {}
                         for c in parsed_c:
                             vr = await OutcomeVerifier.verify_criterion_async(c)
                             c_results.append((c, vr))
-                            norm_ct = canonicalize_target(c.get("target", ""), check_type=c.get("check")) if c.get("target") else ""
+                            eff_ct = criterion_canonical_target_raw(c) or c.get("target", "")
+                            norm_ct = canonicalize_target(eff_ct, check_type=c.get("check")) if eff_ct else ""
                             if norm_ct:
                                 by_target.setdefault(norm_ct, []).append((c, vr))
                             if str(c.get("check", "")).lower() in ("command_output", "command", "cmd") and c.get("target"):
@@ -4898,16 +4916,17 @@ class NativeOrchestrator:
 
                     for norm_ct, items in by_target.items():
                         first_c = items[0][0]
+                        eff_rec_t = criterion_canonical_target_raw(first_c) or first_c["target"]
                         if all(r.success for _, r in items):
                             eff_ledger.record_target_verified(
-                                first_c["target"],
+                                eff_rec_t,
                                 detail=f"{first_c['check']} verified",
                                 check_type=first_c.get("check"),
                             )
                         else:
                             if hasattr(eff_ledger, "invalidate_target_verification"):
                                 eff_ledger.invalidate_target_verification(
-                                    first_c["target"],
+                                    eff_rec_t,
                                     check_type=first_c.get("check"),
                                 )
 
@@ -4961,7 +4980,7 @@ class NativeOrchestrator:
                             is_verified = True
                             criteria_failed = False
                             verified_targets_for_obs = [
-                                canonicalize_target(str(c.get("target")), check_type=c.get("check"))
+                                canonicalize_target(str(criterion_canonical_target_raw(c) or c.get("target")), check_type=c.get("check"))
                                 for c, _ in matching_pairs
                                 if c.get("target")
                             ]
@@ -4972,7 +4991,7 @@ class NativeOrchestrator:
                         for c, r in matching_pairs:
                             if not r.success:
                                 chk = c.get("check", "check")
-                                tgt = c.get("target") or tool_target
+                                tgt = criterion_canonical_target_raw(c) or c.get("target") or tool_target
                                 exp = c.get("expected")
                                 reason = r.error or "Observed state did not match expected criteria"
                                 crit_str = f"{chk} on {tgt}" + (f" (expected '{exp}')" if exp is not None else "")
@@ -5000,7 +5019,10 @@ class NativeOrchestrator:
                 if func_name == "verify_outcome" and str(res_str).lstrip().startswith("[VERIFIED]") and not is_failed and not criteria_failed:
                     is_verified = True
                     v_check_arg = str(func_args.get("check") or "").strip().lower()
-                    v_target_arg = tool_target or str(func_args.get("target") or "").strip()
+                    v_target_arg = tool_target or str(func_args.get("target") or func_args.get("window") or "").strip()
+                    v_sel_arg = str(func_args.get("selector") or "").strip()
+                    if v_target_arg and v_sel_arg and v_check_arg.startswith("desktop_") and "::" not in v_target_arg:
+                        v_target_arg = f"{v_target_arg}::{v_sel_arg}"
                     if v_target_arg:
                         eff_ledger.record_target_verified(v_target_arg, check_type=v_check_arg or None)
                         canon_vt = canonicalize_target(v_target_arg, check_type=v_check_arg or None)
@@ -5022,9 +5044,15 @@ class NativeOrchestrator:
                             )
                     elif fn_low in ("desktop_control", "desktop_automation", "manage_desktop_window", "interact_with_ui", "gui_actuate"):
                         if hasattr(eff_ledger, "invalidate_surface_verifications"):
+                            eff_win_tgt = (
+                                tool_target
+                                or str(func_args.get("expected_window") or func_args.get("window") or "").strip()
+                                or None
+                            )
                             eff_ledger.invalidate_surface_verifications(
                                 "desktop",
                                 exclude_targets=set(verified_targets_for_obs),
+                                window_target=eff_win_tgt,
                             )
 
                 if is_verified and not is_failed:
