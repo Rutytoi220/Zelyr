@@ -951,6 +951,8 @@ async def _execute_headless_run(
                     "response": final_answer,
                     "tool_calls": tool_calls_emitted,
                     "error": final_answer,
+                    "root_execution_status": res_outcome.execution_status.value,
+                    "root_verification_status": res_outcome.verification_status.value,
                     "execution_ledger": ledger.to_dict() if ledger is not None else TurnExecutionLedger().to_dict(),
                 }
                 if res_outcome.policy_compliance.get("has_prohibitions"):
@@ -969,6 +971,8 @@ async def _execute_headless_run(
                     "response": final_answer,
                     "tool_calls": tool_calls_emitted,
                     "truncated": True,
+                    "root_execution_status": res_outcome.execution_status.value,
+                    "root_verification_status": res_outcome.verification_status.value,
                     "execution_ledger": ledger.to_dict() if ledger is not None else TurnExecutionLedger().to_dict(),
                 }
                 if res_outcome.policy_compliance.get("has_prohibitions"):
@@ -992,6 +996,8 @@ async def _execute_headless_run(
                 "model": active_model,
                 "response": final_answer,
                 "tool_calls": tool_calls_emitted,
+                "root_execution_status": res_outcome.execution_status.value,
+                "root_verification_status": res_outcome.verification_status.value,
             }
             if reached_step_limit:
                 payload_dict["step_limit_exceeded"] = True

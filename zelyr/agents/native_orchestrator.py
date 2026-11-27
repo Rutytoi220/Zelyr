@@ -4807,7 +4807,8 @@ class NativeOrchestrator:
                 remedy_hint_out = str(obs_dict.get("remedy_hint") or "")
                 allowed_actions_out = list(obs_dict.get("allowed_actions") or [])
                 error_type_out = str(obs_dict.get("error_type") or "")
-                is_verified = (obs_dict.get("verified") is True)
+                # manage_desktop_window's verified=True confirms WM IPC focus/dispatch only, never root outcome verification.
+                is_verified = (obs_dict.get("verified") is True and func_name != "manage_desktop_window")
                 verification_detail = obs_dict.get("verification_detail") or obs_dict.get("summary")
 
                 try:
@@ -5128,7 +5129,26 @@ class NativeOrchestrator:
                         except Exception:
                             pass
 
-                if acceptance_spec and not is_failed and c_results and all(r.success for _, r in c_results):
+                _desktop_done_with_capture = False
+                if (
+                    acceptance_spec
+                    and not is_failed
+                    and not (c_results and all(r.success for _, r in c_results))
+                    and func_name in ("capture_screen", "desktop_control")
+                    and parsed_c
+                ):
+                    from zelyr.engine.execution_ledger import _assess_desktop_verification_state
+
+                    _d_st = _assess_desktop_verification_state(eff_ledger)
+                    _desktop_done_with_capture = (
+                        _d_st["last_desktop_mut_idx"] >= 0
+                        and not _d_st["trailing_unobserved_mutation"]
+                    )
+
+                if acceptance_spec and not is_failed and (
+                    (c_results and all(r.success for _, r in c_results))
+                    or _desktop_done_with_capture
+                ):
                     all_criteria_satisfied = all(
                         OutcomeVerifier.verify(check=c["check"], target=c["target"], expected=c.get("expected")).success
                         for c in (parsed_c or [])
@@ -6005,7 +6025,7 @@ class NativeOrchestrator:
                                     detail=verification_detail,
                                     check_type=vc.get("check"),
                                 )
-                elif raw_payload.get("verified") is True:
+                elif raw_payload.get("verified") is True and func_name != "manage_desktop_window":
                     is_verified = True
                     outcome_passed = True
                     verification_detail = str(raw_payload.get("verification_detail") or "Verified")

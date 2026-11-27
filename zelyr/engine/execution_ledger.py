@@ -2349,7 +2349,8 @@ class TurnExecutionLedger:
             if not effective_error:
                 effective_error = parsed_output.get("error") or parsed_output.get("detail")
             raw_p_ver = parsed_output.get("verified")
-            if not effective_verified and isinstance(raw_p_ver, bool) and raw_p_ver is True:
+            rec_tool_name = (old.tool_name if old else "").strip().lower()
+            if not effective_verified and isinstance(raw_p_ver, bool) and raw_p_ver is True and rec_tool_name != "manage_desktop_window":
                 effective_verified = True
             raw_p_vf = parsed_output.get("verification_failed")
             if (isinstance(raw_p_vf, bool) and raw_p_vf is True) or (
@@ -2902,7 +2903,7 @@ class TurnExecutionLedger:
             out["execution_id"] = self._execution_id
             if self._verification_status_override is not None:
                 out["verification_status"] = self._verification_status_override
-            elif self.verified_actions():
+            elif self.verified_actions() and not _assess_desktop_verification_state(self)["has_only_window_ipc_verified"]:
                 out["verification_status"] = VerificationStatus.VERIFIED.value
             elif any(getattr(r, "verification_failed", False) for r in records):
                 out["verification_status"] = VerificationStatus.VERIFICATION_FAILED.value
@@ -3284,6 +3285,7 @@ def _assess_desktop_verification_state(ledger: Optional[Any]) -> Dict[str, Any]:
         "last_click_idx": -1,
         "last_type_idx": -1,
         "has_verified_desktop_mut": False,
+        "has_only_window_ipc_verified": False,
         "has_only_pre_mutation_or_window_verified": False,
         "trailing_unobserved_mutation": False,
     }
@@ -3333,6 +3335,11 @@ def _assess_desktop_verification_state(ledger: Optional[Any]) -> Dict[str, Any]:
         and not state["has_verified_desktop_mut"]
     )
     state["trailing_unobserved_mutation"] = trailing_unobserved
+    if verified_indices:
+        state["has_only_window_ipc_verified"] = all(
+            (r.tool_name or "").strip().lower() == "manage_desktop_window"
+            for _, r in verified_indices
+        )
     if trailing_unobserved and verified_indices:
         state["has_only_pre_mutation_or_window_verified"] = all(
             ((r.tool_name or "").strip().lower() == "manage_desktop_window" or v_idx < last_mut_idx)
@@ -3385,14 +3392,27 @@ def resolve_root_execution_outcome(
     has_ver_fail_unresolved = any(getattr(r, "verification_failed", False) for r in unresolved_recs)
 
     eff_v_results: List[Tuple[str, str, Any]] = list(v_results) if v_results is not None else []
-    if (
-        has_verified
-        and not eff_v_results
-        and not verified_targets
-        and desktop_ver_state["trailing_unobserved_mutation"]
-        and desktop_ver_state["has_only_pre_mutation_or_window_verified"]
-    ):
-        has_verified = False
+    if has_verified and not eff_v_results:
+        verified_recs = (
+            list(ledger.verified_actions())
+            if (ledger is not None and hasattr(ledger, "verified_actions"))
+            else []
+        )
+        non_window_verified_actions = any(
+            (r.tool_name or "").strip().lower() != "manage_desktop_window"
+            for r in verified_recs
+        )
+        # Window-focus/IPC confirmation proves window focus dispatch only, never whole-task outcome acceptance.
+        if not non_window_verified_actions and (
+            desktop_ver_state["has_only_window_ipc_verified"] or not verified_targets
+        ):
+            has_verified = False
+        elif (
+            not verified_targets
+            and desktop_ver_state["trailing_unobserved_mutation"]
+            and desktop_ver_state["has_only_pre_mutation_or_window_verified"]
+        ):
+            has_verified = False
     eff_invalid_spec = invalid_verify_spec_error
     if v_results is None and acceptance_spec is not None and not eff_invalid_spec:
         if isinstance(acceptance_spec, str) and not acceptance_spec.strip():
@@ -3651,6 +3671,34 @@ def resolve_root_execution_outcome(
             v_results=eff_v_results,
             all_v_ok=all_v_ok,
             has_unresolved=True,
+            verified_targets=verified_targets,
+            exit_code=2,
+        )
+
+    if (
+        total_acts > 0
+        and _has_requested_desktop_interaction(prompt, require_mutation=True)
+        and desktop_ver_state["last_desktop_mut_idx"] < 0
+    ):
+        ver_st = (
+            VerificationStatus.VERIFIED
+            if (eff_v_results and all_v_ok) or has_verified
+            else (
+                VerificationStatus.CLAIMED_UNVERIFIED
+                if detect_false_success(final_text, has_unresolved=True)
+                else VerificationStatus.NOT_VERIFIED
+            )
+        )
+        return RootOutcomeResolution(
+            execution_status=ExecutionStatus.FAILED,
+            verification_status=ver_st,
+            error="Requested Linux desktop GUI actions were not executed",
+            interruption_reason="unfulfilled_desktop_actions",
+            diagnostic_failures_only=False,
+            policy_compliance=policy_compliance,
+            v_results=eff_v_results,
+            all_v_ok=all_v_ok,
+            has_unresolved=False,
             verified_targets=verified_targets,
             exit_code=2,
         )
@@ -4061,6 +4109,43 @@ def _is_requested_mutation_target(user_prompt: str, target_path: str) -> bool:
     return False
 
 
+def _has_requested_desktop_interaction(user_prompt: str, *, require_mutation: bool = False) -> bool:
+    """Return True if user_prompt explicitly instructs desktop GUI actuation/verification."""
+    if not user_prompt or not isinstance(user_prompt, str):
+        return False
+    cleaned = re.sub(r"```.*?```", " ", user_prompt, flags=re.DOTALL)
+    cleaned = re.sub(
+        r"\b(?:do\s+not|don'?t|never|must\s+not|should\s+not|cannot|can'?t|avoid|without)\s+.*?(?=\.(?:\s|$)|[,;!?:\n]|$)",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    has_surface = bool(
+        re.search(
+            r"\b(?:on\s+(?:your\s+)?(?:linux\s+)?desktop|observe\s+window|desktop_control|desktop\s+window|window\s+screenshot|confirmation\s+window)\b",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+    )
+    if require_mutation:
+        has_action = bool(
+            re.search(
+                r"\b(?:enter|type|click|press|submit)\b",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+        )
+    else:
+        has_action = bool(
+            re.search(
+                r"\b(?:enter|type|click|press|submit|confirm|capture|screenshot)\b",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+        )
+    return has_surface and has_action
+
+
 def has_remaining_explicit_steps(
     user_prompt: str,
     ledger: TurnExecutionLedger,
@@ -4158,6 +4243,12 @@ def has_remaining_explicit_steps(
             )
             if count < target_count:
                 return True
+
+    # 5. Check for unfulfilled requested Linux desktop GUI interactions or trailing unverified desktop actions
+    if _has_requested_desktop_interaction(user_prompt):
+        desktop_ver_state = _assess_desktop_verification_state(ledger)
+        if desktop_ver_state["last_desktop_mut_idx"] < 0 or desktop_ver_state["trailing_unobserved_mutation"]:
+            return True
 
     return False
 
@@ -4311,8 +4402,16 @@ def find_unfulfilled_task_requirements(
                 if rep_desc not in unfulfilled_outcomes:
                     unfulfilled_outcomes.append(rep_desc)
 
-    # 4b. Check trailing unobserved desktop GUI mutations when visual verification was established or requested
+    # 4b. Check requested desktop GUI actuation and trailing unobserved desktop mutations
     desktop_ver_state = _assess_desktop_verification_state(ledger)
+    if _has_requested_desktop_interaction(user_prompt, require_mutation=True) and desktop_ver_state["last_desktop_mut_idx"] < 0:
+        pending_dt_desc = (
+            "Requested Linux desktop GUI input/submission action has not yet been executed; "
+            "call 'capture_screen' on the target window, execute the requested 'desktop_control' "
+            "input/submission, and call 'capture_screen' afterward to confirm completion."
+        )
+        if pending_dt_desc not in unfulfilled_outcomes:
+            unfulfilled_outcomes.append(pending_dt_desc)
     if desktop_ver_state["trailing_unobserved_mutation"]:
         prompt_low = (user_prompt or "").lower()
         has_visual_verify_request = bool(

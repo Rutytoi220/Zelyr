@@ -59,6 +59,46 @@ FIXTURE_SCRIPT = REPO_ROOT / "scripts" / "desktop_test_fixture.py"
 DEFAULT_DESKTOP_TITLE = "Zelyr Cross-Surface Confirmation"
 DEFAULT_DISTRACTION_TITLE = "Zelyr Distraction Window"
 
+SCENARIO_SPECS: Dict[str, Dict[str, Any]] = {
+    "browser_fs": {
+        "description": "Browser + HTTP API + filesystem workflow (no desktop GUI)",
+        "requires_desktop": False,
+        "requires_distraction": False,
+        "fail_browser_dom": False,
+    },
+    "browser_failure_no_gui": {
+        "description": "Browser DOM invalidation recovery + HTTP API + filesystem workflow (no desktop GUI)",
+        "requires_desktop": False,
+        "requires_distraction": False,
+        "fail_browser_dom": True,
+    },
+    "normal": {
+        "description": "Combined 4-surface workflow (browser + HTTP API + filesystem + single desktop fixture)",
+        "requires_desktop": True,
+        "requires_distraction": False,
+        "fail_browser_dom": False,
+    },
+    "browser_failure": {
+        "description": "Browser DOM invalidation recovery inside combined 4-surface workflow",
+        "requires_desktop": True,
+        "requires_distraction": False,
+        "fail_browser_dom": True,
+    },
+    "desktop_focus_loss": {
+        "description": "Hyprland FOCUS_LOST interference + recovery in isolated two-window WS 15 setup",
+        "requires_desktop": True,
+        "requires_distraction": True,
+        "fail_browser_dom": False,
+    },
+}
+
+DEFAULT_SCENARIOS: List[str] = ["browser_fs", "normal", "browser_failure", "desktop_focus_loss"]
+
+INTERNAL_VERIFIER_UNSUPPORTED_LIMITATIONS: List[str] = [
+    "OutcomeVerifier supports file_exists, file_contains, file_checksum, file_json, process_running, port_listening, and allowlisted command_output only.",
+    "Browser DOM state, REST HTTP API responses, and PySide6 desktop widget state are outside OutcomeVerifier's supported scope and are verified independently by external_validation.",
+]
+
 INITIAL_RECORDS: Dict[str, Dict[str, Any]] = {
     "REC-101": {
         "record_id": "REC-101",
@@ -466,10 +506,12 @@ class IsolatedChromiumSession:
                 time.sleep(0.1)
 
         if not self.socket_path.exists():
+            self._kill_proc()
             raise RuntimeError(f"Isolated Native Messaging socket did not appear at {self.socket_path}.")
 
         client = NativeBrowserClient(socket_path=self.socket_path)
         if not asyncio.run(client.is_available()):
+            self._kill_proc()
             raise RuntimeError(f"Isolated Native Messaging host at {self.socket_path} did not answer ping.")
         return self
 
@@ -483,6 +525,7 @@ def setup_cross_surface_workspace(
     *,
     target_record: str = "REC-204",
     desktop_title: str = DEFAULT_DESKTOP_TITLE,
+    requires_desktop: bool = True,
 ) -> Dict[str, Any]:
     """Create isolated filesystem workspace with empty out/, task_spec.json, and expected_result.json."""
     ws_dir.mkdir(parents=True, exist_ok=True)
@@ -493,7 +536,7 @@ def setup_cross_surface_workspace(
     task_spec_path = ws_dir / "task_spec.json"
     expected_result_path = ws_dir / "expected_result.json"
 
-    task_spec = {
+    task_spec: Dict[str, Any] = {
         "workflow": "cross_surface_verification",
         "web_dashboard_url": f"{base_url}/",
         "target_record_id": target_record,
@@ -511,25 +554,29 @@ def setup_cross_surface_workspace(
             "confirmation_token",
             "status",
         ],
-        "desktop_window_title": desktop_title,
-        "desktop_confirmation_button": "Confirm",
-        "confirmation_payload_template": "<record_id>:<confirmation_token>:<status>",
+        "desktop_interaction_required": bool(requires_desktop),
     }
+    if requires_desktop:
+        task_spec["desktop_window_title"] = desktop_title
+        task_spec["desktop_confirmation_button"] = "Confirm"
+        task_spec["confirmation_payload_template"] = "<record_id>:<confirmation_token>:<status>"
     task_spec_path.write_text(json.dumps(task_spec, indent=2) + "\n", encoding="utf-8")
 
     expected_rec = copy.deepcopy(INITIAL_RECORDS[target_record])
     expected_rec["status"] = "APPROVED"
-    expected_result = {
+    expected_result: Dict[str, Any] = {
         "target_record_id": target_record,
         "expected_record": expected_rec,
         "unrelated_records": {
             k: copy.deepcopy(v) for k, v in INITIAL_RECORDS.items() if k != target_record
         },
-        "expected_desktop_confirmation_text": (
-            f"{target_record}:{expected_rec['confirmation_token']}:APPROVED"
-        ),
-        "expected_desktop_status_prefix": "CONFIRMED:",
+        "desktop_interaction_required": bool(requires_desktop),
     }
+    if requires_desktop:
+        expected_result["expected_desktop_confirmation_text"] = (
+            f"{target_record}:{expected_rec['confirmation_token']}:APPROVED"
+        )
+        expected_result["expected_desktop_status_prefix"] = "CONFIRMED:"
     expected_result_path.write_text(json.dumps(expected_result, indent=2) + "\n", encoding="utf-8")
 
     return {
@@ -540,27 +587,71 @@ def setup_cross_surface_workspace(
         "report_json_path": report_json,
         "report_md_path": report_md,
         "expected_result": expected_result,
+        "requires_desktop": bool(requires_desktop),
     }
 
 
-def build_cross_surface_prompt(base_url: str, ws_info: Dict[str, Any], *, desktop_title: str) -> str:
+def build_cross_surface_prompt(
+    base_url: str,
+    ws_info: Dict[str, Any],
+    *,
+    desktop_title: str = DEFAULT_DESKTOP_TITLE,
+    requires_desktop: Optional[bool] = None,
+) -> str:
     """Build a crisp, non-prescriptive cross-surface workflow prompt."""
-    return (
-        f"Complete this cross-surface verification workflow:\n"
+    use_desktop = bool(ws_info.get("requires_desktop", True)) if requires_desktop is None else bool(requires_desktop)
+    steps = [
         f"1. Use Chromium browser automation (do NOT use curl or shell commands to inspect web pages "
         f"or approve records): open {base_url}/, navigate to REC-204's detail page, and click the "
-        f"approval control on the page so its status becomes APPROVED. Leave all other records unchanged.\n"
-        f"2. Run a read-only HTTP GET command against {base_url}/api/records/REC-204 to verify the stored "
-        f"fields and APPROVED status.\n"
+        f"approval control on the page so its status becomes APPROVED. Leave all other records unchanged.",
+        f"2. Outside Chromium (via a read-only shell HTTP GET request, not browser navigation), query "
+        f"{base_url}/api/records/REC-204 to verify the stored fields and APPROVED status.",
         f"3. Write the verified record JSON to {ws_info['report_json_path']} with keys "
         f"record_id, service, owner, region, score, confirmation_token, status, and write a concise "
-        f"Markdown summary with those same verified details to {ws_info['report_md_path']}.\n"
-        f"4. On your Linux desktop (outside Chromium), observe window '{desktop_title}', enforce focused "
-        f"window '{desktop_title}' on every desktop input action, enter "
-        f"'<record_id>:<confirmation_token>:<status>' (using the live verified values) into its input field "
-        f"and submit via 'Confirm' or Enter, then capture a zoomed window screenshot of '{desktop_title}' "
-        f"afterward to confirm completion."
+        f"Markdown summary with those same verified details to {ws_info['report_md_path']}.",
+    ]
+    if use_desktop:
+        steps.append(
+            f"4. On your Linux desktop (outside Chromium), observe window '{desktop_title}', enforce focused "
+            f"window '{desktop_title}' on every desktop input action, enter "
+            f"'<record_id>:<confirmation_token>:<status>' (using the live verified values) into its input field "
+            f"and submit via 'Confirm' or Enter, then capture a window-targeted screenshot of '{desktop_title}' "
+            f"afterward to confirm completion."
+        )
+    header = (
+        "Complete this cross-surface verification workflow:"
+        if use_desktop
+        else "Complete this browser and filesystem verification workflow:"
     )
+    return header + "\n" + "\n".join(steps)
+
+
+def build_cross_surface_verify_spec(ws_info: Dict[str, Any]) -> str:
+    """Build OutcomeVerifier --verify criteria covering supported filesystem deliverables without exposing oracle tokens."""
+    report_json = ws_info["report_json_path"]
+    report_md = ws_info["report_md_path"]
+    return ";".join([
+        f"file_json:{report_json}:record_id,service,owner,region,score,confirmation_token,status",
+        f"file_contains:{report_json}:APPROVED",
+        f"file_contains:{report_md}:APPROVED",
+    ])
+
+
+def _cleanup_cross_surface_fixtures(
+    *procs_and_ports: Tuple[Optional[subprocess.Popen[bytes]], Optional[int]],
+) -> None:
+    """Tear down each fixture process independently so a cleanup error on one never skips another."""
+    for proc, port in procs_and_ports:
+        if proc is None and port is None:
+            continue
+        try:
+            _cleanup_fixture_processes((proc, port))
+        except Exception:
+            if proc is not None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
 
 
 def _run_cross_surface_cli(
@@ -572,6 +663,7 @@ def _run_cross_surface_cli(
     native_socket: Path,
     timeout_s: float = 540.0,
     base_url: Optional[str] = None,
+    verify_spec: Optional[str] = None,
 ) -> Dict[str, Any]:
     cmd = [
         "uv",
@@ -589,6 +681,8 @@ def _run_cross_surface_cli(
     ]
     if base_url:
         cmd.extend(["--base-url", base_url])
+    if verify_spec is not None:
+        cmd.extend(["--verify", verify_spec])
     env = os.environ.copy()
     env["ZELYR_AUTOPILOT"] = "1"
     env.setdefault("ZELYR_NUM_CTX", "8192")
@@ -636,6 +730,7 @@ def _run_cross_surface_cli(
 
     return {
         "cmd": cmd,
+        "verify_spec": verify_spec,
         "start_ts": start_ts,
         "end_ts": end_ts,
         "duration_s": elapsed_s,
@@ -653,14 +748,17 @@ def evaluate_cross_surface_run(
     run_info: Dict[str, Any],
     web_audit: Dict[str, Any],
     ws_info: Dict[str, Any],
-    desktop_before: Dict[str, Any],
-    desktop_after: Dict[str, Any],
+    desktop_before: Optional[Dict[str, Any]] = None,
+    desktop_after: Optional[Dict[str, Any]] = None,
     distraction_after: Optional[Dict[str, Any]] = None,
     steal_telemetry: Optional[Dict[str, Any]] = None,
     desktop_title: str = DEFAULT_DESKTOP_TITLE,
     distraction_title: str = DEFAULT_DISTRACTION_TITLE,
+    requires_desktop: Optional[bool] = None,
+    fixture_launched: Optional[bool] = None,
+    verify_spec_requested: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Fail-closed independent validator returning PASS, FAIL, or UNVERIFIED."""
+    """Fail-closed independent validator separating internal verification from external validation."""
     from zelyr.engine.execution_ledger import _is_inspection_action
 
     cli_json = run_info.get("cli_json") if isinstance(run_info.get("cli_json"), dict) else {}
@@ -754,51 +852,155 @@ def evaluate_cross_surface_run(
     out_files = sorted(p.name for p in Path(ws_info["out_dir"]).iterdir()) if Path(ws_info["out_dir"]).is_dir() else []
     workspace_clean = set(out_files) == {"report.json", "report.md"}
 
-    # 4. Desktop confirmation state & unrelated distraction safety
-    exp_desktop_text = expected["expected_desktop_confirmation_text"]
-    desktop_confirmed = (
-        desktop_after.get("applied_text") == exp_desktop_text
-        and str(desktop_after.get("status_text") or "").startswith("CONFIRMED:")
-        and int(desktop_after.get("key_presses", 0)) >= 1
-    )
-    desktop_observed_after = False
-    last_mut_idx = -1
-    last_obs_idx = -1
-    for i, rec in enumerate(records):
-        if rec.get("state") not in ("success", "verified"):
-            continue
-        tn = rec.get("tool_name")
-        act = str((rec.get("arguments") or {}).get("action") or "").lower()
-        if tn == "desktop_control" and act in _MUTATING_DESKTOP_ACTIONS:
-            last_mut_idx = i
-        elif tn == "capture_screen" or (tn == "desktop_control" and act in ("observe", "screenshot")):
-            last_obs_idx = i
-    desktop_observed_after = last_mut_idx >= 0 and last_obs_idx > last_mut_idx
-
-    distraction_untouched = True
-    if distraction_after is not None:
-        distraction_untouched = (
-            int(distraction_after.get("mouse_clicks", 0)) == 0
-            and int(distraction_after.get("key_presses", 0)) == 0
+    # 4. Desktop confirmation state & unrelated distraction safety (only when scenario requires desktop GUI)
+    spec_defaults = SCENARIO_SPECS.get(scenario, {})
+    eff_requires_desktop = (
+        bool(requires_desktop)
+        if requires_desktop is not None
+        else (
+            bool(ws_info.get("requires_desktop"))
+            if "requires_desktop" in ws_info
+            else bool(spec_defaults.get("requires_desktop", True))
         )
+    )
+    eff_fixture_launched = bool(fixture_launched) if fixture_launched is not None else eff_requires_desktop
+    desktop_after_dict = desktop_after if isinstance(desktop_after, dict) else {}
 
-    # 5. Ledger & CLI integrity
+    if eff_requires_desktop:
+        exp_desktop_text = str(expected.get("expected_desktop_confirmation_text") or "")
+        desktop_confirmed = (
+            bool(exp_desktop_text)
+            and desktop_after_dict.get("applied_text") == exp_desktop_text
+            and str(desktop_after_dict.get("status_text") or "").startswith("CONFIRMED:")
+            and int(desktop_after_dict.get("key_presses", 0)) >= 1
+        )
+        desktop_observed_after = False
+        last_mut_idx = -1
+        last_obs_idx = -1
+        for i, rec in enumerate(records):
+            if rec.get("state") not in ("success", "verified"):
+                continue
+            tn = rec.get("tool_name")
+            act = str((rec.get("arguments") or {}).get("action") or "").lower()
+            if tn == "desktop_control" and act in _MUTATING_DESKTOP_ACTIONS:
+                last_mut_idx = i
+            elif tn == "capture_screen" or (tn == "desktop_control" and act in ("observe", "screenshot")):
+                last_obs_idx = i
+        desktop_observed_after = last_mut_idx >= 0 and last_obs_idx > last_mut_idx
+
+        distraction_untouched = True
+        if distraction_after is not None:
+            distraction_untouched = (
+                int(distraction_after.get("mouse_clicks", 0)) == 0
+                and int(distraction_after.get("key_presses", 0)) == 0
+            )
+    else:
+        desktop_confirmed = True
+        desktop_observed_after = True
+        distraction_untouched = not eff_fixture_launched
+
+    # 5. Internal Zelyr verification & root ledger inspection (never synthesized from external validator state)
+    central_meta = central.get("metadata") if isinstance(central.get("metadata"), dict) else {}
+    eff_verify_spec = (
+        verify_spec_requested
+        if verify_spec_requested is not None
+        else (
+            run_info.get("verify_spec")
+            if run_info.get("verify_spec") is not None
+            else (central_meta.get("acceptance_criteria") if isinstance(central_meta.get("acceptance_criteria"), str) else None)
+        )
+    )
+    cli_ver = cli_json.get("verification") if isinstance(cli_json.get("verification"), dict) else None
+    central_verifications = central.get("verifications") if isinstance(central.get("verifications"), list) else []
+    root_execution_status = str(
+        central.get("status")
+        or cli_json.get("root_execution_status")
+        or (
+            "unavailable"
+            if not (cli_json or central)
+            else ("completed_unverified" if run_info.get("returncode") == 0 else "failed")
+        )
+    )
+    root_verification_status = str(
+        central.get("verification_status")
+        or cli_json.get("root_verification_status")
+        or exec_ledger.get("verification_status")
+        or "unavailable"
+    )
+    internal_requested = bool(eff_verify_spec) or (cli_ver is not None)
+    internal_available = bool(cli_json or central) and (
+        not bool(eff_verify_spec) or cli_ver is not None or bool(central_verifications)
+    )
+    if not (cli_json or central):
+        internal_layer_status = "unavailable"
+        internal_passed: Optional[bool] = None
+    elif not internal_requested:
+        internal_layer_status = "not_requested"
+        internal_passed = None
+    elif not internal_available:
+        internal_layer_status = "unavailable"
+        internal_passed = None
+    else:
+        internal_passed = (
+            bool(cli_ver.get("success"))
+            if cli_ver is not None
+            else (root_verification_status == "verified")
+        )
+        internal_layer_status = "passed" if internal_passed else "failed"
+
+    if cli_ver is not None:
+        if isinstance(cli_ver.get("checks"), list):
+            internal_checks: List[Dict[str, Any]] = list(cli_ver["checks"])
+        else:
+            internal_checks = [cli_ver]
+    else:
+        internal_checks = list(central_verifications)
+
+    unsupported_surfaces = ["web_dom", "http_api"] + (["desktop_gui"] if eff_requires_desktop else [])
+    internal_limitations = list(INTERNAL_VERIFIER_UNSUPPORTED_LIMITATIONS)
+    if internal_layer_status == "not_requested":
+        internal_limitations.append("No CLI --verify criteria were supplied for this run.")
+    elif internal_layer_status == "unavailable":
+        internal_limitations.append("Internal CLI/ledger verification telemetry was unavailable or missing.")
+
+    internal_verification: Dict[str, Any] = {
+        "requested": internal_requested,
+        "verify_spec": eff_verify_spec,
+        "available": internal_available,
+        "layer_status": internal_layer_status,
+        "scope": "filesystem_artifacts_only" if internal_requested else "none",
+        "passed": internal_passed,
+        "checks": internal_checks,
+        "unsupported_surfaces": unsupported_surfaces,
+        "limitations": internal_limitations,
+    }
+
     unresolved_list = exec_ledger.get("unresolved_failures") if isinstance(exec_ledger.get("unresolved_failures"), list) else []
     has_unresolved_flag = exec_ledger.get("has_unresolved_failures")
     if has_unresolved_flag is None:
         has_unresolved_flag = bool(unresolved_list)
+    min_records = 3 if not eff_requires_desktop else 4
     cli_outcome_ok = (
         run_info.get("returncode") == 0
         and has_unresolved_flag is False
         and len(unresolved_list) == 0
-        and central.get("status") in ("completed", "completed_unverified")
+        and root_execution_status in ("completed", "completed_unverified")
         and central.get("error") in (None, "")
-        and central.get("verification_status") not in ("verification_failed", "failed")
-        and len(records) >= 4
+        and root_verification_status not in ("verification_failed", "failed", "claimed_unverified", "unavailable")
+        and len(records) >= min_records
+        and (
+            not internal_requested
+            or (
+                internal_available
+                and internal_passed is True
+                and root_execution_status == "completed"
+                and root_verification_status == "verified"
+            )
+        )
     )
 
-    checks: Dict[str, Any] = {
-        "evidence_present": bool(cli_json and records and reqs),
+    external_checks: Dict[str, Any] = {
+        "evidence_present": bool(cli_json and records and reqs and (not eff_requires_desktop or desktop_after is not None)),
         "browser_dashboard_visited": visited_dash,
         "browser_detail_visited": visited_detail,
         "target_web_approved": target_web_ok,
@@ -808,16 +1010,20 @@ def evaluate_cross_surface_run(
         "report_json_accurate": json_ok,
         "report_md_accurate": md_ok,
         "workspace_clean": workspace_clean,
-        "desktop_confirmed": desktop_confirmed,
-        "desktop_visual_verified_after_mut": desktop_observed_after,
-        "distraction_untouched": distraction_untouched,
-        "cli_and_ledger_consistent": cli_outcome_ok,
     }
+    if eff_requires_desktop:
+        external_checks.update({
+            "desktop_confirmed": desktop_confirmed,
+            "desktop_visual_verified_after_mut": desktop_observed_after,
+            "distraction_untouched": distraction_untouched,
+        })
+    else:
+        external_checks["no_desktop_fixture_launched"] = not eff_fixture_launched
 
     unverified_reasons: List[str] = []
     fail_reasons: List[str] = []
 
-    if scenario == "browser_failure":
+    if scenario in ("browser_failure", "browser_failure_no_gui"):
         dom_events = web_audit.get("dom_invalidated_events") or []
         first_dom_ts = float(dom_events[0]["ts"]) if dom_events else None
         elem_fail_idx = next(
@@ -856,13 +1062,14 @@ def evaluate_cross_surface_run(
             and bool(approve_indices)
             and float(reqs[approve_indices[0]]["ts"]) > first_dom_ts
         )
-        checks.update({
+        checks_recovery = {
             "browser_dom_invalidated": bool(dom_events),
             "browser_failed_element_not_found": browser_fail_classified,
             "browser_snapshot_refreshed_after_fail": refresh_after_fail,
             "browser_retry_succeeded": retry_after_refresh_idx is not None,
             "no_mutation_before_invalidation": no_approve_before_invalidation,
-        })
+        }
+        external_checks.update(checks_recovery)
         if not dom_events or not browser_fail_classified:
             unverified_reasons.append("browser failure was bypassed or not encountered in ledger")
         if bool(approve_indices) and not no_approve_before_invalidation:
@@ -880,14 +1087,15 @@ def evaluate_cross_surface_run(
             tgt = str(args.get("expected_window") or args.get("window") or args.get("target") or "").lower()
             return bool(tgt) and (desktop_title.lower() in tgt or tgt in desktop_title.lower())
 
-        def _matches_initial_obs(args: Any) -> bool:
+        def _matches_initial_obs(args: Any, *, allow_omitted_scope: bool = False) -> bool:
             if _matches_fix(args):
                 return True
             if not isinstance(args, dict):
                 return False
             tgt_scope = str(args.get("target") or "").strip().lower()
+            valid_scopes = ("active_monitor", "active_window", "full", "") if allow_omitted_scope else ("active_monitor", "active_window", "full")
             return (
-                tgt_scope in ("active_monitor", "active_window", "full")
+                tgt_scope in valid_scopes
                 and desktop_title.lower() in str(pre_active.get("title") or "").lower()
             )
 
@@ -899,7 +1107,7 @@ def evaluate_cross_surface_run(
                 or (
                     r.get("tool_name") == "desktop_control"
                     and str((r.get("arguments") or {}).get("action") or "").lower() in ("observe", "screenshot")
-                    and _matches_initial_obs(r.get("arguments"))
+                    and _matches_initial_obs(r.get("arguments"), allow_omitted_scope=True)
                 )
             )
         ]
@@ -965,7 +1173,7 @@ def evaluate_cross_surface_run(
             and records[i].get("state") in ("success", "verified")
             for i in state_changing_mut_indices
         )
-        checks.update({
+        external_checks.update({
             "desktop_initial_observation": first_obs_idx is not None and (first_mut_idx is None or first_obs_idx < first_mut_idx),
             "desktop_controlled_interference": interference_ok,
             "desktop_focus_lost_rejected": first_mut_focus_lost,
@@ -976,23 +1184,51 @@ def evaluate_cross_surface_run(
         if not interference_ok or not first_mut_focus_lost or proactive_focus_bypass:
             unverified_reasons.append("FOCUS_LOST was bypassed or deterministic focus-steal evidence incomplete")
 
-    if not checks["evidence_present"]:
+    if not external_checks["evidence_present"]:
         unverified_reasons.append("missing CLI JSON, ledger records, or HTTP server telemetry")
+
+    ext_fail_reasons = [k for k, v in external_checks.items() if not v]
+    if unverified_reasons:
+        external_validation_status = "UNVERIFIED"
+    elif all(external_checks.values()):
+        external_validation_status = "PASS"
+    else:
+        external_validation_status = "FAIL"
+
+    checks: Dict[str, Any] = {
+        **external_checks,
+        "cli_and_ledger_consistent": cli_outcome_ok,
+    }
+    if internal_requested:
+        checks["internal_verification_passed"] = bool(internal_available and internal_passed is True)
 
     for k, v in checks.items():
         if not v:
             fail_reasons.append(k)
 
     if unverified_reasons:
-        verdict = "UNVERIFIED"
+        benchmark_status = "UNVERIFIED"
     elif all(checks.values()):
-        verdict = "PASS"
+        benchmark_status = "PASS"
     else:
-        verdict = "FAIL"
+        benchmark_status = "FAIL"
 
     return {
         "scenario": scenario,
-        "verdict": verdict,
+        "verdict": benchmark_status,
+        "benchmark_status": benchmark_status,
+        "external_validation_status": external_validation_status,
+        "root_execution_status": root_execution_status,
+        "root_verification_status": root_verification_status,
+        "requires_desktop": eff_requires_desktop,
+        "fixture_launched": eff_fixture_launched,
+        "internal_verification": internal_verification,
+        "external_validation": {
+            "status": external_validation_status,
+            "checks": external_checks,
+            "failed_checks": ext_fail_reasons,
+            "unverified_reasons": list(unverified_reasons),
+        },
         "checks": checks,
         "unverified_reasons": unverified_reasons,
         "failed_checks": fail_reasons,
@@ -1027,26 +1263,35 @@ def _save_run_artifacts(
         "",
         f"- **Timestamp:** {report['timestamp']}",
         f"- **Model:** `{report['model']}` (`num_ctx={report['num_ctx']}`, `max_steps={report['max_steps']}`)",
+        f"- **Verify Mode:** `{report.get('verify_mode', 'filesystem')}`",
         f"- **Passed Scenarios:** {report['passed_count']}/{report['total_count']}",
         "",
-        "| Scenario | Verdict | CLI Exit | Duration (s) | Ledger Status | Unresolved |",
-        "|---|---|---:|---:|---|---:|",
+        "| Scenario | Benchmark | External Validation | Root Execution | Root Verification | Internal Scope | Desktop Fixture | Exit | Duration (s) | Unresolved |",
+        "|---|---|---|---|---|---|---|---:|---:|---:|",
     ]
     for r in report["scenarios"]:
         cli_j = r.get("cli_json") if isinstance(r.get("cli_json"), dict) else {}
         ex_l = cli_j.get("execution_ledger") if isinstance(cli_j.get("execution_ledger"), dict) else {}
-        cen_l = r.get("ledger") if isinstance(r.get("ledger"), dict) else {}
         unres = len(ex_l.get("unresolved_failures") or []) if isinstance(ex_l.get("unresolved_failures"), list) else -1
+        int_v = r.get("internal_verification") if isinstance(r.get("internal_verification"), dict) else {}
         lines.append(
-            f"| `{r['scenario']}` | **{r['verdict']}** | {r['returncode']} | {r['duration_s']} | "
-            f"`{cen_l.get('status')}` | {unres} |"
+            f"| `{r['scenario']}` | **{r.get('benchmark_status', r['verdict'])}** | "
+            f"**{r.get('external_validation_status', '')}** | `{r.get('root_execution_status', '')}` | "
+            f"`{r.get('root_verification_status', '')}` | `{int_v.get('scope', 'none')}` | "
+            f"`{r.get('fixture_launched', True)}` | {r['returncode']} | {r['duration_s']} | {unres} |"
         )
     lines.append("")
     for r in report["scenarios"]:
+        int_v = r.get("internal_verification") if isinstance(r.get("internal_verification"), dict) else {}
+        ext_v = r.get("external_validation") if isinstance(r.get("external_validation"), dict) else {}
         lines.extend([
-            f"## Scenario `{r['scenario']}` — `{r['verdict']}`",
+            f"## Scenario `{r['scenario']}` — `{r.get('benchmark_status', r['verdict'])}`",
             "",
-            f"- **Failed checks:** {r['validation'].get('failed_checks')}",
+            f"- **External validation status:** `{r.get('external_validation_status')}` (failed: {ext_v.get('failed_checks')})",
+            f"- **Root ledger statuses:** execution=`{r.get('root_execution_status')}`, verification=`{r.get('root_verification_status')}`",
+            f"- **Internal verification:** requested={int_v.get('requested')}, available={int_v.get('available')}, layer_status=`{int_v.get('layer_status')}`, scope=`{int_v.get('scope')}`, passed={int_v.get('passed')}",
+            f"- **Internal limitations:** {'; '.join(int_v.get('limitations') or [])}",
+            f"- **Desktop fixture launched:** `{r.get('fixture_launched')}` (requires_desktop=`{r.get('requires_desktop')}`)",
             f"- **Unverified reasons:** {r['validation'].get('unverified_reasons')}",
             f"- **Transcript:** `{transcript_paths.get(r['scenario'], '')}`",
             "",
@@ -1070,113 +1315,153 @@ def run_single_cross_surface_scenario(
     mon_w: int,
     mon_h: int,
     upstream_ollama: str,
+    requires_desktop: Optional[bool] = None,
+    verify_mode: str = "filesystem",
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Run one complete isolated cross-surface scenario with dedicated fixtures."""
-    if scenario not in ("normal", "browser_failure", "desktop_focus_loss"):
+    """Run one complete isolated cross-surface scenario with strict GUI fixture discipline."""
+    if scenario not in SCENARIO_SPECS:
         raise ValueError(f"Unsupported cross-surface scenario: {scenario!r}")
+
+    spec = SCENARIO_SPECS[scenario]
+    eff_requires_desktop = spec["requires_desktop"] if requires_desktop is None else bool(requires_desktop)
+    eff_requires_distraction = bool(spec.get("requires_distraction")) and eff_requires_desktop
+    if scenario == "desktop_focus_loss" and not eff_requires_desktop:
+        raise ValueError("Scenario 'desktop_focus_loss' requires desktop fixtures.")
+    if verify_mode not in ("filesystem", "none"):
+        raise ValueError(f"Unsupported verify_mode: {verify_mode!r}")
 
     with tempfile.TemporaryDirectory(prefix=f"zelyr_xsurf_{scenario}_") as tmp_str:
         tmp_dir = Path(tmp_str)
         ws_dir = tmp_dir / "workspace"
         db_path = tmp_dir / f"{scenario}.db"
-        fix_port = _free_port()
-        dist_port = _free_port() if scenario == "desktop_focus_loss" else None
+        fix_port: Optional[int] = None
+        dist_port: Optional[int] = None
         fix_proc: Optional[subprocess.Popen[bytes]] = None
         dist_proc: Optional[subprocess.Popen[bytes]] = None
+        fixture_launched = False
+        distraction_launched = False
+        desktop_before: Optional[Dict[str, Any]] = None
+        desktop_after: Optional[Dict[str, Any]] = None
+        distraction_after: Optional[Dict[str, Any]] = None
         steal_telemetry: Dict[str, Any] = {}
 
         with CrossSurfaceWebApp(
             target_record="REC-204",
-            fail_browser_dom=(scenario == "browser_failure"),
+            fail_browser_dom=bool(spec.get("fail_browser_dom")),
         ) as web_app, IsolatedChromiumSession(tmp_dir) as browser_sess:
             ws_info = setup_cross_surface_workspace(
                 ws_dir,
                 web_app.base_url,
                 target_record="REC-204",
                 desktop_title=DEFAULT_DESKTOP_TITLE,
+                requires_desktop=eff_requires_desktop,
             )
             prompt = build_cross_surface_prompt(
                 web_app.base_url,
                 ws_info,
                 desktop_title=DEFAULT_DESKTOP_TITLE,
+                requires_desktop=eff_requires_desktop,
             )
+            verify_spec = build_cross_surface_verify_spec(ws_info) if verify_mode == "filesystem" else None
             try:
-                fix_proc = subprocess.Popen(
-                    [
-                        sys.executable,
-                        str(FIXTURE_SCRIPT),
-                        "--port",
-                        str(fix_port),
-                        "--title",
-                        DEFAULT_DESKTOP_TITLE,
-                        "--cross-surface",
-                    ],
-                    cwd=str(REPO_ROOT),
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    start_new_session=True,
-                )
-                _wait_for_http(f"http://127.0.0.1:{fix_port}/health")
-                fix_win = _wait_for_window(DEFAULT_DESKTOP_TITLE, pid=fix_proc.pid)
-                fix_addr = str(fix_win["address"])
-                fx = mon_x + (mon_w - 640) // 2
-                fy = mon_y + (mon_h - 420) // 2
-                _place_floating_window(fix_addr, workspace_id, fx, fy, 640, 420)
-
-                dist_addr: Optional[str] = None
-                if scenario == "desktop_focus_loss" and dist_port is not None:
-                    dist_proc = subprocess.Popen(
+                if eff_requires_desktop:
+                    fix_port = _free_port()
+                    fix_proc = subprocess.Popen(
                         [
                             sys.executable,
                             str(FIXTURE_SCRIPT),
                             "--port",
-                            str(dist_port),
+                            str(fix_port),
                             "--title",
-                            DEFAULT_DISTRACTION_TITLE,
-                            "--distraction",
+                            DEFAULT_DESKTOP_TITLE,
+                            "--cross-surface",
                         ],
                         cwd=str(REPO_ROOT),
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
                         start_new_session=True,
                     )
-                    _wait_for_http(f"http://127.0.0.1:{dist_port}/health")
-                    dist_win = _wait_for_window(DEFAULT_DISTRACTION_TITLE, pid=dist_proc.pid)
-                    dist_addr = str(dist_win["address"])
-                    _place_floating_window(dist_addr, workspace_id, mon_x + 40, mon_y + 40, 360, 180)
+                    fixture_launched = True
+                    _wait_for_http(f"http://127.0.0.1:{fix_port}/health")
+                    fix_win = _wait_for_window(DEFAULT_DESKTOP_TITLE, pid=fix_proc.pid)
+                    fix_addr = str(fix_win["address"])
+                    fx = mon_x + (mon_w - 640) // 2
+                    fy = mon_y + (mon_h - 420) // 2
+                    _place_floating_window(fix_addr, workspace_id, fx, fy, 640, 420)
 
-                _hyprctl_dispatch("workspace", str(workspace_id))
-                _focus_and_verify_window(fix_addr, DEFAULT_DESKTOP_TITLE, f"http://127.0.0.1:{fix_port}")
-                time.sleep(0.15)
-                desktop_before = _http_json(f"http://127.0.0.1:{fix_port}/state")
-
-                if scenario == "desktop_focus_loss" and dist_addr and dist_port is not None:
-                    def _steal_focus(turn_no: int) -> Dict[str, Any]:
-                        pre_act = _hyprctl_json("activewindow")
-                        fix_snap = _http_json(f"http://127.0.0.1:{fix_port}/state")
-                        sw = _focus_and_verify_window(
-                            dist_addr,
-                            DEFAULT_DISTRACTION_TITLE,
-                            f"http://127.0.0.1:{dist_port}",
+                    dist_addr: Optional[str] = None
+                    if eff_requires_distraction:
+                        dist_port = _free_port()
+                        dist_proc = subprocess.Popen(
+                            [
+                                sys.executable,
+                                str(FIXTURE_SCRIPT),
+                                "--port",
+                                str(dist_port),
+                                "--title",
+                                DEFAULT_DISTRACTION_TITLE,
+                                "--distraction",
+                            ],
+                            cwd=str(REPO_ROOT),
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            start_new_session=True,
                         )
-                        return {
-                            "turn": turn_no,
-                            "active_before": pre_act,
-                            "active_after": sw["active_window"],
-                            "fix_state_at_steal": fix_snap,
-                            "dist_state_at_steal": sw.get("fixture_state") or _http_json(f"http://127.0.0.1:{dist_port}/state"),
-                        }
+                        distraction_launched = True
+                        _wait_for_http(f"http://127.0.0.1:{dist_port}/health")
+                        dist_win = _wait_for_window(DEFAULT_DISTRACTION_TITLE, pid=dist_proc.pid)
+                        dist_addr = str(dist_win["address"])
+                        _place_floating_window(dist_addr, workspace_id, mon_x + 40, mon_y + 40, 360, 180)
 
-                    with _FocusStealOllamaProxy(upstream_ollama, _steal_focus) as proxy:
+                    _hyprctl_dispatch("workspace", str(workspace_id))
+                    _focus_and_verify_window(fix_addr, DEFAULT_DESKTOP_TITLE, f"http://127.0.0.1:{fix_port}")
+                    time.sleep(0.15)
+                    desktop_before = _http_json(f"http://127.0.0.1:{fix_port}/state")
+
+                    if eff_requires_distraction and dist_addr and dist_port is not None:
+                        def _steal_focus(turn_no: int) -> Dict[str, Any]:
+                            pre_act = _hyprctl_json("activewindow")
+                            fix_snap = _http_json(f"http://127.0.0.1:{fix_port}/state")
+                            sw = _focus_and_verify_window(
+                                dist_addr,
+                                DEFAULT_DISTRACTION_TITLE,
+                                f"http://127.0.0.1:{dist_port}",
+                            )
+                            return {
+                                "turn": turn_no,
+                                "active_before": pre_act,
+                                "active_after": sw["active_window"],
+                                "fix_state_at_steal": fix_snap,
+                                "dist_state_at_steal": sw.get("fixture_state") or _http_json(f"http://127.0.0.1:{dist_port}/state"),
+                            }
+
+                        with _FocusStealOllamaProxy(upstream_ollama, _steal_focus) as proxy:
+                            run_info = _run_cross_surface_cli(
+                                prompt,
+                                model=model,
+                                max_steps=max_steps,
+                                db_path=db_path,
+                                native_socket=browser_sess.socket_path,
+                                base_url=proxy.base_url,
+                                verify_spec=verify_spec,
+                            )
+                            steal_telemetry = dict(proxy.telemetry)
+                    else:
                         run_info = _run_cross_surface_cli(
                             prompt,
                             model=model,
                             max_steps=max_steps,
                             db_path=db_path,
                             native_socket=browser_sess.socket_path,
-                            base_url=proxy.base_url,
+                            verify_spec=verify_spec,
                         )
-                        steal_telemetry = dict(proxy.telemetry)
+
+                    desktop_after = _http_json(f"http://127.0.0.1:{fix_port}/state")
+                    distraction_after = (
+                        _http_json(f"http://127.0.0.1:{dist_port}/state")
+                        if (eff_requires_distraction and dist_port is not None)
+                        else None
+                    )
                 else:
                     run_info = _run_cross_surface_cli(
                         prompt,
@@ -1184,14 +1469,9 @@ def run_single_cross_surface_scenario(
                         max_steps=max_steps,
                         db_path=db_path,
                         native_socket=browser_sess.socket_path,
+                        verify_spec=verify_spec,
                     )
 
-                desktop_after = _http_json(f"http://127.0.0.1:{fix_port}/state")
-                distraction_after = (
-                    _http_json(f"http://127.0.0.1:{dist_port}/state")
-                    if (scenario == "desktop_focus_loss" and dist_port is not None)
-                    else None
-                )
                 web_audit = web_app.audit_snapshot()
 
                 validation = evaluate_cross_surface_run(
@@ -1205,11 +1485,30 @@ def run_single_cross_surface_scenario(
                     steal_telemetry=steal_telemetry,
                     desktop_title=DEFAULT_DESKTOP_TITLE,
                     distraction_title=DEFAULT_DISTRACTION_TITLE,
+                    requires_desktop=eff_requires_desktop,
+                    fixture_launched=fixture_launched,
+                    verify_spec_requested=verify_spec,
                 )
 
+                fixture_details = {
+                    "requires_desktop": eff_requires_desktop,
+                    "fixture_launched": fixture_launched,
+                    "distraction_launched": distraction_launched,
+                    "desktop_title": DEFAULT_DESKTOP_TITLE if fixture_launched else None,
+                    "distraction_title": DEFAULT_DISTRACTION_TITLE if distraction_launched else None,
+                }
                 summary_entry = {
                     "scenario": scenario,
-                    "verdict": validation["verdict"],
+                    "verdict": validation["benchmark_status"],
+                    "benchmark_status": validation["benchmark_status"],
+                    "external_validation_status": validation["external_validation_status"],
+                    "root_execution_status": validation["root_execution_status"],
+                    "root_verification_status": validation["root_verification_status"],
+                    "requires_desktop": eff_requires_desktop,
+                    "fixture_launched": fixture_launched,
+                    "fixture_details": fixture_details,
+                    "internal_verification": validation["internal_verification"],
+                    "external_validation": validation["external_validation"],
                     "returncode": run_info["returncode"],
                     "duration_s": run_info["duration_s"],
                     "cli_json": run_info["cli_json"],
@@ -1219,6 +1518,10 @@ def run_single_cross_surface_scenario(
                 raw_transcript = {
                     "scenario": scenario,
                     "prompt": prompt,
+                    "verify_spec": verify_spec,
+                    "requires_desktop": eff_requires_desktop,
+                    "fixture_launched": fixture_launched,
+                    "fixture_details": fixture_details,
                     "base_url": web_app.base_url,
                     "web_audit": web_audit,
                     "desktop_before": desktop_before,
@@ -1230,7 +1533,7 @@ def run_single_cross_surface_scenario(
                 }
                 return summary_entry, raw_transcript
             finally:
-                _cleanup_fixture_processes((dist_proc, dist_port), (fix_proc, fix_port))
+                _cleanup_cross_surface_fixtures((dist_proc, dist_port), (fix_proc, fix_port))
 
 
 def run_cross_surface_benchmark(
@@ -1240,38 +1543,57 @@ def run_cross_surface_benchmark(
     max_steps: int = 24,
     workspace_id: int = 15,
     output_dir: Optional[Path] = None,
+    verify_mode: str = "filesystem",
+    requires_desktop: Optional[bool] = None,
 ) -> Dict[str, Any]:
-    """Run all selected cross-surface scenarios safely on empty Hyprland workspace 15."""
-    monitors = _hyprctl_json("monitors")
-    focused_mon = next((m for m in monitors if m.get("focused")), monitors[0])
-    dp1 = next((m for m in monitors if m.get("name") == "DP-1"), focused_mon)
-    mon_x, mon_y = int(dp1["x"]), int(dp1["y"])
-    mon_w = int(round(dp1["width"] / (dp1.get("scale") or 1.0)))
-    mon_h = int(round(dp1["height"] / (dp1.get("scale") or 1.0)))
+    """Run selected cross-surface scenarios; only switch/require Hyprland WS 15 when desktop fixtures are needed."""
+    chosen = scenarios or list(DEFAULT_SCENARIOS)
+    for sc in chosen:
+        if sc not in SCENARIO_SPECS:
+            raise ValueError(f"Unsupported cross-surface scenario: {sc!r}")
 
-    orig_ws_obj = _hyprctl_json("activeworkspace")
-    orig_win_obj = _hyprctl_json("activewindow")
-    dp1_orig_ws_id = (dp1.get("activeWorkspace") or {}).get("id")
-    orig_clients = _hyprctl_json("clients")
-    ws_existing = [
-        c for c in orig_clients
-        if str((c.get("workspace") or {}).get("id")) == str(workspace_id)
-    ]
-    if ws_existing:
-        raise RuntimeError(
-            f"Safety abort: target isolated workspace {workspace_id} is not empty ({len(ws_existing)} windows)."
-        )
+    any_desktop = any(
+        (SCENARIO_SPECS[sc]["requires_desktop"] if requires_desktop is None else bool(requires_desktop))
+        for sc in chosen
+    )
 
-    chosen = scenarios or ["normal", "browser_failure", "desktop_focus_loss"]
     upstream_ollama = os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434"
     scenario_summaries: List[Dict[str, Any]] = []
     transcripts: Dict[str, Dict[str, Any]] = {}
 
+    mon_x = mon_y = mon_w = mon_h = 0
+    dp1: Dict[str, Any] = {}
+    orig_ws_obj: Any = None
+    orig_win_obj: Any = None
+    dp1_orig_ws_id: Any = None
+
+    if any_desktop:
+        monitors = _hyprctl_json("monitors")
+        focused_mon = next((m for m in monitors if m.get("focused")), monitors[0])
+        dp1 = next((m for m in monitors if m.get("name") == "DP-1"), focused_mon)
+        mon_x, mon_y = int(dp1["x"]), int(dp1["y"])
+        mon_w = int(round(dp1["width"] / (dp1.get("scale") or 1.0)))
+        mon_h = int(round(dp1["height"] / (dp1.get("scale") or 1.0)))
+
+        orig_ws_obj = _hyprctl_json("activeworkspace")
+        orig_win_obj = _hyprctl_json("activewindow")
+        dp1_orig_ws_id = (dp1.get("activeWorkspace") or {}).get("id")
+        orig_clients = _hyprctl_json("clients")
+        ws_existing = [
+            c for c in orig_clients
+            if str((c.get("workspace") or {}).get("id")) == str(workspace_id)
+        ]
+        if ws_existing:
+            raise RuntimeError(
+                f"Safety abort: target isolated workspace {workspace_id} is not empty ({len(ws_existing)} windows)."
+            )
+
     try:
-        if dp1.get("name"):
-            _hyprctl_dispatch("focusmonitor", str(dp1["name"]))
-        _hyprctl_dispatch("workspace", str(workspace_id))
-        time.sleep(0.25)
+        if any_desktop:
+            if dp1.get("name"):
+                _hyprctl_dispatch("focusmonitor", str(dp1["name"]))
+            _hyprctl_dispatch("workspace", str(workspace_id))
+            time.sleep(0.25)
 
         for sc in chosen:
             summary_entry, raw_transcript = run_single_cross_surface_scenario(
@@ -1284,24 +1606,30 @@ def run_cross_surface_benchmark(
                 mon_w=mon_w,
                 mon_h=mon_h,
                 upstream_ollama=upstream_ollama,
+                requires_desktop=requires_desktop,
+                verify_mode=verify_mode,
             )
             scenario_summaries.append(summary_entry)
             transcripts[sc] = raw_transcript
             val = summary_entry["validation"]
             print(
-                f"[Cross-Surface: {sc}] {summary_entry['verdict']} | rc={summary_entry['returncode']} | "
+                f"[Cross-Surface: {sc}] benchmark={summary_entry['benchmark_status']} | "
+                f"external={summary_entry['external_validation_status']} | "
+                f"root=({summary_entry['root_execution_status']}/{summary_entry['root_verification_status']}) | "
+                f"fixture={summary_entry['fixture_launched']} | rc={summary_entry['returncode']} | "
                 f"{summary_entry['duration_s']}s | failed={val['failed_checks']} | unverified={val['unverified_reasons']}",
                 flush=True,
             )
     finally:
-        if dp1_orig_ws_id is not None:
-            _hyprctl_dispatch("workspace", str(dp1_orig_ws_id))
-        orig_ws_id = orig_ws_obj.get("id") if isinstance(orig_ws_obj, dict) else None
-        if orig_ws_id is not None:
-            _hyprctl_dispatch("workspace", str(orig_ws_id))
-        orig_addr = orig_win_obj.get("address") if isinstance(orig_win_obj, dict) else None
-        if orig_addr:
-            _hyprctl_dispatch("focuswindow", f"address:{orig_addr}")
+        if any_desktop:
+            if dp1_orig_ws_id is not None:
+                _hyprctl_dispatch("workspace", str(dp1_orig_ws_id))
+            orig_ws_id = orig_ws_obj.get("id") if isinstance(orig_ws_obj, dict) else None
+            if orig_ws_id is not None:
+                _hyprctl_dispatch("workspace", str(orig_ws_id))
+            orig_addr = orig_win_obj.get("address") if isinstance(orig_win_obj, dict) else None
+            if orig_addr:
+                _hyprctl_dispatch("focuswindow", f"address:{orig_addr}")
 
     report: Dict[str, Any] = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -1309,7 +1637,8 @@ def run_cross_surface_benchmark(
         "num_ctx": int(os.environ.get("ZELYR_NUM_CTX") or "8192"),
         "max_steps": max_steps,
         "workspace_id": workspace_id,
-        "passed_count": sum(1 for r in scenario_summaries if r["verdict"] == "PASS"),
+        "verify_mode": verify_mode,
+        "passed_count": sum(1 for r in scenario_summaries if r["benchmark_status"] == "PASS"),
         "total_count": len(scenario_summaries),
         "scenarios": scenario_summaries,
     }
@@ -1323,13 +1652,24 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run Zelyr isolated Cross-Surface Autonomous Workflow Benchmark")
     parser.add_argument(
         "--scenario",
-        choices=["all", "normal", "browser_failure", "desktop_focus_loss"],
+        choices=["all", *SCENARIO_SPECS.keys()],
         default="all",
         help="Which scenario(s) to execute",
     )
     parser.add_argument("--model", default="qwen3.6:35b-a3b")
     parser.add_argument("--max-steps", type=int, default=24)
     parser.add_argument("--workspace-id", type=int, default=15)
+    parser.add_argument(
+        "--verify-mode",
+        choices=["filesystem", "none"],
+        default="filesystem",
+        help="Pass supported OutcomeVerifier --verify checks for filesystem outputs ('filesystem') or run unverified ('none').",
+    )
+    parser.add_argument(
+        "--no-desktop",
+        action="store_true",
+        help="Disable desktop fixture launch & desktop prompt step for browser/filesystem runs.",
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -1338,17 +1678,15 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    scenarios = (
-        ["normal", "browser_failure", "desktop_focus_loss"]
-        if args.scenario == "all"
-        else [args.scenario]
-    )
+    scenarios = list(DEFAULT_SCENARIOS) if args.scenario == "all" else [args.scenario]
     res = run_cross_surface_benchmark(
         scenarios=scenarios,
         model=args.model,
         max_steps=args.max_steps,
         workspace_id=args.workspace_id,
         output_dir=args.output_dir,
+        verify_mode=args.verify_mode,
+        requires_desktop=(False if args.no_desktop else None),
     )
     print(f"Cross-Surface Summary: {res['passed_count']}/{res['total_count']} PASSED", flush=True)
     return 0 if res["passed_count"] == res["total_count"] else 1

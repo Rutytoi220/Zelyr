@@ -2,33 +2,46 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import http.client
 import json
+import subprocess
 import urllib.parse
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from scripts import cross_surface_benchmark as bench_mod
 from scripts.cross_surface_benchmark import (
     CrossSurfaceWebApp,
     DEFAULT_DESKTOP_TITLE,
     DEFAULT_DISTRACTION_TITLE,
     INITIAL_RECORDS,
+    IsolatedChromiumSession,
+    _cleanup_cross_surface_fixtures,
+    _save_run_artifacts,
     build_cross_surface_prompt,
+    build_cross_surface_verify_spec,
     evaluate_cross_surface_run,
+    run_cross_surface_benchmark,
+    run_single_cross_surface_scenario,
     setup_cross_surface_workspace,
 )
+from zelyr.cli.main import _execute_headless_run
 from zelyr.agents.actuator_arbiter import ActuatorArbiter
 from zelyr.agents.native_orchestrator import NativeOrchestrator
 from zelyr.core.plugins import filter_tool_schemas_by_tier, get_tool_schemas, load_plugins
 from zelyr.engine.error_classifier import ErrorClassifier
 from zelyr.engine.execution_ledger import (
+    CentralExecutionLedger,
     ExecutionStatus,
+    LedgerEventType,
     TurnExecutionLedger,
     VerificationStatus,
     _is_inspection_action,
+    has_remaining_explicit_steps,
     resolve_root_execution_outcome,
 )
 from zelyr.tools.browser_cdp import InteractWithBrowserTool
@@ -436,6 +449,26 @@ def test_scenario_b_focus_loss_rejects_proactive_bypass_and_validates_real_recov
     )
     assert ok_move["verdict"] == "PASS"
 
+    # desktop_control(action="observe") with omitted target counts as initial observation when pre_active matches
+    obs_action_run = copy.deepcopy(real_run)
+    obs_action_run["cli_json"]["execution_ledger"]["records"][6] = {
+        "tool_name": "desktop_control",
+        "arguments": {"action": "observe"},
+        "state": "success",
+    }
+    ok_obs_act = evaluate_cross_surface_run(
+        scenario="desktop_focus_loss",
+        run_info=obs_action_run,
+        web_audit=web_audit,
+        ws_info=ws_info,
+        desktop_before=desktop_before,
+        desktop_after=desktop_after,
+        distraction_after={"mouse_clicks": 0, "key_presses": 0},
+        steal_telemetry=steal_info,
+    )
+    assert ok_obs_act["verdict"] == "PASS"
+    assert ok_obs_act["checks"]["desktop_initial_observation"] is True
+
     premature_click_run = copy.deepcopy(real_run)
     premature_click_run["cli_json"]["execution_ledger"]["records"].insert(
         7,
@@ -782,3 +815,676 @@ async def test_desktop_refocus_resets_identical_call_ceiling_after_focus_lost():
     # Step 1 FOCUS_LOST -> Step 2 blocked pre-exec -> Step 3 focus -> Step 4 retried & succeeded!
     assert len(dc_execs) == 2
     assert any(c[0] == "manage_desktop_window" and c[1].get("action") == "focus" for c in executed_calls)
+
+
+def _read_sqlite_ledger_snapshot(db_path: Path, exec_id: str) -> dict:
+    central = CentralExecutionLedger(db_path=db_path)
+    try:
+        rec = central.get_execution(exec_id)
+        events = central.get_events(exec_id)
+        ver_events = [
+            {
+                "tool_id": ev.tool_id,
+                "status": ev.status,
+                "metadata": ev.metadata,
+            }
+            for ev in events
+            if ev.event_type == LedgerEventType.VERIFICATION_RECORDED.value
+        ]
+        return {
+            "execution_id": exec_id,
+            "status": rec.status if rec else None,
+            "verification_status": rec.verification_status if rec else None,
+            "error": rec.error if rec else None,
+            "metadata": rec.metadata if rec else {},
+            "verifications": ver_events,
+        }
+    finally:
+        central.close()
+
+
+@pytest.mark.asyncio
+async def test_unverified_run_with_window_focus_ipc_stays_completed_unverified(tmp_path, capsys):
+    """Without --verify or verify_outcome, manage_desktop_window(focus, verify=True) + post-mutation
+    capture_screen MUST remain completed_unverified / not_verified and keep internal/external layers distinct."""
+    # 1. Direct TurnExecutionLedger + resolve_root_execution_outcome invariant (even after post-mutation capture_screen)
+    direct_ledger = TurnExecutionLedger()
+    direct_ledger.record_proposed("foc1", "manage_desktop_window", {"action": "focus", "target": DEFAULT_DESKTOP_TITLE, "verify": True})
+    direct_ledger.record_dispatched("foc1")
+    direct_ledger.record_observation("foc1", "success", {"status": "success", "verified": True}, verified=True)
+    direct_ledger.record_proposed("dc1", "desktop_control", {"action": "keyboard_type", "text": "REC-204:BL-204-OK:APPROVED", "expected_window": DEFAULT_DESKTOP_TITLE})
+    direct_ledger.record_dispatched("dc1")
+    direct_ledger.record_observation("dc1", "success", {"success": True})
+    direct_ledger.record_proposed("cap1", "capture_screen", {"target": "window", "window": DEFAULT_DESKTOP_TITLE})
+    direct_ledger.record_dispatched("cap1")
+    direct_ledger.record_observation("cap1", "success", {"success": True})
+
+    direct_out = resolve_root_execution_outcome(prompt="Confirm window and capture.", ledger=direct_ledger, final_text="Done.")
+    assert direct_out.execution_status == ExecutionStatus.COMPLETED_UNVERIFIED
+    assert direct_out.verification_status == VerificationStatus.NOT_VERIFIED
+    attached_ledger = TurnExecutionLedger(central_ledger=CentralExecutionLedger(db_path=tmp_path / "direct_attached.db"))
+    try:
+        attached_ledger.record_proposed("foc1", "manage_desktop_window", {"action": "focus", "target": DEFAULT_DESKTOP_TITLE, "verify": True})
+        attached_ledger.record_dispatched("foc1")
+        attached_ledger.record_observation("foc1", "success", {"status": "success", "verified": True}, verified=True)
+        assert attached_ledger.to_dict()["verification_status"] == VerificationStatus.NOT_VERIFIED.value
+    finally:
+        attached_ledger._central_ledger.close()
+
+    # 2. Full _execute_headless_run without --verify: manage_desktop_window(verify=True) does NOT emit VERIFICATION_RECORDED
+    ws_info, web_audit, _, dbefore, dafter = _make_base_eval_inputs(tmp_path)
+    db_path = tmp_path / "unverified_focus.db"
+    central = CentralExecutionLedger(db_path=db_path, raise_on_persistence_error=True)
+    orch = NativeOrchestrator(central_ledger=central, max_steps=10)
+    orch.workspace_root = ws_info["workspace_dir"]
+
+    turn = 0
+
+    async def mock_stream(payload, *_a, **_kw):
+        nonlocal turn
+        turn += 1
+        seq = [
+            ("b0", "interact_with_browser", {"action": "open_tab", "url": "http://127.0.0.1:43210/"}),
+            ("a0", "execute_command", {"command": "curl -sS http://127.0.0.1:43210/api/records/REC-204"}),
+            ("f0", "manage_workspace_file", {"action": "write", "path": str(ws_info["report_json_path"])}),
+            ("m0", "manage_desktop_window", {"action": "focus", "target": DEFAULT_DESKTOP_TITLE, "verify": True}),
+            ("d0", "desktop_control", {"action": "keyboard_type", "text": "REC-204:BL-204-OK:APPROVED", "expected_window": DEFAULT_DESKTOP_TITLE, "press_enter": True}),
+            ("c0", "capture_screen", {"target": "window", "window": DEFAULT_DESKTOP_TITLE}),
+        ]
+        if turn <= len(seq):
+            cid, name, args = seq[turn - 1]
+            yield {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": cid, "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}]}, "finish_reason": "tool_calls"}]}
+        else:
+            yield {"choices": [{"delta": {"content": "Finished all steps."}, "finish_reason": "stop"}]}
+
+    async def fake_exec(name, **kw):
+        if name == "manage_desktop_window":
+            return json.dumps({"status": "success", "action": "focus", "target": DEFAULT_DESKTOP_TITLE, "verified": True})
+        return json.dumps({"status": "success", "success": True})
+
+    orch._stream_model_events = mock_stream
+    orch.execute_tool = fake_exec
+    try:
+        with patch.object(orch, "get_active_window", AsyncMock(return_value={"class": "python3", "title": DEFAULT_DESKTOP_TITLE})):
+            rc = await _execute_headless_run(
+                build_cross_surface_prompt("http://127.0.0.1:43210", ws_info, desktop_title=DEFAULT_DESKTOP_TITLE),
+                orchestrator=orch,
+                verify_spec=None,
+                output_json=True,
+            )
+    finally:
+        eid = orch.current_ledger._execution_id
+        central.close()
+
+    assert rc == 0
+    cli_json = json.loads(capsys.readouterr().out.strip())
+    assert cli_json["root_execution_status"] == "completed_unverified"
+    assert cli_json["root_verification_status"] == "not_verified"
+    assert cli_json["execution_ledger"]["verification_status"] == "not_verified"
+    assert "verification" not in cli_json
+
+    ledger_snap = _read_sqlite_ledger_snapshot(db_path, eid)
+    assert ledger_snap["status"] == "completed_unverified"
+    assert ledger_snap["verification_status"] == "not_verified"
+    assert ledger_snap["verifications"] == []
+
+    # External benchmark PASS remains cleanly distinct from internal not_verified (and never mutates SQLite)
+    run_info = {
+        "returncode": rc,
+        "verify_spec": None,
+        "cli_json": cli_json,
+        "ledger": ledger_snap,
+    }
+    res = evaluate_cross_surface_run(
+        scenario="normal",
+        run_info=run_info,
+        web_audit=web_audit,
+        ws_info=ws_info,
+        desktop_before=dbefore,
+        desktop_after=dafter,
+    )
+    assert res["benchmark_status"] == "PASS"
+    assert res["external_validation_status"] == "PASS"
+    assert res["root_execution_status"] == "completed_unverified"
+    assert res["root_verification_status"] == "not_verified"
+    assert res["internal_verification"]["requested"] is False
+    assert res["internal_verification"]["layer_status"] == "not_requested"
+    assert res["internal_verification"]["scope"] == "none"
+    assert _read_sqlite_ledger_snapshot(db_path, eid)["verifications"] == []
+
+
+@pytest.mark.asyncio
+async def test_verified_cross_surface_run_completes_desktop_step_and_records_filesystem_scope(tmp_path, capsys):
+    """Supported --verify criteria (report.json / report.md) produce completed/verified without
+    disabling tools before Step 4 desktop confirmation + post-mutation capture_screen complete."""
+    ws_info, web_audit, _, dbefore, dafter = _make_base_eval_inputs(tmp_path)
+    ws_info["report_json_path"].unlink()
+    ws_info["report_md_path"].unlink()
+    verify_spec = build_cross_surface_verify_spec(ws_info)
+    prompt = build_cross_surface_prompt("http://127.0.0.1:43210", ws_info, desktop_title=DEFAULT_DESKTOP_TITLE)
+
+    db_path = tmp_path / "verified_xsurf.db"
+    central = CentralExecutionLedger(db_path=db_path, raise_on_persistence_error=True)
+    orch = NativeOrchestrator(central_ledger=central, max_steps=12)
+    orch.workspace_root = ws_info["workspace_dir"]
+
+    exp_rec = ws_info["expected_result"]["expected_record"]
+    seen_tools_after_md: list[int] = []
+    turn = 0
+
+    async def mock_stream(payload, *_a, **_kw):
+        nonlocal turn
+        turn += 1
+        tools_len = len(payload.get("tools") or [])
+        if ws_info["report_md_path"].exists():
+            seen_tools_after_md.append(tools_len)
+        seq = [
+            ("b0", "interact_with_browser", {"action": "open_tab", "url": "http://127.0.0.1:43210/"}),
+            ("c0", "execute_command", {"command": "curl -sS http://127.0.0.1:43210/api/records/REC-204"}),
+            ("f_json", "manage_workspace_file", {"action": "write", "path": str(ws_info["report_json_path"])}),
+            ("f_md", "manage_workspace_file", {"action": "write", "path": str(ws_info["report_md_path"])}),
+            ("m0", "manage_desktop_window", {"action": "focus", "target": DEFAULT_DESKTOP_TITLE, "verify": True}),
+            ("d0", "desktop_control", {"action": "keyboard_type", "text": "REC-204:BL-204-OK:APPROVED", "expected_window": DEFAULT_DESKTOP_TITLE, "press_enter": True}),
+            ("cap1", "capture_screen", {"target": "window", "window": DEFAULT_DESKTOP_TITLE}),
+        ]
+        if turn <= len(seq):
+            cid, name, args = seq[turn - 1]
+            yield {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": cid, "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}]}, "finish_reason": "tool_calls"}]}
+        else:
+            yield {"choices": [{"delta": {"content": "Verified and confirmed across all surfaces."}, "finish_reason": "stop"}]}
+
+    async def fake_exec(name, **kw):
+        if name == "manage_workspace_file":
+            p = Path(kw["path"])
+            if p == ws_info["report_json_path"]:
+                p.write_text(json.dumps(exp_rec, indent=2), encoding="utf-8")
+            elif p == ws_info["report_md_path"]:
+                p.write_text(
+                    f"# Report\n\n- REC-204 ({exp_rec['service']}, {exp_rec['owner']}, {exp_rec['region']}, "
+                    f"{exp_rec['score']}, {exp_rec['confirmation_token']}, APPROVED)\n",
+                    encoding="utf-8",
+                )
+        elif name == "manage_desktop_window":
+            return json.dumps({"status": "success", "action": "focus", "target": DEFAULT_DESKTOP_TITLE, "verified": True})
+        return json.dumps({"status": "success", "success": True})
+
+    orch._stream_model_events = mock_stream
+    orch.execute_tool = fake_exec
+    load_plugins()
+    try:
+        with patch.object(orch, "get_active_window", AsyncMock(return_value={"class": "python3", "title": DEFAULT_DESKTOP_TITLE})):
+            rc = await _execute_headless_run(
+                prompt,
+                orchestrator=orch,
+                verify_spec=verify_spec,
+                output_json=True,
+            )
+    finally:
+        eid = orch.current_ledger._execution_id
+        central.close()
+
+    assert rc == 0
+    # Tools MUST remain enabled after report.md satisfied --verify until Step 4 desktop actions + post-capture finish,
+    # then disable cleanly for the synthesis turn.
+    assert len(seen_tools_after_md) >= 4 and all(n > 0 for n in seen_tools_after_md[:3]) and seen_tools_after_md[-1] == 0
+
+    cli_json = json.loads(capsys.readouterr().out.strip())
+    assert cli_json["root_execution_status"] == "completed"
+    assert cli_json["root_verification_status"] == "verified"
+    assert cli_json["verification"]["success"] is True
+
+    ledger_snap = _read_sqlite_ledger_snapshot(db_path, eid)
+    assert ledger_snap["status"] == "completed"
+    assert ledger_snap["verification_status"] == "verified"
+    assert len(ledger_snap["verifications"]) >= 1
+    assert all(v["tool_id"] != "manage_desktop_window" for v in ledger_snap["verifications"])
+
+    res = evaluate_cross_surface_run(
+        scenario="normal",
+        run_info={"returncode": rc, "verify_spec": verify_spec, "cli_json": cli_json, "ledger": ledger_snap},
+        web_audit=web_audit,
+        ws_info=ws_info,
+        desktop_before=dbefore,
+        desktop_after=dafter,
+    )
+    assert res["benchmark_status"] == "PASS"
+    assert res["external_validation_status"] == "PASS"
+    assert res["root_execution_status"] == "completed"
+    assert res["root_verification_status"] == "verified"
+    assert res["internal_verification"]["requested"] is True
+    assert res["internal_verification"]["passed"] is True
+    assert res["internal_verification"]["scope"] == "filesystem_artifacts_only"
+    assert set(res["internal_verification"]["unsupported_surfaces"]) == {"web_dom", "http_api", "desktop_gui"}
+
+
+@pytest.mark.asyncio
+async def test_failed_internal_verification_despite_model_claiming_success(tmp_path, capsys):
+    """When --verify fails (e.g. report.md lacks APPROVED), CLI exits non-zero with
+    failed / verification_failed even when the model falsely claims full success."""
+    ws_info, web_audit, _, dbefore, dafter = _make_base_eval_inputs(tmp_path)
+    ws_info["report_md_path"].write_text("# Incomplete\n\n- REC-204 pending\n", encoding="utf-8")
+    verify_spec = build_cross_surface_verify_spec(ws_info)
+
+    db_path = tmp_path / "failed_internal_ver.db"
+    central = CentralExecutionLedger(db_path=db_path, raise_on_persistence_error=True)
+    orch = NativeOrchestrator(central_ledger=central, max_steps=6)
+    orch.workspace_root = ws_info["workspace_dir"]
+
+    async def mock_stream(payload, *_a, **_kw):
+        if len(payload.get("messages", [])) <= 2:
+            yield {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "b1", "type": "function", "function": {"name": "interact_with_browser", "arguments": json.dumps({"action": "open_tab", "url": "http://127.0.0.1:43210/"})}}]}, "finish_reason": "tool_calls"}]}
+        else:
+            yield {"choices": [{"delta": {"content": "Successfully completed everything and verified all files!"}, "finish_reason": "stop"}]}
+
+    orch._stream_model_events = mock_stream
+    orch.execute_tool = AsyncMock(return_value=json.dumps({"status": "success", "success": True}))
+    try:
+        rc = await _execute_headless_run(
+            "Open dashboard and finalize report.",
+            orchestrator=orch,
+            verify_spec=verify_spec,
+            output_json=True,
+        )
+    finally:
+        eid = orch.current_ledger._execution_id
+        central.close()
+
+    assert rc == 2
+    cli_json = json.loads(capsys.readouterr().out.strip())
+    assert cli_json["root_execution_status"] == "failed"
+    assert cli_json["root_verification_status"] == "verification_failed"
+    assert cli_json["verification"]["success"] is False
+
+    ledger_snap = _read_sqlite_ledger_snapshot(db_path, eid)
+    res = evaluate_cross_surface_run(
+        scenario="normal",
+        run_info={"returncode": rc, "verify_spec": verify_spec, "cli_json": cli_json, "ledger": ledger_snap},
+        web_audit=web_audit,
+        ws_info=ws_info,
+        desktop_before=dbefore,
+        desktop_after=dafter,
+    )
+    assert res["internal_verification"]["passed"] is False
+    assert res["internal_verification"]["layer_status"] == "failed"
+    assert res["root_execution_status"] == "failed"
+    assert res["root_verification_status"] == "verification_failed"
+    assert res["benchmark_status"] == "FAIL"
+
+
+def test_external_validation_fails_independently_of_internal_verification_pass(tmp_path):
+    """Internal --verify on filesystem schema/APPROVED can PASS while external validation
+    independently FAILS on forged confirmation_token, unapproved web state, or missing desktop confirmation."""
+    ws_info, web_audit, run_info, dbefore, dafter = _make_base_eval_inputs(tmp_path, approved=False)
+    forged = copy.deepcopy(ws_info["expected_result"]["expected_record"])
+    forged["confirmation_token"] = "FORGED-TOKEN"
+    ws_info["report_json_path"].write_text(json.dumps(forged, indent=2), encoding="utf-8")
+    ws_info["report_md_path"].write_text("# Report\n\n- REC-204 billing-ledger fin-core eu-central-1 98 FORGED-TOKEN APPROVED\n", encoding="utf-8")
+
+    verify_spec = build_cross_surface_verify_spec(ws_info)
+    run_info["verify_spec"] = verify_spec
+    run_info["cli_json"]["root_execution_status"] = "completed"
+    run_info["cli_json"]["root_verification_status"] = "verified"
+    run_info["cli_json"]["verification"] = {
+        "success": True,
+        "checks": [
+            {"check": "file_json", "target": str(ws_info["report_json_path"]), "success": True},
+            {"check": "file_contains", "target": str(ws_info["report_json_path"]), "success": True},
+            {"check": "file_contains", "target": str(ws_info["report_md_path"]), "success": True},
+        ],
+    }
+
+    res = evaluate_cross_surface_run(
+        scenario="normal",
+        run_info=run_info,
+        web_audit=web_audit,
+        ws_info=ws_info,
+        desktop_before=dbefore,
+        desktop_after=dafter,
+    )
+    assert res["root_execution_status"] == "completed"
+    assert res["root_verification_status"] == "verified"
+    assert res["internal_verification"]["passed"] is True
+    assert res["internal_verification"]["layer_status"] == "passed"
+    assert res["external_validation_status"] == "FAIL"
+    assert "report_json_accurate" in res["external_validation"]["failed_checks"]
+    assert "target_web_approved" in res["external_validation"]["failed_checks"]
+    assert res["benchmark_status"] == "FAIL"
+
+
+def test_internal_verification_unavailable_and_unsupported_reporting_and_artifact_schema(tmp_path):
+    """Reports honestly reflect unavailable internal verifier telemetry and render distinct layer columns."""
+    ws_info, web_audit, run_info, dbefore, dafter = _make_base_eval_inputs(tmp_path)
+    verify_spec = build_cross_surface_verify_spec(ws_info)
+
+    # Requested --verify but internal verification field and DB verifications are missing
+    missing_ver_run = copy.deepcopy(run_info)
+    missing_ver_run["verify_spec"] = verify_spec
+    missing_ver_run["ledger"] = {"status": "completed", "verification_status": "verified", "verifications": []}
+    res_unavail = evaluate_cross_surface_run(
+        scenario="normal",
+        run_info=missing_ver_run,
+        web_audit=web_audit,
+        ws_info=ws_info,
+        desktop_before=dbefore,
+        desktop_after=dafter,
+    )
+    assert res_unavail["internal_verification"]["requested"] is True
+    assert res_unavail["internal_verification"]["available"] is False
+    assert res_unavail["internal_verification"]["layer_status"] == "unavailable"
+    assert res_unavail["external_validation_status"] == "PASS"
+    assert res_unavail["benchmark_status"] == "FAIL"
+
+    # Artifact writer records explicit dual-layer fields
+    art_dir = tmp_path / "artifacts"
+    summary_entry = {
+        "scenario": "normal",
+        "verdict": res_unavail["benchmark_status"],
+        "benchmark_status": res_unavail["benchmark_status"],
+        "external_validation_status": res_unavail["external_validation_status"],
+        "root_execution_status": res_unavail["root_execution_status"],
+        "root_verification_status": res_unavail["root_verification_status"],
+        "requires_desktop": True,
+        "fixture_launched": True,
+        "internal_verification": res_unavail["internal_verification"],
+        "external_validation": res_unavail["external_validation"],
+        "returncode": 0,
+        "duration_s": 1.2,
+        "cli_json": missing_ver_run["cli_json"],
+        "ledger": missing_ver_run["ledger"],
+        "validation": res_unavail,
+    }
+    paths = _save_run_artifacts(
+        art_dir,
+        {
+            "timestamp": "2026-11-27T09:00:00Z",
+            "model": "qwen3.6:35b-a3b",
+            "num_ctx": 8192,
+            "max_steps": 24,
+            "verify_mode": "filesystem",
+            "passed_count": 0,
+            "total_count": 1,
+            "scenarios": [summary_entry],
+        },
+        {"normal": {"validation": res_unavail}},
+    )
+    md_out = Path(paths["md"]).read_text(encoding="utf-8")
+    assert "External validation status" in md_out
+    assert "Root ledger statuses" in md_out
+    assert "Internal limitations" in md_out
+
+
+def test_browser_only_scenarios_never_launch_desktop_fixtures_or_touch_hyprland(tmp_path, monkeypatch):
+    """Browser+filesystem and browser-recovery-without-GUI scenarios MUST NOT spawn desktop fixtures,
+    must omit desktop steps from prompt/spec, and run_cross_surface_benchmark skips Hyprland switching."""
+    popen_calls: list[list[str]] = []
+
+    class _FakeBrowserSess:
+        def __init__(self, root: Path):
+            self.socket_path = root / "sock"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+    monkeypatch.setattr(bench_mod, "IsolatedChromiumSession", _FakeBrowserSess)
+    monkeypatch.setattr(bench_mod, "_hyprctl_dispatch", lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("hyprctl dispatch must not run for non-GUI scenario")))
+    monkeypatch.setattr(bench_mod, "_hyprctl_json", lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("hyprctl json must not run for non-GUI scenario")))
+
+    orig_popen = subprocess.Popen
+
+    def guarded_popen(*args, **kwargs):
+        cmd = args[0] if args else kwargs.get("args", [])
+        popen_calls.append(list(cmd))
+        raise AssertionError(f"Desktop fixture Popen must not be invoked: {cmd}")
+
+    monkeypatch.setattr(bench_mod.subprocess, "Popen", guarded_popen)
+
+    class _FakeWebApp:
+        def __init__(self, *, target_record="REC-204", fail_browser_dom=False):
+            self.base_url = "http://127.0.0.1:45555"
+            self.fail_browser_dom = fail_browser_dom
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def audit_snapshot(self):
+            recs = copy.deepcopy(INITIAL_RECORDS)
+            recs["REC-204"]["status"] = "APPROVED"
+            return {
+                "target_record": "REC-204",
+                "fail_browser_dom": self.fail_browser_dom,
+                "dom_invalidated_events": [{"ts": 101.5}] if self.fail_browser_dom else [],
+                "records": recs,
+                "requests": [
+                    {"idx": 0, "ts": 100.0, "method": "GET", "path": "/", "status": 200},
+                    {"idx": 1, "ts": 101.0, "method": "GET", "path": "/records/REC-204", "status": 200},
+                    {"idx": 2, "ts": 102.0, "method": "POST", "path": "/api/records/REC-204/approve", "status": 200},
+                    {"idx": 3, "ts": 103.0, "method": "GET", "path": "/api/records/REC-204", "status": 200},
+                ],
+            }
+
+    monkeypatch.setattr(bench_mod, "CrossSurfaceWebApp", _FakeWebApp)
+
+    def fake_cli(prompt, *, db_path, verify_spec=None, **_kw):
+        assert "On your Linux desktop" not in prompt
+        ws_dir = db_path.parent / "workspace"
+        out_dir = ws_dir / "out"
+        exp = copy.deepcopy(INITIAL_RECORDS["REC-204"])
+        exp["status"] = "APPROVED"
+        (out_dir / "report.json").write_text(json.dumps(exp, indent=2), encoding="utf-8")
+        (out_dir / "report.md").write_text(
+            f"# Verified\n\n- REC-204 billing-ledger fin-core eu-central-1 98 BL-204-OK APPROVED\n",
+            encoding="utf-8",
+        )
+        records = [
+            {"tool_name": "interact_with_browser", "arguments": {"action": "open_tab", "url": "http://127.0.0.1:45555/"}, "state": "success"},
+            {"tool_name": "interact_with_browser", "arguments": {"action": "get_page_snapshot"}, "state": "success"},
+            {"tool_name": "interact_with_browser", "arguments": {"action": "click_element", "element_id": 1}, "state": "failed", "error": "Element ID 1 not found"},
+            {"tool_name": "interact_with_browser", "arguments": {"action": "get_page_snapshot"}, "state": "success"},
+            {"tool_name": "interact_with_browser", "arguments": {"action": "click_element", "element_id": 2}, "state": "success"},
+            {"tool_name": "execute_command", "arguments": {"command": "curl -sS http://127.0.0.1:45555/api/records/REC-204"}, "state": "success"},
+            {"tool_name": "manage_workspace_file", "arguments": {"action": "write", "path": str(out_dir / "report.json")}, "state": "success"},
+            {"tool_name": "manage_workspace_file", "arguments": {"action": "write", "path": str(out_dir / "report.md")}, "state": "success"},
+        ]
+        return {
+            "cmd": ["uv", "run", "zelyr"],
+            "verify_spec": verify_spec,
+            "start_ts": "t0",
+            "end_ts": "t1",
+            "duration_s": 0.5,
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "cli_json": {
+                "root_execution_status": "completed",
+                "root_verification_status": "verified",
+                "verification": {"success": True, "checks": []},
+                "execution_ledger": {"has_unresolved_failures": False, "unresolved_failures": [], "records": records},
+            },
+            "ledger": {"status": "completed", "verification_status": "verified", "verifications": [{"status": "verified"}]},
+        }
+
+    monkeypatch.setattr(bench_mod, "_run_cross_surface_cli", fake_cli)
+    monkeypatch.setattr(bench_mod, "DEFAULT_SCENARIOS", ["browser_fs", "browser_failure_no_gui"])
+    report = run_cross_surface_benchmark(
+        scenarios=["browser_fs", "browser_failure_no_gui"],
+        output_dir=tmp_path / "non_gui_reports",
+    )
+    assert popen_calls == []
+    assert orig_popen is not bench_mod.subprocess.Popen
+    assert report["passed_count"] == 2
+    for entry in report["scenarios"]:
+        assert entry["requires_desktop"] is False
+        assert entry["fixture_launched"] is False
+        assert entry["benchmark_status"] == "PASS"
+        assert entry["validation"]["checks"]["no_desktop_fixture_launched"] is True
+        assert "desktop_gui" not in entry["internal_verification"]["unsupported_surfaces"]
+
+
+def test_desktop_fixture_cleanup_after_failure_and_cancellation(tmp_path, monkeypatch):
+    """Desktop fixture processes are torn down deterministically even on RuntimeError,
+    CancelledError, or cleanup errors on one fixture, and IsolatedChromiumSession cleans up on startup failure."""
+    class _FakeSess:
+        def __init__(self, root: Path):
+            self.socket_path = root / "sock"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+    class _FakeWeb:
+        def __init__(self, **_kw):
+            self.base_url = "http://127.0.0.1:45556"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+    monkeypatch.setattr(bench_mod, "IsolatedChromiumSession", _FakeSess)
+    monkeypatch.setattr(bench_mod, "CrossSurfaceWebApp", _FakeWeb)
+    monkeypatch.setattr(bench_mod, "_wait_for_http", lambda *_a, **_kw: {"ok": True})
+    monkeypatch.setattr(bench_mod, "_wait_for_window", lambda title, pid=0: {"address": f"0x{pid:x}", "title": title})
+    monkeypatch.setattr(bench_mod, "_place_floating_window", lambda *_a, **_kw: None)
+    monkeypatch.setattr(bench_mod, "_hyprctl_dispatch", lambda *_a, **_kw: None)
+    monkeypatch.setattr(bench_mod, "_focus_and_verify_window", lambda *_a, **_kw: {"active_window": {"title": "x"}})
+    monkeypatch.setattr(bench_mod, "_http_json", lambda *_a, **_kw: {"applied_text": "", "status_text": "IDLE", "mouse_clicks": 0, "key_presses": 0})
+    monkeypatch.setattr(bench_mod, "_FocusStealOllamaProxy", lambda *_a, **_kw: MagicMock(__enter__=lambda s: MagicMock(base_url="http://127.0.0.1:1"), __exit__=lambda *_a: False))
+
+    created_procs: list[MagicMock] = []
+    cleaned_ports: list[int] = []
+
+    def fake_popen(*_a, **_kw):
+        p = MagicMock()
+        p.pid = 5000 + len(created_procs)
+        created_procs.append(p)
+        return p
+
+    monkeypatch.setattr(bench_mod.subprocess, "Popen", fake_popen)
+
+    def tracking_cleanup(*pairs):
+        for proc, port in pairs:
+            if proc is not None:
+                proc.terminate()
+                cleaned_ports.append(port)
+
+    monkeypatch.setattr(bench_mod, "_cleanup_fixture_processes", tracking_cleanup)
+
+    # 1. RuntimeError during CLI execution still cleans up BOTH confirmation and distraction fixtures
+    monkeypatch.setattr(bench_mod, "_run_cross_surface_cli", MagicMock(side_effect=RuntimeError("synthetic crash")))
+    with pytest.raises(RuntimeError, match="synthetic crash"):
+        run_single_cross_surface_scenario(
+            "desktop_focus_loss",
+            model="qwen3.6:35b-a3b",
+            max_steps=4,
+            workspace_id=15,
+            mon_x=0,
+            mon_y=0,
+            mon_w=1920,
+            mon_h=1080,
+            upstream_ollama="http://127.0.0.1:11434",
+        )
+    assert len(created_procs) == 2
+    assert all(p.terminate.call_count == 1 for p in created_procs)
+    assert len(cleaned_ports) == 2
+
+    # 2. asyncio.CancelledError (BaseException) during CLI execution ALSO cleans up BOTH fixtures
+    created_procs.clear()
+    cleaned_ports.clear()
+    monkeypatch.setattr(bench_mod, "_run_cross_surface_cli", MagicMock(side_effect=asyncio.CancelledError()))
+    with pytest.raises(asyncio.CancelledError):
+        run_single_cross_surface_scenario(
+            "desktop_focus_loss",
+            model="qwen3.6:35b-a3b",
+            max_steps=4,
+            workspace_id=15,
+            mon_x=0,
+            mon_y=0,
+            mon_w=1920,
+            mon_h=1080,
+            upstream_ollama="http://127.0.0.1:11434",
+        )
+    assert len(created_procs) == 2
+    assert all(p.terminate.call_count == 1 for p in created_procs)
+    assert len(cleaned_ports) == 2
+
+    # 3. _cleanup_cross_surface_fixtures isolates error on first proc so second proc is still killed cleanly
+    p_bad = MagicMock()
+    p_good = MagicMock()
+
+    def flaky_cleanup(pair):
+        proc, _ = pair
+        if proc is p_bad:
+            raise OSError("wait failed")
+        proc.terminate()
+
+    monkeypatch.setattr(bench_mod, "_cleanup_fixture_processes", flaky_cleanup)
+    _cleanup_cross_surface_fixtures((p_bad, 9101), (p_good, 9102))
+    assert p_bad.kill.call_count == 1
+    assert p_good.terminate.call_count == 1
+
+    # 4. IsolatedChromiumSession.__enter__ cleans up launched browser proc if socket never appears
+    fake_chrom = MagicMock()
+    fake_chrom.pid = 7777
+    monkeypatch.setattr(bench_mod.subprocess, "Popen", lambda *_a, **_kw: fake_chrom)
+    monkeypatch.setattr(bench_mod.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(bench_mod.os, "killpg", MagicMock())
+    monkeypatch.setattr(bench_mod.os, "getpgid", lambda pid: pid)
+    sess = IsolatedChromiumSession(tmp_path / "chrom_fail")
+    with pytest.raises(RuntimeError, match="Native Messaging socket"):
+        sess.__enter__()
+    assert sess._proc is None
+    assert bench_mod.os.killpg.call_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_premature_desktop_skip_triggers_replanning_and_fails_closed_when_still_skipped(tmp_path, capsys):
+    """If a prompt requires desktop input alongside --verify filesystem outputs, trying to stop
+    after report.md triggers Stage 4 replanning and fails closed (rc=2) if desktop remains unexecuted."""
+    ws_info, _, _, _, _ = _make_base_eval_inputs(tmp_path)
+    verify_spec = build_cross_surface_verify_spec(ws_info)
+    prompt = build_cross_surface_prompt("http://127.0.0.1:43210", ws_info, desktop_title=DEFAULT_DESKTOP_TITLE)
+
+    db_path = tmp_path / "skip_desktop.db"
+    central = CentralExecutionLedger(db_path=db_path, raise_on_persistence_error=True)
+    orch = NativeOrchestrator(central_ledger=central, max_steps=10)
+    orch.workspace_root = ws_info["workspace_dir"]
+
+    replan_prompts_seen: list[str] = []
+    turn = 0
+
+    async def mock_stream(payload, *_a, **_kw):
+        nonlocal turn
+        turn += 1
+        for m in payload.get("messages", []):
+            txt = str(m.get("content") or "")
+            if "Goal-Aware Replanning" in txt:
+                replan_prompts_seen.append(txt)
+        if turn == 1:
+            yield {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "f1", "type": "function", "function": {"name": "manage_workspace_file", "arguments": json.dumps({"action": "write", "path": str(ws_info["report_json_path"])})}}]}, "finish_reason": "tool_calls"}]}
+        else:
+            yield {"choices": [{"delta": {"content": "Completed desktop confirmation and screenshot!"}, "finish_reason": "stop"}]}
+
+    orch._stream_model_events = mock_stream
+    orch.execute_tool = AsyncMock(return_value=json.dumps({"status": "success", "success": True}))
+    try:
+        rc = await _execute_headless_run(prompt, orchestrator=orch, verify_spec=verify_spec, output_json=True)
+    finally:
+        eid = orch.current_ledger._execution_id
+        central.close()
+
+    assert replan_prompts_seen and any("desktop GUI input/submission" in p for p in replan_prompts_seen)
+    assert rc == 2
+    cli_json = json.loads(capsys.readouterr().out.strip())
+    assert cli_json["root_execution_status"] == "failed"
+    snap = _read_sqlite_ledger_snapshot(db_path, eid)
+    assert snap["status"] == "failed"
+    assert snap["metadata"].get("interruption_reason") == "unfulfilled_desktop_actions"

@@ -939,7 +939,9 @@ class ObservationFramingEngine:
                 raw_ver = parsed.get("verified") if "verified" in parsed else (res_block.get("verified") if res_block else None)
                 if isinstance(raw_ver, bool):
                     if raw_ver is True and not is_error:
-                        verified = True
+                        # manage_desktop_window reports local WM focus/dispatch confirmation, not task outcome verification.
+                        if tool_name != "manage_desktop_window":
+                            verified = True
                     elif raw_ver is True and is_error:
                         has_contradiction = True
                         verified = False
@@ -1629,7 +1631,9 @@ class ObservationFramingEngine:
 
                 if isinstance(raw_ver, bool):
                     if raw_ver is True and status == "SUCCESS":
-                        verified = True
+                        # manage_desktop_window reports local WM focus/dispatch confirmation, not task outcome verification.
+                        if tool_name != "manage_desktop_window":
+                            verified = True
                     elif raw_ver is False:
                         is_legacy_record_default = (
                             "state" in parsed
