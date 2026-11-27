@@ -190,6 +190,14 @@ class DesktopAutomationTool(BaseTool):
             self._ipc_client = HyprlandIPCClient()
         return self._ipc_client
 
+    def close(self) -> None:
+        """Release any held virtual input devices cleanly."""
+        if self._wayland_controller is not None:
+            try:
+                self._wayland_controller.close()
+            except Exception:
+                pass
+
     def _ensure_gui(self) -> None:
         """Initialize the unified Wayland/Linux input controller (or non-Linux pyautogui fallback)."""
         if self._wayland_controller is not None:
@@ -262,12 +270,31 @@ class DesktopAutomationTool(BaseTool):
         )
 
     async def _verify_expected_window_focus(self, expected_window: Optional[str]) -> Optional[ToolResult]:
-        """Fail closed with FOCUS_LOST if expected_window does not match the active focused window."""
+        """Fail closed with FOCUS_TARGET_REQUIRED or FOCUS_LOST before mutating shared desktop input."""
         exp = str(expected_window or "").strip()
-        if not exp:
-            return None
+        explicit_ipc = self._ipc_client is not None
         ipc = self._get_ipc()
-        if not ipc.can_connect() and not (os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") or "").strip():
+        can_conn = ipc.can_connect()
+        has_live_ipc = ipc.is_available() or (explicit_ipc and can_conn)
+        if not exp:
+            if not has_live_ipc:
+                return None
+            try:
+                active_now = await ipc.get_active_window()
+            except Exception:
+                active_now = {}
+            return self._structured_error(
+                error_type="FOCUS_TARGET_REQUIRED",
+                error=(
+                    "Refusing desktop pointer/keyboard mutation without explicit 'expected_window' while "
+                    "Hyprland compositor is active (active window: "
+                    f"title={active_now.get('title')!r}, class={active_now.get('class')!r})."
+                ),
+                remedy_hint="Specify 'expected_window' targeting the intended application window.",
+                allowed_actions=["manage_desktop_window", "capture_screen", "desktop_control"],
+                active_window=active_now if isinstance(active_now, dict) else {},
+            )
+        if not can_conn and not (os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") or "").strip():
             return None
         try:
             active = await ipc.get_active_window()

@@ -450,6 +450,108 @@ class NativeOrchestrator:
         **{alias: "manage_routine" for alias in ROUTINE_TOOL_ALIASES},
     }
 
+    _DESKTOP_READ_ONLY_ACTIONS = frozenset({
+        "get_screen_size",
+        "inspect_windows",
+        "get_active_window",
+        "get_cursor_position",
+        "observe",
+        "screenshot",
+    })
+    _DESKTOP_INPUT_TOOLS = frozenset({
+        "desktop_control",
+        "desktop_automation",
+        "interact_with_ui",
+        "gui_actuate",
+        "click_tag",
+        "type_text",
+        "press_key",
+        "move_mouse",
+        "click_mouse",
+        *DESKTOP_CONTROL_ALIASES,
+    })
+    _WINDOW_READ_ONLY_ACTIONS = frozenset({
+        "list",
+        "list_windows",
+        "clients",
+        "get_active",
+        "get_active_window",
+        "active",
+        "activewindow",
+        "status",
+        "monitors",
+        "workspaces",
+        "get_geometry",
+    })
+
+    @staticmethod
+    def _extract_current_user_prompt(messages: Optional[List[Dict[str, Any]]]) -> str:
+        """Return the latest real user prompt, ignoring synthetic system/vision directives and prior turns."""
+        for msg in reversed(messages or ()):
+            if not isinstance(msg, dict) or msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if isinstance(content, list):
+                text = " ".join(part.get("text", "") for part in content if isinstance(part, dict)).strip()
+            elif isinstance(content, str):
+                text = content.strip()
+            else:
+                continue
+            if not text or text.startswith(("[SYSTEM", "[Transient desktop screenshot")):
+                continue
+            return text
+        return ""
+
+    @classmethod
+    def check_desktop_intent_guard(
+        cls,
+        tool_name: str,
+        tool_args: Optional[Dict[str, Any]],
+        *,
+        user_prompt: str,
+        acceptance_spec: Any = None,
+    ) -> Optional[Tuple[str, str]]:
+        """Block unrequested desktop pointer/keyboard input or window/workspace mutations across all dispatch paths."""
+        fn_low = (tool_name or "").strip().lower()
+        act_low = str((tool_args or {}).get("action") or "").strip().lower()
+        is_mut_dc = fn_low in cls._DESKTOP_INPUT_TOOLS and not (
+            fn_low in ("desktop_control", "desktop_automation")
+            and act_low in cls._DESKTOP_READ_ONLY_ACTIONS
+        )
+        is_mut_win = (
+            fn_low == "manage_desktop_window"
+            and act_low not in cls._WINDOW_READ_ONLY_ACTIONS
+        )
+        if not (is_mut_dc or is_mut_win):
+            return None
+
+        from zelyr.agents.actuator_arbiter import ActuatorArbiter
+        from zelyr.engine.execution_ledger import KNOWN_DESKTOP_CHECKS, parse_acceptance_criteria
+
+        has_desktop_criteria = any(
+            str(c.get("check") or "").strip().lower() in KNOWN_DESKTOP_CHECKS
+            for c in (parse_acceptance_criteria(acceptance_spec) if acceptance_spec else ())
+        )
+        gui_allowed = (
+            ActuatorArbiter.has_explicit_desktop_gui_intent(user_prompt)
+            or has_desktop_criteria
+        )
+        win_allowed = (
+            gui_allowed
+            or ActuatorArbiter.has_explicit_window_control_intent(user_prompt)
+        )
+        if is_mut_dc and not gui_allowed:
+            return (
+                "unrequested_desktop_control",
+                "Refused unrequested desktop pointer/keyboard action during a non-desktop task.",
+            )
+        if is_mut_win and not win_allowed:
+            return (
+                "unrequested_window_focus",
+                "Refused unrequested window focus or workspace switch during a non-desktop task.",
+            )
+        return None
+
     @staticmethod
     def _strip_tool_prefixes(name: Any) -> str:
         """Strip common prefixes ('tool.', 'tools.', 'functions.', 'function.') without alias mapping."""
@@ -3749,16 +3851,27 @@ class NativeOrchestrator:
                         fingerprint = (func_name, self._canonicalize_tool_args(func_args))
 
                 eff_step_limit = getattr(self, "max_steps", 5)
+                current_user_prompt = self._extract_current_user_prompt(payload.get("messages"))
+                all_user_prompts = " ".join(
+                    (m.get("content") if isinstance(m.get("content"), str) else "")
+                    for m in payload.get("messages", [])
+                    if m.get("role") == "user" and not str(m.get("content", "")).startswith("[SYSTEM")
+                )
+                if rejection_reason is None:
+                    guard_hit = self.check_desktop_intent_guard(
+                        func_name,
+                        func_args,
+                        user_prompt=current_user_prompt,
+                        acceptance_spec=acceptance_spec,
+                    )
+                    if guard_hit is not None:
+                        rejection_reason, rejection_detail = guard_hit
+
                 if rejection_reason is None and actual_step_count >= eff_step_limit:
                     rejection_reason = "step_limit_reached"
                     rejection_detail = f"Maximum execution step limit ({eff_step_limit}) reached for current turn. Explain the limitation and synthesize the answer."
                     force_disable_next = True
                 elif rejection_reason is None and eff_cycle_detection:
-                    all_user_prompts = " ".join(
-                        (m.get("content") if isinstance(m.get("content"), str) else "")
-                        for m in payload.get("messages", [])
-                        if m.get("role") == "user" and not str(m.get("content", "")).startswith("[SYSTEM")
-                    )
                     is_explicit_repeat = self._is_explicit_repeat_requested(all_user_prompts)
 
                     from zelyr.engine.execution_ledger import (

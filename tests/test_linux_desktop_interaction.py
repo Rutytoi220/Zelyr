@@ -113,6 +113,7 @@ async def test_backend_unavailable_when_binaries_and_uinput_missing(monkeypatch)
 async def test_uinput_permission_denied_surfaces_structured_error(monkeypatch, tmp_path):
     monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-1")
     monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("HYPRLAND_INSTANCE_SIGNATURE", raising=False)
     fake_uinput = tmp_path / "uinput"
     fake_uinput.write_bytes(b"")
 
@@ -203,6 +204,7 @@ async def test_input_timeout_and_modifier_release_on_failure(monkeypatch):
 @pytest.mark.asyncio
 async def test_cancelled_error_closes_uinput_and_propagates(monkeypatch):
     monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-1")
+    monkeypatch.delenv("HYPRLAND_INSTANCE_SIGNATURE", raising=False)
     ctrl = WaylandInputController(auto_check=False)
     ctrl.close = MagicMock(wraps=ctrl.close)
 
@@ -706,8 +708,13 @@ async def test_focus_recovery_after_focus_lost_not_blocked_as_redundant():
         "messages": [{"role": "user", "content": "Click button and recover focus if FOCUS_LOST."}],
         "tools": schemas,
     }
-    async for _ in orch.generate_stream(payload, ledger=ledger):
-        pass
+    with patch.object(
+        NativeOrchestrator,
+        "get_active_window_sync",
+        return_value={"class": "python3", "title": "Zelyr Desktop Test Fixture"},
+    ):
+        async for _ in orch.generate_stream(payload, ledger=ledger):
+            pass
 
     assert executed == [
         ("manage_desktop_window", "focus"),
@@ -773,8 +780,13 @@ async def test_disabled_interact_with_ui_returns_tool_unavailable_and_keeps_desk
         "messages": [{"role": "user", "content": "Click Apply Text in the window."}],
         "tools": schemas,
     }
-    async for _ in orch.generate_stream(payload, ledger=ledger):
-        pass
+    with patch.object(
+        NativeOrchestrator,
+        "get_active_window_sync",
+        return_value={"class": "python3", "title": "Zelyr Desktop Test Fixture"},
+    ):
+        async for _ in orch.generate_stream(payload, ledger=ledger):
+            pass
 
     assert executed == []
     tool_msgs = [m for m in payload["messages"] if m.get("role") == "tool"]
@@ -988,6 +1000,7 @@ async def test_cancelled_error_releases_and_destroys_active_uinput_fds(monkeypat
     from zelyr.tools.input_controller import _UI_DEV_DESTROY, _UInputBackend
 
     monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-1")
+    monkeypatch.delenv("HYPRLAND_INSTANCE_SIGNATURE", raising=False)
     uinput = _UInputBackend(settle_s=0.0)
     uinput._pointer_fd = 101
     uinput._keyboard_fd = 102
@@ -1148,7 +1161,7 @@ def test_focus_recovery_validator_tri_state_and_fixture_cleanup(monkeypatch):
     monkeypatch.setattr(bench, "_run_zelyr_cli", MagicMock(side_effect=RuntimeError("boom mid-run")))
 
     with pytest.raises(RuntimeError, match="boom mid-run"):
-        bench.run_focus_recovery_benchmark(runs=1)
+        bench.run_focus_recovery_benchmark(runs=1, allow_live_desktop=True)
 
     assert len(cleaned_procs) == 2
     assert ("workspace", "11") in dispatched

@@ -30,6 +30,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_SCRIPT = REPO_ROOT / "scripts" / "desktop_test_fixture.py"
+_REAL_POPEN = subprocess.Popen
 
 
 def _free_port() -> int:
@@ -689,12 +690,54 @@ def _run_zelyr_cli(
     }
 
 
+def ensure_live_desktop_benchmark_authorized(
+    *,
+    workspace_id: int,
+    target_monitor: str,
+    monitors: List[Dict[str, Any]],
+    active_window: Optional[Dict[str, Any]],
+    allow_live_desktop: Optional[bool] = None,
+    force_live_focus: Optional[bool] = None,
+) -> None:
+    """Refuse to commandeer a live desktop seat, monitor focus, or global pointer without explicit opt-in."""
+    eff_allow = (
+        os.environ.get("ZELYR_ALLOW_LIVE_DESKTOP") == "1"
+        if allow_live_desktop is None
+        else bool(allow_live_desktop)
+    )
+    if not eff_allow:
+        raise RuntimeError(
+            f"Safety abort: refusing to launch desktop GUI fixtures or mutate live Hyprland workspace {workspace_id} "
+            "and shared Wayland pointer/keyboard on an active user session without explicit opt-in. "
+            "Pass --allow-live-desktop (or set ZELYR_ALLOW_LIVE_DESKTOP=1), or run non-GUI scenarios (--no-desktop)."
+        )
+
+    eff_force = (
+        os.environ.get("ZELYR_FORCE_LIVE_FOCUS") == "1"
+        if force_live_focus is None
+        else bool(force_live_focus)
+    )
+    if not eff_force:
+        focused_mon = next((m for m in (monitors or []) if m.get("focused")), None)
+        if focused_mon and target_monitor and str(focused_mon.get("name") or "") != str(target_monitor):
+            win_title = (active_window or {}).get("title") if isinstance(active_window, dict) else None
+            win_class = (active_window or {}).get("class") if isinstance(active_window, dict) else None
+            raise RuntimeError(
+                f"Safety abort: user is actively focused on monitor {focused_mon.get('name')!r} "
+                f"(active window title={win_title!r}, class={win_class!r}); refusing to hijack focus/cursor onto "
+                f"monitor {target_monitor!r} workspace {workspace_id}. Pass --force-live-focus / ZELYR_FORCE_LIVE_FOCUS=1 "
+                "only when the desktop is unattended."
+            )
+
+
 def run_benchmark(
     *,
     model: str = "qwen3.6:35b-a3b",
     max_steps: int = 12,
     workspace_id: int = 15,
     only_tasks: Optional[List[int]] = None,
+    allow_live_desktop: Optional[bool] = None,
+    force_live_focus: Optional[bool] = None,
 ) -> Dict[str, Any]:
     # Inspect live monitors & original focus before touching workspace
     monitors = _hyprctl_json("monitors")
@@ -707,6 +750,14 @@ def run_benchmark(
     orig_ws_obj = _hyprctl_json("activeworkspace")
     orig_win_obj = _hyprctl_json("activewindow")
     dp1_orig_ws_id = (dp1.get("activeWorkspace") or {}).get("id")
+    ensure_live_desktop_benchmark_authorized(
+        workspace_id=workspace_id,
+        target_monitor=str(dp1.get("name") or ""),
+        monitors=monitors,
+        active_window=orig_win_obj if isinstance(orig_win_obj, dict) else {},
+        allow_live_desktop=allow_live_desktop,
+        force_live_focus=force_live_focus,
+    )
     orig_clients = _hyprctl_json("clients")
     ws_existing = [
         c for c in orig_clients
@@ -722,9 +773,11 @@ def run_benchmark(
     fix_proc: Optional[subprocess.Popen] = None
     dist_proc: Optional[subprocess.Popen] = None
     results: List[Dict[str, Any]] = []
+    did_switch_workspace = False
 
     try:
         # Switch DP-1 cleanly onto empty workspace 15
+        did_switch_workspace = True
         if dp1.get("name"):
             _hyprctl_dispatch("focusmonitor", str(dp1["name"]))
         _hyprctl_dispatch("workspace", str(workspace_id))
@@ -970,27 +1023,18 @@ def run_benchmark(
                     flush=True,
                 )
     finally:
-        for p, port_v in ((dist_proc, dist_port), (fix_proc, fix_port)):
-            if p is not None:
-                try:
-                    _http_json(f"http://127.0.0.1:{port_v}/quit", method="POST", timeout=1.0)
-                except Exception:
-                    pass
-                p.terminate()
-                try:
-                    p.wait(timeout=3.0)
-                except subprocess.TimeoutExpired:
-                    p.kill()
+        _cleanup_fixture_processes((dist_proc, dist_port), (fix_proc, fix_port))
 
         # Restore DP-1 original workspace plus overall original workspace & focus cleanly
-        if dp1_orig_ws_id is not None:
-            _hyprctl_dispatch("workspace", str(dp1_orig_ws_id))
-        orig_ws_id = orig_ws_obj.get("id") if isinstance(orig_ws_obj, dict) else None
-        if orig_ws_id is not None:
-            _hyprctl_dispatch("workspace", str(orig_ws_id))
-        orig_addr = orig_win_obj.get("address") if isinstance(orig_win_obj, dict) else None
-        if orig_addr:
-            _hyprctl_dispatch("focuswindow", f"address:{orig_addr}")
+        if did_switch_workspace:
+            if dp1_orig_ws_id is not None:
+                _hyprctl_dispatch("workspace", str(dp1_orig_ws_id))
+            orig_ws_id = orig_ws_obj.get("id") if isinstance(orig_ws_obj, dict) else None
+            if orig_ws_id is not None:
+                _hyprctl_dispatch("workspace", str(orig_ws_id))
+            orig_addr = orig_win_obj.get("address") if isinstance(orig_win_obj, dict) else None
+            if orig_addr:
+                _hyprctl_dispatch("focuswindow", f"address:{orig_addr}")
 
     return {
         "model": model,
@@ -1002,8 +1046,33 @@ def run_benchmark(
     }
 
 
+def _safe_popen_pgid(proc: Any) -> Optional[int]:
+    """Return process group ID only for a live real Popen leading its own session/process group."""
+    if not isinstance(proc, _REAL_POPEN):
+        return None
+    try:
+        if proc.poll() is not None:
+            return None
+    except Exception:
+        return None
+    try:
+        pid_int = int(getattr(proc, "pid", 0) or 0)
+    except Exception:
+        return None
+    if pid_int <= 1:
+        return None
+    try:
+        cand_pgid = os.getpgid(pid_int)
+        own_pgrp = os.getpgrp()
+    except Exception:
+        return None
+    if cand_pgid > 1 and cand_pgid != own_pgrp and cand_pgid == pid_int:
+        return cand_pgid
+    return None
+
+
 def _cleanup_fixture_processes(*procs_and_ports: Tuple[Optional[subprocess.Popen], Optional[int]]) -> None:
-    """Terminate disposable fixture processes deterministically after success or failure."""
+    """Terminate disposable fixture process groups deterministically after success, failure, or cancellation."""
     for p, port_v in procs_and_ports:
         if p is not None:
             if port_v is not None:
@@ -1011,15 +1080,32 @@ def _cleanup_fixture_processes(*procs_and_ports: Tuple[Optional[subprocess.Popen
                     _http_json(f"http://127.0.0.1:{port_v}/quit", method="POST", timeout=1.0)
                 except Exception:
                     pass
-            p.terminate()
+            pgid = _safe_popen_pgid(p)
+            if pgid is not None:
+                try:
+                    os.killpg(pgid, signal.SIGTERM)
+                except Exception:
+                    pass
+            try:
+                p.terminate()
+            except Exception:
+                pass
             try:
                 p.wait(timeout=3.0)
             except subprocess.TimeoutExpired:
-                p.kill()
+                pgid_kill = _safe_popen_pgid(p)
+                if pgid_kill is not None:
+                    try:
+                        os.killpg(pgid_kill, signal.SIGKILL)
+                    except Exception:
+                        pass
                 try:
+                    p.kill()
                     p.wait(timeout=1.0)
                 except Exception:
                     pass
+            except Exception:
+                pass
 
 
 def run_focus_recovery_benchmark(
@@ -1028,6 +1114,8 @@ def run_focus_recovery_benchmark(
     max_steps: int = 12,
     workspace_id: int = 15,
     runs: int = 2,
+    allow_live_desktop: Optional[bool] = None,
+    force_live_focus: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Run deterministic live focus-loss recovery N times with fresh fixture instances each run."""
     monitors = _hyprctl_json("monitors")
@@ -1040,6 +1128,14 @@ def run_focus_recovery_benchmark(
     orig_ws_obj = _hyprctl_json("activeworkspace")
     orig_win_obj = _hyprctl_json("activewindow")
     dp1_orig_ws_id = (dp1.get("activeWorkspace") or {}).get("id")
+    ensure_live_desktop_benchmark_authorized(
+        workspace_id=workspace_id,
+        target_monitor=str(dp1.get("name") or ""),
+        monitors=monitors,
+        active_window=orig_win_obj if isinstance(orig_win_obj, dict) else {},
+        allow_live_desktop=allow_live_desktop,
+        force_live_focus=force_live_focus,
+    )
     orig_clients = _hyprctl_json("clients")
     ws_existing = [
         c for c in orig_clients
@@ -1052,8 +1148,10 @@ def run_focus_recovery_benchmark(
 
     results: List[Dict[str, Any]] = []
     upstream_ollama = os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434"
+    did_switch_workspace = False
 
     try:
+        did_switch_workspace = True
         if dp1.get("name"):
             _hyprctl_dispatch("focusmonitor", str(dp1["name"]))
         _hyprctl_dispatch("workspace", str(workspace_id))
@@ -1159,14 +1257,15 @@ def run_focus_recovery_benchmark(
                 finally:
                     _cleanup_fixture_processes((dist_proc, dist_port), (fix_proc, fix_port))
     finally:
-        if dp1_orig_ws_id is not None:
-            _hyprctl_dispatch("workspace", str(dp1_orig_ws_id))
-        orig_ws_id = orig_ws_obj.get("id") if isinstance(orig_ws_obj, dict) else None
-        if orig_ws_id is not None:
-            _hyprctl_dispatch("workspace", str(orig_ws_id))
-        orig_addr = orig_win_obj.get("address") if isinstance(orig_win_obj, dict) else None
-        if orig_addr:
-            _hyprctl_dispatch("focuswindow", f"address:{orig_addr}")
+        if did_switch_workspace:
+            if dp1_orig_ws_id is not None:
+                _hyprctl_dispatch("workspace", str(dp1_orig_ws_id))
+            orig_ws_id = orig_ws_obj.get("id") if isinstance(orig_ws_obj, dict) else None
+            if orig_ws_id is not None:
+                _hyprctl_dispatch("workspace", str(orig_ws_id))
+            orig_addr = orig_win_obj.get("address") if isinstance(orig_win_obj, dict) else None
+            if orig_addr:
+                _hyprctl_dispatch("focuswindow", f"address:{orig_addr}")
 
     passed_cnt = sum(1 for r in results if r["verdict"] == "PASS")
     unverified_cnt = sum(1 for r in results if r["verdict"] == "UNVERIFIED")
@@ -1194,6 +1293,16 @@ def main() -> int:
     parser.add_argument("--tasks", type=str, default="", help="Optional comma-separated task IDs (e.g. 1,2,3)")
     parser.add_argument("--focus-recovery", action="store_true", help="Run dedicated deterministic FOCUS_LOST recovery scenario")
     parser.add_argument("--runs", type=int, default=2, help="Number of fresh runs for --focus-recovery (default 2)")
+    parser.add_argument(
+        "--allow-live-desktop",
+        action="store_true",
+        help="Explicitly authorize launching live GUI fixtures and pointer/focus automation on the active Wayland seat (or ZELYR_ALLOW_LIVE_DESKTOP=1).",
+    )
+    parser.add_argument(
+        "--force-live-focus",
+        action="store_true",
+        help="Explicitly allow switching focus even if another monitor holds active user focus (or ZELYR_FORCE_LIVE_FOCUS=1).",
+    )
     parser.add_argument("--out", type=Path, default=None, help="Optional JSON report output path")
     args = parser.parse_args()
 
@@ -1206,6 +1315,8 @@ def main() -> int:
             max_steps=args.max_steps,
             workspace_id=args.workspace,
             runs=args.runs,
+            allow_live_desktop=(True if args.allow_live_desktop else None),
+            force_live_focus=(True if args.force_live_focus else None),
         )
         if args.out is not None:
             args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -1222,6 +1333,8 @@ def main() -> int:
         max_steps=args.max_steps,
         workspace_id=args.workspace,
         only_tasks=only,
+        allow_live_desktop=(True if args.allow_live_desktop else None),
+        force_live_focus=(True if args.force_live_focus else None),
     )
     if args.out is not None:
         args.out.parent.mkdir(parents=True, exist_ok=True)

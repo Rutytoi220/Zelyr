@@ -21,7 +21,7 @@ from typing import Any, Dict, List
 os.environ.setdefault("QT_ACCESSIBILITY", "1")
 os.environ.setdefault("QT_LINUX_ACCESSIBILITY_ALWAYS_ON", "1")
 
-from PySide6.QtCore import QEvent, QObject, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication,
@@ -39,6 +39,7 @@ class FixtureWindow(QWidget):
 
     reset_requested = Signal()
     activate_requested = Signal()
+    quit_requested = Signal()
 
     def __init__(
         self,
@@ -46,9 +47,14 @@ class FixtureWindow(QWidget):
         distraction: bool = False,
         cross_surface: bool = False,
         initial_status: str = "IDLE",
+        no_activate: bool = False,
     ) -> None:
         super().__init__()
         self.setWindowTitle(title)
+        self._no_activate = bool(no_activate)
+        if self._no_activate:
+            self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+            self.setWindowFlag(Qt.WindowType.WindowDoesNotAcceptFocus, True)
         self._lock = threading.Lock()
         self._counter = 0
         self._applied_text = ""
@@ -72,6 +78,9 @@ class FixtureWindow(QWidget):
         self.installEventFilter(self)
         self.reset_requested.connect(self._reset_ui_slot)
         self.activate_requested.connect(self._activate_ui_slot)
+        app_inst = QApplication.instance()
+        if app_inst is not None:
+            self.quit_requested.connect(app_inst.quit, Qt.ConnectionType.QueuedConnection)
 
     def _init_distraction_ui(self) -> None:
         self.setFixedSize(360, 180)
@@ -268,6 +277,8 @@ class FixtureWindow(QWidget):
         self._record_event("apply", text)
 
     def _activate_ui_slot(self) -> None:
+        if self._no_activate:
+            return
         self.show()
         self.raise_()
         self.activateWindow()
@@ -331,6 +342,7 @@ class FixtureWindow(QWidget):
         with self._lock:
             base: Dict[str, Any] = {
                 "window_title": self.windowTitle(),
+                "no_activate": self._no_activate,
                 "is_active_window": bool(self.isActiveWindow()),
                 "counter": self._counter,
                 "applied_text": self._applied_text,
@@ -387,12 +399,15 @@ def _make_handler(window: FixtureWindow, app: QApplication):
                 time.sleep(0.05)
                 self._send_json(200, {"ok": True, "state": window.snapshot_state()})
             elif self.path == "/activate":
+                if window._no_activate:
+                    self._send_json(403, {"ok": False, "error": "no_activate_mode"})
+                    return
                 window.activate_requested.emit()
                 time.sleep(0.05)
                 self._send_json(200, {"ok": True, "state": window.snapshot_state()})
             elif self.path == "/quit":
                 self._send_json(200, {"ok": True})
-                app.quit()
+                window.quit_requested.emit()
             else:
                 self._send_json(404, {"error": "not found"})
 
@@ -406,11 +421,20 @@ def main() -> int:
     parser.add_argument("--distraction", action="store_true", help="Launch auxiliary focus-steal distraction window")
     parser.add_argument("--cross-surface", action="store_true", help="Enable Cross-Surface confirmation mode")
     parser.add_argument("--initial-status", type=str, default=None, help="Initial status label text")
+    parser.add_argument(
+        "--no-activate",
+        action="store_true",
+        help="Show window without requesting compositor activation/focus (also ZELYR_FIXTURE_NO_ACTIVATE=1)",
+    )
     args = parser.parse_args()
 
+    no_activate = bool(args.no_activate or os.environ.get("ZELYR_FIXTURE_NO_ACTIVATE") == "1")
     app = QApplication(sys.argv)
     signal.signal(signal.SIGTERM, lambda *_a: app.quit())
     signal.signal(signal.SIGINT, lambda *_a: app.quit())
+    _sig_wake_timer = QTimer()
+    _sig_wake_timer.start(150)
+    _sig_wake_timer.timeout.connect(lambda: None)
 
     init_status = args.initial_status or ("AWAITING_CONFIRMATION" if args.cross_surface else "IDLE")
     win = FixtureWindow(
@@ -418,6 +442,7 @@ def main() -> int:
         distraction=args.distraction,
         cross_surface=args.cross_surface,
         initial_status=init_status,
+        no_activate=no_activate,
     )
     win.show()
 

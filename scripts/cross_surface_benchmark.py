@@ -37,6 +37,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+_REAL_POPEN = subprocess.Popen
+_REAL_OS_KILLPG = os.killpg
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -51,6 +53,7 @@ from scripts.linux_desktop_benchmark import (  # noqa: E402
     _MUTATING_DESKTOP_ACTIONS,
     _place_floating_window,
     _read_ledger_summary,
+    _safe_popen_pgid,
     _wait_for_http,
     _wait_for_window,
 )
@@ -396,6 +399,29 @@ class CrossSurfaceWebApp:
             self._server.server_close()
 
 
+def _signal_proc_group_or_direct(proc: Any, sig: int) -> None:
+    pgid = _safe_popen_pgid(proc)
+    if pgid is not None:
+        try:
+            os.killpg(pgid, sig)
+            return
+        except Exception:
+            pass
+    if not isinstance(proc, _REAL_POPEN) and os.killpg is not _REAL_OS_KILLPG:
+        try:
+            os.killpg(os.getpgid(proc.pid), sig)
+            return
+        except Exception:
+            pass
+    try:
+        if sig == signal.SIGTERM:
+            proc.terminate()
+        else:
+            proc.kill()
+    except Exception:
+        pass
+
+
 class IsolatedChromiumSession:
     """Manages an isolated headless Chromium + Native Messaging AF_UNIX IPC session."""
 
@@ -411,23 +437,11 @@ class IsolatedChromiumSession:
     def _kill_proc(self) -> None:
         if self._proc is None:
             return
-        try:
-            os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
-        except Exception:
-            try:
-                self._proc.terminate()
-            except Exception:
-                pass
+        _signal_proc_group_or_direct(self._proc, signal.SIGTERM)
         try:
             self._proc.wait(timeout=4.0)
         except Exception:
-            try:
-                os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL)
-            except Exception:
-                try:
-                    self._proc.kill()
-                except Exception:
-                    pass
+            _signal_proc_group_or_direct(self._proc, signal.SIGKILL)
         self._proc = None
 
     def __enter__(self) -> "IsolatedChromiumSession":
@@ -730,12 +744,9 @@ def _cleanup_cross_surface_fixtures(
             continue
         try:
             _cleanup_fixture_processes((proc, port))
-        except Exception:
+        except BaseException:
             if proc is not None:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+                _signal_proc_group_or_direct(proc, signal.SIGKILL)
 
 
 def _run_cross_surface_cli(
@@ -1682,8 +1693,12 @@ def run_cross_surface_benchmark(
     output_dir: Optional[Path] = None,
     verify_mode: str = "cross_surface",
     requires_desktop: Optional[bool] = None,
+    allow_live_desktop: Optional[bool] = None,
+    force_live_focus: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Run selected cross-surface scenarios; only switch/require Hyprland WS 15 when desktop fixtures are needed."""
+    from scripts.linux_desktop_benchmark import ensure_live_desktop_benchmark_authorized
+
     chosen = scenarios or list(DEFAULT_SCENARIOS)
     for sc in chosen:
         if sc not in SCENARIO_SPECS:
@@ -1703,6 +1718,7 @@ def run_cross_surface_benchmark(
     orig_ws_obj: Any = None
     orig_win_obj: Any = None
     dp1_orig_ws_id: Any = None
+    did_switch_workspace = False
 
     if any_desktop:
         monitors = _hyprctl_json("monitors")
@@ -1716,6 +1732,14 @@ def run_cross_surface_benchmark(
         orig_win_obj = _hyprctl_json("activewindow")
         dp1_orig_ws_id = (dp1.get("activeWorkspace") or {}).get("id")
         orig_clients = _hyprctl_json("clients")
+        ensure_live_desktop_benchmark_authorized(
+            workspace_id=workspace_id,
+            target_monitor=str(dp1.get("name") or ""),
+            monitors=monitors,
+            active_window=orig_win_obj if isinstance(orig_win_obj, dict) else {},
+            allow_live_desktop=allow_live_desktop,
+            force_live_focus=force_live_focus,
+        )
         ws_existing = [
             c for c in orig_clients
             if str((c.get("workspace") or {}).get("id")) == str(workspace_id)
@@ -1727,6 +1751,7 @@ def run_cross_surface_benchmark(
 
     try:
         if any_desktop:
+            did_switch_workspace = True
             if dp1.get("name"):
                 _hyprctl_dispatch("focusmonitor", str(dp1["name"]))
             _hyprctl_dispatch("workspace", str(workspace_id))
@@ -1758,7 +1783,7 @@ def run_cross_surface_benchmark(
                 flush=True,
             )
     finally:
-        if any_desktop:
+        if any_desktop and did_switch_workspace:
             if dp1_orig_ws_id is not None:
                 _hyprctl_dispatch("workspace", str(dp1_orig_ws_id))
             orig_ws_id = orig_ws_obj.get("id") if isinstance(orig_ws_obj, dict) else None
@@ -1808,6 +1833,16 @@ def main() -> int:
         help="Disable desktop fixture launch & desktop prompt step for browser/filesystem runs.",
     )
     parser.add_argument(
+        "--allow-live-desktop",
+        action="store_true",
+        help="Explicitly authorize launching live GUI fixtures and pointer/focus automation on the active Wayland seat (or ZELYR_ALLOW_LIVE_DESKTOP=1).",
+    )
+    parser.add_argument(
+        "--force-live-focus",
+        action="store_true",
+        help="Explicitly allow switching focus even if another monitor holds active user focus (or ZELYR_FORCE_LIVE_FOCUS=1).",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("/tmp/zelyr_cross_surface_benchmark_reports"),
@@ -1824,6 +1859,8 @@ def main() -> int:
         output_dir=args.output_dir,
         verify_mode=args.verify_mode,
         requires_desktop=(False if args.no_desktop else None),
+        allow_live_desktop=(True if args.allow_live_desktop else None),
+        force_live_focus=(True if args.force_live_focus else None),
     )
     print(f"Cross-Surface Summary: {res['passed_count']}/{res['total_count']} PASSED", flush=True)
     return 0 if res["passed_count"] == res["total_count"] else 1

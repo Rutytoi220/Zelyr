@@ -1264,6 +1264,22 @@ class InlineRepl:
             name = decision.tool_name
             kwargs = decision.normalized_arguments
 
+            guard_hit = NativeOrchestrator.check_desktop_intent_guard(
+                name,
+                kwargs,
+                user_prompt=user_prompt,
+                acceptance_spec=getattr(nat_orch, "acceptance_criteria", None),
+            )
+            if guard_hit is not None:
+                guard_reason, guard_detail = guard_hit
+                console.print(f"\n  [bold red]✗ Blocked {name}:[/bold red] {guard_detail}\n")
+                return json.dumps({
+                    "success": False,
+                    "error": guard_detail,
+                    "error_type": "AUTHORIZATION_DENIED",
+                    "reason": guard_reason,
+                })
+
             from zelyr.engine.execution_policy import (
                 authorized_policy_context,
                 evaluate_direct_tool_policy_async,

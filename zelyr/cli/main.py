@@ -607,6 +607,26 @@ async def _execute_headless_run(
         clean_name = decision.tool_name
         norm_kwargs = decision.normalized_arguments
 
+        guard_hit = NativeOrchestrator.check_desktop_intent_guard(
+            clean_name,
+            norm_kwargs,
+            user_prompt=clean_prompt,
+            acceptance_spec=verify_spec,
+        )
+        if guard_hit is not None:
+            guard_reason, guard_detail = guard_hit
+            tool_calls_emitted.append({"name": clean_name, "arguments": norm_kwargs, "status": "blocked"})
+            if not output_json:
+                sys.stderr.write(f"[step {step_no}] tool={clean_name} args={_redact_cli_args(norm_kwargs, verbose=verbose)}\n")
+                sys.stderr.write(f"[result {step_no}] tool={clean_name} status=blocked reason={guard_reason}\n")
+                sys.stderr.flush()
+            return json.dumps({
+                "success": False,
+                "error": guard_detail,
+                "error_type": "AUTHORIZATION_DENIED",
+                "reason": guard_reason,
+            })
+
         from zelyr.engine.execution_policy import (
             authorized_policy_context,
             evaluate_direct_tool_policy_async,

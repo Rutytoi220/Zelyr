@@ -74,6 +74,20 @@ _PURE_WINDOW_IPC_PATTERNS = [
     r"\b(list windows|active window|fullscreen|toggle floating|hyprctl|hyprland)\b",
 ]
 
+# Explicit desktop target tokens preventing ordinary code/HTML UI wording from misrouting to mouse control
+_EXPLICIT_DESKTOP_TARGET_PATTERNS = [
+    *TIER_3_EXPLICIT_PATTERNS,
+    r"\b(capture_screen|screen_capture|screenshot|screen capture|take a screenshot|desktop_control)\b",
+    r"\b(mouse_move|mouse_click|double[- ]click|right[- ]click|left[- ]click|mouse_drag|mouse_scroll|keyboard_type|keyboard_press)\b",
+    r"\b(desktop\s+(?:app|application|window|fixture|ui|gui)|fixture\s+window|test\s+fixture)\b",
+    r"\b(?:desktop|app(?:lication)?|fixture|distraction|confirmation|popup|active|focused|target)\s+window\b",
+    r"\b(?:in|on|of|from|to)\s+(?:the\s+|that\s+|this\s+|target\s+|focused\s+|active\s+)?window\b",
+    r"\bwindow\s+(?:titled|title|matching)\b",
+    r"\bfocus\b[^.\n]{0,40}\bwindow\b",
+    r"\bfocus_lost\b",
+    r"\b(?:pyside\d?|gtk|qt)\s+(?:window|fixture|gui|app|dialog|widget)\b",
+]
+
 # Tier 1 Desktop/OS indicators
 TIER_1_PATTERNS = [
     r"\b(workspace|workspaces|fullscreen|floating|tile|tiling)\b",
@@ -84,7 +98,8 @@ TIER_1_PATTERNS = [
     r"\b(network|gateway|ip\s+address|interfaces|tailscale|dns|ping|vpn|wifi)\b",
     r"\b(media|music|playerctl|playback|volume|track|song|mpris)\b",
     r"\b(file|files|patch|rollback|undo|backup)\b",
-    r"\b(repository|repo|project|codebase|directory|folder|tests?|pytest|unittest|entrypoint|pyproject|bug|diff|git)\b",
+    r"\b\w+\.(?:py|tsx?|jsx?|rs|go|java|html|css|scss|json|ya?ml|toml|md|sh|sql)\b",
+    r"\b(repository|repo|project|codebase|directory|folder|tests?|pytest|unittest|entrypoint|pyproject|bug|diff|git|src|component|function|class|module|schema|endpoint)\b",
     r"\b(command|bash|shell|terminal|exec|run command|cli|uptime|hostname|uname|kernel|distro|cpu|memory|disk|df|lsblk)\b",
 ]
 
@@ -172,7 +187,45 @@ class ActuatorArbiter:
         )
         if not has_browser:
             return False
+        is_tier1 = any(re.search(p, task_lower) for p in TIER_1_PATTERNS)
+        is_explicit_target = any(re.search(p, task_lower) for p in _EXPLICIT_DESKTOP_TARGET_PATTERNS)
+        if is_tier1 and not (is_explicit_target or re.search(r"\bdesktop\b", task_lower)):
+            return False
         return any(re.search(p, task_lower) for p in cls.CROSS_SURFACE_DESKTOP_PATTERNS)
+
+    @classmethod
+    def has_explicit_desktop_gui_intent(cls, task: str) -> bool:
+        """Return True only when the task explicitly requests desktop GUI observation or input actuation."""
+        task_clean = re.sub(r"\[Active Window:[^\]]*\]\s*", "", task or "")
+        task_lower = task_clean.lower().strip()
+        if not task_lower:
+            return False
+        if cls.has_cross_surface_browser_and_desktop_intent(task_clean):
+            return True
+        is_tier1 = any(re.search(p, task_lower) for p in TIER_1_PATTERNS)
+        is_tier2_explicit = any(re.search(p, task_lower) for p in TIER_2_PATTERNS)
+        is_explicit_target = any(re.search(p, task_lower) for p in _EXPLICIT_DESKTOP_TARGET_PATTERNS)
+        is_desktop_gui = any(re.search(p, task_lower) for p in DESKTOP_GUI_PATTERNS)
+        is_ui_interaction = any(re.search(p, task_lower) for p in UI_INTERACTION_PATTERNS)
+        if is_tier1 and not is_explicit_target:
+            return False
+        if is_tier2_explicit and not is_explicit_target:
+            return False
+        return bool(is_explicit_target or is_desktop_gui or (is_ui_interaction and not is_tier1 and not is_tier2_explicit))
+
+    @classmethod
+    def has_explicit_window_control_intent(cls, task: str) -> bool:
+        """Return True when task explicitly requests compositor window/workspace control or desktop GUI focus."""
+        task_clean = re.sub(r"\[Active Window:[^\]]*\]\s*", "", task or "")
+        task_lower = task_clean.lower().strip()
+        if not task_lower:
+            return False
+        if cls.has_explicit_desktop_gui_intent(task_clean):
+            return True
+        return bool(
+            any(re.search(p, task_lower) for p in _PURE_WINDOW_IPC_PATTERNS)
+            or re.search(r"\b(focus|switch\s+to|move\s+to|close|minimize|maximize|tile|float|fullscreen)\b[^.\n]{0,40}\b(window|workspace|display|monitor|hyprland|0x[0-9a-f]+)\b", task_lower)
+        )
 
     @classmethod
     def arbitrate(
@@ -208,16 +261,19 @@ class ActuatorArbiter:
         is_tier1 = any(re.search(p, task_lower) for p in TIER_1_PATTERNS)
         is_tier2_explicit = any(re.search(p, task_lower) for p in TIER_2_PATTERNS)
         is_tier3_explicit = any(re.search(p, task_lower) for p in TIER_3_EXPLICIT_PATTERNS)
+        is_explicit_desktop_target = any(re.search(p, task_lower) for p in _EXPLICIT_DESKTOP_TARGET_PATTERNS)
         is_desktop_gui = any(re.search(p, task_lower) for p in DESKTOP_GUI_PATTERNS)
         is_ui_interaction = any(re.search(p, task_lower) for p in UI_INTERACTION_PATTERNS)
         is_pure_window_ipc = any(re.search(p, task_lower) for p in _PURE_WINDOW_IPC_PATTERNS)
 
-        has_desktop_gui_intent = is_tier3_explicit or is_desktop_gui or (
+        has_desktop_gui_intent = is_tier3_explicit or (
+            is_desktop_gui and (is_explicit_desktop_target or (not is_tier1 and not is_tier2_explicit))
+        ) or (
             is_ui_interaction and not is_tier2_explicit and not is_tier1
         )
 
-        # Prioritized Tier 1 OS/shell/repo/workspace operations (unless browser or desktop GUI input/observation requested)
-        if is_tier1 and not is_tier2_explicit and (is_pure_window_ipc or not (is_tier3_explicit or is_desktop_gui)):
+        # Prioritized Tier 1 OS/shell/repo/workspace operations (unless browser or explicit desktop GUI input/observation requested)
+        if is_tier1 and not is_tier2_explicit and (is_pure_window_ipc or not has_desktop_gui_intent):
             return "tier1_ipc"
 
         # 2. Explicit visual/screen/desktop GUI request:
