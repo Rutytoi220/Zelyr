@@ -1791,7 +1791,10 @@ class NativeOrchestrator:
                     )
                 )
                 if not already_finalized and not defer_root_finalization:
-                    from zelyr.engine.execution_ledger import resolve_root_execution_outcome
+                    from zelyr.engine.execution_ledger import (
+                        parse_acceptance_criteria,
+                        resolve_root_execution_outcome,
+                    )
 
                     root_meta = getattr(eff_ledger, "_root_meta", {}) or {}
                     final_text = "".join(collected_out)
@@ -1801,11 +1804,28 @@ class NativeOrchestrator:
                         if (root_meta.get("connection_error") or root_meta.get("provider_error"))
                         else None
                     )
+                    pre_v_results = None
+                    if (
+                        acceptance_spec is not None
+                        and not (was_cancelled or getattr(self, "_cancelled", False) or payload.get("cancelled", False) or root_meta.get("cancelled"))
+                        and caught_exc is None
+                        and not prov_err
+                    ):
+                        parsed_root_specs = parse_acceptance_criteria(acceptance_spec)
+                        if parsed_root_specs:
+                            from zelyr.engine.verifier import OutcomeVerifier
+
+                            pre_v_results = []
+                            for spec_item in parsed_root_specs:
+                                vr = await OutcomeVerifier.verify_criterion_async(spec_item)
+                                pre_v_results.append((spec_item.get("check", ""), spec_item.get("target", ""), vr))
+
                     res_outcome = resolve_root_execution_outcome(
                         prompt=user_prompt,
                         ledger=eff_ledger,
                         final_text=final_text,
                         acceptance_spec=acceptance_spec,
+                        v_results=pre_v_results,
                         was_cancelled=bool(
                             was_cancelled
                             or getattr(self, "_cancelled", False)
@@ -1881,7 +1901,15 @@ class NativeOrchestrator:
                                 exec_id,
                                 LedgerEventType.VERIFICATION_RECORDED,
                                 status=VerificationStatus.VERIFIED.value if v_res.success else VerificationStatus.VERIFICATION_FAILED.value,
-                                metadata={"check": v_check, "target": v_target, "error": getattr(v_res, "error", None)},
+                                metadata={
+                                    "check": v_check,
+                                    "target": v_target,
+                                    "result": getattr(v_res, "result", "PASS" if v_res.success else "FAIL"),
+                                    "evidence_source": getattr(v_res, "evidence_source", None),
+                                    "evidence_collected": getattr(v_res, "evidence_collected", None),
+                                    "expected": getattr(v_res, "expected", None),
+                                    "error": getattr(v_res, "error", None),
+                                },
                             )
 
                     fin_meta: Dict[str, Any] = {
@@ -3323,7 +3351,7 @@ class NativeOrchestrator:
                 and not is_abandoned
                 and not is_truthful_failure_report(clean_text)
             ):
-                from zelyr.engine.execution_ledger import find_unfulfilled_task_requirements
+                from zelyr.engine.execution_ledger import find_unfulfilled_task_requirements_async
 
                 clean_user_prompt = ""
                 for m in payload.get("messages", []):
@@ -3343,7 +3371,7 @@ class NativeOrchestrator:
                             clean_user_prompt = c_clean
                             break
 
-                verified_outcomes, unfulfilled_outcomes = find_unfulfilled_task_requirements(
+                verified_outcomes, unfulfilled_outcomes = await find_unfulfilled_task_requirements_async(
                     clean_user_prompt,
                     eff_ledger,
                     acceptance_spec=acceptance_spec,
@@ -3910,7 +3938,13 @@ class NativeOrchestrator:
                             if c.get("target") and criterion_applies_to_target(c, mt, all_c_targets)
                         ]
                         if matching_c:
-                            if all(OutcomeVerifier.verify(check=c["check"], target=c["target"], expected=c.get("expected")).success for c in matching_c):
+                            c_ok = True
+                            for mc in matching_c:
+                                mc_vr = await OutcomeVerifier.verify_criterion_async(mc)
+                                if not mc_vr.success:
+                                    c_ok = False
+                                    break
+                            if c_ok:
                                 target_already_verified = True
                                 verified_target_hit = mt
                                 eff_ledger.record_target_verified(mt, check_type=matching_c[0].get("check"))
@@ -4847,7 +4881,7 @@ class NativeOrchestrator:
                         c_results = []
                         by_target: Dict[str, List[Any]] = {}
                         for c in parsed_c:
-                            vr = OutcomeVerifier.verify(check=c["check"], target=c["target"], expected=c.get("expected"))
+                            vr = await OutcomeVerifier.verify_criterion_async(c)
                             c_results.append((c, vr))
                             norm_ct = canonicalize_target(c.get("target", ""), check_type=c.get("check")) if c.get("target") else ""
                             if norm_ct:
@@ -4965,17 +4999,33 @@ class NativeOrchestrator:
 
                 if func_name == "verify_outcome" and str(res_str).lstrip().startswith("[VERIFIED]") and not is_failed and not criteria_failed:
                     is_verified = True
-                    if tool_target:
-                        eff_ledger.record_target_verified(tool_target)
-                        if tool_target not in verified_targets_for_obs:
-                            verified_targets_for_obs.append(tool_target)
-                elif not is_failed and not acceptance_spec and tool_target:
-                    # If an authorized mutating tool altered a previously verified target without re-verifying it,
-                    # invalidate stale verification until re-verified.
-                    muts = self._get_mutation_targets(func_name, func_args, eff_ledger.get_verified_targets())
-                    for mt in muts:
-                        if not is_verified and hasattr(eff_ledger, "invalidate_target_verification"):
-                            eff_ledger.invalidate_target_verification(mt)
+                    v_check_arg = str(func_args.get("check") or "").strip().lower()
+                    v_target_arg = tool_target or str(func_args.get("target") or "").strip()
+                    if v_target_arg:
+                        eff_ledger.record_target_verified(v_target_arg, check_type=v_check_arg or None)
+                        canon_vt = canonicalize_target(v_target_arg, check_type=v_check_arg or None)
+                        if canon_vt and canon_vt not in verified_targets_for_obs:
+                            verified_targets_for_obs.append(canon_vt)
+                elif not is_failed and not _is_inspection_action(func_name, func_args):
+                    # Invalidate any previously verified targets affected by this later mutation.
+                    fn_low = (func_name or "").strip().lower()
+                    if not acceptance_spec and tool_target:
+                        muts = self._get_mutation_targets(func_name, func_args, eff_ledger.get_verified_targets())
+                        for mt in muts:
+                            if not is_verified and hasattr(eff_ledger, "invalidate_target_verification"):
+                                eff_ledger.invalidate_target_verification(mt)
+                    if fn_low in ("interact_with_browser", "browser_cdp", "browser_navigate"):
+                        if hasattr(eff_ledger, "invalidate_surface_verifications"):
+                            eff_ledger.invalidate_surface_verifications(
+                                "browser",
+                                exclude_targets=set(verified_targets_for_obs),
+                            )
+                    elif fn_low in ("desktop_control", "desktop_automation", "manage_desktop_window", "interact_with_ui", "gui_actuate"):
+                        if hasattr(eff_ledger, "invalidate_surface_verifications"):
+                            eff_ledger.invalidate_surface_verifications(
+                                "desktop",
+                                exclude_targets=set(verified_targets_for_obs),
+                            )
 
                 if is_verified and not is_failed:
                     ver_meta_ok = {
@@ -5149,10 +5199,12 @@ class NativeOrchestrator:
                     (c_results and all(r.success for _, r in c_results))
                     or _desktop_done_with_capture
                 ):
-                    all_criteria_satisfied = all(
-                        OutcomeVerifier.verify(check=c["check"], target=c["target"], expected=c.get("expected")).success
-                        for c in (parsed_c or [])
-                    )
+                    all_criteria_satisfied = True
+                    for c in (parsed_c or []):
+                        c_vr = await OutcomeVerifier.verify_criterion_async(c)
+                        if not c_vr.success:
+                            all_criteria_satisfied = False
+                            break
                     if all_criteria_satisfied:
                         all_user_prompts = " ".join(
                             (m.get("content") if isinstance(m.get("content"), str) else "")

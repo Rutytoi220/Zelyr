@@ -6,6 +6,8 @@ JSON formatting, processes, listening ports, and command outputs.
 
 from __future__ import annotations
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 import hashlib
 import json
@@ -20,7 +22,8 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple, Union
+import urllib.parse
 
 
 MAX_COMMAND_OUTPUT_BYTES = 512 * 1024  # 512 KB
@@ -130,7 +133,142 @@ STRICT_ENV_ALLOWLIST: Set[str] = {
 }
 
 
-@dataclass(frozen=True)
+BROWSER_VERIFICATION_CHECKS: Set[str] = {
+    "browser_url",
+    "browser_navigation",
+    "browser_origin",
+    "browser_title",
+    "browser_element_present",
+    "browser_element_absent",
+    "browser_visible_text",
+    "browser_element_state",
+    "browser_field_value",
+}
+
+DESKTOP_COMPOSITOR_CHECKS: Set[str] = {
+    "desktop_window_exists",
+    "desktop_window_title",
+    "desktop_active_window",
+}
+
+DESKTOP_SEMANTIC_UNSUPPORTED_CHECKS: Set[str] = {
+    "desktop_visible_text",
+    "desktop_widget_state",
+    "desktop_text",
+    "desktop_status",
+    "desktop_ui_state",
+}
+
+DESKTOP_VERIFICATION_CHECKS: Set[str] = (
+    DESKTOP_COMPOSITOR_CHECKS | DESKTOP_SEMANTIC_UNSUPPORTED_CHECKS
+)
+
+FILESYSTEM_AND_HOST_CHECKS: Set[str] = {
+    "file_exists", "exists",
+    "file_contains", "contains",
+    "file_checksum", "checksum", "sha256",
+    "file_json", "json",
+    "process_running", "process", "proc",
+    "port_listening", "port", "listen",
+    "command_output", "command", "cmd",
+}
+
+ALL_KNOWN_VERIFICATION_CHECKS: Set[str] = (
+    FILESYSTEM_AND_HOST_CHECKS
+    | BROWSER_VERIFICATION_CHECKS
+    | DESKTOP_VERIFICATION_CHECKS
+)
+
+VERDICT_PASS = "PASS"
+VERDICT_FAIL = "FAIL"
+VERDICT_UNVERIFIED = "UNVERIFIED"
+VERDICT_UNSUPPORTED = "UNSUPPORTED"
+VALID_VERDICTS = frozenset({
+    VERDICT_PASS,
+    VERDICT_FAIL,
+    VERDICT_UNVERIFIED,
+    VERDICT_UNSUPPORTED,
+})
+
+_EVIDENCE_SOURCE_BY_CHECK: Dict[str, str] = {
+    "file_exists": "filesystem",
+    "exists": "filesystem",
+    "file_contains": "filesystem",
+    "contains": "filesystem",
+    "file_checksum": "filesystem",
+    "checksum": "filesystem",
+    "sha256": "filesystem",
+    "file_json": "filesystem",
+    "json": "filesystem",
+    "process_running": "proc_table",
+    "process": "proc_table",
+    "proc": "proc_table",
+    "port_listening": "socket_probe",
+    "port": "socket_probe",
+    "listen": "socket_probe",
+    "command_output": "command_execution",
+    "command": "command_execution",
+    "cmd": "command_execution",
+    "browser_url": "browser_native_messaging",
+    "browser_navigation": "browser_native_messaging",
+    "browser_origin": "browser_native_messaging",
+    "browser_title": "browser_native_messaging",
+    "browser_element_present": "browser_native_messaging",
+    "browser_element_absent": "browser_native_messaging",
+    "browser_visible_text": "browser_native_messaging",
+    "browser_element_state": "browser_native_messaging",
+    "browser_field_value": "browser_native_messaging",
+    "desktop_window_exists": "hyprland_ipc",
+    "desktop_window_title": "hyprland_ipc",
+    "desktop_active_window": "hyprland_ipc",
+    "desktop_visible_text": "desktop_accessibility",
+    "desktop_widget_state": "desktop_accessibility",
+    "desktop_text": "desktop_accessibility",
+    "desktop_status": "desktop_accessibility",
+    "desktop_ui_state": "desktop_accessibility",
+}
+
+
+def _infer_verdict(success: bool, observed: Any, explicit_result: Optional[str]) -> str:
+    if explicit_result:
+        norm = str(explicit_result).strip().upper()
+        if norm in VALID_VERDICTS:
+            return norm
+    obs = observed if isinstance(observed, dict) else {}
+    if obs.get("unsupported"):
+        return VERDICT_UNSUPPORTED
+    if obs.get("unverified") or (obs.get("evidence_collected") is False and not obs.get("invalid_spec")):
+        return VERDICT_UNVERIFIED
+    return VERDICT_PASS if success else VERDICT_FAIL
+
+
+def _infer_evidence_collected(
+    *,
+    result: str,
+    observed: Any,
+    explicit: Optional[bool],
+) -> bool:
+    if explicit is not None:
+        return bool(explicit)
+    if result in (VERDICT_UNSUPPORTED, VERDICT_UNVERIFIED):
+        return False
+    obs = observed if isinstance(observed, dict) else {}
+    if "evidence_collected" in obs:
+        return bool(obs["evidence_collected"])
+    if (
+        obs.get("invalid_spec")
+        or obs.get("safety_blocked")
+        or obs.get("workspace_escape")
+        or obs.get("interpreter_rejected")
+        or obs.get("timeout")
+        or obs.get("cancelled")
+        or obs.get("execution_error")
+    ):
+        return False
+    return True
+
+
+@dataclass(frozen=True, init=False)
 class VerificationResult:
     """Immutable result of an outcome verification check."""
 
@@ -140,11 +278,94 @@ class VerificationResult:
     observed: Any
     error: Optional[str] = None
 
+    def __init__(
+        self,
+        success: bool,
+        check: str,
+        target: str,
+        observed: Any,
+        error: Optional[str] = None,
+        *,
+        result: Optional[str] = None,
+        evidence_source: Optional[str] = None,
+        expected: Any = None,
+        evidence_collected: Optional[bool] = None,
+        criterion: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        verdict = _infer_verdict(bool(success), observed, result)
+        # Fail closed: UNSUPPORTED / UNVERIFIED / FAIL cannot report success=True.
+        eff_success = bool(success) and verdict == VERDICT_PASS
+        object.__setattr__(self, "success", eff_success)
+        object.__setattr__(self, "check", check)
+        object.__setattr__(self, "target", target)
+        object.__setattr__(self, "observed", observed)
+        object.__setattr__(self, "error", error)
+
+        obs = observed if isinstance(observed, dict) else {}
+        eff_expected = expected
+        if eff_expected is None and isinstance(obs, dict):
+            if "expected" in obs:
+                eff_expected = obs.get("expected")
+            elif "pattern" in obs:
+                eff_expected = obs.get("pattern")
+        eff_source = str(
+            evidence_source
+            or _EVIDENCE_SOURCE_BY_CHECK.get(str(check or "").strip().lower(), "verifier")
+        )
+        eff_collected = _infer_evidence_collected(
+            result=verdict,
+            observed=observed,
+            explicit=evidence_collected,
+        )
+        eff_criterion = (
+            dict(criterion)
+            if isinstance(criterion, dict)
+            else {"check": check, "target": target, "expected": eff_expected}
+        )
+        object.__setattr__(
+            self,
+            "_evidence_meta",
+            {
+                "result": verdict,
+                "evidence_source": eff_source,
+                "expected": eff_expected,
+                "evidence_collected": eff_collected,
+                "criterion": eff_criterion,
+            },
+        )
+
+    @property
+    def result(self) -> str:
+        """Normalized four-state outcome: PASS, FAIL, UNVERIFIED, or UNSUPPORTED."""
+        return str(self._evidence_meta["result"])
+
+    @property
+    def evidence_source(self) -> str:
+        """Trusted verification mechanism used to gather evidence."""
+        return str(self._evidence_meta["evidence_source"])
+
+    @property
+    def expected(self) -> Any:
+        """Expected condition or value asserted by the criterion."""
+        return self._evidence_meta["expected"]
+
+    @property
+    def evidence_collected(self) -> bool:
+        """Whether trusted evidence was successfully gathered from the target surface."""
+        return bool(self._evidence_meta["evidence_collected"])
+
+    @property
+    def criterion(self) -> Dict[str, Any]:
+        """Structured criterion specification checked."""
+        return dict(self._evidence_meta["criterion"])
+
     @property
     def status(self) -> str:
         """Return structured outcome status category preserving 5-field dict compatibility."""
         if self.success:
             return "verified"
+        if self.result == VERDICT_UNSUPPORTED:
+            return "unsupported"
         obs = self.observed if isinstance(self.observed, dict) else {}
         if obs.get("safety_blocked") or obs.get("workspace_escape") or obs.get("interpreter_rejected"):
             return "rejected"
@@ -154,13 +375,30 @@ class VerificationResult:
             return "cancelled"
         if obs.get("invalid_spec"):
             return "invalid_spec"
+        if self.result == VERDICT_UNVERIFIED or obs.get("unverified"):
+            return "unverified"
         if obs.get("execution_error") or obs.get("truncated"):
             return "execution_error"
         return "failed"
 
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert result to a standard dictionary payload."""
-        return asdict(self)
+    def to_dict(self, *, detailed: bool = False) -> Dict[str, Any]:
+        """Convert result to a dictionary (5-field compatible by default; rich evidence when detailed=True)."""
+        base = asdict(self)
+        if not detailed:
+            return base
+        return {
+            **base,
+            "result": self.result,
+            "status": self.status,
+            "criterion": self.criterion,
+            "evidence_source": self.evidence_source,
+            "expected": self.expected,
+            "evidence_collected": self.evidence_collected,
+        }
+
+    def to_detailed_dict(self) -> Dict[str, Any]:
+        """Return dictionary including full evidence attribution and four-state verdict."""
+        return self.to_dict(detailed=True)
 
 
 def _resolve_target_path(
@@ -1460,32 +1698,1046 @@ def verify_command_output(
         )
 
 
-def verify_outcome(
-    check: str,
-    target: str,
-    expected: Optional[str] = None,
-    **kwargs: Any,
-) -> VerificationResult:
-    """Dispatch outcome verification based on check name."""
-    if not isinstance(check, str) or not check.strip():
+_FORBIDDEN_BROWSER_SELECTOR_RE = re.compile(
+    r"(?:document\.cookie|localstorage|sessionstorage|indexeddb|chrome\.cookies|javascript:|window\.|eval\s*\(|new\s+function)",
+    flags=re.IGNORECASE,
+)
+
+_BROWSER_STATE_BOOL_MAP: Dict[str, Tuple[str, bool]] = {
+    "disabled": ("disabled", True),
+    "enabled": ("disabled", False),
+    "checked": ("checked", True),
+    "unchecked": ("checked", False),
+    "selected": ("selected", True),
+    "unselected": ("selected", False),
+    "visible": ("visible", True),
+    "hidden": ("visible", False),
+    "focused": ("focused", True),
+    "unfocused": ("focused", False),
+}
+
+
+def _run_coro_sync(coro_factory: Callable[[], Awaitable[VerificationResult]]) -> VerificationResult:
+    """Run an async verification coroutine synchronously without deadlocking active event loops."""
+    try:
+        asyncio.get_running_loop()
+        in_loop = True
+    except RuntimeError:
+        in_loop = False
+
+    if not in_loop:
+        return asyncio.run(coro_factory())
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(lambda: asyncio.run(coro_factory()))
+        return future.result(timeout=15.0)
+
+
+def _normalize_http_url(url_str: str) -> Optional[Tuple[str, str, str, str, str]]:
+    """Return normalized (scheme, netloc, path, query, fragment) for HTTP(S) URLs."""
+    try:
+        p = urllib.parse.urlparse(url_str.strip())
+    except Exception:
+        return None
+    if p.scheme.lower() not in ("http", "https") or not p.netloc:
+        return None
+    path = p.path or "/"
+    if len(path) > 1:
+        path = path.rstrip("/")
+    return (p.scheme.lower(), p.netloc.lower(), path, p.query, p.fragment)
+
+
+def _parse_browser_state_expectation(expected: Any) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Validate and parse expected element state into canonical dict assertions."""
+    if expected is None:
+        return None, "Incomplete verification specification: 'browser_element_state' requires an expected state."
+    if isinstance(expected, dict):
+        raw_map = expected
+    else:
+        raw_s = str(expected).strip()
+        if not raw_s:
+            return None, "Incomplete verification specification: 'browser_element_state' requires a non-empty expected state."
+        if raw_s.startswith("{"):
+            try:
+                decoded = json.loads(raw_s)
+            except Exception as exc:
+                return None, f"Invalid JSON state specification for 'browser_element_state': {exc}"
+            if not isinstance(decoded, dict) or not decoded:
+                return None, "JSON state specification for 'browser_element_state' must be a non-empty object."
+            raw_map = decoded
+        elif "=" in raw_s:
+            k, v = [p.strip() for p in raw_s.split("=", 1)]
+            k_low = k.lower()
+            if k_low in ("selected_option", "option"):
+                return {"selected_option": v}, None
+            if v.lower() in ("true", "1", "yes"):
+                raw_map = {k_low: True}
+            elif v.lower() in ("false", "0", "no"):
+                raw_map = {k_low: False}
+            else:
+                return None, f"Unsupported boolean state value '{v}' for key '{k}'."
+        else:
+            tok_low = raw_s.lower()
+            if tok_low in _BROWSER_STATE_BOOL_MAP:
+                field_name, field_bool = _BROWSER_STATE_BOOL_MAP[tok_low]
+                return {field_name: field_bool}, None
+            return None, (
+                f"Unsupported expected state '{raw_s}' for 'browser_element_state'. "
+                "Supported states: enabled, disabled, checked, unchecked, selected, unselected, "
+                "visible, hidden, focused, unfocused, selected_option=<val>."
+            )
+
+    parsed: Dict[str, Any] = {}
+    for k, v in raw_map.items():
+        k_low = str(k).strip().lower()
+        if k_low in ("disabled", "checked", "selected", "visible", "focused"):
+            if not isinstance(v, bool):
+                return None, f"State key '{k_low}' expects a boolean value."
+            parsed[k_low] = v
+        elif k_low == "selected_option":
+            parsed[k_low] = str(v)
+        else:
+            return None, f"Unsupported state attribute '{k}' in 'browser_element_state'."
+    return (parsed, None) if parsed else (None, "Empty state specification for 'browser_element_state'.")
+
+
+def _extract_browser_context_args(
+    target_val: str,
+    kwargs: Dict[str, Any],
+) -> Tuple[Optional[int], Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """Extract and validate optional browser context filters (tab_id, expected_url, expected_origin, url_prefix)."""
+    from zelyr.tools.browser_native_host import validate_browser_url
+
+    ctx = kwargs.get("context") if isinstance(kwargs.get("context"), dict) else {}
+    tab_id_raw = kwargs.get("tab_id") if kwargs.get("tab_id") is not None else ctx.get("tab_id")
+    tab_id: Optional[int] = None
+    if tab_id_raw is not None and str(tab_id_raw).strip() != "":
+        try:
+            tab_id = int(tab_id_raw)
+            if tab_id < 1:
+                return None, None, None, None, "Browser verification 'tab_id' must be a positive integer."
+        except (TypeError, ValueError):
+            return None, None, None, None, f"Invalid browser verification 'tab_id': {tab_id_raw!r}."
+    elif target_val.strip().lower().startswith("tab:"):
+        raw_tid = target_val.strip()[4:].strip()
+        try:
+            tab_id = int(raw_tid)
+            if tab_id < 1:
+                return None, None, None, None, "Browser verification 'tab:<id>' requires a positive integer."
+        except (TypeError, ValueError):
+            return None, None, None, None, f"Invalid tab reference '{target_val}'."
+
+    exp_url = kwargs.get("expected_url") or kwargs.get("url") or ctx.get("expected_url") or ctx.get("url")
+    exp_origin = kwargs.get("expected_origin") or kwargs.get("origin") or ctx.get("expected_origin") or ctx.get("origin")
+    url_prefix = kwargs.get("url_prefix") or ctx.get("url_prefix")
+
+    for label, val in (("url", exp_url), ("origin", exp_origin), ("url_prefix", url_prefix)):
+        if val is not None and str(val).strip():
+            ok_u, u_err = validate_browser_url(str(val).strip())
+            if not ok_u:
+                return None, None, None, None, f"Invalid browser context '{label}': {u_err}"
+
+    return (
+        tab_id,
+        str(exp_url).strip() if exp_url else None,
+        str(exp_origin).strip() if exp_origin else None,
+        str(url_prefix).strip() if url_prefix else None,
+        None,
+    )
+
+
+def _validate_browser_params(
+    norm_check: str,
+    target_val: str,
+    expected: Optional[Any],
+    kwargs: Dict[str, Any],
+) -> Union[Tuple[None, VerificationResult], Tuple[Dict[str, Any], None]]:
+    """Pure parameter/selector/URL validation for browser verification checks (no IPC side effects)."""
+    from zelyr.tools.browser_native_host import (
+        MAX_SELECTOR_LEN,
+        MAX_URL_LEN,
+        validate_browser_url,
+    )
+
+    canon_check = "browser_url" if norm_check == "browser_navigation" else norm_check
+    ctx = kwargs.get("context") if isinstance(kwargs.get("context"), dict) else {}
+    criterion_obj = {"check": canon_check, "target": target_val, "expected": expected}
+
+    def _invalid(msg: str, obs: Optional[Dict[str, Any]] = None) -> VerificationResult:
         return VerificationResult(
             success=False,
-            check=str(check or ""),
-            target="" if target is None else str(target),
-            observed={"invalid_spec": True},
-            error="Incomplete verification specification: 'check' must be a non-empty check name.",
-        )
-    if target is None or not isinstance(target, (str, Path)):
-        return VerificationResult(
-            success=False,
-            check=check.strip().lower(),
-            target="" if target is None else str(target),
-            observed={"invalid_spec": True},
-            error="Invalid verification specification: 'target' must be a string or Path.",
+            check=canon_check,
+            target=target_val,
+            observed={"invalid_spec": True, **(obs or {})},
+            error=msg,
+            result=VERDICT_FAIL,
+            evidence_source="browser_native_messaging",
+            expected=expected,
+            evidence_collected=False,
+            criterion=criterion_obj,
         )
 
-    norm_check = check.strip().lower()
-    target_val = str(target)
+    if "\x00" in target_val or (isinstance(expected, str) and "\x00" in expected):
+        return None, _invalid("Invalid browser verification specification: null byte is not permitted.")
+
+    tab_id, exp_url, exp_origin, url_prefix, ctx_err = _extract_browser_context_args(target_val, kwargs)
+    if ctx_err:
+        return None, _invalid(ctx_err)
+
+    match_mode = str(kwargs.get("match") or ctx.get("match") or "").strip().lower()
+    selector: Optional[str] = None
+    parsed_state: Optional[Dict[str, Any]] = None
+    eff_expected = expected
+
+    if canon_check == "browser_url":
+        if expected is not None and str(expected).strip() != "":
+            eff_expected = str(expected).strip()
+            if (
+                target_val.lower().startswith(("http://", "https://"))
+                and exp_url is None
+                and url_prefix is None
+            ):
+                url_prefix = target_val
+        elif target_val and target_val.lower() not in ("active", "current") and not target_val.lower().startswith("tab:"):
+            eff_expected = target_val
+        else:
+            return None, _invalid("Incomplete verification specification: 'browser_url' requires a target URL or expected URL.")
+
+        exp_s = str(eff_expected).strip()
+        if len(exp_s) > MAX_URL_LEN:
+            return None, _invalid(f"Expected URL exceeds {MAX_URL_LEN} char limit.")
+        if not exp_s.startswith("/"):
+            ok_u, u_err = validate_browser_url(exp_s)
+            if not ok_u:
+                return None, _invalid(f"Invalid browser URL expectation: {u_err}")
+        mode = "url"
+    elif canon_check == "browser_origin":
+        if expected is not None and str(expected).strip() != "":
+            eff_expected = str(expected).strip()
+        elif target_val and target_val.lower() not in ("active", "current") and not target_val.lower().startswith("tab:"):
+            eff_expected = target_val
+        else:
+            return None, _invalid("Incomplete verification specification: 'browser_origin' requires an expected origin.")
+        ok_o, o_err = validate_browser_url(str(eff_expected).strip())
+        if not ok_o:
+            return None, _invalid(f"Invalid browser origin expectation: {o_err}")
+        mode = "origin"
+    elif canon_check == "browser_title":
+        if not target_val:
+            return None, _invalid("Incomplete verification specification: 'browser_title' requires a target context or 'active'.")
+        if expected is None or str(expected).strip() == "":
+            return None, _invalid("Incomplete verification specification: 'browser_title' requires a non-empty expected title.")
+        if target_val.lower().startswith(("http://", "https://")) and exp_url is None and url_prefix is None:
+            url_prefix = target_val
+        eff_expected = str(expected).strip()
+        mode = "title"
+    elif canon_check in (
+        "browser_element_present",
+        "browser_element_absent",
+        "browser_visible_text",
+        "browser_element_state",
+        "browser_field_value",
+    ):
+        selector = str(kwargs.get("selector") or ctx.get("selector") or target_val).strip()
+        if not selector:
+            return None, _invalid(f"Incomplete verification specification: '{canon_check}' requires a non-empty CSS selector.")
+        if len(selector) > MAX_SELECTOR_LEN:
+            return None, _invalid(f"Selector exceeds {MAX_SELECTOR_LEN} char limit.")
+        if _FORBIDDEN_BROWSER_SELECTOR_RE.search(selector):
+            return None, _invalid("Blocked selector referencing cookies, browser storage, or executable script.")
+
+        if canon_check == "browser_element_present":
+            exp_low = "" if expected is None else str(expected).strip().lower()
+            if exp_low not in ("", "visible", "present", "exists"):
+                return None, _invalid(
+                    f"Incompatible expectation '{expected}' for 'browser_element_present' (allowed: omitted or 'visible')."
+                )
+            mode = "element_present"
+        elif canon_check == "browser_element_absent":
+            if expected is not None and str(expected).strip() != "":
+                return None, _invalid("Incompatible specification: 'browser_element_absent' does not accept an expected value.")
+            mode = "element_absent"
+        elif canon_check == "browser_visible_text":
+            if expected is None or str(expected).strip() == "":
+                return None, _invalid("Incomplete verification specification: 'browser_visible_text' requires expected text.")
+            eff_expected = str(expected)
+            mode = "visible_text"
+        elif canon_check == "browser_element_state":
+            parsed_state, st_err = _parse_browser_state_expectation(expected)
+            if st_err:
+                return None, _invalid(st_err)
+            eff_expected = parsed_state
+            mode = "element_state"
+        else:
+            if expected is None:
+                return None, _invalid("Incomplete verification specification: 'browser_field_value' requires an expected value.")
+            eff_expected = str(expected)
+            mode = "field_value"
+    else:
+        return None, _invalid(f"Unknown browser verification check '{norm_check}'.")
+
+    try:
+        timeout = float(kwargs.get("timeout", 5.0))
+    except (TypeError, ValueError):
+        return None, _invalid(f"Invalid timeout for '{canon_check}': {kwargs.get('timeout')!r}.")
+
+    criterion_obj["expected"] = eff_expected
+    return {
+        "canon_check": canon_check,
+        "mode": mode,
+        "selector": selector,
+        "parsed_state": parsed_state,
+        "eff_expected": eff_expected,
+        "tab_id": tab_id,
+        "exp_url": exp_url,
+        "exp_origin": exp_origin,
+        "url_prefix": url_prefix,
+        "match_mode": match_mode,
+        "timeout": timeout,
+        "ctx": ctx,
+        "criterion_obj": criterion_obj,
+    }, None
+
+
+async def verify_browser_outcome_async(
+    check: str,
+    target: str,
+    expected: Optional[Any] = None,
+    **kwargs: Any,
+) -> VerificationResult:
+    """Verify read-only browser DOM/navigation state via Chromium Native Messaging."""
+    from zelyr.tools.browser_native_host import NativeBrowserClient, validate_browser_url
+
+    norm_raw = (check or "").strip().lower()
+    target_val = "" if target is None else str(target).strip()
+    validated, invalid_res = _validate_browser_params(norm_raw, target_val, expected, kwargs)
+    if invalid_res is not None:
+        return invalid_res
+    assert validated is not None
+
+    canon_check = validated["canon_check"]
+    mode = validated["mode"]
+    selector = validated["selector"]
+    parsed_state = validated["parsed_state"]
+    eff_expected = validated["eff_expected"]
+    tab_id = validated["tab_id"]
+    exp_url = validated["exp_url"]
+    exp_origin = validated["exp_origin"]
+    url_prefix = validated["url_prefix"]
+    match_mode = validated["match_mode"]
+    timeout = validated["timeout"]
+    ctx = validated["ctx"]
+    criterion_obj = validated["criterion_obj"]
+
+    client = kwargs.get("browser_client")
+    if client is None:
+        sock_override = kwargs.get("browser_socket_path")
+        env_sock = os.environ.get("ZELYR_BROWSER_NATIVE_SOCKET", "").strip()
+        if not sock_override and not env_sock:
+            return VerificationResult(
+                success=False,
+                check=canon_check,
+                target=target_val,
+                observed={"unverified": True, "evidence_collected": False, "error_type": "EXTENSION_DISCONNECTED"},
+                error="Browser verification failed closed: Chromium Native Messaging socket is not configured (ZELYR_BROWSER_NATIVE_SOCKET unset).",
+                result=VERDICT_UNVERIFIED,
+                evidence_source="browser_native_messaging",
+                expected=eff_expected,
+                evidence_collected=False,
+                criterion=criterion_obj,
+            )
+        client = NativeBrowserClient(socket_path=sock_override or env_sock)
+        if not client.is_socket_present():
+            return VerificationResult(
+                success=False,
+                check=canon_check,
+                target=target_val,
+                observed={"unverified": True, "evidence_collected": False, "error_type": "EXTENSION_DISCONNECTED"},
+                error=f"Browser extension disconnected: Native Messaging socket not found ({client.socket_path}).",
+                result=VERDICT_UNVERIFIED,
+                evidence_source="browser_native_messaging",
+                expected=eff_expected,
+                evidence_collected=False,
+                criterion=criterion_obj,
+            )
+
+    cmd_params: Dict[str, Any] = {"mode": mode}
+    if selector is not None:
+        cmd_params["selector"] = selector
+    if tab_id is not None:
+        cmd_params["tab_id"] = tab_id
+    if exp_url:
+        cmd_params["expected_url"] = exp_url
+    if exp_origin:
+        cmd_params["expected_origin"] = exp_origin
+    if url_prefix:
+        cmd_params["url_prefix"] = url_prefix
+
+    native_res = await client.send_command("verify_dom_state", timeout=timeout, **cmd_params)
+    resp = native_res.output if isinstance(native_res.output, dict) else {}
+
+    if not native_res.success:
+        if resp.get("invalid_selector"):
+            return VerificationResult(
+                success=False,
+                check=canon_check,
+                target=target_val,
+                observed={"invalid_spec": True, "url": resp.get("url"), "selector": selector},
+                error=native_res.error or f"Invalid CSS selector '{selector}'.",
+                result=VERDICT_FAIL,
+                evidence_source="browser_native_messaging",
+                expected=eff_expected,
+                evidence_collected=False,
+                criterion=criterion_obj,
+            )
+        if resp.get("context_mismatch"):
+            return VerificationResult(
+                success=False,
+                check=canon_check,
+                target=target_val,
+                observed={
+                    "context_mismatch": True,
+                    "tab_id": resp.get("tab_id"),
+                    "url": resp.get("url"),
+                    "origin": resp.get("origin"),
+                    "title": resp.get("title"),
+                },
+                error=native_res.error or "Active browser tab context does not match requested URL/origin.",
+                result=VERDICT_FAIL,
+                evidence_source="browser_native_messaging",
+                expected=eff_expected,
+                evidence_collected=True,
+                criterion=criterion_obj,
+            )
+        return VerificationResult(
+            success=False,
+            check=canon_check,
+            target=target_val,
+            observed={
+                "unverified": True,
+                "evidence_collected": False,
+                "stale": bool(resp.get("stale", False)),
+                "error_type": resp.get("error_type") or "EXTENSION_UNAVAILABLE",
+                "url": resp.get("url"),
+            },
+            error=native_res.error or "Unable to collect browser verification evidence.",
+            result=VERDICT_UNVERIFIED,
+            evidence_source="browser_native_messaging",
+            expected=eff_expected,
+            evidence_collected=False,
+            criterion=criterion_obj,
+        )
+
+    obs_url = str(resp.get("url") or "")
+    if obs_url and obs_url.lower() != "about:blank":
+        ok_obs_url, obs_url_err = validate_browser_url(obs_url)
+        if not ok_obs_url:
+            return VerificationResult(
+                success=False,
+                check=canon_check,
+                target=target_val,
+                observed={"safety_blocked": True, "url": obs_url, "evidence_collected": False},
+                error=f"Observed browser page URL rejected by security policy: {obs_url_err}",
+                result=VERDICT_FAIL,
+                evidence_source="browser_native_messaging",
+                expected=eff_expected,
+                evidence_collected=False,
+                criterion=criterion_obj,
+            )
+
+    obs_origin = str(resp.get("origin") or "")
+    if not obs_origin and obs_url.lower().startswith(("http://", "https://")):
+        pu = urllib.parse.urlparse(obs_url)
+        obs_origin = f"{pu.scheme.lower()}://{pu.netloc.lower()}"
+    obs_title = str(resp.get("title") or "")
+    tab_used = resp.get("tab_id")
+
+    if canon_check == "browser_url":
+        exp_s = str(eff_expected).strip()
+        if exp_s.startswith("/"):
+            p_obs = _normalize_http_url(obs_url)
+            exp_path = "/" if exp_s == "/" else exp_s.rstrip("/")
+            matched = bool(p_obs and p_obs[2] == exp_path)
+        elif match_mode == "contains":
+            matched = exp_s in obs_url
+        elif match_mode == "prefix":
+            matched = obs_url.startswith(exp_s)
+        else:
+            matched = (_normalize_http_url(obs_url) is not None and _normalize_http_url(obs_url) == _normalize_http_url(exp_s))
+        obs_payload = {"tab_id": tab_used, "url": obs_url, "origin": obs_origin, "title": obs_title}
+        return VerificationResult(
+            success=matched,
+            check=canon_check,
+            target=target_val,
+            observed=obs_payload,
+            error=None if matched else f"Expected browser URL '{exp_s}', observed '{obs_url}'.",
+            result=VERDICT_PASS if matched else VERDICT_FAIL,
+            evidence_source="browser_native_messaging",
+            expected=exp_s,
+            evidence_collected=True,
+            criterion=criterion_obj,
+        )
+
+    if canon_check == "browser_origin":
+        p_exp = urllib.parse.urlparse(str(eff_expected).strip())
+        exp_orig = f"{p_exp.scheme.lower()}://{p_exp.netloc.lower()}"
+        matched = obs_origin.lower() == exp_orig
+        obs_payload = {"tab_id": tab_used, "url": obs_url, "origin": obs_origin}
+        return VerificationResult(
+            success=matched,
+            check=canon_check,
+            target=target_val,
+            observed=obs_payload,
+            error=None if matched else f"Expected browser origin '{exp_orig}', observed '{obs_origin}'.",
+            result=VERDICT_PASS if matched else VERDICT_FAIL,
+            evidence_source="browser_native_messaging",
+            expected=exp_orig,
+            evidence_collected=True,
+            criterion=criterion_obj,
+        )
+
+    if canon_check == "browser_title":
+        exp_s = str(eff_expected).strip()
+        matched = (obs_title == exp_s) if match_mode == "exact" else (exp_s in obs_title)
+        obs_payload = {"tab_id": tab_used, "url": obs_url, "title": obs_title}
+        return VerificationResult(
+            success=matched,
+            check=canon_check,
+            target=target_val,
+            observed=obs_payload,
+            error=None if matched else f"Expected title containing '{exp_s}', observed '{obs_title}'.",
+            result=VERDICT_PASS if matched else VERDICT_FAIL,
+            evidence_source="browser_native_messaging",
+            expected=exp_s,
+            evidence_collected=True,
+            criterion=criterion_obj,
+        )
+
+    match_count = int(resp.get("match_count") or 0)
+    visible_count = int(resp.get("visible_count") or 0)
+    matches = resp.get("matches") if isinstance(resp.get("matches"), list) else []
+
+    if canon_check == "browser_element_present":
+        require_visible = str(expected or "").strip().lower() == "visible" or bool(kwargs.get("visible_only") or ctx.get("visible_only"))
+        passed = (visible_count >= 1) if require_visible else (match_count >= 1)
+        obs_payload = {
+            "tab_id": tab_used,
+            "url": obs_url,
+            "selector": selector,
+            "present": match_count >= 1,
+            "match_count": match_count,
+            "visible_count": visible_count,
+        }
+        err_msg = None if passed else (
+            f"Element '{selector}' not visible (match_count={match_count}, visible_count={visible_count})."
+            if require_visible
+            else f"Element '{selector}' not found on page '{obs_url}'."
+        )
+        return VerificationResult(
+            success=passed,
+            check=canon_check,
+            target=target_val,
+            observed=obs_payload,
+            error=err_msg,
+            result=VERDICT_PASS if passed else VERDICT_FAIL,
+            evidence_source="browser_native_messaging",
+            expected=eff_expected,
+            evidence_collected=True,
+            criterion=criterion_obj,
+        )
+
+    if canon_check == "browser_element_absent":
+        passed = match_count == 0
+        obs_payload = {
+            "tab_id": tab_used,
+            "url": obs_url,
+            "selector": selector,
+            "absent": passed,
+            "match_count": match_count,
+        }
+        return VerificationResult(
+            success=passed,
+            check=canon_check,
+            target=target_val,
+            observed=obs_payload,
+            error=None if passed else f"Element '{selector}' is unexpectedly present (match_count={match_count}).",
+            result=VERDICT_PASS if passed else VERDICT_FAIL,
+            evidence_source="browser_native_messaging",
+            expected=None,
+            evidence_collected=True,
+            criterion=criterion_obj,
+        )
+
+    if match_count == 0 or not matches:
+        return VerificationResult(
+            success=False,
+            check=canon_check,
+            target=target_val,
+            observed={
+                "tab_id": tab_used,
+                "url": obs_url,
+                "selector": selector,
+                "match_count": 0,
+                "visible_count": 0,
+            },
+            error=f"DOM element matching '{selector}' was not found on '{obs_url}'.",
+            result=VERDICT_FAIL,
+            evidence_source="browser_native_messaging",
+            expected=eff_expected,
+            evidence_collected=True,
+            criterion=criterion_obj,
+        )
+
+    first = matches[0] if isinstance(matches[0], dict) else {}
+
+    if canon_check == "browser_visible_text":
+        if any(isinstance(m, dict) and m.get("sensitive_redacted") for m in matches):
+            return VerificationResult(
+                success=False,
+                check=canon_check,
+                target=target_val,
+                observed={"safety_blocked": True, "selector": selector, "url": obs_url},
+                error=f"Refused to verify text content on sensitive credential field '{selector}'.",
+                result=VERDICT_FAIL,
+                evidence_source="browser_native_messaging",
+                expected=eff_expected,
+                evidence_collected=False,
+                criterion=criterion_obj,
+            )
+        exp_txt = str(eff_expected)
+        visible_texts = [
+            str(m.get("visible_text") or "")
+            for m in matches
+            if isinstance(m, dict) and m.get("visible")
+        ]
+        if match_mode == "exact":
+            matched = any(t == exp_txt for t in visible_texts)
+        else:
+            matched = any(exp_txt in t for t in visible_texts)
+        obs_text = visible_texts[0] if visible_texts else ""
+        obs_payload = {
+            "tab_id": tab_used,
+            "url": obs_url,
+            "selector": selector,
+            "visible": bool(first.get("visible")) if not visible_texts else True,
+            "visible_text": obs_text,
+            "match_count": match_count,
+            "visible_count": visible_count,
+        }
+        err_msg = None
+        if not matched:
+            if visible_count == 0:
+                err_msg = f"Element '{selector}' matched DOM but is hidden (visible_count=0)."
+            else:
+                err_msg = f"Expected visible text '{exp_txt}' on '{selector}', observed '{obs_text}'."
+        return VerificationResult(
+            success=matched,
+            check=canon_check,
+            target=target_val,
+            observed=obs_payload,
+            error=err_msg,
+            result=VERDICT_PASS if matched else VERDICT_FAIL,
+            evidence_source="browser_native_messaging",
+            expected=exp_txt,
+            evidence_collected=True,
+            criterion=criterion_obj,
+        )
+
+    if canon_check == "browser_field_value":
+        if first.get("sensitive_redacted"):
+            return VerificationResult(
+                success=False,
+                check=canon_check,
+                target=target_val,
+                observed={"safety_blocked": True, "selector": selector, "url": obs_url},
+                error=f"Refused to inspect value of sensitive password/credential field '{selector}'.",
+                result=VERDICT_FAIL,
+                evidence_source="browser_native_messaging",
+                expected=eff_expected,
+                evidence_collected=False,
+                criterion=criterion_obj,
+            )
+        obs_val = first.get("value")
+        exp_val = str(eff_expected)
+        if obs_val is None:
+            matched = False
+            err_msg = f"Element '{selector}' (tag={first.get('tag')}) does not expose a form value."
+        elif match_mode == "contains":
+            matched = exp_val in str(obs_val)
+            err_msg = None if matched else f"Expected field '{selector}' value containing '{exp_val}', observed '{obs_val}'."
+        else:
+            matched = str(obs_val) == exp_val
+            err_msg = None if matched else f"Expected field '{selector}' value '{exp_val}', observed '{obs_val}'."
+        return VerificationResult(
+            success=matched,
+            check=canon_check,
+            target=target_val,
+            observed={"tab_id": tab_used, "url": obs_url, "selector": selector, "value": obs_val, "tag": first.get("tag")},
+            error=err_msg,
+            result=VERDICT_PASS if matched else VERDICT_FAIL,
+            evidence_source="browser_native_messaging",
+            expected=exp_val,
+            evidence_collected=True,
+            criterion=criterion_obj,
+        )
+
+    # browser_element_state
+    assert parsed_state is not None
+    state_mismatches: List[str] = []
+    obs_state: Dict[str, Any] = {
+        "visible": first.get("visible"),
+        "disabled": first.get("disabled"),
+        "checked": first.get("checked"),
+        "selected": first.get("selected"),
+        "focused": first.get("focused"),
+        "value": first.get("value") if not first.get("sensitive_redacted") else None,
+        "selected_options": first.get("selected_options"),
+    }
+    for attr_name, exp_attr_val in parsed_state.items():
+        if attr_name == "selected_option":
+            sel_opts = first.get("selected_options") or []
+            opt_vals = [str(o.get("value", "")) for o in sel_opts if isinstance(o, dict)]
+            opt_texts = [str(o.get("text", "")) for o in sel_opts if isinstance(o, dict)]
+            if str(exp_attr_val) not in opt_vals and str(exp_attr_val) not in opt_texts and str(first.get("value") or "") != str(exp_attr_val):
+                state_mismatches.append(f"selected_option={exp_attr_val!r} (observed options={sel_opts})")
+        else:
+            actual_val = first.get(attr_name)
+            if actual_val is None or bool(actual_val) != bool(exp_attr_val):
+                state_mismatches.append(f"{attr_name}={exp_attr_val} (observed {actual_val})")
+
+    passed = not state_mismatches
+    return VerificationResult(
+        success=passed,
+        check=canon_check,
+        target=target_val,
+        observed={"tab_id": tab_used, "url": obs_url, "selector": selector, "state": obs_state},
+        error=None if passed else f"Element '{selector}' state mismatch: {'; '.join(state_mismatches)}.",
+        result=VERDICT_PASS if passed else VERDICT_FAIL,
+        evidence_source="browser_native_messaging",
+        expected=parsed_state,
+        evidence_collected=True,
+        criterion=criterion_obj,
+    )
+
+
+async def verify_desktop_outcome_async(
+    check: str,
+    target: str,
+    expected: Optional[Any] = None,
+    **kwargs: Any,
+) -> VerificationResult:
+    """Verify read-only Linux desktop compositor window state (no synthetic input or screenshot guessing)."""
+    from zelyr.engine.hyprland_ipc import HyprlandIPCClient, HyprlandUnavailableError
+
+    norm_check = (check or "").strip().lower()
+    target_val = "" if target is None else str(target).strip()
+    ctx = kwargs.get("context") if isinstance(kwargs.get("context"), dict) else {}
+    match_mode = str(kwargs.get("match") or ctx.get("match") or "").strip().lower()
+    criterion_obj = {"check": norm_check, "target": target_val, "expected": expected}
+
+    def _invalid(msg: str) -> VerificationResult:
+        return VerificationResult(
+            success=False,
+            check=norm_check,
+            target=target_val,
+            observed={"invalid_spec": True},
+            error=msg,
+            result=VERDICT_FAIL,
+            evidence_source="hyprland_ipc" if norm_check in DESKTOP_COMPOSITOR_CHECKS else "desktop_accessibility",
+            expected=expected,
+            evidence_collected=False,
+            criterion=criterion_obj,
+        )
+
+    if "\x00" in target_val or (isinstance(expected, str) and "\x00" in expected):
+        return _invalid("Invalid desktop verification specification: null byte is not permitted.")
+
+    if not target_val:
+        return _invalid(f"Incomplete verification specification: '{norm_check}' requires a non-empty target window identifier.")
+
+    if norm_check in DESKTOP_SEMANTIC_UNSUPPORTED_CHECKS:
+        if expected is None or str(expected).strip() == "":
+            return _invalid(f"Incomplete verification specification: '{norm_check}' requires an expected text/state.")
+        # Honest boundary: never synthesize semantic proof from Hyprland focus, input injection, or pixels.
+        reader = kwargs.get("desktop_accessibility_reader")
+        if callable(reader):
+            try:
+                acc_res = reader(target=target_val, expected=str(expected), check=norm_check)
+                if asyncio.iscoroutine(acc_res):
+                    acc_res = await acc_res
+                if isinstance(acc_res, VerificationResult):
+                    return acc_res
+            except Exception as acc_exc:
+                return VerificationResult(
+                    success=False,
+                    check=norm_check,
+                    target=target_val,
+                    observed={"unverified": True, "evidence_collected": False},
+                    error=f"Desktop accessibility query failed: {acc_exc}",
+                    result=VERDICT_UNVERIFIED,
+                    evidence_source="desktop_accessibility",
+                    expected=expected,
+                    evidence_collected=False,
+                    criterion=criterion_obj,
+                )
+        try:
+            import pyatspi  # type: ignore  # noqa: F401
+        except Exception:
+            return VerificationResult(
+                success=False,
+                check=norm_check,
+                target=target_val,
+                observed={
+                    "unsupported": True,
+                    "evidence_collected": False,
+                    "focus_ipc_not_semantic": True,
+                    "reason": (
+                        "AT-SPI accessibility backend (pyatspi) is not available in this runtime; "
+                        "compositor IPC verifies window existence/title/focus metadata only."
+                    ),
+                },
+                error=(
+                    f"Unsupported verification criterion '{norm_check}': semantic desktop UI widget text/state "
+                    "cannot be verified natively without an available accessibility bridge (pyatspi)."
+                ),
+                result=VERDICT_UNSUPPORTED,
+                evidence_source="desktop_accessibility",
+                expected=expected,
+                evidence_collected=False,
+                criterion=criterion_obj,
+            )
+
+        return VerificationResult(
+            success=False,
+            check=norm_check,
+            target=target_val,
+            observed={
+                "unsupported": True,
+                "evidence_collected": False,
+                "reason": "Scoped semantic widget inspection via AT-SPI requires an explicit target widget bridge.",
+            },
+            error=f"Unsupported verification criterion '{norm_check}': deterministic scoped AT-SPI widget verification is not enabled.",
+            result=VERDICT_UNSUPPORTED,
+            evidence_source="desktop_accessibility",
+            expected=expected,
+            evidence_collected=False,
+            criterion=criterion_obj,
+        )
+
+    if norm_check in ("desktop_window_exists", "desktop_active_window"):
+        if expected is not None and str(expected).strip() != "":
+            return _invalid(
+                f"Incompatible specification: '{norm_check}' does not accept expected text (use 'desktop_window_title' for title checks)."
+            )
+    elif norm_check == "desktop_window_title":
+        if expected is None or str(expected).strip() == "":
+            return _invalid("Incomplete verification specification: 'desktop_window_title' requires an expected title.")
+    else:
+        return _invalid(f"Unknown desktop verification check '{check}'.")
+
+    hypr = kwargs.get("hyprland_client")
+    if hypr is None:
+        hypr = HyprlandIPCClient(socket_path=kwargs.get("hyprland_socket_path"))
+
+    can_conn = getattr(hypr, "can_connect", None)
+    if callable(can_conn) and not can_conn():
+        return VerificationResult(
+            success=False,
+            check=norm_check,
+            target=target_val,
+            observed={"unverified": True, "evidence_collected": False, "error_type": "COMPOSITOR_UNAVAILABLE"},
+            error="Hyprland compositor IPC is unavailable; desktop window state cannot be verified.",
+            result=VERDICT_UNVERIFIED,
+            evidence_source="hyprland_ipc",
+            expected=expected,
+            evidence_collected=False,
+            criterion=criterion_obj,
+        )
+
+    try:
+        if norm_check == "desktop_active_window":
+            active_win = await hypr.get_active_window()
+            if not isinstance(active_win, dict) or not active_win:
+                return VerificationResult(
+                    success=False,
+                    check=norm_check,
+                    target=target_val,
+                    observed={
+                        "active_matches_target": False,
+                        "focus_only": True,
+                        "semantic_outcome_verified": False,
+                    },
+                    error=f"No focused window is active; expected '{target_val}'.",
+                    result=VERDICT_FAIL,
+                    evidence_source="hyprland_ipc",
+                    expected=target_val,
+                    evidence_collected=True,
+                    criterion=criterion_obj,
+                )
+            matched = HyprlandIPCClient._match_client([active_win], target_val)
+            if matched is None:
+                # Privacy guard: do not dump arbitrary unrelated private user window titles.
+                return VerificationResult(
+                    success=False,
+                    check=norm_check,
+                    target=target_val,
+                    observed={
+                        "active_matches_target": False,
+                        "focus_only": True,
+                        "semantic_outcome_verified": False,
+                    },
+                    error=f"Focused compositor window does not match target '{target_val}'.",
+                    result=VERDICT_FAIL,
+                    evidence_source="hyprland_ipc",
+                    expected=target_val,
+                    evidence_collected=True,
+                    criterion=criterion_obj,
+                )
+            ws_obj = matched.get("workspace") if isinstance(matched.get("workspace"), dict) else {}
+            return VerificationResult(
+                success=True,
+                check=norm_check,
+                target=target_val,
+                observed={
+                    "active_matches_target": True,
+                    "focus_only": True,
+                    "semantic_outcome_verified": False,
+                    "window": {
+                        "address": matched.get("address"),
+                        "title": matched.get("title"),
+                        "class": matched.get("class") or matched.get("initialClass"),
+                        "workspace_id": ws_obj.get("id"),
+                    },
+                },
+                error=None,
+                result=VERDICT_PASS,
+                evidence_source="hyprland_ipc",
+                expected=target_val,
+                evidence_collected=True,
+                criterion=criterion_obj,
+            )
+
+        clients = await hypr.get_clients()
+        if not isinstance(clients, list):
+            raise HyprlandUnavailableError("Invalid compositor client response.")
+        matched = HyprlandIPCClient._match_client(clients, target_val)
+        # Privacy guard: inspect only the target-matching client; never leak unrelated user windows.
+        win_info = (
+            {
+                "address": matched.get("address"),
+                "title": matched.get("title"),
+                "class": matched.get("class") or matched.get("initialClass"),
+                "workspace_id": (matched.get("workspace") or {}).get("id") if isinstance(matched.get("workspace"), dict) else None,
+                "mapped": matched.get("mapped"),
+            }
+            if matched is not None
+            else None
+        )
+        if norm_check == "desktop_window_exists":
+            passed = matched is not None
+            return VerificationResult(
+                success=passed,
+                check=norm_check,
+                target=target_val,
+                observed={"exists": passed, "window": win_info},
+                error=None if passed else f"No open desktop window matching '{target_val}'.",
+                result=VERDICT_PASS if passed else VERDICT_FAIL,
+                evidence_source="hyprland_ipc",
+                expected=True,
+                evidence_collected=True,
+                criterion=criterion_obj,
+            )
+
+        # desktop_window_title
+        exp_title = str(expected).strip()
+        if matched is None:
+            return VerificationResult(
+                success=False,
+                check=norm_check,
+                target=target_val,
+                observed={"exists": False, "window": None},
+                error=f"Target window '{target_val}' was not found to verify title '{exp_title}'.",
+                result=VERDICT_FAIL,
+                evidence_source="hyprland_ipc",
+                expected=exp_title,
+                evidence_collected=True,
+                criterion=criterion_obj,
+            )
+        obs_title = str(matched.get("title") or "")
+        passed = (obs_title == exp_title) if match_mode == "exact" else (exp_title in obs_title)
+        return VerificationResult(
+            success=passed,
+            check=norm_check,
+            target=target_val,
+            observed={"exists": True, "title": obs_title, "window": win_info},
+            error=None if passed else f"Expected window title containing '{exp_title}', observed '{obs_title}'.",
+            result=VERDICT_PASS if passed else VERDICT_FAIL,
+            evidence_source="hyprland_ipc",
+            expected=exp_title,
+            evidence_collected=True,
+            criterion=criterion_obj,
+        )
+    except (HyprlandUnavailableError, OSError, asyncio.TimeoutError) as exc:
+        return VerificationResult(
+            success=False,
+            check=norm_check,
+            target=target_val,
+            observed={"unverified": True, "evidence_collected": False, "error_type": "COMPOSITOR_UNAVAILABLE"},
+            error=f"Hyprland compositor IPC query failed: {exc}",
+            result=VERDICT_UNVERIFIED,
+            evidence_source="hyprland_ipc",
+            expected=expected,
+            evidence_collected=False,
+            criterion=criterion_obj,
+        )
+
+
+def verify_browser_outcome(
+    check: str,
+    target: str,
+    expected: Optional[Any] = None,
+    **kwargs: Any,
+) -> VerificationResult:
+    """Synchronous wrapper around verify_browser_outcome_async."""
+    return _run_coro_sync(lambda: verify_browser_outcome_async(check, target, expected, **kwargs))
+
+
+def verify_desktop_outcome(
+    check: str,
+    target: str,
+    expected: Optional[Any] = None,
+    **kwargs: Any,
+) -> VerificationResult:
+    """Synchronous wrapper around verify_desktop_outcome_async."""
+    return _run_coro_sync(lambda: verify_desktop_outcome_async(check, target, expected, **kwargs))
+
+
+def _with_expected_meta(vr: VerificationResult, expected: Any) -> VerificationResult:
+    """Populate expected metadata on sync VerificationResult instances when caller supplied expected."""
+    if expected is None or vr.expected is not None:
+        return vr
+    return VerificationResult(
+        success=vr.success,
+        check=vr.check,
+        target=vr.target,
+        observed=vr.observed,
+        error=vr.error,
+        result=vr.result,
+        evidence_source=vr.evidence_source,
+        expected=expected,
+        evidence_collected=vr.evidence_collected,
+        criterion={**vr.criterion, "expected": expected},
+    )
+
+
+def _dispatch_sync_check(
+    norm_check: str,
+    raw_check: str,
+    target_val: str,
+    expected: Optional[Any],
+    kwargs: Dict[str, Any],
+) -> Optional[VerificationResult]:
+    """Dispatch synchronous filesystem, process, port, and allowlisted command checks."""
     cwd = kwargs.get("cwd")
     allow_external = bool(kwargs.get("allow_external", False))
 
@@ -1502,7 +2754,7 @@ def verify_outcome(
                 ),
             )
         return verify_file_exists(target_val, cwd=cwd, allow_external=allow_external)
-    elif norm_check in ("file_contains", "contains"):
+    if norm_check in ("file_contains", "contains"):
         if expected is None or str(expected) == "":
             return VerificationResult(
                 success=False,
@@ -1512,10 +2764,16 @@ def verify_outcome(
                 error="Incomplete verification specification: 'file_contains' requires expected pattern or content.",
             )
         regex = bool(kwargs.get("regex", False))
-        return verify_file_contains(target_val, expected, regex=regex, cwd=cwd, allow_external=allow_external)
-    elif norm_check in ("file_checksum", "checksum", "sha256"):
-        return verify_file_checksum(target_val, expected or "", cwd=cwd, allow_external=allow_external)
-    elif norm_check in ("file_json", "json"):
+        return _with_expected_meta(
+            verify_file_contains(target_val, expected, regex=regex, cwd=cwd, allow_external=allow_external),
+            expected,
+        )
+    if norm_check in ("file_checksum", "checksum", "sha256"):
+        return _with_expected_meta(
+            verify_file_checksum(target_val, expected or "", cwd=cwd, allow_external=allow_external),
+            expected,
+        )
+    if norm_check in ("file_json", "json"):
         schema = kwargs.get("schema")
         if schema is None and expected is not None and str(expected).strip() != "":
             exp_str = str(expected).strip()
@@ -1532,8 +2790,11 @@ def verify_outcome(
                     )
             else:
                 schema = {"required_keys": [k.strip() for k in exp_str.split(",") if k.strip()]}
-        return verify_file_json(target_val, schema=schema, cwd=cwd, allow_external=allow_external)
-    elif norm_check in ("process_running", "process", "proc"):
+        return _with_expected_meta(
+            verify_file_json(target_val, schema=schema, cwd=cwd, allow_external=allow_external),
+            expected,
+        )
+    if norm_check in ("process_running", "process", "proc"):
         if expected is not None and str(expected).strip() != "":
             return VerificationResult(
                 success=False,
@@ -1543,7 +2804,7 @@ def verify_outcome(
                 error="Incompatible verification specification: 'process_running' only verifies process existence and does not accept expected content.",
             )
         return verify_process_running(target_val)
-    elif norm_check in ("port_listening", "port", "listen"):
+    if norm_check in ("port_listening", "port", "listen"):
         target_spec = target_val
         if expected and str(expected).strip():
             target_clean = target_val.strip()
@@ -1563,8 +2824,11 @@ def verify_outcome(
                 observed={"invalid_spec": True},
                 error=f"Invalid timeout for 'port_listening': {kwargs.get('timeout')!r}.",
             )
-        return verify_port_listening(target_spec, host=host, timeout=timeout)
-    elif norm_check in ("command_output", "command", "cmd"):
+        return _with_expected_meta(
+            verify_port_listening(target_spec, host=host, timeout=timeout),
+            expected,
+        )
+    if norm_check in ("command_output", "command", "cmd"):
         try:
             timeout = float(kwargs.get("timeout", 5.0))
         except (TypeError, ValueError):
@@ -1576,34 +2840,421 @@ def verify_outcome(
                 error=f"Invalid timeout for 'command_output': {kwargs.get('timeout')!r}.",
             )
         cancel_event = kwargs.get("cancel_event")
-        return verify_command_output(target_val, expected or "", timeout=timeout, cwd=cwd, cancel_event=cancel_event)
-    else:
+        return _with_expected_meta(
+            verify_command_output(target_val, expected or "", timeout=timeout, cwd=cwd, cancel_event=cancel_event),
+            expected,
+        )
+    return None
+
+
+def _validate_base_dispatch_args(check: str, target: str) -> Optional[VerificationResult]:
+    if not isinstance(check, str) or not check.strip():
         return VerificationResult(
             success=False,
-            check=check,
+            check=str(check or ""),
+            target="" if target is None else str(target),
+            observed={"invalid_spec": True},
+            error="Incomplete verification specification: 'check' must be a non-empty check name.",
+        )
+    if target is None or not isinstance(target, (str, Path)):
+        return VerificationResult(
+            success=False,
+            check=check.strip().lower(),
+            target="" if target is None else str(target),
+            observed={"invalid_spec": True},
+            error="Invalid verification specification: 'target' must be a string or Path.",
+        )
+    return None
+
+
+async def verify_outcome_async(
+    check: str,
+    target: str,
+    expected: Optional[Any] = None,
+    **kwargs: Any,
+) -> VerificationResult:
+    """Async outcome verification dispatcher supporting filesystem, host, browser, and desktop checks."""
+    invalid_base = _validate_base_dispatch_args(check, target)
+    if invalid_base is not None:
+        return invalid_base
+
+    norm_check = check.strip().lower()
+    target_val = str(target)
+
+    if norm_check in BROWSER_VERIFICATION_CHECKS:
+        return await verify_browser_outcome_async(norm_check, target_val, expected=expected, **kwargs)
+    if norm_check in DESKTOP_VERIFICATION_CHECKS:
+        return await verify_desktop_outcome_async(norm_check, target_val, expected=expected, **kwargs)
+
+    sync_res = _dispatch_sync_check(norm_check, check, target_val, expected, kwargs)
+    if sync_res is not None:
+        return sync_res
+
+    return VerificationResult(
+        success=False,
+        check=check,
+        target=target_val,
+        observed={"invalid_spec": True},
+        error=(
+            f"Unknown verification check '{check}'. Supported checks: "
+            f"{', '.join(sorted(ALL_KNOWN_VERIFICATION_CHECKS))}."
+        ),
+    )
+
+
+def verify_outcome(
+    check: str,
+    target: str,
+    expected: Optional[Any] = None,
+    **kwargs: Any,
+) -> VerificationResult:
+    """Dispatch outcome verification based on check name."""
+    invalid_base = _validate_base_dispatch_args(check, target)
+    if invalid_base is not None:
+        return invalid_base
+
+    norm_check = check.strip().lower()
+    target_val = str(target)
+
+    if norm_check in BROWSER_VERIFICATION_CHECKS:
+        return verify_browser_outcome(norm_check, target_val, expected=expected, **kwargs)
+    if norm_check in DESKTOP_VERIFICATION_CHECKS:
+        return verify_desktop_outcome(norm_check, target_val, expected=expected, **kwargs)
+
+    sync_res = _dispatch_sync_check(norm_check, check, target_val, expected, kwargs)
+    if sync_res is not None:
+        return sync_res
+
+    return VerificationResult(
+        success=False,
+        check=check,
+        target=target_val,
+        observed={"invalid_spec": True},
+        error=(
+            f"Unknown verification check '{check}'. Supported checks: "
+            f"{', '.join(sorted(ALL_KNOWN_VERIFICATION_CHECKS))}."
+        ),
+    )
+
+
+def validate_criterion_spec(
+    criterion: Dict[str, Any],
+    **kwargs: Any,
+) -> Optional[VerificationResult]:
+    """Validate a single parsed criterion statically before task execution (no external I/O on valid specs)."""
+    if not isinstance(criterion, dict):
+        return VerificationResult(
+            success=False,
+            check="",
+            target="",
+            observed={"invalid_spec": True},
+            error="Verification criterion must be an object.",
+        )
+    check = criterion.get("check", "")
+    target = criterion.get("target", "")
+    expected = criterion.get("expected")
+    invalid_base = _validate_base_dispatch_args(check, target)
+    if invalid_base is not None:
+        return invalid_base
+
+    norm_check = str(check).strip().lower()
+    target_val = str(target).strip()
+
+    if norm_check not in ALL_KNOWN_VERIFICATION_CHECKS:
+        return VerificationResult(
+            success=False,
+            check=str(check),
             target=target_val,
             observed={"invalid_spec": True},
             error=(
                 f"Unknown verification check '{check}'. Supported checks: "
-                "file_exists, file_contains, file_checksum, file_json, "
-                "process_running, port_listening, command_output."
+                f"{', '.join(sorted(ALL_KNOWN_VERIFICATION_CHECKS))}."
             ),
         )
+
+    if "\x00" in target_val or (isinstance(expected, str) and "\x00" in expected):
+        return VerificationResult(
+            success=False,
+            check=norm_check,
+            target=target_val,
+            observed={"invalid_spec": True},
+            error="Invalid verification specification: null byte is not permitted.",
+        )
+
+    if norm_check in BROWSER_VERIFICATION_CHECKS:
+        merged_kw = dict(kwargs)
+        if isinstance(criterion.get("context"), dict):
+            merged_kw.setdefault("context", criterion["context"])
+        _, invalid_res = _validate_browser_params(norm_check, target_val, expected, merged_kw)
+        return invalid_res
+
+    if norm_check in DESKTOP_VERIFICATION_CHECKS:
+        if not target_val:
+            return VerificationResult(
+                success=False,
+                check=norm_check,
+                target="",
+                observed={"invalid_spec": True},
+                error=f"Incomplete verification specification: '{norm_check}' requires a non-empty target window identifier.",
+            )
+        if norm_check in ("desktop_window_exists", "desktop_active_window"):
+            if expected is not None and str(expected).strip() != "":
+                return VerificationResult(
+                    success=False,
+                    check=norm_check,
+                    target=target_val,
+                    observed={"invalid_spec": True},
+                    error=f"Incompatible specification: '{norm_check}' does not accept expected text.",
+                )
+        else:
+            if expected is None or str(expected).strip() == "":
+                return VerificationResult(
+                    success=False,
+                    check=norm_check,
+                    target=target_val,
+                    observed={"invalid_spec": True},
+                    error=f"Incomplete verification specification: '{norm_check}' requires expected text/state.",
+                )
+        return None
+
+    if norm_check in ("file_exists", "exists"):
+        if not target_val:
+            return VerificationResult(
+                success=False,
+                check="file_exists",
+                target="",
+                observed={"exists": False, "invalid_spec": True},
+                error="Incomplete verification specification: 'file_exists' requires a non-empty target path.",
+            )
+        if expected is not None and str(expected).strip() != "":
+            return VerificationResult(
+                success=False,
+                check="file_exists",
+                target=target_val,
+                observed={"expected_content_provided": expected, "invalid_spec": True},
+                error="Incompatible verification specification: 'file_exists' does not accept expected content.",
+            )
+        return None
+    if norm_check in ("file_contains", "contains"):
+        if not target_val:
+            return VerificationResult(
+                success=False,
+                check="file_contains",
+                target="",
+                observed={"matched": False, "invalid_spec": True},
+                error="Incomplete verification specification: 'file_contains' requires a non-empty target path.",
+            )
+        if expected is None or str(expected) == "":
+            return VerificationResult(
+                success=False,
+                check="file_contains",
+                target=target_val,
+                observed={"pattern": expected, "invalid_spec": True},
+                error="Incomplete verification specification: 'file_contains' requires expected pattern or content.",
+            )
+        return None
+    if norm_check in ("file_checksum", "checksum", "sha256"):
+        if not target_val or expected is None or not str(expected).strip():
+            return VerificationResult(
+                success=False,
+                check="file_checksum",
+                target=target_val,
+                observed={"invalid_spec": True},
+                error="Incomplete verification specification: 'file_checksum' requires target path and expected checksum.",
+            )
+        return None
+    if norm_check in ("file_json", "json"):
+        if not target_val:
+            return VerificationResult(
+                success=False,
+                check="file_json",
+                target="",
+                observed={"valid": False, "invalid_spec": True},
+                error="Incomplete verification specification: 'file_json' requires a non-empty target path.",
+            )
+        if expected is not None and str(expected).strip().startswith("{"):
+            try:
+                json.loads(str(expected).strip())
+            except Exception as exc:
+                return VerificationResult(
+                    success=False,
+                    check="file_json",
+                    target=target_val,
+                    observed={"valid": False, "invalid_spec": True},
+                    error=f"Invalid schema JSON provided for 'file_json': {exc}",
+                )
+        return None
+    if norm_check in ("process_running", "process", "proc"):
+        if not target_val or (expected is not None and str(expected).strip() != ""):
+            return VerificationResult(
+                success=False,
+                check="process_running",
+                target=target_val,
+                observed={"invalid_spec": True},
+                error="Invalid specification for 'process_running': requires non-empty pattern and no expected value.",
+            )
+        return None
+    if norm_check in ("port_listening", "port", "listen"):
+        port_s = str(expected).strip() if (expected and ":" not in target_val and not target_val.isdigit()) else target_val.split(":")[-1].strip()
+        try:
+            pnum = int(port_s)
+            if not (1 <= pnum <= 65535):
+                raise ValueError("out of range")
+        except Exception:
+            return VerificationResult(
+                success=False,
+                check="port_listening",
+                target=target_val,
+                observed={"invalid_spec": True},
+                error=f"Invalid port specification for 'port_listening': '{target_val}'.",
+            )
+        return None
+    if norm_check in ("command_output", "command", "cmd"):
+        if not target_val or expected is None or str(expected) == "":
+            return VerificationResult(
+                success=False,
+                check="command_output",
+                target=target_val,
+                observed={"invalid_spec": True},
+                error="Incomplete verification specification: 'command_output' requires command and expected output.",
+            )
+        return None
+    return None
+
+
+def validate_verification_spec(
+    spec: Any,
+    *,
+    parser_fn: Optional[Callable[[Any], List[Dict[str, Any]]]] = None,
+) -> Tuple[List[Dict[str, Any]], Optional[str], Optional[VerificationResult]]:
+    """Parse and statically validate a --verify / acceptance_criteria spec before execution."""
+    if spec is None:
+        return [], "Empty verification specification provided.", None
+    if isinstance(spec, str):
+        stripped = spec.strip()
+        if not stripped:
+            return [], "Empty verification specification provided.", None
+        if stripped.startswith(("[", "{")):
+            try:
+                decoded = json.loads(stripped)
+            except Exception as exc:
+                return [], f"Malformed JSON verification specification: {exc}", None
+            if isinstance(decoded, list) and not decoded:
+                return [], "Empty verification specification list provided.", None
+            if not isinstance(decoded, (list, dict)):
+                return [], "JSON verification specification must be an object or array of objects.", None
+
+    if parser_fn is None:
+        from zelyr.engine.execution_ledger import parse_acceptance_criteria as parser_fn
+
+    parsed = parser_fn(spec)
+    if not parsed:
+        return [], f"Unable to parse verification specification: '{spec}'", None
+
+    for item in parsed:
+        err_res = validate_criterion_spec(item)
+        if err_res is not None:
+            return parsed, f"{err_res.check} on {err_res.target}: FAIL ({err_res.error})", err_res
+    return parsed, None, None
+
+
+def summarize_verification_scope(
+    criteria: Optional[List[Dict[str, Any]]],
+    v_results: Optional[List[Tuple[str, str, VerificationResult]]] = None,
+) -> Dict[str, Any]:
+    """Summarize verified surfaces, verdict counts, and evidence attribution cleanly."""
+    surfaces: List[str] = []
+    checks_to_inspect: List[str] = []
+    if v_results:
+        checks_to_inspect.extend(str(chk or "").strip().lower() for chk, _, _ in v_results)
+    elif criteria:
+        checks_to_inspect.extend(str(c.get("check") or "").strip().lower() for c in criteria if isinstance(c, dict))
+
+    for chk in checks_to_inspect:
+        if chk in BROWSER_VERIFICATION_CHECKS and "browser" not in surfaces:
+            surfaces.append("browser")
+        elif chk in DESKTOP_COMPOSITOR_CHECKS and "desktop_compositor" not in surfaces:
+            surfaces.append("desktop_compositor")
+        elif chk in DESKTOP_SEMANTIC_UNSUPPORTED_CHECKS and "desktop_semantic" not in surfaces:
+            surfaces.append("desktop_semantic")
+        elif chk in ("file_exists", "exists", "file_contains", "contains", "file_checksum", "checksum", "sha256", "file_json", "json"):
+            if "filesystem" not in surfaces:
+                surfaces.append("filesystem")
+        elif chk in ("process_running", "process", "proc", "port_listening", "port", "listen"):
+            if "host_runtime" not in surfaces:
+                surfaces.append("host_runtime")
+        elif chk in ("command_output", "command", "cmd"):
+            if "command" not in surfaces:
+                surfaces.append("command")
+
+    counts = {VERDICT_PASS: 0, VERDICT_FAIL: 0, VERDICT_UNVERIFIED: 0, VERDICT_UNSUPPORTED: 0}
+    if v_results:
+        for _, _, vr in v_results:
+            v = getattr(vr, "result", VERDICT_PASS if getattr(vr, "success", False) else VERDICT_FAIL)
+            counts[v] = counts.get(v, 0) + 1
+
+    if not v_results:
+        overall = VERDICT_UNVERIFIED
+    elif counts[VERDICT_UNSUPPORTED] > 0:
+        overall = VERDICT_UNSUPPORTED
+    elif counts[VERDICT_UNVERIFIED] > 0:
+        overall = VERDICT_UNVERIFIED
+    elif counts[VERDICT_FAIL] > 0:
+        overall = VERDICT_FAIL
+    else:
+        overall = VERDICT_PASS
+
+    return {
+        "surfaces": surfaces,
+        "overall_result": overall,
+        "counts": counts,
+    }
 
 
 class OutcomeVerifier:
     """Independent outcome verifier engine for deterministic state assertions."""
 
     @staticmethod
-    def verify(
-        check: str,
-        target: str,
-        expected: Optional[str] = None,
-        **kwargs: Any,
-    ) -> VerificationResult:
-        """Verify state outcome for the given check type, target, and expectation."""
-        return verify_outcome(check, target, expected, **kwargs)
+    def verify_criterion(criterion: Dict[str, Any], **kwargs: Any) -> VerificationResult:
+        """Verify a parsed criterion dictionary synchronously (preserving typed context)."""
+        merged = dict(kwargs)
+        if isinstance(criterion.get("context"), dict):
+            merged.setdefault("context", criterion["context"])
+        return verify_outcome(
+            check=str(criterion.get("check", "")),
+            target=str(criterion.get("target", "")),
+            expected=criterion.get("expected"),
+            **merged,
+        )
 
+    @classmethod
+    async def verify_criterion_async(cls, criterion: Dict[str, Any], **kwargs: Any) -> VerificationResult:
+        """Verify a parsed criterion dictionary asynchronously (preserving typed context and test mocks)."""
+        merged = dict(kwargs)
+        if isinstance(criterion.get("context"), dict):
+            merged.setdefault("context", criterion["context"])
+        chk = str(criterion.get("check", ""))
+        tgt = str(criterion.get("target", ""))
+        exp = criterion.get("expected")
+        norm_check = chk.strip().lower()
+        # Honor monkeypatched/mocked OutcomeVerifier.verify and route synchronous checks cleanly through cls.verify.
+        if cls.verify is not verify_outcome or (
+            norm_check not in BROWSER_VERIFICATION_CHECKS
+            and norm_check not in DESKTOP_VERIFICATION_CHECKS
+        ):
+            return cls.verify(chk, tgt, expected=exp, **merged)
+        return await verify_outcome_async(
+            check=chk,
+            target=tgt,
+            expected=exp,
+            **merged,
+        )
+
+    verify = staticmethod(verify_outcome)
+    verify_async = staticmethod(verify_outcome_async)
+    validate_spec = staticmethod(validate_verification_spec)
+    validate_criterion = staticmethod(validate_criterion_spec)
+    summarize_scope = staticmethod(summarize_verification_scope)
     verify_file_exists = staticmethod(verify_file_exists)
     verify_file_contains = staticmethod(verify_file_contains)
     verify_file_checksum = staticmethod(verify_file_checksum)
@@ -1611,3 +3262,7 @@ class OutcomeVerifier:
     verify_process_running = staticmethod(verify_process_running)
     verify_port_listening = staticmethod(verify_port_listening)
     verify_command_output = staticmethod(verify_command_output)
+    verify_browser_outcome = staticmethod(verify_browser_outcome)
+    verify_browser_outcome_async = staticmethod(verify_browser_outcome_async)
+    verify_desktop_outcome = staticmethod(verify_desktop_outcome)
+    verify_desktop_outcome_async = staticmethod(verify_desktop_outcome_async)

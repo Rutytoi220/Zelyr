@@ -10,9 +10,10 @@ import json
 from typing import Any, Dict, Optional
 
 from zelyr.engine.verifier import (
+    ALL_KNOWN_VERIFICATION_CHECKS,
     OutcomeVerifier,
     VerificationResult,
-    verify_outcome,
+    verify_outcome_async,
 )
 from zelyr.tools.core import BaseTool, ToolParameter, ToolResult
 
@@ -25,28 +26,21 @@ TOOL_SCHEMA: Dict[str, Any] = {
     "function": {
         "name": "verify_outcome",
         "description": (
-            "Deterministically verify an expected system or filesystem state outcome "
-            "(files, contents, checksums, JSON, running processes, listening ports, command outputs)."
+            "Deterministically verify an expected system, filesystem, browser, or desktop state outcome "
+            "(files, contents, checksums, JSON, processes, listening ports, command outputs, "
+            "read-only Chromium DOM/URL checks, read-only Hyprland compositor window checks)."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "check": {
                     "type": "string",
-                    "enum": [
-                        "file_exists",
-                        "file_contains",
-                        "file_checksum",
-                        "file_json",
-                        "process_running",
-                        "port_listening",
-                        "command_output",
-                    ],
+                    "enum": sorted(ALL_KNOWN_VERIFICATION_CHECKS),
                     "description": "The type of state verification to perform.",
                 },
                 "target": {
                     "type": "string",
-                    "description": "Target of the check: file path, process name/pattern, port number (or host:port), or command string.",
+                    "description": "Target of the check: file path, process pattern, port, command, CSS selector/URL, or window identifier.",
                 },
                 "expected": {
                     "type": "string",
@@ -125,17 +119,17 @@ class VerifyOutcomeTool(BaseTool):
         if expected is None and "expected" in kwargs:
             expected = kwargs.pop("expected")
 
-        res: VerificationResult = verify_outcome(check=check, target=target, expected=expected, **kwargs)
+        res: VerificationResult = await verify_outcome_async(check=check, target=target, expected=expected, **kwargs)
         if res.success:
             return ToolResult(
                 success=True,
                 output=f"[VERIFIED] {res.check} on {res.target}: PASS ({json.dumps(res.observed)})",
-                metadata={"verification": res.to_dict()},
+                metadata={"verification": res.to_detailed_dict()},
             )
         return ToolResult(
             success=False,
-            error=res.error or f"Verification failed for {res.check} on {res.target}",
-            metadata={"verification": res.to_dict()},
+            error=res.error or f"Verification {res.result} for {res.check} on {res.target}",
+            metadata={"verification": res.to_detailed_dict()},
         )
 
 
@@ -153,13 +147,18 @@ async def execute(
     if expected is None and "expected" in kwargs:
         expected = kwargs.pop("expected")
 
-    res = verify_outcome(check=check, target=target, expected=expected, **kwargs)
+    res = await verify_outcome_async(check=check, target=target, expected=expected, **kwargs)
     payload = {
         "status": "success" if res.success else "error",
         "verified": res.success,
+        "result": res.result,
+        "evidence_source": res.evidence_source,
+        "evidence_collected": res.evidence_collected,
+        "expected": res.expected,
         "check": res.check,
         "target": res.target,
         "observed": res.observed,
+        "criterion": res.criterion,
     }
     if res.error:
         payload["error"] = res.error

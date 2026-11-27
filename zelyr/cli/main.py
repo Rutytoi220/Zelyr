@@ -403,6 +403,89 @@ async def _execute_headless_run(
             central_ledger=cli_ledger,
             max_steps=eff_max_steps,
         )
+
+    if verify_spec is not None:
+        from zelyr.engine.verifier import OutcomeVerifier
+
+        _, pre_spec_err, pre_spec_res = OutcomeVerifier.validate_spec(verify_spec)
+        if pre_spec_err:
+            from zelyr.engine.execution_ledger import (
+                ExecutionStatus,
+                LedgerEventType,
+                TurnExecutionLedger,
+                VerificationStatus,
+                get_default_central_ledger,
+                resolve_root_execution_outcome,
+            )
+
+            pre_ledger = TurnExecutionLedger()
+            orch.current_ledger = pre_ledger
+            c_ledger = cli_ledger or getattr(orch, "central_ledger", None) or get_default_central_ledger()
+            exec_id = None
+            if c_ledger is not None and hasattr(c_ledger, "create_execution"):
+                rec = c_ledger.create_execution(
+                    clean_prompt,
+                    source_component="cli.headless_run",
+                    status=ExecutionStatus.RUNNING,
+                    metadata={"model": active_model, "acceptance_criteria": verify_spec},
+                )
+                exec_id = rec.execution_id
+                pre_ledger.attach_central_ledger(c_ledger, exec_id, source_component="cli.headless_run")
+                c_ledger.record_event(
+                    exec_id,
+                    LedgerEventType.VERIFICATION_RECORDED,
+                    status=VerificationStatus.VERIFICATION_FAILED.value,
+                    metadata={
+                        "check": pre_spec_res.check if pre_spec_res else "verify_spec",
+                        "target": pre_spec_res.target if pre_spec_res else "",
+                        "result": getattr(pre_spec_res, "result", "FAIL") if pre_spec_res else "FAIL",
+                        "evidence_collected": False,
+                        "error": pre_spec_err,
+                    },
+                )
+            res_pre = resolve_root_execution_outcome(
+                prompt=clean_prompt,
+                ledger=pre_ledger,
+                final_text="",
+                acceptance_spec=verify_spec,
+                invalid_verify_spec_error=pre_spec_err,
+            )
+            pre_ledger.set_verification_status(res_pre.verification_status)
+            if c_ledger is not None and exec_id is not None:
+                c_ledger.finalize_execution(
+                    exec_id,
+                    status=res_pre.execution_status,
+                    verification_status=res_pre.verification_status,
+                    error=pre_spec_err,
+                    metadata={"interruption_reason": "invalid_verification_spec"},
+                )
+            if owns_cli_ledger and cli_ledger is not None:
+                cli_ledger.close()
+                cli_ledger = None
+            if output_json:
+                err_payload: Dict[str, Any] = {
+                    "prompt": clean_prompt,
+                    "model": active_model,
+                    "response": "",
+                    "tool_calls": [],
+                    "error": pre_spec_err,
+                    "invalid_verification_spec": True,
+                    "root_execution_status": res_pre.execution_status.value,
+                    "root_verification_status": res_pre.verification_status.value,
+                    "execution_ledger": pre_ledger.to_dict(),
+                }
+                if pre_spec_res is not None:
+                    err_payload["verification"] = pre_spec_res.to_detailed_dict()
+                sys.stdout.write(json.dumps(err_payload) + "\n")
+                sys.stdout.flush()
+            else:
+                err_msg = f"[verification failed] {pre_spec_err}\n"
+                sys.stdout.write(err_msg)
+                sys.stdout.flush()
+                sys.stderr.write(err_msg)
+                sys.stderr.flush()
+            return 2
+
     from zelyr.agents.actuator_arbiter import ActuatorArbiter
 
     all_schemas = get_tool_schemas(0)
@@ -664,6 +747,15 @@ async def _execute_headless_run(
                     fb_ver_failed = bool(fb_parsed.get("verification_failed"))
                     fb_ver_detail = fb_parsed.get("verification_detail")
 
+                    if hasattr(orch, "current_ledger") and orch.current_ledger is not None and fb_status == "success":
+                        from zelyr.engine.execution_ledger import _is_inspection_action
+                        if not _is_inspection_action(fn_name, fn_args):
+                            fn_low = (fn_name or "").strip().lower()
+                            if fn_low in ("interact_with_browser", "browser_cdp", "browser_navigate"):
+                                orch.current_ledger.invalidate_surface_verifications("browser")
+                            elif fn_low in ("desktop_control", "desktop_automation", "manage_desktop_window", "interact_with_ui", "gui_actuate"):
+                                orch.current_ledger.invalidate_surface_verifications("desktop")
+
                     fb_failed_targets: List[str] = []
                     fb_verified_targets: List[str] = []
                     if verify_spec:
@@ -673,10 +765,14 @@ async def _execute_headless_run(
                         if parsed_c:
                             c_ver_results = []
                             for c in parsed_c:
-                                vr = OutcomeVerifier.verify(check=c["check"], target=c["target"], expected=c.get("expected"))
+                                vr = await OutcomeVerifier.verify_criterion_async(c)
                                 c_ver_results.append((c, vr))
                                 if vr.success and hasattr(orch, "current_ledger") and orch.current_ledger is not None:
-                                    orch.current_ledger.record_target_verified(c["target"], detail=f"{c['check']} verified")
+                                    orch.current_ledger.record_target_verified(
+                                        c["target"],
+                                        detail=f"{c['check']} verified",
+                                        check_type=c.get("check"),
+                                    )
                                 elif not vr.success and hasattr(orch, "current_ledger") and orch.current_ledger is not None:
                                     orch.current_ledger.invalidate_target_verification(c["target"], check_type=c.get("check"))
                             if fb_status == "success":
@@ -821,25 +917,21 @@ async def _execute_headless_run(
 
     try:
         v_results = []
+        ver_scope: Optional[Dict[str, Any]] = None
         invalid_verify_spec_error: Optional[str] = None
         if not was_cancelled and headless_exc is None and not is_model_err and not is_truncated and verify_spec is not None:
-            if not verify_spec.strip():
-                invalid_verify_spec_error = "Empty verification specification provided."
-            else:
-                from zelyr.engine.execution_ledger import parse_acceptance_criteria
-                from zelyr.engine.verifier import OutcomeVerifier
+            from zelyr.engine.verifier import OutcomeVerifier
 
-                parsed_specs = parse_acceptance_criteria(verify_spec)
-                if parsed_specs:
-                    for item in parsed_specs:
-                        v_res = OutcomeVerifier.verify(
-                            check=item.get("check", ""),
-                            target=item.get("target", ""),
-                            expected=item.get("expected"),
-                        )
-                        v_results.append((item.get("check", ""), item.get("target", ""), v_res))
-                else:
-                    invalid_verify_spec_error = f"Unable to parse verification specification: '{verify_spec}'"
+            parsed_specs, pre_err, _ = OutcomeVerifier.validate_spec(verify_spec)
+            if pre_err:
+                invalid_verify_spec_error = pre_err
+            elif parsed_specs:
+                for item in parsed_specs:
+                    v_res = await OutcomeVerifier.verify_criterion_async(item)
+                    v_results.append((item.get("check", ""), item.get("target", ""), v_res))
+                ver_scope = OutcomeVerifier.summarize_scope(parsed_specs, v_results)
+            else:
+                invalid_verify_spec_error = f"Unable to parse verification specification: '{verify_spec}'"
 
         ledger = getattr(orch, "current_ledger", None)
         from zelyr.engine.execution_ledger import (
@@ -876,7 +968,15 @@ async def _execute_headless_run(
                         c_exec_id,
                         LedgerEventType.VERIFICATION_RECORDED,
                         status=VerificationStatus.VERIFIED.value if v_res.success else VerificationStatus.VERIFICATION_FAILED.value,
-                        metadata={"check": v_check, "target": v_target, "error": getattr(v_res, "error", None)},
+                        metadata={
+                            "check": v_check,
+                            "target": v_target,
+                            "result": getattr(v_res, "result", "PASS" if v_res.success else "FAIL"),
+                            "evidence_source": getattr(v_res, "evidence_source", None),
+                            "evidence_collected": getattr(v_res, "evidence_collected", None),
+                            "expected": getattr(v_res, "expected", None),
+                            "error": getattr(v_res, "error", None),
+                        },
                     )
 
             from zelyr.engine.checkpoint import CheckpointManager
@@ -921,6 +1021,8 @@ async def _execute_headless_run(
                 fin_meta["diagnostic_test_failed"] = True
             if res_outcome.policy_compliance.get("has_prohibitions"):
                 fin_meta["policy_compliance"] = res_outcome.policy_compliance
+            if ver_scope is not None:
+                fin_meta["verification_scope"] = ver_scope
             if cp_err:
                 fin_meta["checkpoint_error"] = cp_err
 
@@ -1006,12 +1108,22 @@ async def _execute_headless_run(
             if res_outcome.policy_compliance.get("has_prohibitions"):
                 payload_dict["policy_compliance"] = res_outcome.policy_compliance
             if res_outcome.v_results:
+                eff_scope = ver_scope
+                if eff_scope is None:
+                    from zelyr.engine.verifier import summarize_verification_scope
+
+                    eff_scope = summarize_verification_scope(None, res_outcome.v_results)
                 if len(res_outcome.v_results) == 1:
-                    payload_dict["verification"] = res_outcome.v_results[0][2].to_dict()
+                    payload_dict["verification"] = {
+                        **res_outcome.v_results[0][2].to_detailed_dict(),
+                        "scope": eff_scope,
+                    }
                 else:
                     payload_dict["verification"] = {
                         "success": res_outcome.all_v_ok,
-                        "checks": [res.to_dict() for _, _, res in res_outcome.v_results],
+                        "result": eff_scope["overall_result"],
+                        "scope": eff_scope,
+                        "checks": [res.to_detailed_dict() for _, _, res in res_outcome.v_results],
                     }
             payload_dict["execution_ledger"] = (
                 ledger.to_dict() if ledger is not None else TurnExecutionLedger().to_dict()
@@ -1026,12 +1138,13 @@ async def _execute_headless_run(
         any_failed = False
         if res_outcome.v_results:
             for v_check, v_target, v_res in res_outcome.v_results:
+                verdict = getattr(v_res, "result", "PASS" if v_res.success else "FAIL")
                 if v_res.success:
                     sys.stdout.write(f"[verified] {v_check} on {v_target}: PASS\n")
                     sys.stdout.flush()
                 else:
                     any_failed = True
-                    err_msg = f"[verification failed] {v_check} on {v_target}: FAIL ({v_res.error})\n"
+                    err_msg = f"[verification failed] {v_check} on {v_target}: {verdict} ({v_res.error})\n"
                     sys.stdout.write(err_msg)
                     sys.stdout.flush()
                     sys.stderr.write(err_msg)
@@ -1095,6 +1208,18 @@ async def _execute_planned_headless_run(
         sys.stderr.write(f"Error: --max-concurrency must be an integer >= 1 (got {max_concurrency!r}).\n")
         sys.stderr.flush()
         return 1
+
+    if verify_spec is not None:
+        from zelyr.engine.verifier import OutcomeVerifier
+
+        _, pre_spec_err, _ = OutcomeVerifier.validate_spec(verify_spec)
+        if pre_spec_err:
+            err_msg = f"[verification failed] {pre_spec_err}\n"
+            sys.stdout.write(err_msg)
+            sys.stdout.flush()
+            sys.stderr.write(err_msg)
+            sys.stderr.flush()
+            return 2
 
     load_plugins()
     base_cfg = getattr(orchestrator, "config", None) or get_config()
@@ -3000,7 +3125,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--verify",
         type=str,
         default=None,
-        help="Deterministic outcome assertion formatted as CHECK:TARGET[:EXPECTED]",
+        help="Deterministic outcome criteria (CHECK:TARGET[:EXPECTED] or JSON array covering filesystem, host, browser, or desktop checks)",
     )
     p_run.add_argument(
         "--plan",

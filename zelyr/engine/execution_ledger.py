@@ -356,6 +356,19 @@ def canonicalize_target(target: str, check_type: Optional[str] = None) -> str:
         return f"process:{t_str.lower()}"
     if check_type in ("command_output", "command", "cmd"):
         return f"cmd:{t_str}"
+    norm_ct = str(check_type or "").strip().lower()
+    if norm_ct in (
+        "browser_url", "browser_navigation", "browser_origin", "browser_title",
+        "browser_element_present", "browser_element_absent", "browser_visible_text",
+        "browser_element_state", "browser_field_value",
+    ):
+        return f"browser:{norm_ct}:{t_str}"
+    if norm_ct in (
+        "desktop_window_exists", "desktop_window_title", "desktop_active_window",
+        "desktop_visible_text", "desktop_widget_state", "desktop_text",
+        "desktop_status", "desktop_ui_state",
+    ):
+        return f"desktop:{norm_ct}:{t_str.lower()}"
 
     # Strip any trailing punctuation that might leak from sentence splitting
     t_clean = re.sub(r"[.,:;!?]+$", "", t_str).strip()
@@ -400,12 +413,8 @@ def targets_match(
     if not candidate_raw or not known_canon:
         return False
 
-    non_fs_prefixes = ("port:", "process:", "cmd:")
-    if known_canon.startswith(non_fs_prefixes) or check_type in (
-        "port_listening", "port", "listen",
-        "process_running", "process", "proc",
-        "command_output", "command", "cmd",
-    ):
+    non_fs_prefixes = ("port:", "process:", "cmd:", "browser:", "desktop:")
+    if known_canon.startswith(non_fs_prefixes) or str(check_type or "").strip().lower() in KNOWN_NON_FS_CHECKS:
         cand_clean = str(candidate_raw).strip()
         if cand_clean.startswith("process:"):
             cand_norm = f"process:{cand_clean[8:].lower()}"
@@ -1093,7 +1102,7 @@ def _normalize_target_list(targets: Any) -> List[str]:
         val = raw.strip()
         if not val:
             continue
-        if not val.startswith(("cmd:", "port:", "process:")):
+        if not val.startswith(("cmd:", "port:", "process:", "browser:", "desktop:")):
             val = canonicalize_target(val)
         if val and val not in out:
             out.append(val)
@@ -1130,7 +1139,11 @@ def _collect_later_resolution_targets(later: ActionRecord, later_is_inspect: boo
         targets = _normalize_target_list(getattr(later, "verified_targets", []))
     target_later = _extract_action_target(later.tool_name, later.arguments)
     if target_later and (not later_is_inspect or later.tool_name == "verify_outcome"):
-        norm_tl = canonicalize_target(target_later) if not target_later.startswith(("cmd:", "port:", "process:")) else target_later
+        norm_tl = (
+            canonicalize_target(target_later)
+            if not target_later.startswith(("cmd:", "port:", "process:", "browser:", "desktop:"))
+            else target_later
+        )
         if norm_tl and norm_tl not in targets:
             targets.append(norm_tl)
     return targets
@@ -1554,6 +1567,73 @@ class TurnExecutionLedger:
                 LedgerEventType.VERIFICATION_RECORDED,
                 status="verification_invalidated",
                 metadata={"target": target, "check_type": check_type},
+            )
+
+    def invalidate_surface_verifications(
+        self,
+        surface: str,
+        exclude_targets: Optional[Set[str]] = None,
+    ) -> None:
+        """Invalidate prior verifications belonging to a surface (e.g. 'browser', 'desktop') after later mutation."""
+        surf = str(surface or "").strip().lower()
+        if not surf:
+            return
+        prefix = f"{surf}:"
+        excluded = set(exclude_targets or ())
+        to_remove = [
+            vt for vt in list(self._verified_targets)
+            if vt.startswith(prefix) and vt not in excluded
+        ]
+        for vt in to_remove:
+            self._verified_targets.discard(vt)
+
+        invalidated_any = bool(to_remove)
+        surface_tools = (
+            {"interact_with_browser", "browser_cdp", "browser_navigate"}
+            if surf == "browser"
+            else (
+                {"desktop_control", "desktop_automation", "manage_desktop_window", "interact_with_ui", "gui_actuate"}
+                if surf == "desktop"
+                else set()
+            )
+        )
+        for cid in self._order:
+            rec = self._records.get(cid)
+            if not rec or rec.state != ActionState.VERIFIED:
+                continue
+            rec_t_low = (rec.tool_name or "").strip().lower()
+            rec_target = _extract_action_target(rec.tool_name, rec.arguments) or ""
+            is_match = rec_target.startswith(prefix) or rec_t_low in surface_tools
+            if rec_t_low == "verify_outcome" and isinstance(rec.arguments, dict):
+                chk_low = str(rec.arguments.get("check") or "").strip().lower()
+                if surf == "browser" and chk_low.startswith("browser_"):
+                    is_match = True
+                elif surf == "desktop" and chk_low.startswith("desktop_"):
+                    is_match = True
+            if is_match and rec_target not in excluded:
+                invalidated_any = True
+                self._records[cid] = ActionRecord(
+                    call_id=rec.call_id,
+                    tool_name=rec.tool_name,
+                    arguments=rec.arguments,
+                    state=ActionState.UNVERIFIED,
+                    exit_code=rec.exit_code,
+                    error=rec.error,
+                    verified=False,
+                    verification_detail=rec.verification_detail,
+                    timestamp=rec.timestamp,
+                    terminal=rec.terminal,
+                    recovery_attempts=rec.recovery_attempts,
+                    turn=rec.turn,
+                    raw_name=rec.raw_name,
+                    rejection_reason=rec.rejection_reason,
+                    verification_failed=rec.verification_failed,
+                )
+        if invalidated_any:
+            self._emit_central_event(
+                LedgerEventType.VERIFICATION_RECORDED,
+                status="verification_invalidated",
+                metadata={"surface": surf, "invalidated_targets": to_remove},
             )
 
     def is_target_verified(self, target: str, check_type: Optional[str] = None) -> bool:
@@ -3335,14 +3415,22 @@ def _assess_desktop_verification_state(ledger: Optional[Any]) -> Dict[str, Any]:
         and not state["has_verified_desktop_mut"]
     )
     state["trailing_unobserved_mutation"] = trailing_unobserved
+    def _is_window_focus_only_record(rec: ActionRecord) -> bool:
+        t_l = (rec.tool_name or "").strip().lower()
+        if t_l == "manage_desktop_window":
+            return True
+        if t_l == "verify_outcome" and isinstance(rec.arguments, dict):
+            return str(rec.arguments.get("check") or "").strip().lower() == "desktop_active_window"
+        return False
+
     if verified_indices:
         state["has_only_window_ipc_verified"] = all(
-            (r.tool_name or "").strip().lower() == "manage_desktop_window"
+            _is_window_focus_only_record(r)
             for _, r in verified_indices
         )
     if trailing_unobserved and verified_indices:
         state["has_only_pre_mutation_or_window_verified"] = all(
-            ((r.tool_name or "").strip().lower() == "manage_desktop_window" or v_idx < last_mut_idx)
+            (_is_window_focus_only_record(r) or v_idx < last_mut_idx)
             and (r.tool_name or "").strip().lower() != "verify_outcome"
             for v_idx, r in verified_indices
         )
@@ -3400,6 +3488,11 @@ def resolve_root_execution_outcome(
         )
         non_window_verified_actions = any(
             (r.tool_name or "").strip().lower() != "manage_desktop_window"
+            and not (
+                (r.tool_name or "").strip().lower() == "verify_outcome"
+                and isinstance(r.arguments, dict)
+                and str(r.arguments.get("check") or "").strip().lower() == "desktop_active_window"
+            )
             for r in verified_recs
         )
         # Window-focus/IPC confirmation proves window focus dispatch only, never whole-task outcome acceptance.
@@ -3425,11 +3518,7 @@ def resolve_root_execution_outcome(
                 for item in parsed_specs:
                     chk = item.get("check", "")
                     tgt = item.get("target", "")
-                    vr = OutcomeVerifier.verify(
-                        check=chk,
-                        target=tgt,
-                        expected=item.get("expected"),
-                    )
+                    vr = OutcomeVerifier.verify_criterion(item)
                     eff_v_results.append((chk, tgt, vr))
             else:
                 eff_invalid_spec = f"Unable to parse verification specification: '{acceptance_spec}'"
@@ -3804,15 +3893,52 @@ def has_valid_inaction_justification(text: str) -> bool:
     return False
 
 
-KNOWN_VERIFICATION_CHECKS = {
-    "file_exists", "exists",
-    "file_contains", "contains",
-    "file_checksum", "checksum", "sha256",
-    "file_json", "json",
-    "process_running", "process", "proc",
-    "port_listening", "port", "listen",
-    "command_output", "command", "cmd",
+KNOWN_BROWSER_CHECKS = {
+    "browser_url",
+    "browser_navigation",
+    "browser_origin",
+    "browser_title",
+    "browser_element_present",
+    "browser_element_absent",
+    "browser_visible_text",
+    "browser_element_state",
+    "browser_field_value",
 }
+
+KNOWN_DESKTOP_CHECKS = {
+    "desktop_window_exists",
+    "desktop_window_title",
+    "desktop_active_window",
+    "desktop_visible_text",
+    "desktop_widget_state",
+    "desktop_text",
+    "desktop_status",
+    "desktop_ui_state",
+}
+
+KNOWN_NON_FS_CHECKS = (
+    {
+        "port_listening", "port", "listen",
+        "process_running", "process", "proc",
+        "command_output", "command", "cmd",
+    }
+    | KNOWN_BROWSER_CHECKS
+    | KNOWN_DESKTOP_CHECKS
+)
+
+KNOWN_VERIFICATION_CHECKS = (
+    {
+        "file_exists", "exists",
+        "file_contains", "contains",
+        "file_checksum", "checksum", "sha256",
+        "file_json", "json",
+        "process_running", "process", "proc",
+        "port_listening", "port", "listen",
+        "command_output", "command", "cmd",
+    }
+    | KNOWN_BROWSER_CHECKS
+    | KNOWN_DESKTOP_CHECKS
+)
 
 
 def _strip_matching_quotes(val: Optional[str]) -> Optional[str]:
@@ -3901,9 +4027,13 @@ def _parse_single_criterion_string(spec: str) -> Dict[str, Any]:
 
     # Check if target is a Windows drive path (e.g. C:\path\to\file or C:/path)
     win_drive_match = re.match(r"^([a-zA-Z]:[\\/][^:]*)(?::(.*))?$", rest)
+    url_match = re.match(r"^(https?://[^:\s]+(?::\d+)?(?:/[^\s:]*)?)(?::(.*))?$", rest, flags=re.IGNORECASE)
     if win_drive_match:
         target = win_drive_match.group(1).strip()
         expected = win_drive_match.group(2) if win_drive_match.group(2) is not None else None
+    elif url_match:
+        target = url_match.group(1).strip()
+        expected = url_match.group(2) if url_match.group(2) is not None else None
     elif rest.startswith(('"', "'")):
         # Target is quoted: find the matching closing quote
         quote_char = rest[0]
@@ -3953,11 +4083,38 @@ def parse_acceptance_criteria(criteria: Any) -> List[Dict[str, Any]]:
 
     for item in items:
         if isinstance(item, dict):
-            parsed_list.append({
+            raw_target = (
+                item.get("target")
+                or item.get("selector")
+                or item.get("url")
+                or item.get("window")
+                or ""
+            )
+            entry: Dict[str, Any] = {
                 "check": str(item.get("check", "")).strip(),
-                "target": str(item.get("target", "")).strip(),
+                "target": str(raw_target).strip(),
                 "expected": item.get("expected"),
-            })
+            }
+            ctx: Dict[str, Any] = {}
+            if isinstance(item.get("context"), dict):
+                ctx.update(item["context"])
+            for extra_key in (
+                "selector",
+                "url",
+                "expected_url",
+                "origin",
+                "expected_origin",
+                "url_prefix",
+                "tab_id",
+                "match",
+                "visible_only",
+                "surface",
+            ):
+                if extra_key in item and item[extra_key] is not None:
+                    ctx[extra_key] = item[extra_key]
+            if ctx:
+                entry["context"] = ctx
+            parsed_list.append(entry)
         elif isinstance(item, str) and item.strip():
             raw_specs = _split_criteria_records(item)
             for spec in raw_specs:
@@ -4253,6 +4410,32 @@ def has_remaining_explicit_steps(
     return False
 
 
+async def find_unfulfilled_task_requirements_async(
+    user_prompt: str,
+    ledger: TurnExecutionLedger,
+    acceptance_spec: Optional[Any] = None,
+) -> Tuple[List[str], List[str]]:
+    """Async counterpart to find_unfulfilled_task_requirements avoiding sync-in-loop deadlocks."""
+    verified_outcomes: List[str] = []
+    unfulfilled_outcomes: List[str] = []
+
+    parsed_criteria = parse_acceptance_criteria(acceptance_spec)
+    pre_verified: Dict[int, Any] = {}
+    if parsed_criteria:
+        from zelyr.engine.verifier import OutcomeVerifier
+
+        for idx, c in enumerate(parsed_criteria):
+            pre_verified[idx] = await OutcomeVerifier.verify_criterion_async(c)
+
+    return _evaluate_unfulfilled_task_requirements(
+        user_prompt,
+        ledger,
+        acceptance_spec=acceptance_spec,
+        parsed_criteria=parsed_criteria,
+        pre_verified=pre_verified,
+    )
+
+
 def find_unfulfilled_task_requirements(
     user_prompt: str,
     ledger: TurnExecutionLedger,
@@ -4263,22 +4446,42 @@ def find_unfulfilled_task_requirements(
     Returns:
         (verified_outcomes, unfulfilled_outcomes)
     """
+    return _evaluate_unfulfilled_task_requirements(
+        user_prompt,
+        ledger,
+        acceptance_spec=acceptance_spec,
+    )
+
+
+def _evaluate_unfulfilled_task_requirements(
+    user_prompt: str,
+    ledger: TurnExecutionLedger,
+    acceptance_spec: Optional[Any] = None,
+    *,
+    parsed_criteria: Optional[List[Dict[str, Any]]] = None,
+    pre_verified: Optional[Dict[int, Any]] = None,
+) -> Tuple[List[str], List[str]]:
+    """Shared implementation for find_unfulfilled_task_requirements and async counterpart."""
     verified_outcomes: List[str] = []
     unfulfilled_outcomes: List[str] = []
 
     # 1. Evaluate explicit acceptance criteria if provided
-    parsed_criteria = parse_acceptance_criteria(acceptance_spec)
-    if parsed_criteria:
+    eff_criteria = parsed_criteria if parsed_criteria is not None else parse_acceptance_criteria(acceptance_spec)
+    if eff_criteria:
         from zelyr.engine.verifier import OutcomeVerifier
 
         # Group criteria results by canonical target so multi-criterion targets are only marked
         # verified when ALL criteria for that target succeed.
         target_results: Dict[str, List[Tuple[Dict[str, Any], Any]]] = {}
-        for c in parsed_criteria:
+        for idx, c in enumerate(eff_criteria):
             check_name = c["check"]
             target = c["target"]
             expected = c.get("expected")
-            vr = OutcomeVerifier.verify(check=check_name, target=target, expected=expected)
+            vr = (
+                pre_verified[idx]
+                if pre_verified is not None and idx in pre_verified
+                else OutcomeVerifier.verify_criterion(c)
+            )
             norm_t = canonicalize_target(target, check_type=check_name) if target else ""
             if norm_t:
                 target_results.setdefault(norm_t, []).append((c, vr))
@@ -4294,7 +4497,8 @@ def find_unfulfilled_task_requirements(
                 if desc not in verified_outcomes:
                     verified_outcomes.append(desc)
             else:
-                desc = f"Target '{target}' unfulfilled: {check_name}" + (f" expected '{expected}'" if expected is not None else "")
+                verdict = getattr(vr, "result", "FAIL")
+                desc = f"Target '{target}' unfulfilled ({verdict}): {check_name}" + (f" expected '{expected}'" if expected is not None else "")
                 if desc not in unfulfilled_outcomes:
                     unfulfilled_outcomes.append(desc)
 
@@ -4343,7 +4547,7 @@ def find_unfulfilled_task_requirements(
                         successful_targets.add(ft)
 
     for ft in file_targets:
-        if any(criterion_applies_to_target(c, ft, file_targets) for c in parsed_criteria if c.get("target")):
+        if any(criterion_applies_to_target(c, ft, file_targets) for c in eff_criteria if c.get("target")):
             continue
         if any(targets_match(ft, pt, prohibited_targets, allow_dir_containment=True) for pt in prohibited_targets):
             continue

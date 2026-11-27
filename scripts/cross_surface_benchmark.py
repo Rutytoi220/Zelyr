@@ -95,8 +95,8 @@ SCENARIO_SPECS: Dict[str, Dict[str, Any]] = {
 DEFAULT_SCENARIOS: List[str] = ["browser_fs", "normal", "browser_failure", "desktop_focus_loss"]
 
 INTERNAL_VERIFIER_UNSUPPORTED_LIMITATIONS: List[str] = [
-    "OutcomeVerifier supports file_exists, file_contains, file_checksum, file_json, process_running, port_listening, and allowlisted command_output only.",
-    "Browser DOM state, REST HTTP API responses, and PySide6 desktop widget state are outside OutcomeVerifier's supported scope and are verified independently by external_validation.",
+    "OutcomeVerifier natively verifies filesystem artifacts, read-only Chromium DOM/URL state via Native Messaging, and read-only Hyprland compositor window existence/title/focus metadata.",
+    "Direct REST HTTP API endpoints and PySide6 desktop widget internal text/state (requires an available AT-SPI/pyatspi accessibility bridge) remain outside OutcomeVerifier's semantic scope and are verified independently by external_validation.",
 ]
 
 INITIAL_RECORDS: Dict[str, Dict[str, Any]] = {
@@ -626,15 +626,82 @@ def build_cross_surface_prompt(
     return header + "\n" + "\n".join(steps)
 
 
-def build_cross_surface_verify_spec(ws_info: Dict[str, Any]) -> str:
-    """Build OutcomeVerifier --verify criteria covering supported filesystem deliverables without exposing oracle tokens."""
-    report_json = ws_info["report_json_path"]
-    report_md = ws_info["report_md_path"]
-    return ";".join([
-        f"file_json:{report_json}:record_id,service,owner,region,score,confirmation_token,status",
-        f"file_contains:{report_json}:APPROVED",
-        f"file_contains:{report_md}:APPROVED",
-    ])
+def build_cross_surface_verify_spec(
+    ws_info: Dict[str, Any],
+    *,
+    base_url: Optional[str] = None,
+    requires_desktop: Optional[bool] = None,
+    desktop_title: str = DEFAULT_DESKTOP_TITLE,
+    verify_mode: str = "cross_surface",
+) -> str:
+    """Build OutcomeVerifier --verify criteria across natively supported surfaces without exposing oracle tokens."""
+    report_json = str(ws_info["report_json_path"])
+    report_md = str(ws_info["report_md_path"])
+    fs_criteria = [
+        {
+            "surface": "filesystem",
+            "check": "file_json",
+            "target": report_json,
+            "expected": "record_id,service,owner,region,score,confirmation_token,status",
+        },
+        {
+            "surface": "filesystem",
+            "check": "file_contains",
+            "target": report_json,
+            "expected": "APPROVED",
+        },
+        {
+            "surface": "filesystem",
+            "check": "file_contains",
+            "target": report_md,
+            "expected": "APPROVED",
+        },
+    ]
+    if verify_mode == "filesystem" or not base_url:
+        return ";".join([
+            f"file_json:{report_json}:record_id,service,owner,region,score,confirmation_token,status",
+            f"file_contains:{report_json}:APPROVED",
+            f"file_contains:{report_md}:APPROVED",
+        ])
+
+    detail_url = f"{base_url.rstrip('/')}/records/REC-204"
+    criteria: List[Dict[str, Any]] = list(fs_criteria) + [
+        {
+            "surface": "browser",
+            "check": "browser_url",
+            "target": detail_url,
+            "expected": detail_url,
+        },
+        {
+            "surface": "browser",
+            "check": "browser_element_present",
+            "target": "#status-badge",
+            "expected": "visible",
+            "url": detail_url,
+        },
+        {
+            "surface": "browser",
+            "check": "browser_visible_text",
+            "target": "#status-badge",
+            "expected": "APPROVED",
+            "url": detail_url,
+        },
+        {
+            "surface": "browser",
+            "check": "browser_element_state",
+            "target": "#action-slot button",
+            "expected": "disabled",
+            "url": detail_url,
+        },
+    ]
+    use_desktop = bool(ws_info.get("requires_desktop", True)) if requires_desktop is None else bool(requires_desktop)
+    if use_desktop:
+        criteria.append({
+            "surface": "desktop_compositor",
+            "check": "desktop_window_exists",
+            "target": desktop_title,
+        })
+    return json.dumps(criteria)
 
 
 def _cleanup_cross_surface_fixtures(
@@ -956,7 +1023,41 @@ def evaluate_cross_surface_run(
     else:
         internal_checks = list(central_verifications)
 
-    unsupported_surfaces = ["web_dom", "http_api"] + (["desktop_gui"] if eff_requires_desktop else [])
+    verified_surfaces: List[str] = []
+    cli_scope = cli_ver.get("scope") if isinstance(cli_ver, dict) and isinstance(cli_ver.get("scope"), dict) else None
+    if cli_scope and isinstance(cli_scope.get("surfaces"), list):
+        verified_surfaces = [str(s) for s in cli_scope["surfaces"] if s]
+    else:
+        for chk in internal_checks:
+            if not isinstance(chk, dict):
+                continue
+            cname = str(chk.get("check") or "").strip().lower()
+            if cname.startswith("file_") and "filesystem" not in verified_surfaces:
+                verified_surfaces.append("filesystem")
+            elif cname.startswith("browser_") and "browser" not in verified_surfaces:
+                verified_surfaces.append("browser")
+            elif cname in ("desktop_window_exists", "desktop_window_title", "desktop_active_window") and "desktop_compositor" not in verified_surfaces:
+                verified_surfaces.append("desktop_compositor")
+            elif cname.startswith("desktop_") and "desktop_semantic" not in verified_surfaces:
+                verified_surfaces.append("desktop_semantic")
+
+    unsupported_surfaces: List[str] = []
+    if "browser" not in verified_surfaces:
+        unsupported_surfaces.append("web_dom")
+    unsupported_surfaces.append("http_api")
+    if eff_requires_desktop:
+        if "desktop_compositor" in verified_surfaces:
+            unsupported_surfaces.append("desktop_widget_semantic_text")
+        elif "desktop_semantic" not in verified_surfaces:
+            unsupported_surfaces.append("desktop_gui")
+
+    if not internal_requested:
+        internal_scope_label = "none"
+    elif verified_surfaces == ["filesystem"] or not verified_surfaces:
+        internal_scope_label = "filesystem_artifacts_only"
+    else:
+        internal_scope_label = "+".join(verified_surfaces)
+
     internal_limitations = list(INTERNAL_VERIFIER_UNSUPPORTED_LIMITATIONS)
     if internal_layer_status == "not_requested":
         internal_limitations.append("No CLI --verify criteria were supplied for this run.")
@@ -968,7 +1069,8 @@ def evaluate_cross_surface_run(
         "verify_spec": eff_verify_spec,
         "available": internal_available,
         "layer_status": internal_layer_status,
-        "scope": "filesystem_artifacts_only" if internal_requested else "none",
+        "scope": internal_scope_label,
+        "verified_surfaces": verified_surfaces,
         "passed": internal_passed,
         "checks": internal_checks,
         "unsupported_surfaces": unsupported_surfaces,
@@ -1284,12 +1386,18 @@ def _save_run_artifacts(
     for r in report["scenarios"]:
         int_v = r.get("internal_verification") if isinstance(r.get("internal_verification"), dict) else {}
         ext_v = r.get("external_validation") if isinstance(r.get("external_validation"), dict) else {}
+        chk_summary = ", ".join(
+            f"{c.get('check')}={c.get('result', 'PASS' if c.get('success') else 'FAIL')}"
+            for c in (int_v.get("checks") or [])
+            if isinstance(c, dict)
+        ) or "none"
         lines.extend([
             f"## Scenario `{r['scenario']}` — `{r.get('benchmark_status', r['verdict'])}`",
             "",
             f"- **External validation status:** `{r.get('external_validation_status')}` (failed: {ext_v.get('failed_checks')})",
             f"- **Root ledger statuses:** execution=`{r.get('root_execution_status')}`, verification=`{r.get('root_verification_status')}`",
-            f"- **Internal verification:** requested={int_v.get('requested')}, available={int_v.get('available')}, layer_status=`{int_v.get('layer_status')}`, scope=`{int_v.get('scope')}`, passed={int_v.get('passed')}",
+            f"- **Internal verification:** requested={int_v.get('requested')}, available={int_v.get('available')}, layer_status=`{int_v.get('layer_status')}`, scope=`{int_v.get('scope')}`, verified_surfaces=`{int_v.get('verified_surfaces')}`, unsupported_surfaces=`{int_v.get('unsupported_surfaces')}`, passed={int_v.get('passed')}",
+            f"- **Internal checks:** {chk_summary}",
             f"- **Internal limitations:** {'; '.join(int_v.get('limitations') or [])}",
             f"- **Desktop fixture launched:** `{r.get('fixture_launched')}` (requires_desktop=`{r.get('requires_desktop')}`)",
             f"- **Unverified reasons:** {r['validation'].get('unverified_reasons')}",
@@ -1316,7 +1424,7 @@ def run_single_cross_surface_scenario(
     mon_h: int,
     upstream_ollama: str,
     requires_desktop: Optional[bool] = None,
-    verify_mode: str = "filesystem",
+    verify_mode: str = "cross_surface",
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Run one complete isolated cross-surface scenario with strict GUI fixture discipline."""
     if scenario not in SCENARIO_SPECS:
@@ -1327,7 +1435,7 @@ def run_single_cross_surface_scenario(
     eff_requires_distraction = bool(spec.get("requires_distraction")) and eff_requires_desktop
     if scenario == "desktop_focus_loss" and not eff_requires_desktop:
         raise ValueError("Scenario 'desktop_focus_loss' requires desktop fixtures.")
-    if verify_mode not in ("filesystem", "none"):
+    if verify_mode not in ("cross_surface", "filesystem", "none"):
         raise ValueError(f"Unsupported verify_mode: {verify_mode!r}")
 
     with tempfile.TemporaryDirectory(prefix=f"zelyr_xsurf_{scenario}_") as tmp_str:
@@ -1362,7 +1470,17 @@ def run_single_cross_surface_scenario(
                 desktop_title=DEFAULT_DESKTOP_TITLE,
                 requires_desktop=eff_requires_desktop,
             )
-            verify_spec = build_cross_surface_verify_spec(ws_info) if verify_mode == "filesystem" else None
+            verify_spec = (
+                build_cross_surface_verify_spec(
+                    ws_info,
+                    base_url=web_app.base_url,
+                    requires_desktop=eff_requires_desktop,
+                    desktop_title=DEFAULT_DESKTOP_TITLE,
+                    verify_mode=verify_mode,
+                )
+                if verify_mode in ("cross_surface", "filesystem")
+                else None
+            )
             try:
                 if eff_requires_desktop:
                     fix_port = _free_port()
@@ -1543,7 +1661,7 @@ def run_cross_surface_benchmark(
     max_steps: int = 24,
     workspace_id: int = 15,
     output_dir: Optional[Path] = None,
-    verify_mode: str = "filesystem",
+    verify_mode: str = "cross_surface",
     requires_desktop: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Run selected cross-surface scenarios; only switch/require Hyprland WS 15 when desktop fixtures are needed."""
@@ -1661,9 +1779,9 @@ def main() -> int:
     parser.add_argument("--workspace-id", type=int, default=15)
     parser.add_argument(
         "--verify-mode",
-        choices=["filesystem", "none"],
-        default="filesystem",
-        help="Pass supported OutcomeVerifier --verify checks for filesystem outputs ('filesystem') or run unverified ('none').",
+        choices=["cross_surface", "filesystem", "none"],
+        default="cross_surface",
+        help="Pass OutcomeVerifier --verify criteria across filesystem+browser+desktop compositor ('cross_surface'), filesystem only ('filesystem'), or unverified ('none').",
     )
     parser.add_argument(
         "--no-desktop",

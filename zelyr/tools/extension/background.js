@@ -232,6 +232,49 @@ async function getTargetTab(msg) {
   return allTabs.length > 0 ? allTabs[0] : null;
 }
 
+async function getStrictTargetTab(msg) {
+  if (msg.tab_id !== undefined && msg.tab_id !== null && String(msg.tab_id).trim() !== "") {
+    const requestedId = Number(msg.tab_id);
+    if (!Number.isInteger(requestedId) || requestedId < 1) {
+      return { tab: null, error: `Invalid tab_id '${msg.tab_id}'.`, errorCode: "INVALID_TAB_ID" };
+    }
+    try {
+      const tab = await chrome.tabs.get(requestedId);
+      if (!tab || !tab.id) {
+        return { tab: null, error: `Target tab ${requestedId} not found.`, errorCode: "TAB_NOT_FOUND" };
+      }
+      return { tab, error: null, errorCode: null };
+    } catch (_) {
+      return { tab: null, error: `Target tab ${requestedId} is closed or unavailable.`, errorCode: "TAB_NOT_FOUND" };
+    }
+  }
+
+  const activeFocused = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  if (activeFocused && activeFocused.length === 1) {
+    return { tab: activeFocused[0], error: null, errorCode: null };
+  }
+  if (activeFocused && activeFocused.length > 1) {
+    return {
+      tab: null,
+      error: "Multiple active tabs detected in focused window; supply explicit tab_id.",
+      errorCode: "AMBIGUOUS_ACTIVE_TABS",
+    };
+  }
+
+  const anyActive = await chrome.tabs.query({ active: true });
+  if (anyActive && anyActive.length === 1) {
+    return { tab: anyActive[0], error: null, errorCode: null };
+  }
+  if (anyActive && anyActive.length > 1) {
+    return {
+      tab: null,
+      error: "Ambiguous active browser tabs across multiple windows; focus target window or pass explicit tab_id.",
+      errorCode: "AMBIGUOUS_ACTIVE_TABS",
+    };
+  }
+  return { tab: null, error: "No active browser tab available.", errorCode: "NO_ACTIVE_TAB" };
+}
+
 function waitForSettled(options = {}) {
   const quietWindow = options.quietWindow || 75; // ms without mutations
   const maxTimeout = options.maxTimeout || 800;   // ms hard cap
@@ -2689,6 +2732,340 @@ async function handleCommand(msg) {
             error: `Unsupported tab operation: '${subaction}'. Supported: 'duplicate', 'reload', 'pin', 'close', 'open', 'switch', 'list'.`,
           });
         }
+        break;
+      }
+
+      case "verify_dom_state": {
+        const { tab, error: tabErr, errorCode } = await getStrictTargetTab(msg);
+        if (!tab || !tab.id) {
+          sendReply({
+            id,
+            success: false,
+            action: "verify_dom_state",
+            error_type: errorCode || "TAB_UNAVAILABLE",
+            stale: true,
+            error: tabErr || "No active browser tab available.",
+          });
+          return;
+        }
+        if (tab.discarded) {
+          sendReply({
+            id,
+            success: false,
+            action: "verify_dom_state",
+            tab_id: tab.id,
+            error_type: "TAB_DISCARDED",
+            stale: true,
+            error: `Target tab ${tab.id} is discarded.`,
+          });
+          return;
+        }
+
+        let liveTab = tab;
+        if (liveTab.status === "loading") {
+          const deadline = Date.now() + Math.min(Number(msg.wait_ms || 800), 2000);
+          while (liveTab.status === "loading" && Date.now() < deadline) {
+            await new Promise((r) => setTimeout(r, 50));
+            try {
+              liveTab = await chrome.tabs.get(tab.id);
+            } catch (_) {
+              sendReply({
+                id,
+                success: false,
+                action: "verify_dom_state",
+                tab_id: tab.id,
+                error_type: "TAB_CLOSED",
+                stale: true,
+                error: `Target tab ${tab.id} closed while loading.`,
+              });
+              return;
+            }
+          }
+          if (liveTab.status === "loading") {
+            sendReply({
+              id,
+              success: false,
+              action: "verify_dom_state",
+              tab_id: liveTab.id,
+              url: liveTab.url || "",
+              title: liveTab.title || "",
+              error_type: "PAGE_STALE_LOADING",
+              stale: true,
+              error: `Target tab ${liveTab.id} is still loading.`,
+            });
+            return;
+          }
+        }
+
+        const tabUrl = String(liveTab.url || "");
+        const mode = String(msg.mode || "snapshot").trim().toLowerCase();
+        const selector = msg.selector !== undefined && msg.selector !== null ? String(msg.selector) : "";
+
+        if (
+          tabUrl.startsWith("chrome://") ||
+          tabUrl.startsWith("devtools://") ||
+          tabUrl.startsWith("chrome-extension://") ||
+          tabUrl.startsWith("view-source:")
+        ) {
+          sendReply({
+            id,
+            success: false,
+            action: "verify_dom_state",
+            tab_id: liveTab.id,
+            url: tabUrl,
+            title: liveTab.title || "",
+            error_type: "UNVERIFIABLE_INTERNAL_PAGE",
+            stale: true,
+            error: `Cannot inspect internal browser URL '${tabUrl}'.`,
+          });
+          return;
+        }
+
+        const expUrl = msg.expected_url ? String(msg.expected_url).trim() : "";
+        const expOrigin = msg.expected_origin ? String(msg.expected_origin).trim() : "";
+        const urlPrefix = msg.url_prefix ? String(msg.url_prefix).trim() : "";
+        if (expUrl || expOrigin || urlPrefix) {
+          let parsedTab = null;
+          try {
+            parsedTab = new URL(tabUrl);
+          } catch (_) {
+            parsedTab = null;
+          }
+          if (expOrigin && (!parsedTab || parsedTab.origin !== expOrigin.replace(/\/+$/, ""))) {
+            sendReply({
+              id,
+              success: false,
+              action: "verify_dom_state",
+              tab_id: liveTab.id,
+              url: tabUrl,
+              origin: parsedTab ? parsedTab.origin : "",
+              title: liveTab.title || "",
+              context_mismatch: true,
+              error_type: "CONTEXT_MISMATCH",
+              error: `Active tab origin '${parsedTab ? parsedTab.origin : tabUrl}' does not match requested context origin '${expOrigin}'.`,
+            });
+            return;
+          }
+          if (expUrl && tabUrl.replace(/\/+$/, "") !== expUrl.replace(/\/+$/, "")) {
+            sendReply({
+              id,
+              success: false,
+              action: "verify_dom_state",
+              tab_id: liveTab.id,
+              url: tabUrl,
+              origin: parsedTab ? parsedTab.origin : "",
+              title: liveTab.title || "",
+              context_mismatch: true,
+              error_type: "CONTEXT_MISMATCH",
+              error: `Active tab URL '${tabUrl}' does not match requested context URL '${expUrl}'.`,
+            });
+            return;
+          }
+          if (urlPrefix && !tabUrl.startsWith(urlPrefix)) {
+            sendReply({
+              id,
+              success: false,
+              action: "verify_dom_state",
+              tab_id: liveTab.id,
+              url: tabUrl,
+              origin: parsedTab ? parsedTab.origin : "",
+              title: liveTab.title || "",
+              context_mismatch: true,
+              error_type: "CONTEXT_MISMATCH",
+              error: `Active tab URL '${tabUrl}' does not match requested prefix '${urlPrefix}'.`,
+            });
+            return;
+          }
+        }
+
+        if (
+          !tabUrl ||
+          (!tabUrl.startsWith("http://") && !tabUrl.startsWith("https://"))
+        ) {
+          if (mode === "url" || mode === "origin" || mode === "title") {
+            let obsOrigin = "";
+            try {
+              obsOrigin = tabUrl ? new URL(tabUrl).origin : "";
+            } catch (_) {
+              obsOrigin = "";
+            }
+            sendReply({
+              id,
+              success: true,
+              action: "verify_dom_state",
+              tab_id: liveTab.id,
+              url: tabUrl,
+              origin: obsOrigin,
+              title: liveTab.title || "",
+              ready_state: "complete",
+              match_count: 0,
+              visible_count: 0,
+              matches: [],
+            });
+            return;
+          }
+          sendReply({
+            id,
+            success: false,
+            action: "verify_dom_state",
+            tab_id: liveTab.id,
+            url: tabUrl,
+            title: liveTab.title || "",
+            error_type: "PAGE_NOT_HTTP",
+            stale: true,
+            error: `Active tab URL '${tabUrl || "empty"}' is not an HTTP/HTTPS document.`,
+          });
+          return;
+        }
+
+        const results = await chrome.scripting.executeScript({
+          target: { tabId: liveTab.id },
+          func: (selStr) => {
+            function isElVisible(el) {
+              if (!el || typeof window === "undefined" || typeof window.getComputedStyle !== "function") {
+                return false;
+              }
+              try {
+                let cur = el;
+                while (cur && cur.nodeType === 1) {
+                  if (cur.hidden) return false;
+                  const style = window.getComputedStyle(cur);
+                  if (
+                    style.display === "none" ||
+                    style.visibility === "hidden" ||
+                    parseFloat(style.opacity || "1") === 0
+                  ) {
+                    return false;
+                  }
+                  cur = cur.parentElement;
+                }
+                const rect = el.getBoundingClientRect();
+                if (rect && rect.width === 0 && rect.height === 0) {
+                  return false;
+                }
+              } catch (_) {
+                return false;
+              }
+              return true;
+            }
+
+            const baseInfo = {
+              url: String(window.location.href || ""),
+              origin: String(window.location.origin || ""),
+              title: String(document.title || ""),
+              ready_state: String(document.readyState || ""),
+            };
+
+            if (!selStr) {
+              return {
+                ...baseInfo,
+                success: true,
+                match_count: 0,
+                visible_count: 0,
+                matches: [],
+              };
+            }
+
+            let nodes;
+            try {
+              nodes = Array.from(document.querySelectorAll(selStr));
+            } catch (selErr) {
+              return {
+                ...baseInfo,
+                success: false,
+                invalid_selector: true,
+                error: `Invalid CSS selector '${selStr}': ${selErr.message || String(selErr)}`,
+              };
+            }
+
+            let visibleCount = 0;
+            const matches = [];
+            for (const el of nodes) {
+              const vis = isElVisible(el);
+              if (vis) visibleCount += 1;
+              if (matches.length >= 5) continue;
+
+              const tag = String(el.tagName || "").toLowerCase();
+              const inputType = tag === "input" ? String(el.type || "text").toLowerCase() : "";
+              const autoAttr = String(el.getAttribute && (el.getAttribute("autocomplete") || "")).toLowerCase();
+              const isSensitive = (tag === "input" && inputType === "password") || autoAttr.includes("password");
+
+              const visibleText = (!isSensitive && vis)
+                ? String(el.innerText !== undefined ? el.innerText : (el.textContent || ""))
+                    .trim()
+                    .replace(/\s+/g, " ")
+                    .slice(0, 2048)
+                : "";
+              const textContent = !isSensitive
+                ? String(el.textContent || "").trim().replace(/\s+/g, " ").slice(0, 2048)
+                : "";
+
+              let fieldValue = null;
+              let selectedOptions = null;
+              if (!isSensitive && (tag === "input" || tag === "textarea" || tag === "select")) {
+                fieldValue = String(el.value !== undefined && el.value !== null ? el.value : "").slice(0, 2048);
+                if (tag === "select" && el.selectedOptions) {
+                  selectedOptions = Array.from(el.selectedOptions)
+                    .slice(0, 10)
+                    .map((opt) => ({
+                      value: String(opt.value || "").slice(0, 256),
+                      text: String(opt.textContent || "").trim().slice(0, 256),
+                    }));
+                }
+              }
+
+              const checked = (inputType === "checkbox" || inputType === "radio")
+                ? Boolean(el.checked)
+                : (el.getAttribute && el.getAttribute("aria-checked") !== null
+                    ? el.getAttribute("aria-checked") === "true"
+                    : null);
+
+              const disabled = Boolean(
+                el.disabled || (el.getAttribute && el.getAttribute("aria-disabled") === "true")
+              );
+              const selected = (tag === "option")
+                ? Boolean(el.selected)
+                : (el.getAttribute && el.getAttribute("aria-selected") !== null
+                    ? el.getAttribute("aria-selected") === "true"
+                    : null);
+              const focused = document.activeElement === el;
+
+              matches.push({
+                tag,
+                input_type: inputType || null,
+                visible: vis,
+                disabled,
+                checked,
+                selected,
+                focused,
+                sensitive_redacted: isSensitive,
+                visible_text: visibleText,
+                text_content: textContent,
+                value: fieldValue,
+                selected_options: selectedOptions,
+              });
+            }
+
+            return {
+              ...baseInfo,
+              success: true,
+              match_count: nodes.length,
+              visible_count: visibleCount,
+              matches,
+            };
+          },
+          args: [selector],
+        });
+
+        const execResult = results && results[0] && results[0].result
+          ? results[0].result
+          : { success: false, stale: true, error: "DOM verification script produced no result." };
+        sendReply({
+          ...execResult,
+          id,
+          action: "verify_dom_state",
+          tab_id: liveTab.id,
+        });
         break;
       }
 

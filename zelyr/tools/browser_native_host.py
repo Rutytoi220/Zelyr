@@ -74,7 +74,25 @@ ALLOWED_NATIVE_ACTIONS = frozenset({
     "duplicate_tab",
     "pin_tab",
     "manage_browser_tabs",
+    "verify_dom_state",
 })
+
+VALID_DOM_VERIFICATION_MODES = frozenset({
+    "url",
+    "origin",
+    "title",
+    "element_present",
+    "element_absent",
+    "visible_text",
+    "element_state",
+    "field_value",
+    "snapshot",
+})
+
+_FORBIDDEN_VERIFY_SELECTOR_RE = re.compile(
+    r"(?:document\.cookie|localstorage|sessionstorage|indexeddb|chrome\.cookies|javascript:|window\.|eval\s*\(|new\s+function)",
+    flags=re.IGNORECASE,
+)
 
 METADATA_HOSTS = frozenset({
     "169.254.169.254",
@@ -368,6 +386,40 @@ def validate_browser_command(
     if "text" in msg and msg["text"] is not None:
         if not isinstance(msg["text"], str) or len(msg["text"]) > MAX_TEXT_LEN:
             return False, f"'text' parameter must be a string <= {MAX_TEXT_LEN} chars."
+
+    if action == "verify_dom_state":
+        mode = str(msg.get("mode") or "snapshot").strip().lower()
+        if mode not in VALID_DOM_VERIFICATION_MODES:
+            return False, f"Invalid verification mode '{mode}' for verify_dom_state."
+        tab_id = msg.get("tab_id")
+        if tab_id is not None and tab_id != "":
+            try:
+                if int(tab_id) < 1:
+                    return False, "verify_dom_state 'tab_id' must be a positive integer."
+            except (TypeError, ValueError):
+                return False, "verify_dom_state 'tab_id' must be an integer."
+        sel = msg.get("selector")
+        selector_modes = {"element_present", "element_absent", "visible_text", "element_state", "field_value"}
+        if mode in selector_modes:
+            if not isinstance(sel, str) or not sel.strip():
+                return False, f"verify_dom_state mode '{mode}' requires a non-empty 'selector'."
+        if sel is not None:
+            if not isinstance(sel, str):
+                return False, "verify_dom_state 'selector' must be a string."
+            if len(sel) > MAX_SELECTOR_LEN:
+                return False, f"Selector exceeds {MAX_SELECTOR_LEN} char limit."
+            if any(ord(ch) < 32 for ch in sel):
+                return False, "Selector contains illegal control characters."
+            if _FORBIDDEN_VERIFY_SELECTOR_RE.search(sel):
+                return False, "Selector references forbidden cookie/storage/script interface."
+        for url_key in ("expected_url", "expected_origin", "url_prefix"):
+            uval = msg.get(url_key)
+            if uval is not None and str(uval).strip():
+                ok_u, u_err = validate_browser_url(
+                    str(uval), allowed_hosts=allowed_hosts, denied_hosts=denied_hosts
+                )
+                if not ok_u:
+                    return False, f"Invalid '{url_key}': {u_err}"
 
     return True, "ok"
 
