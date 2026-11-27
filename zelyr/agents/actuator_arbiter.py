@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -166,8 +166,218 @@ class ActuatorArbiter:
         "tier3_vision": ["desktop_control", "capture_screen", "interact_with_ui"],
     }
 
+    DESKTOP_READ_ONLY_ACTIONS = frozenset({
+        "get_screen_size",
+        "inspect_windows",
+        "get_active_window",
+        "get_cursor_position",
+        "observe",
+        "screenshot",
+    })
+    WINDOW_READ_ONLY_ACTIONS = frozenset({
+        "list",
+        "list_windows",
+        "clients",
+        "get_active",
+        "get_active_window",
+        "active",
+        "activewindow",
+        "status",
+        "monitors",
+        "workspaces",
+        "get_geometry",
+    })
+    WINDOW_CONTROL_TOOLS = frozenset({
+        "manage_desktop_window",
+        "managedesktopwindowtool",
+        "switch_workspace",
+        "focus_window",
+        "desktop_window",
+        "hyprland_ipc",
+        "hyprland",
+        "window_manager",
+    })
+    DESKTOP_CONTROL_ALIASES = frozenset({
+        "mouse_move",
+        "move_mouse",
+        "mouse_click",
+        "click_mouse",
+        "double_click",
+        "mouse_drag",
+        "mouse_scroll",
+        "keyboard_type",
+        "type_text",
+        "keyboard_press",
+        "press_key",
+    })
+    DESKTOP_INPUT_TOOLS = frozenset({
+        "desktop_control",
+        "desktop_automation",
+        "desktopautomationtool",
+        "interact_with_ui",
+        "interactwithuitool",
+        "gui_actuate",
+        "click_tag",
+        "som_click",
+        "somclicktool",
+        "som_type",
+        "somtypetool",
+        "som_key",
+        "somkeytool",
+        "press_keys",
+        "ydotool_click",
+        "ydotool_type",
+        "ydotool_key",
+        "nxbt_controller",
+        *DESKTOP_CONTROL_ALIASES,
+    })
+    _EXECUTE_ACTION_DESKTOP_MUTATIONS = frozenset({
+        "click",
+        "double_click",
+        "right_click",
+        "left_click",
+        "middle_click",
+        "drag",
+        "scroll",
+        "type",
+        "press",
+        "hotkey",
+        *DESKTOP_CONTROL_ALIASES,
+    })
+    _EXECUTE_ACTION_WINDOW_MUTATIONS = frozenset({
+        "focus",
+        "focus_window",
+        "fullscreen",
+        "close",
+        "close_window",
+        "minimize",
+        "maximize",
+        "tile",
+        "float",
+        "move",
+        "move_window",
+        "workspace",
+        "switch_workspace",
+    })
+
+    @staticmethod
+    def extract_current_user_prompt(messages: Optional[List[Dict[str, Any]]]) -> str:
+        """Return the latest real user prompt, ignoring synthetic system/vision directives and prior turns."""
+        for msg in reversed(messages or ()):
+            if not isinstance(msg, dict) or msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if isinstance(content, list):
+                text = " ".join(part.get("text", "") for part in content if isinstance(part, dict)).strip()
+            elif isinstance(content, str):
+                text = content.strip()
+            else:
+                continue
+            if not text or text.startswith(("[SYSTEM", "[Transient desktop screenshot")):
+                continue
+            return text
+        return ""
+
+    @classmethod
+    def _normalize_guard_tool_name(cls, tool_name: Any) -> str:
+        """Strip tool/namespace/legacy prefixes to resolve the canonical guard key."""
+        clean = str(tool_name or "").strip().lower()
+        changed = True
+        while changed:
+            changed = False
+            for prefix in ("tool.", "tools.", "functions.", "function."):
+                if clean.startswith(prefix):
+                    clean = clean.removeprefix(prefix).strip()
+                    changed = True
+        if clean.startswith("legacy_"):
+            stripped = clean.removeprefix("legacy_").strip()
+            if stripped in cls.DESKTOP_INPUT_TOOLS or stripped in cls.WINDOW_CONTROL_TOOLS:
+                return stripped
+        return clean
+
+    @classmethod
+    def filter_tool_schemas_for_intent(
+        cls,
+        schemas: List[Dict[str, Any]],
+        user_prompt: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        """Drop mutating desktop GUI schemas unless user_prompt explicitly requests desktop GUI interaction."""
+        prompt_text = user_prompt if isinstance(user_prompt, str) else ""
+        if cls.has_explicit_desktop_gui_intent(prompt_text):
+            return list(schemas)
+        filtered: List[Dict[str, Any]] = []
+        for schema in schemas or ():
+            if not isinstance(schema, dict):
+                continue
+            fn_obj = schema.get("function") if isinstance(schema.get("function"), dict) else {}
+            raw_name = fn_obj.get("name") or schema.get("name") or ""
+            norm_name = cls._normalize_guard_tool_name(raw_name)
+            if norm_name in cls.DESKTOP_INPUT_TOOLS:
+                continue
+            filtered.append(schema)
+        return filtered
+
+    @classmethod
+    def check_desktop_intent_guard(
+        cls,
+        tool_name: str,
+        tool_args: Optional[Dict[str, Any]],
+        *,
+        user_prompt: Optional[str],
+        acceptance_spec: Any = None,
+    ) -> Optional[Tuple[str, str]]:
+        """Block unrequested desktop pointer/keyboard input or window/workspace mutations across all dispatch paths."""
+        from zelyr.tool_registry import canonicalize_tool_invocation
+
+        canon_name, canon_args = canonicalize_tool_invocation(tool_name, tool_args)
+        fn_low = cls._normalize_guard_tool_name(canon_name)
+        act_low = str((canon_args or {}).get("action") or "").strip().lower()
+
+        if fn_low == "execute_action":
+            is_mut_dc = act_low in cls._EXECUTE_ACTION_DESKTOP_MUTATIONS
+            is_mut_win = act_low in cls._EXECUTE_ACTION_WINDOW_MUTATIONS
+        else:
+            is_mut_dc = fn_low in cls.DESKTOP_INPUT_TOOLS and not (
+                fn_low in ("desktop_control", "desktop_automation", "desktopautomationtool")
+                and act_low in cls.DESKTOP_READ_ONLY_ACTIONS
+            )
+            is_mut_win = (
+                fn_low in cls.WINDOW_CONTROL_TOOLS
+                and act_low not in cls.WINDOW_READ_ONLY_ACTIONS
+            )
+        if not (is_mut_dc or is_mut_win):
+            return None
+
+        from zelyr.engine.execution_ledger import KNOWN_DESKTOP_CHECKS, parse_acceptance_criteria
+
+        prompt_text = user_prompt if isinstance(user_prompt, str) else ""
+        has_desktop_criteria = any(
+            str(c.get("check") or "").strip().lower() in KNOWN_DESKTOP_CHECKS
+            for c in (parse_acceptance_criteria(acceptance_spec) if acceptance_spec else ())
+        )
+        gui_allowed = (
+            cls.has_explicit_desktop_gui_intent(prompt_text)
+            or has_desktop_criteria
+        )
+        win_allowed = (
+            gui_allowed
+            or cls.has_explicit_window_control_intent(prompt_text)
+        )
+        if is_mut_dc and not gui_allowed:
+            return (
+                "unrequested_desktop_control",
+                "Refused unrequested desktop pointer/keyboard action during a non-desktop task.",
+            )
+        if is_mut_win and not win_allowed:
+            return (
+                "unrequested_window_focus",
+                "Refused unrequested window focus or workspace switch during a non-desktop task.",
+            )
+        return None
+
     CROSS_SURFACE_DESKTOP_PATTERNS = [
-        *DESKTOP_GUI_PATTERNS,
+        *DESKTOP_GUI_PATTERNS[:-1],
+        r"\b(?:focus|inspect|observe|click|type|press|drag|scroll)\b[^.\n]{0,60}\b(?:fixture|gui)\b",
         *TIER_3_EXPLICIT_PATTERNS,
         r"\b(desktop\s+(?:app|application|window|fixture|ui|gui)|pyside\d?|gtk|qt)\b",
         r"\b(desktop)\b[^.\n]{0,80}\b(window|button|field|input|confirm|submit|label|status|screen)\b",

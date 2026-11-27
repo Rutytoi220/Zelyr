@@ -9,6 +9,7 @@ import uuid
 from pathlib import Path
 import httpx
 from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+from zelyr.agents.actuator_arbiter import ActuatorArbiter
 from zelyr.core.plugins import get_tool_schemas, execute_tool, get_tier_timeout
 
 REFUSAL_PHRASES = [
@@ -450,57 +451,14 @@ class NativeOrchestrator:
         **{alias: "manage_routine" for alias in ROUTINE_TOOL_ALIASES},
     }
 
-    _DESKTOP_READ_ONLY_ACTIONS = frozenset({
-        "get_screen_size",
-        "inspect_windows",
-        "get_active_window",
-        "get_cursor_position",
-        "observe",
-        "screenshot",
-    })
-    _DESKTOP_INPUT_TOOLS = frozenset({
-        "desktop_control",
-        "desktop_automation",
-        "interact_with_ui",
-        "gui_actuate",
-        "click_tag",
-        "type_text",
-        "press_key",
-        "move_mouse",
-        "click_mouse",
-        *DESKTOP_CONTROL_ALIASES,
-    })
-    _WINDOW_READ_ONLY_ACTIONS = frozenset({
-        "list",
-        "list_windows",
-        "clients",
-        "get_active",
-        "get_active_window",
-        "active",
-        "activewindow",
-        "status",
-        "monitors",
-        "workspaces",
-        "get_geometry",
-    })
+    _DESKTOP_READ_ONLY_ACTIONS = ActuatorArbiter.DESKTOP_READ_ONLY_ACTIONS
+    _DESKTOP_INPUT_TOOLS = ActuatorArbiter.DESKTOP_INPUT_TOOLS | frozenset(DESKTOP_CONTROL_ALIASES)
+    _WINDOW_READ_ONLY_ACTIONS = ActuatorArbiter.WINDOW_READ_ONLY_ACTIONS
 
     @staticmethod
     def _extract_current_user_prompt(messages: Optional[List[Dict[str, Any]]]) -> str:
         """Return the latest real user prompt, ignoring synthetic system/vision directives and prior turns."""
-        for msg in reversed(messages or ()):
-            if not isinstance(msg, dict) or msg.get("role") != "user":
-                continue
-            content = msg.get("content")
-            if isinstance(content, list):
-                text = " ".join(part.get("text", "") for part in content if isinstance(part, dict)).strip()
-            elif isinstance(content, str):
-                text = content.strip()
-            else:
-                continue
-            if not text or text.startswith(("[SYSTEM", "[Transient desktop screenshot")):
-                continue
-            return text
-        return ""
+        return ActuatorArbiter.extract_current_user_prompt(messages)
 
     @classmethod
     def check_desktop_intent_guard(
@@ -512,45 +470,12 @@ class NativeOrchestrator:
         acceptance_spec: Any = None,
     ) -> Optional[Tuple[str, str]]:
         """Block unrequested desktop pointer/keyboard input or window/workspace mutations across all dispatch paths."""
-        fn_low = (tool_name or "").strip().lower()
-        act_low = str((tool_args or {}).get("action") or "").strip().lower()
-        is_mut_dc = fn_low in cls._DESKTOP_INPUT_TOOLS and not (
-            fn_low in ("desktop_control", "desktop_automation")
-            and act_low in cls._DESKTOP_READ_ONLY_ACTIONS
+        return ActuatorArbiter.check_desktop_intent_guard(
+            tool_name,
+            tool_args,
+            user_prompt=user_prompt,
+            acceptance_spec=acceptance_spec,
         )
-        is_mut_win = (
-            fn_low == "manage_desktop_window"
-            and act_low not in cls._WINDOW_READ_ONLY_ACTIONS
-        )
-        if not (is_mut_dc or is_mut_win):
-            return None
-
-        from zelyr.agents.actuator_arbiter import ActuatorArbiter
-        from zelyr.engine.execution_ledger import KNOWN_DESKTOP_CHECKS, parse_acceptance_criteria
-
-        has_desktop_criteria = any(
-            str(c.get("check") or "").strip().lower() in KNOWN_DESKTOP_CHECKS
-            for c in (parse_acceptance_criteria(acceptance_spec) if acceptance_spec else ())
-        )
-        gui_allowed = (
-            ActuatorArbiter.has_explicit_desktop_gui_intent(user_prompt)
-            or has_desktop_criteria
-        )
-        win_allowed = (
-            gui_allowed
-            or ActuatorArbiter.has_explicit_window_control_intent(user_prompt)
-        )
-        if is_mut_dc and not gui_allowed:
-            return (
-                "unrequested_desktop_control",
-                "Refused unrequested desktop pointer/keyboard action during a non-desktop task.",
-            )
-        if is_mut_win and not win_allowed:
-            return (
-                "unrequested_window_focus",
-                "Refused unrequested window focus or workspace switch during a non-desktop task.",
-            )
-        return None
 
     @staticmethod
     def _strip_tool_prefixes(name: Any) -> str:

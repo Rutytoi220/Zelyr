@@ -9,6 +9,8 @@ except ImportError:
     def build_som_override(names=None):  # type: ignore[misc]
         return ""
 import asyncio
+from contextlib import contextmanager
+from contextvars import ContextVar
 import json
 import logging
 import hashlib
@@ -28,6 +30,7 @@ from zelyr.engine.tool_pruner import ToolPruner
 from zelyr.swarm.consensus import ConsensusEngine
 from zelyr.agents.actuator_arbiter import ActuatorArbiter
 logger = logging.getLogger(__name__)
+_ACTIVE_ORCHESTRATOR_TASK: ContextVar[Optional[str]] = ContextVar("_active_orchestrator_task", default=None)
 MAX_TOOL_ROUNDS = 40
 LLM_RETRIES = 3
 DOCUMENT_EXTRACTION_NOTICE = '[Document Extraction Notice]: Zero selectable characters found in {file_path}. This document may be encrypted, security-locked, or rendered as a flat image scan lacking a readable text layer. Please convert via OCR.'
@@ -278,7 +281,20 @@ Returns:
             if self._current_execution_id == exec_id:
                 self._current_execution_id = None
 
+    @contextmanager
+    def _intent_scope(self, user_prompt: Optional[str]):
+        """Bind user intent cleanly to the current async execution context."""
+        token = _ACTIVE_ORCHESTRATOR_TASK.set(user_prompt if isinstance(user_prompt, str) else "")
+        try:
+            yield
+        finally:
+            _ACTIVE_ORCHESTRATOR_TASK.reset(token)
+
     async def _agentic_loop_core(self, task: str, steps: List[str], use_tools: bool=True, session_id: Optional[str]=None, timeout: Optional[float]=None) -> AgentResult:
+        with self._intent_scope(task):
+            return await self._agentic_loop_core_impl(task, steps, use_tools=use_tools, session_id=session_id, timeout=timeout)
+
+    async def _agentic_loop_core_impl(self, task: str, steps: List[str], use_tools: bool=True, session_id: Optional[str]=None, timeout: Optional[float]=None) -> AgentResult:
         session_id = str(session_id or uuid.uuid4())
         plan = self._load_plan(session_id) or self._create_plan(task)
         state = AgentState.THINK
@@ -303,6 +319,7 @@ Returns:
             self._log("Task intent is 'chat'. Conditionally disabling tools for rapid response.", steps)
         raw_schemas = self._get_tool_schemas() if use_tools else []
         tool_schemas = ToolPruner.prune_schemas(task, raw_schemas, intent)
+        tool_schemas = ActuatorArbiter.filter_tool_schemas_for_intent(tool_schemas, task)
         dropped = len(raw_schemas) - len(tool_schemas)
         if dropped > 0:
             self._log(f"[Schema Pruner]: Dropped {dropped} irrelevant tools. Active context: {[t.get('name') for t in tool_schemas]}", steps)
@@ -1558,6 +1575,35 @@ Returns:
         tool_name = decision.tool_name
         validated_arguments = copy.deepcopy(decision.normalized_arguments)
         arguments = copy.deepcopy(validated_arguments)
+
+        # Turn-level desktop/window intent guard (shared with NativeOrchestrator via ActuatorArbiter)
+        active_user_prompt = _ACTIVE_ORCHESTRATOR_TASK.get()
+        guard_hit = ActuatorArbiter.check_desktop_intent_guard(
+            tool_name,
+            validated_arguments,
+            user_prompt=active_user_prompt,
+        )
+        if guard_hit is not None:
+            guard_reason, guard_detail = guard_hit
+            res = self._structured_tool_result(
+                tool_name,
+                validated_arguments,
+                {
+                    'error': guard_detail,
+                    'error_type': 'AUTHORIZATION_DENIED',
+                    'reason': guard_reason,
+                },
+                False,
+            )
+            return record_outcome(
+                res,
+                t_id=tool_name,
+                src_id=src_id,
+                src_type=src_type,
+                is_ext=is_ext,
+                auth_status="denied",
+                auth_reason=guard_reason,
+            )
 
         # Unified Execution Policy check before ActionGovernor / FastestPath / Tool invoke
         from zelyr.engine.execution_policy import authorized_policy_context, build_execution_policy_engine

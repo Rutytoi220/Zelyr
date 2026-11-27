@@ -355,8 +355,12 @@ async def receive_webhook(hook_id: str, request: Request):
 async def chat_completions(req: ChatRequest, request: Request):
     """OpenAI-compatible chat completion endpoint (Ollama proxy)."""
     
+    from zelyr.agents.actuator_arbiter import ActuatorArbiter
+    from zelyr.agents.native_orchestrator import NativeOrchestrator
     from zelyr.core.config import get_model_routing, get_context_limits
     from zelyr.core.plugins import get_tool_schemas, execute_tool
+    from zelyr.engine.normalizer import strict_json_loads
+    from zelyr.tool_registry import canonicalize_tool_invocation
     
     COMPUTE_ROUTER = get_model_routing()
     tier = request.headers.get("x-compute-tier", "").lower()
@@ -386,7 +390,6 @@ async def chat_completions(req: ChatRequest, request: Request):
     }
 
     incoming_messages = []
-    user_prompt_text = ""
     for m in req.messages:
         if m.role == "system":
             continue
@@ -409,8 +412,10 @@ async def chat_completions(req: ChatRequest, request: Request):
                 })
                 
         incoming_messages.append(msg_dict)
-        if m.role == "user" and m.content:
-            user_prompt_text = m.content
+
+    # Extract only the latest real incoming user prompt so prior turns / DB history cannot bleed intent.
+    current_user_prompt = ActuatorArbiter.extract_current_user_prompt(incoming_messages)
+    user_prompt_text = current_user_prompt
 
     payload_messages = [system_msg] + historical_messages + incoming_messages
 
@@ -419,7 +424,10 @@ async def chat_completions(req: ChatRequest, request: Request):
         t.get("function", {}).get("name") for t in tools_list if isinstance(t, dict)
     }
 
-    dynamic_tools = get_tool_schemas(requested_ring)
+    dynamic_tools = ActuatorArbiter.filter_tool_schemas_for_intent(
+        get_tool_schemas(requested_ring),
+        current_user_prompt,
+    )
     for wt in dynamic_tools:
         if wt["function"]["name"] == "search_memory" and req.model == "gemini-3.8-flash":
             continue
@@ -573,21 +581,70 @@ async def chat_completions(req: ChatRequest, request: Request):
                 func_name = tc["function"]["name"]
                 func_args_str = tc["function"]["arguments"]
                 tool_call_id = tc["id"]
-                
-                try:
-                    func_args = json.loads(func_args_str) if func_args_str else {}
-                except Exception:
-                    func_args = {}
-                    
-                try:
-                    tool_result = await execute_tool(func_name, **func_args)
-                    
-                    if not isinstance(tool_result, str):
-                        tool_result = json.dumps(tool_result, indent=2)
-                        
-                    res_str = tool_result
-                except Exception as e:
-                    res_str = json.dumps({"error": str(e), "status": "tool_execution_failed"})
+
+                arg_parse_error = None
+                if isinstance(func_args_str, dict):
+                    parsed_raw_args = dict(func_args_str)
+                elif isinstance(func_args_str, str) and func_args_str.strip():
+                    try:
+                        parsed_obj = strict_json_loads(func_args_str.strip())
+                        if not isinstance(parsed_obj, dict):
+                            arg_parse_error = f"Tool arguments for '{func_name}' must be a JSON object."
+                            parsed_raw_args = {}
+                        else:
+                            parsed_raw_args = parsed_obj
+                    except Exception as parse_exc:
+                        arg_parse_error = f"Malformed tool arguments JSON for '{func_name}': {parse_exc}"
+                        parsed_raw_args = {}
+                elif not func_args_str:
+                    parsed_raw_args = {}
+                else:
+                    arg_parse_error = f"Tool arguments for '{func_name}' must be a JSON object."
+                    parsed_raw_args = {}
+
+                if arg_parse_error is not None:
+                    res_str = json.dumps({
+                        "success": False,
+                        "status": "rejected",
+                        "error": arg_parse_error,
+                        "error_type": "SCHEMA_VALIDATION_ERROR",
+                        "reason": "schema_validation_error",
+                        "tool": func_name,
+                    })
+                else:
+                    clean_name = NativeOrchestrator.normalize_tool_name(func_name, active_schemas=tools_list)
+                    clean_name, clean_args = canonicalize_tool_invocation(clean_name, parsed_raw_args)
+                    clean_args = NativeOrchestrator.normalize_tool_arguments(
+                        clean_name,
+                        clean_args,
+                        original_name=func_name,
+                        active_schemas=tools_list,
+                    )
+                    guard_hit = ActuatorArbiter.check_desktop_intent_guard(
+                        clean_name,
+                        clean_args,
+                        user_prompt=current_user_prompt,
+                    )
+                    if guard_hit is not None:
+                        guard_reason, guard_detail = guard_hit
+                        res_str = json.dumps({
+                            "success": False,
+                            "status": "rejected",
+                            "error": guard_detail,
+                            "error_type": "AUTHORIZATION_DENIED",
+                            "reason": guard_reason,
+                            "tool": clean_name,
+                        })
+                    else:
+                        try:
+                            tool_result = await execute_tool(clean_name, **clean_args)
+
+                            if not isinstance(tool_result, str):
+                                tool_result = json.dumps(tool_result, indent=2)
+
+                            res_str = tool_result
+                        except Exception as e:
+                            res_str = json.dumps({"error": str(e), "status": "tool_execution_failed"})
                     
                 tool_msg = {
                     "role": "tool",
@@ -651,23 +708,34 @@ async def orchestrate(req: OrchestrateRequest):
     steps_taken = []
     
     try:
+        import inspect
         from zelyr.agents.orchestrator_agent import OrchestratorAgent
         from zelyr.tool_registry import ToolRegistry
         
         reg = ToolRegistry()
         orchestrator = OrchestratorAgent(registry=reg)
-        
-        result = await orchestrator.run(
-            prompt,
-            session_id=session_id,
-            override_prompt=req.override_prompt,
-            intent=req.intent
-        )
+
+        run_fn = orchestrator.run
+        run_sig = inspect.signature(run_fn)
+        run_kwargs: Dict[str, Any] = {}
+        if "session_id" in run_sig.parameters:
+            run_kwargs["session_id"] = session_id
+        if "override_prompt" in run_sig.parameters:
+            run_kwargs["override_prompt"] = req.override_prompt
+        if "intent" in run_sig.parameters:
+            run_kwargs["intent"] = req.intent
+
+        if inspect.iscoroutinefunction(run_fn):
+            result = await run_fn(prompt, **run_kwargs)
+        else:
+            result = await asyncio.to_thread(run_fn, prompt, **run_kwargs)
         
         if hasattr(result, "output") and isinstance(result.output, dict):
             agent_response = result.output.get("response", str(result.output))
-        elif hasattr(result, "output"):
+        elif hasattr(result, "output") and result.output is not None:
             agent_response = str(result.output)
+        elif getattr(result, "error", None):
+            agent_response = str(result.error)
         else:
             agent_response = str(result)
             

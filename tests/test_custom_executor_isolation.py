@@ -735,10 +735,11 @@ class TestLegacyAgentExecutionBoundaries:
         )
 
         # Passing service-restart or URL text to an authorized tool must invoke the authorized tool, NEVER FastestPathRouter
-        res_ui = await agent._execute_tool(
-            "interact_with_ui",
-            {"instruction": "restart service bluetooth and open https://example.com and mute volume"},
-        )
+        with agent._intent_scope("Click the button in the desktop window"):
+            res_ui = await agent._execute_tool(
+                "interact_with_ui",
+                {"instruction": "restart service bluetooth and open https://example.com and mute volume"},
+            )
         assert res_ui["success"] is True
         assert mock_popen.call_count == 0
         assert mock_run.call_count == 0
